@@ -4,6 +4,7 @@ package identity_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -217,5 +218,148 @@ func TestAuthorize_LadderAndAdminBypass(t *testing.T) {
 	}
 	if len(grants) != 1 || grants[0].Level != identity.GrantRun || grants[0].ProjectID != projectID {
 		t.Fatalf("grants = %+v", grants)
+	}
+}
+
+func TestBootstrap_ConcurrentCallsCreateOneAdmin(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+
+	// Start signal and wait group for coordinating concurrent calls.
+	var start sync.WaitGroup
+	start.Add(2)
+	var done sync.WaitGroup
+	done.Add(2)
+
+	var result1, result2 identity.User
+	var err1, err2 error
+
+	// Goroutine 1: bootstrap first admin.
+	go func() {
+		defer done.Done()
+		start.Done()
+		start.Wait()
+		result1, err1 = svc.Bootstrap(ctx, "admin1@example.com", testPassword)
+	}()
+
+	// Goroutine 2: bootstrap second admin concurrently.
+	go func() {
+		defer done.Done()
+		start.Done()
+		start.Wait()
+		result2, err2 = svc.Bootstrap(ctx, "admin2@example.com", testPassword)
+	}()
+
+	done.Wait()
+
+	// Exactly one must succeed, the other must fail with ClassConflict.
+	successCount := 0
+	if err1 == nil {
+		successCount++
+	}
+	if err2 == nil {
+		successCount++
+	}
+	if successCount != 1 {
+		t.Fatalf("expected exactly one success, got %d (err1=%v, err2=%v)", successCount, err1, err2)
+	}
+
+	// The one that succeeded must have role admin.
+	if err1 == nil && result1.Role != identity.RoleAdmin {
+		t.Fatalf("bootstrap 1: role = %s, want admin", result1.Role)
+	}
+	if err2 == nil && result2.Role != identity.RoleAdmin {
+		t.Fatalf("bootstrap 2: role = %s, want admin", result2.Role)
+	}
+
+	// The one that failed must have ClassConflict.
+	if err1 != nil {
+		wantClass(t, err1, xerrors.ClassConflict)
+	}
+	if err2 != nil {
+		wantClass(t, err2, xerrors.ClassConflict)
+	}
+
+	// Exactly one admin row must exist.
+	var adminCount int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE role = 'admin'`).Scan(&adminCount); err != nil {
+		t.Fatal(err)
+	}
+	if adminCount != 1 {
+		t.Fatalf("admin count = %d, want 1", adminCount)
+	}
+}
+
+func TestUpdateUser_ConcurrentDemotionsKeepOneActiveAdmin(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+
+	// Bootstrap admin A.
+	admin, _ := svc.Bootstrap(ctx, "adminA@example.com", testPassword)
+	actor := identity.Principal{UserID: admin.ID, Email: admin.Email, Role: admin.Role}
+
+	// Create admin B.
+	adminB, err := svc.CreateUser(ctx, actor, "adminB@example.com", testPassword, identity.RoleAdmin)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Concurrent UpdateUser calls:
+	// - Admin A demotes Admin B
+	// - Admin B demotes Admin A (using outdated principal, still marked as admin in principal)
+	var start sync.WaitGroup
+	start.Add(2)
+	var done sync.WaitGroup
+	done.Add(2)
+
+	var errA, errB error
+	demote := identity.RoleMember
+
+	// Goroutine 1: A demotes B.
+	go func() {
+		defer done.Done()
+		start.Done()
+		start.Wait()
+		_, errA = svc.UpdateUser(ctx, actor, adminB.ID, identity.UserUpdate{Role: &demote})
+	}()
+
+	// Goroutine 2: B (using outdated principal) demotes A.
+	go func() {
+		defer done.Done()
+		start.Done()
+		start.Wait()
+		bActor := identity.Principal{UserID: adminB.ID, Email: adminB.Email, Role: identity.RoleAdmin}
+		_, errB = svc.UpdateUser(ctx, bActor, admin.ID, identity.UserUpdate{Role: &demote})
+	}()
+
+	done.Wait()
+
+	// Exactly one must succeed, the other must fail with ClassConflict.
+	successCount := 0
+	if errA == nil {
+		successCount++
+	}
+	if errB == nil {
+		successCount++
+	}
+	if successCount != 1 {
+		t.Fatalf("expected exactly one success, got %d (errA=%v, errB=%v)", successCount, errA, errB)
+	}
+
+	// The one that failed must have ClassConflict.
+	if errA != nil {
+		wantClass(t, errA, xerrors.ClassConflict)
+	}
+	if errB != nil {
+		wantClass(t, errB, xerrors.ClassConflict)
+	}
+
+	// At least one user must still be admin + active.
+	var activeAdminCount int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE role = 'admin' AND active`).Scan(&activeAdminCount); err != nil {
+		t.Fatal(err)
+	}
+	if activeAdminCount < 1 {
+		t.Fatalf("active admin count = %d, want >= 1", activeAdminCount)
 	}
 }

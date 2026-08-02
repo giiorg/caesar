@@ -19,6 +19,10 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
 
+// adminGuardLockID serializes admin-count guard transactions (Bootstrap and
+// UpdateUser) to prevent concurrent bypass of the last-admin check.
+const adminGuardLockID = 1
+
 // Params are the deployment-tunable knobs (config supplies them in app
 // wiring; defaults pinned in the plan header).
 type Params struct {
@@ -98,6 +102,10 @@ func (s *Service) Bootstrap(ctx context.Context, email, password string) (User, 
 		return User{}, fmt.Errorf("identity: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", adminGuardLockID); err != nil {
+		return User{}, fmt.Errorf("identity: advisory lock: %w", err)
+	}
 	q := store.New(tx)
 
 	admins, err := q.CountAdmins(ctx)
@@ -217,6 +225,10 @@ func (s *Service) UpdateUser(ctx context.Context, actor Principal, id uuid.UUID,
 		return User{}, fmt.Errorf("identity: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", adminGuardLockID); err != nil {
+		return User{}, fmt.Errorf("identity: advisory lock: %w", err)
+	}
 	q := store.New(tx)
 
 	current, err := q.GetUserByID(ctx, id)
