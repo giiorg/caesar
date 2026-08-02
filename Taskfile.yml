@@ -1,0 +1,137 @@
+version: '3'
+
+vars:
+  GOLANGCI_LINT_VERSION: v1.64.8
+  GOFUMPT_VERSION: v0.7.0
+  GOVULNCHECK_VERSION: v1.1.4
+  ATLAS_VERSION: v0.34.1
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.21.2
+  ACTIONLINT_IMAGE: rhysd/actionlint:1.7.4
+
+tasks:
+  tools:
+    dir: backend
+    env:
+      GOBIN: '{{.ROOT_DIR}}/backend/bin'
+    status:
+      # Version-aware: a pin bump makes these fail and reinstalls.
+      - bin/golangci-lint version 2>/dev/null | grep -q {{.GOLANGCI_LINT_VERSION}}
+      - bin/gofumpt --version 2>/dev/null | grep -q {{.GOFUMPT_VERSION}}
+      - bin/govulncheck -version 2>/dev/null | grep -q govulncheck@{{.GOVULNCHECK_VERSION}}
+    cmds:
+      - go install github.com/golangci/golangci-lint/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}
+      - go install mvdan.cc/gofumpt@{{.GOFUMPT_VERSION}}
+      - go install golang.org/x/vuln/cmd/govulncheck@{{.GOVULNCHECK_VERSION}}
+
+  backend:fmt:
+    deps: [tools]
+    dir: backend
+    cmds:
+      - bin/gofumpt -w .
+
+  backend:fmt:check:
+    deps: [tools]
+    dir: backend
+    cmds:
+      - test -z "$(bin/gofumpt -l .)" || (bin/gofumpt -l . && exit 1)
+
+  backend:vet:
+    dir: backend
+    cmds:
+      - go vet -tags integration ./...
+
+  backend:lint:
+    deps: [tools]
+    dir: backend
+    cmds:
+      - bin/golangci-lint run
+
+  backend:vuln:
+    deps: [tools]
+    dir: backend
+    cmds:
+      - bin/govulncheck -tags integration ./...
+
+  backend:build:
+    dir: backend
+    vars:
+      VERSION:
+        sh: git describe --tags --always --dirty
+      COMMIT:
+        sh: git rev-parse --short HEAD
+      DATE:
+        sh: date -u +%Y-%m-%dT%H:%M:%SZ
+    cmds:
+      - go build -trimpath -ldflags "-s -w -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Version={{.VERSION}} -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Commit={{.COMMIT}} -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Date={{.DATE}}" -o bin/caesar ./cmd/caesar
+
+  backend:test:
+    dir: backend
+    cmds:
+      - go test -race ./...
+
+  backend:analyze:
+    dir: backend
+    cmds:
+      - go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze
+      - go vet -tags integration -vettool=./bin/caesar-analyze ./...
+
+  backend:run:
+    desc: "Run the control plane against the dev database (task db:up first)"
+    dir: backend
+    cmds:
+      - go run ./cmd/caesar serve -config caesar.dev.json
+
+  db:up:
+    cmds:
+      - docker compose -f compose.dev.yaml up -d --wait
+
+  db:down:
+    cmds:
+      - docker compose -f compose.dev.yaml down
+
+  backend:test:integration:
+    dir: backend
+    cmds:
+      - go test -race -tags integration -count=1 ./...
+
+  db:new:
+    desc: "Author a migration from schema.sql changes: task db:new -- add_users"
+    dir: backend
+    cmds:
+      - atlas migrate diff {{.CLI_ARGS}} --dir "file://internal/platform/pg/migrations?format=goose" --to "file://internal/platform/pg/schema.sql" --dev-url "docker://postgres/18/dev"
+
+  secrets:
+    cmds:
+      - docker run --rm -u "$(id -u):$(id -g)" -v "{{.ROOT_DIR}}:/repo" {{.GITLEAKS_IMAGE}} git /repo --config /repo/.gitleaks.toml --verbose
+
+  image:build:
+    vars:
+      VERSION:
+        sh: git describe --tags --always --dirty
+      COMMIT:
+        sh: git rev-parse --short HEAD
+      DATE:
+        sh: date -u +%Y-%m-%dT%H:%M:%SZ
+    cmds:
+      - docker build --build-arg VERSION={{.VERSION}} --build-arg COMMIT={{.COMMIT}} --build-arg DATE={{.DATE}} -t caesar:dev .
+
+  backend:ci:
+    cmds:
+      - task: backend:fmt:check
+      - task: backend:vet
+      - task: backend:lint
+      - task: backend:analyze
+      - task: backend:test
+      - task: backend:test:integration
+      - task: backend:vuln
+      - task: backend:build
+
+  lint:actions:
+    cmds:
+      - docker run --rm -v "{{.ROOT_DIR}}:/repo" -w /repo {{.ACTIONLINT_IMAGE}} -color
+
+  ci:
+    cmds:
+      - task: backend:ci
+      - task: secrets
+      - task: lint:actions

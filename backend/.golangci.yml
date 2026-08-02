@@ -1,0 +1,96 @@
+# caesar house lint (Plan 01 pin). Broad set, justified disables only.
+# House law beyond lint lives in internal/analyzers and internal/arch.
+run:
+  timeout: 5m
+  build-tags:
+    - integration
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - gosimple
+    - ineffassign
+    - errorlint      # %w-aware error comparisons
+    - bodyclose
+    - noctx          # outbound requests must carry a context
+    - rowserrcheck
+    - sqlclosecheck
+    - copyloopvar
+    - gocritic
+    - misspell
+    - unconvert
+    - wastedassign
+    - nilerr
+    - gosec
+    - gofumpt
+    - goimports
+    - depguard
+    - forbidigo
+    - revive
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/giiorg/caesar/backend
+  gosec:
+    excludes:
+      - G104 # duplicate of errcheck
+  depguard:
+    # Fast-feedback mirror of the canonical deny-list in internal/arch/rules.go
+    # (arch test is authoritative; keep both in sync when the list changes).
+    rules:
+      main:
+        files:
+          - $all
+        deny:
+          - pkg: github.com/stretchr/testify
+            desc: stdlib asserts + go-cmp only
+          - pkg: gorm.io
+            desc: no ORMs
+          - pkg: entgo.io
+            desc: no ORMs
+          - pkg: go.uber.org/fx
+            desc: no DI frameworks — manual composition roots
+          - pkg: go.uber.org/dig
+            desc: no DI frameworks — manual composition roots
+          - pkg: go.uber.org/zap
+            desc: log/slog only
+          - pkg: github.com/sirupsen/logrus
+            desc: log/slog only
+          - pkg: github.com/rs/zerolog
+            desc: log/slog only
+          - pkg: github.com/spf13/cobra
+            desc: stdlib flag only
+          - pkg: github.com/spf13/viper
+            desc: strict JSON config only
+          - pkg: github.com/joho/godotenv
+            desc: env access only inside platform/config
+          - pkg: github.com/pkg/errors
+            desc: stdlib errors + %w
+  forbidigo:
+    forbid:
+      - p: ^fmt\.Print(f|ln)?$
+        msg: write to an injected io.Writer or use slog
+  revive:
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: error-return
+      - name: error-naming
+      - name: increment-decrement
+      - name: receiver-naming
+      - name: time-naming
+      - name: var-declaration
+      - name: range
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gosec
+        - noctx
+        - bodyclose
+        - forbidigo
