@@ -265,6 +265,12 @@ func (s *Service) UpdateUser(ctx context.Context, actor Principal, id uuid.UUID,
 	if err != nil {
 		return User{}, fmt.Errorf("identity: update user: %w", err)
 	}
+	if newRole != Role(current.Role) || newActive != current.Active {
+		now := s.clock.Now()
+		if err := q.RevokeUserSessions(ctx, store.RevokeUserSessionsParams{UserID: id, RevokedAt: &now}); err != nil {
+			return User{}, fmt.Errorf("identity: revoke sessions: %w", err)
+		}
+	}
 	err = s.audit.Record(ctx, tx, audit.Entry{
 		Actor:  uuid.NullUUID{UUID: actor.UserID, Valid: true},
 		Action: "user.updated", SubjectKind: "user", SubjectID: id.String(),
@@ -308,4 +314,18 @@ func (s *Service) Authorize(ctx context.Context, p Principal, projectID uuid.UUI
 		return false, fmt.Errorf("identity: grant lookup: %w", err)
 	}
 	return GrantLevel(level).AtLeast(min), nil
+}
+
+// MintSessionForTest mints a session outside a login flow. Test seam only.
+func (s *Service) MintSessionForTest(ctx context.Context, userID uuid.UUID) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	token, err := s.mintSession(ctx, store.New(tx), userID)
+	if err != nil {
+		return "", err
+	}
+	return token, tx.Commit(ctx)
 }

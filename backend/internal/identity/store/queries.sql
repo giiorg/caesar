@@ -43,3 +43,24 @@ SELECT project_id, level FROM grants WHERE user_id = $1 ORDER BY project_id;
 
 -- name: GetGrantLevel :one
 SELECT level FROM grants WHERE user_id = $1 AND project_id = $2;
+
+-- name: InsertSession :one
+INSERT INTO sessions (user_id, token_hash, created_at, last_seen_at, expires_at)
+VALUES ($1, $2, $3, $3, $4)
+RETURNING id;
+
+-- name: GetSessionByTokenHash :one
+SELECT s.id, s.user_id, s.created_at, s.last_seen_at, s.expires_at, s.revoked_at,
+       u.email, u.role, u.active
+FROM sessions s
+JOIN users u ON u.id = s.user_id
+WHERE s.token_hash = $1;
+
+-- name: TouchSession :exec
+UPDATE sessions SET last_seen_at = $2 WHERE id = $1;
+
+-- name: RevokeSession :exec
+UPDATE sessions SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL;
+
+-- name: RevokeUserSessions :exec
+UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL;

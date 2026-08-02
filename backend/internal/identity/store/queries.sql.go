@@ -80,6 +80,43 @@ func (q *Queries) GetGrantLevel(ctx context.Context, arg GetGrantLevelParams) (s
 	return level, err
 }
 
+const getSessionByTokenHash = `-- name: GetSessionByTokenHash :one
+SELECT s.id, s.user_id, s.created_at, s.last_seen_at, s.expires_at, s.revoked_at,
+       u.email, u.role, u.active
+FROM sessions s
+JOIN users u ON u.id = s.user_id
+WHERE s.token_hash = $1
+`
+
+type GetSessionByTokenHashRow struct {
+	ID         uuid.UUID
+	UserID     uuid.UUID
+	CreatedAt  time.Time
+	LastSeenAt time.Time
+	ExpiresAt  time.Time
+	RevokedAt  *time.Time
+	Email      string
+	Role       string
+	Active     bool
+}
+
+func (q *Queries) GetSessionByTokenHash(ctx context.Context, tokenHash []byte) (GetSessionByTokenHashRow, error) {
+	row := q.db.QueryRow(ctx, getSessionByTokenHash, tokenHash)
+	var i GetSessionByTokenHashRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.CreatedAt,
+		&i.LastSeenAt,
+		&i.ExpiresAt,
+		&i.RevokedAt,
+		&i.Email,
+		&i.Role,
+		&i.Active,
+	)
+	return i, err
+}
+
 const getUserByEmail = `-- name: GetUserByEmail :one
 SELECT id, email, password_hash, role, active, created_at, updated_at
 FROM users
@@ -151,6 +188,31 @@ func (q *Queries) GrantsForUser(ctx context.Context, userID uuid.UUID) ([]Grants
 	return items, nil
 }
 
+const insertSession = `-- name: InsertSession :one
+INSERT INTO sessions (user_id, token_hash, created_at, last_seen_at, expires_at)
+VALUES ($1, $2, $3, $3, $4)
+RETURNING id
+`
+
+type InsertSessionParams struct {
+	UserID    uuid.UUID
+	TokenHash []byte
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
+func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertSession,
+		arg.UserID,
+		arg.TokenHash,
+		arg.CreatedAt,
+		arg.ExpiresAt,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const listUsers = `-- name: ListUsers :many
 SELECT id, email, password_hash, role, active, created_at, updated_at
 FROM users
@@ -183,6 +245,48 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const revokeSession = `-- name: RevokeSession :exec
+UPDATE sessions SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL
+`
+
+type RevokeSessionParams struct {
+	ID        uuid.UUID
+	RevokedAt *time.Time
+}
+
+func (q *Queries) RevokeSession(ctx context.Context, arg RevokeSessionParams) error {
+	_, err := q.db.Exec(ctx, revokeSession, arg.ID, arg.RevokedAt)
+	return err
+}
+
+const revokeUserSessions = `-- name: RevokeUserSessions :exec
+UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL
+`
+
+type RevokeUserSessionsParams struct {
+	UserID    uuid.UUID
+	RevokedAt *time.Time
+}
+
+func (q *Queries) RevokeUserSessions(ctx context.Context, arg RevokeUserSessionsParams) error {
+	_, err := q.db.Exec(ctx, revokeUserSessions, arg.UserID, arg.RevokedAt)
+	return err
+}
+
+const touchSession = `-- name: TouchSession :exec
+UPDATE sessions SET last_seen_at = $2 WHERE id = $1
+`
+
+type TouchSessionParams struct {
+	ID         uuid.UUID
+	LastSeenAt time.Time
+}
+
+func (q *Queries) TouchSession(ctx context.Context, arg TouchSessionParams) error {
+	_, err := q.db.Exec(ctx, touchSession, arg.ID, arg.LastSeenAt)
+	return err
 }
 
 const updateUserPassword = `-- name: UpdateUserPassword :exec
