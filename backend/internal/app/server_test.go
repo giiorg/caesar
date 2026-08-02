@@ -20,7 +20,7 @@ func discard() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard, ni
 // getHealthzWithPinger is shared with serve_integration_test.go (same package).
 func getHealthzWithPinger(t *testing.T, db Pinger) (*http.Response, map[string]any) {
 	t.Helper()
-	srv := httptest.NewServer(Routes(discard(), db))
+	srv := httptest.NewServer(Routes(discard(), db, nil, "http://localhost:8080"))
 	t.Cleanup(srv.Close)
 	resp, err := http.Get(srv.URL + "/healthz")
 	if err != nil {

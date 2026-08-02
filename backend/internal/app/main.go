@@ -14,12 +14,13 @@ const usage = `caesar — deterministic orchestrator of agentic workflows
 commands:
   serve     start the control plane (default)
   migrate   run database migrations (up|down|status)
+  admin     administrative commands (bootstrap)
   version   print build information
 `
 
 // Main dispatches subcommands. It returns the process exit code; main() is
 // the only caller of os.Exit.
-func Main(args []string, stdout, stderr io.Writer) int {
+func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	cmd := "serve"
 	if len(args) > 0 {
 		cmd = args[0]
@@ -33,6 +34,8 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return runMigrateCmd(args, stdout, stderr)
 	case "serve":
 		return runServeCmd(args, stdout, stderr)
+	case "admin":
+		return runAdminCmd(args, stdin, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", cmd, usage)
 		return 2

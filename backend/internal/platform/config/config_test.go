@@ -71,6 +71,29 @@ func TestLoad_AppliesDefaultsForOmittedFields(t *testing.T) {
 	if cfg.Log.Level != "info" {
 		t.Errorf("default Log.Level = %q, want info", cfg.Log.Level)
 	}
+	if cfg.Server.AppOrigin != "http://localhost:8080" {
+		t.Errorf("default AppOrigin = %q, want http://localhost:8080", cfg.Server.AppOrigin)
+	}
+	if cfg.Auth.SessionIdleTTL.Std() != 14*24*time.Hour {
+		t.Errorf("default SessionIdleTTL = %v, want 336h", cfg.Auth.SessionIdleTTL.Std())
+	}
+	if cfg.Auth.SessionAbsoluteTTL.Std() != 90*24*time.Hour {
+		t.Errorf("default SessionAbsoluteTTL = %v, want 2160h", cfg.Auth.SessionAbsoluteTTL.Std())
+	}
+}
+
+func TestLoad_ParsesExplicitAuthTTLs(t *testing.T) {
+	body := `{"database": {"url": "postgres://x"}, "auth": {"session_idle_ttl": "1h", "session_absolute_ttl": "2h"}}`
+	cfg, err := Load(writeFile(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Auth.SessionIdleTTL.Std() != time.Hour {
+		t.Errorf("SessionIdleTTL = %v, want 1h", cfg.Auth.SessionIdleTTL.Std())
+	}
+	if cfg.Auth.SessionAbsoluteTTL.Std() != 2*time.Hour {
+		t.Errorf("SessionAbsoluteTTL = %v, want 2h", cfg.Auth.SessionAbsoluteTTL.Std())
+	}
 }
 
 func TestLoad_DatabaseURLEnvOverridesFile(t *testing.T) {
@@ -93,6 +116,10 @@ func TestLoad_FailsClosed(t *testing.T) {
 		{"log level with offset -", `{"database": {"url": "postgres://x"}, "log": {"level": "warn-100"}}`, "log.level"},
 		{"bad duration", `{"server": {"shutdown_timeout": "fast"}, "database": {"url": "postgres://x"}}`, "duration"},
 		{"malformed json", `{`, "parse"},
+		{"absolute ttl less than idle ttl", `{"database": {"url": "postgres://x"}, "auth": {"session_idle_ttl": "2h", "session_absolute_ttl": "1h"}}`, "auth.session_absolute_ttl"},
+		{"zero idle ttl", `{"database": {"url": "postgres://x"}, "auth": {"session_idle_ttl": "0s", "session_absolute_ttl": "1h"}}`, "auth.session_idle_ttl"},
+		{"negative idle ttl", `{"database": {"url": "postgres://x"}, "auth": {"session_idle_ttl": "-1h", "session_absolute_ttl": "1h"}}`, "auth.session_idle_ttl"},
+		{"empty app origin", `{"database": {"url": "postgres://x"}, "server": {"app_origin": ""}}`, "server.app_origin"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
