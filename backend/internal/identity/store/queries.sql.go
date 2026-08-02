@@ -12,6 +12,17 @@ import (
 	"github.com/google/uuid"
 )
 
+const countActiveAdmins = `-- name: CountActiveAdmins :one
+SELECT count(*) FROM users WHERE role = 'admin' AND active
+`
+
+func (q *Queries) CountActiveAdmins(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveAdmins)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countAdmins = `-- name: CountAdmins :one
 SELECT count(*) FROM users WHERE role = 'admin'
 `
@@ -51,6 +62,22 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const getGrantLevel = `-- name: GetGrantLevel :one
+SELECT level FROM grants WHERE user_id = $1 AND project_id = $2
+`
+
+type GetGrantLevelParams struct {
+	UserID    uuid.UUID
+	ProjectID uuid.UUID
+}
+
+func (q *Queries) GetGrantLevel(ctx context.Context, arg GetGrantLevelParams) (string, error) {
+	row := q.db.QueryRow(ctx, getGrantLevel, arg.UserID, arg.ProjectID)
+	var level string
+	err := row.Scan(&level)
+	return level, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
@@ -93,6 +120,35 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const grantsForUser = `-- name: GrantsForUser :many
+SELECT project_id, level FROM grants WHERE user_id = $1 ORDER BY project_id
+`
+
+type GrantsForUserRow struct {
+	ProjectID uuid.UUID
+	Level     string
+}
+
+func (q *Queries) GrantsForUser(ctx context.Context, userID uuid.UUID) ([]GrantsForUserRow, error) {
+	rows, err := q.db.Query(ctx, grantsForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GrantsForUserRow
+	for rows.Next() {
+		var i GrantsForUserRow
+		if err := rows.Scan(&i.ProjectID, &i.Level); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listUsers = `-- name: ListUsers :many

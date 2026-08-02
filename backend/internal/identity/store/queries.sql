@@ -34,3 +34,12 @@ WHERE id = $1;
 
 -- name: CountAdmins :one
 SELECT count(*) FROM users WHERE role = 'admin';
+
+-- name: CountActiveAdmins :one
+SELECT count(*) FROM users WHERE role = 'admin' AND active;
+
+-- name: GrantsForUser :many
+SELECT project_id, level FROM grants WHERE user_id = $1 ORDER BY project_id;
+
+-- name: GetGrantLevel :one
+SELECT level FROM grants WHERE user_id = $1 AND project_id = $2;
