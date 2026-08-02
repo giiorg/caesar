@@ -11,7 +11,12 @@ func TestCheckDeadConfig_FlagsFieldsWithoutReadSites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"config field Config.Unused has no read site outside the config package (no dead config)"}
+	want := []string{
+		"config field Config.OnlyAssigned has no read site outside the config package (no dead config)",
+		"config field Config.OnlyLiteralKey has no read site outside the config package (no dead config)",
+		"config field Config.OnlyTestRead has no read site outside the config package (no dead config)",
+		"config field Config.Unused has no read site outside the config package (no dead config)",
+	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatal(diff)
 	}
