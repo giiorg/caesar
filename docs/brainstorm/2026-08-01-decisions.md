@@ -1,6 +1,6 @@
 # caesar — V1 decisions record (brainstorming phase)
 
-**Date:** 2026-08-01 · **Status:** LOCKED unless explicitly reopened · **Process:** superpowers:brainstorming, mid-flight (see `2026-08-01-handoff.md`)
+**Date:** 2026-08-01 · **Updated:** 2026-08-02 (deployment pivot — §3/§8 revised, NATS-free core reaffirmed) · **Status:** LOCKED unless explicitly reopened · **Process:** superpowers:brainstorming, mid-flight (see `2026-08-01-handoff.md`)
 
 Every decision below was made explicitly with the user during the 2026-08-01 brainstorming session. Do not re-litigate silently; if new evidence challenges one, raise it with the user.
 
@@ -21,19 +21,19 @@ Every decision below was made explicitly with the user during the 2026-08-01 bra
   - Queue: `SELECT … FOR UPDATE SKIP LOCKED` + CAS state transitions (`UPDATE … WHERE status = $expected`) + durable leases (`worker_id`, `leased_until`, heartbeats). Attempt limits enforced in the claim `WHERE`.
   - Events: append-only `run_events` table written in the same tx as state changes; transactional **outbox** table from day one (future NATS relay attaches there; no semantic change).
   - LISTEN/NOTIFY = **wake-up signal only, never the data** (at-most-once, non-durable). Consumers read state first, then listen; slow fallback polls. Lost notification costs latency, never correctness.
-- **No NATS, no Redis in caesar's core loop.** Both exist on the target cluster; "available ≠ load-bearing." NATS may later relay the outbox for external consumers. Redis unused.
+- **No NATS, no Redis in caesar's core loop** (reaffirmed 2026-08-02 during the deployment pivot). NATS may later relay the outbox for external consumers; Redis unused. **Core external dependencies for any caesar deployment: PostgreSQL + a container runtime. Nothing else.** This is what makes the portable-deployment story work.
 - **API:** REST + OpenAPI 3.1 on stdlib `net/http` mux. Generated TypeScript client; schema-drift CI gates (port of the bitnet-frontend-admin discipline). Realtime to browser: **SSE** (snapshot-then-deltas, resume via last event id). No GraphQL, no gRPC in V1.
 - **Frontend:** React mobile-first web app (React Native later). See §7/§10.
 - **Repo:** monorepo — `/backend`, `/web`, `/deploy`, `/docs`.
 
 ## 3. Execution & isolation
 
-- **Every agent run executes in a disposable container.** Runner is a **port** with two adapters from day one:
-  - **Prod: Kubernetes Jobs** on the user's existing Hetzner cluster (redlight project: Talos, Cilium, Tetragon, CNPG, OpenTofu IaC; NATS/Redis present). Hardened pod spec per agentd doc-08: fresh pod per run, `readOnlyRootFilesystem`, `runAsNonRoot`, drop ALL caps, `automountServiceAccountToken: false`, ephemeral workspace, `activeDeadlineSeconds`, `ttlSecondsAfterFinished`, `backoffLimit: 0`.
-  - **Dev: local Docker/Podman** on the Mac. **Hard condition: the dev loop stays cluster-free** — control plane runs locally against local Postgres; no image-push/Flux wait in the inner loop.
-- **Egress:** Cilium FQDN allowlist per run — model provider endpoint(s) + target forge only; **no route to caesar's control plane or Postgres**. (Allowlist must cover each harness's own provider endpoint.)
-- Env allowlist always (never `os.Environ()` passthrough — a shipped bug in two predecessors). Scoped, short-lived credentials per run. Tetragon for runtime security observation/enforcement on agent pods.
-- Cost note: fits in the user's existing $200–300/mo cluster; dedicated tainted node pool for agent Jobs only when volume justifies.
+- **Every agent run executes in a disposable container.** Runner is a **port** with two adapters from day one — **revised 2026-08-02: Docker is the production adapter, Kubernetes the secondary**:
+  - **Docker adapter (primary — prod AND dev).** Prod = the compose deployment on the user's dedicated box (§8); dev = the same adapter on the Mac. **Hard condition unchanged: the dev loop stays cluster-free** — control plane runs locally against local Postgres; no image-push wait in the inner loop. Hardened per run: fresh container, `runAsNonRoot`, read-only root FS, all caps dropped, ephemeral workspace, CPU/mem limits, wall-clock deadline, per-run default-deny network.
+  - **Kubernetes Jobs adapter (secondary, kept as a real port).** For k8s deployments (minimal manifests in `/deploy`; helm chart post-V1). Hardened pod spec per agentd doc-08: fresh pod per run, `readOnlyRootFilesystem`, `runAsNonRoot`, drop ALL caps, `automountServiceAccountToken: false`, ephemeral workspace, `activeDeadlineSeconds`, `ttlSecondsAfterFinished`, `backoffLimit: 0`.
+- **Egress invariant identical across adapters:** model provider endpoint(s) + target forge only; **no route to caesar's control plane or Postgres**. (Allowlist must cover each harness's own provider endpoint.) Mechanism per adapter — Docker: per-run default-deny network + filtering egress proxy with DNS-pinned domain allowlist (Cilium is a k8s CNI in practice, not usable for plain Docker); k8s: Cilium `toFQDNs` CNPs with exact names **and** wildcard companions (redlight's hard-won lesson: exact-only names black-hole CDN/virtual-hosted addressing) + default-deny floor.
+- Env allowlist always (never `os.Environ()` passthrough — a shipped bug in two predecessors). Scoped, short-lived credentials per run. **Tetragon is not k8s-bound:** standalone eBPF agent on the VM in compose mode (optional, observe-first), DaemonSet in k8s mode.
+- Cost note (revised 2026-08-02): runs on the user's existing dedicated Hetzner box (§8); no new hardware spend for V1.
 
 ## 4. Harnesses & forges
 
@@ -80,11 +80,17 @@ Every decision below was made explicitly with the user during the 2026-08-01 bra
 - **Theming day one by construction:** semantic OKLCH tokens (CSS variables), `data-theme` on root, system-preference default; ship exactly 1 dark (flagship) + 1 light; more themes = new token file, never component edits.
 - **Mobile-first structurally:** bottom sheets as default modal, safe-area insets, web app manifest, mobile viewport in Playwright CI. Card-first lists with desktop table projections. Self-hosted fonts.
 
-## 8. Deployment
+## 8. Deployment (revised 2026-08-02 — compose-first, portable core)
 
-- **Prod:** control plane as a Deployment on the existing redlight cluster; Postgres via CNPG; agent runs as Jobs; ingress + secrets via the cluster's existing conventions (**bind specifics against the NEWER redlight repo** — the local copy at `/Users/sofo/Projects/bitnet/redlight` is stale; user will provide the current one).
-- CI → registry → GitOps deploy (cluster conventions); nightly DB backups (CNPG/PITR per cluster setup).
-- **Dev:** same binary locally + local Postgres + Docker adapter. `task run`-grade simplicity.
+All bindings below were settled 2026-08-02 after surveying the current redlight repo (reports in `docs/research/2026-08-02-redlight-*.md`).
+
+- **V1 ships ONE polished deployment path: docker-compose on any Linux host with Docker.** Stack: caesar (one binary: API + orchestrator + SSE + UI) + PostgreSQL + cloudflared. Agent containers are created/destroyed per run by the Docker runner adapter on the same host. Dependency contract for a deployer: Postgres + container runtime, nothing else (§2).
+- **The actual V1 deployment target: the user's dedicated Hetzner box** — 96 CPU / 250 GiB running Proxmox (a Superset LXC is a neighbor). Caesar lives in one Linux VM (~2/3 of the box, e.g. 64 CPU / 160 GiB). The VM recipe is documented in `/deploy`; Proxmox itself is not caesar's concern. **No new physical cluster, no separate infra repo, no new hardware spend.**
+- **Edge: Cloudflare Tunnel container in the compose stack** (redlight's edge pattern, sans k8s). Zero open inbound ports; TLS at Cloudflare; hostname on one of the user's zones; optional Cloudflare Access as an outer gate in front of caesar's own auth. SSE/WebSockets pass the tunnel cleanly (proven by ntfy on redlight); caesar's handlers do immediate-flush + heartbeats + `Last-Event-ID` resume.
+- **CI/CD: private GitHub repo (as today) + GitHub Actions + ghcr.io** ("other options later" — user, 2026-08-02). Composite CI gate per §9/§10; the box pulls images with a token. Dogfood consequence: GitHub being a V1 forge means caesar can run its own conveyor on itself day one. Forgejo adapter for the team's `git.swap.io` repos = post-V1 candidate (Gitea-compatible API, third adapter behind the forge port).
+- **Durability bar (user-set, 2026-08-02): losing DB data is acceptable — the real work lands in git.** Default = scheduled `pg_dump`-style backups; CNPG/PITR machinery is optional k8s-mode content, not a V1 requirement.
+- **Kubernetes remains a supported deployment shape, not the V1 flagship:** minimal manifests in `/deploy` exercising the k8s runner adapter; helm chart post-V1. **redlight = IaC pattern donor only, never a deployment target** (its two clusters host an unrelated production fleet). Donor patterns harvested: hardened-Job spec, FQDN-egress CNP shapes, Tetragon policies, cloudflared conventions, SOPS+age, CNPG-with-real-backups.
+- **Deployment-config secrets on the box:** exact shape decided in the spec (plain chmod-600 `.env` vs SOPS+age-encrypted env in the repo); lean default acceptable given the box is single-admin.
 
 ## 9. Backend engineering standards (from the user's reference repos)
 
@@ -116,5 +122,6 @@ Research summaries live in `docs/research/` (written 2026-08-01):
 - `2026-08-01-forge.md` — typed-definitions verdict (Go types as source of truth; CUE deferred; skill contract worth stealing).
 - `2026-08-01-go-style-references.md` — bitnet-backend-go + arb-lab style synthesis.
 - `2026-08-01-frontend-admin-ui.md` — UI stack survey; keep/upgrade lists.
+- `2026-08-02-redlight-gitops-secrets-ci.md` / `2026-08-02-redlight-data-edge.md` / `2026-08-02-redlight-nodes-policies.md` — survey of the current redlight repo (SOPS+age, Flux, Forgejo CI/registry, CNPG+backup landmines, Cloudflare Tunnel edge, Cilium FQDN policies, Tetragon corpus, node topology). Outcome: redlight demoted to **IaC pattern donor**; caesar deploys compose-first per §8.
 
 Selected reference repos (user-confirmed): `bitnet/bitnet-neo`, `bitnet/ai-augmented`, `bitnet/ai-augmented-development-platform` (+v2), `forge/repos/forge` + `forge/docs`, `bitnet/repos/bitnet/bitnet-frontend-admin`, `bitnet/repos/bitnet/bitnet-backend-go`, `misc/arb-lab`. Global taste file: `/Users/sofo/Projects/_CLAUDE.md`.
