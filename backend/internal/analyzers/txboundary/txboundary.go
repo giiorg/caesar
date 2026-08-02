@@ -2,7 +2,8 @@
 // bounded contexts" (spec §1 evolvability rule): no exported function,
 // method, or interface method declared inside a bounded context may mention
 // a pgx transaction type in its signature. Transactions stay an internal
-// implementation detail of the context that opened them.
+// implementation detail of the context that opened them. Generated files
+// (e.g. sqlc output) are skipped since the rule targets hand-written APIs.
 package txboundary
 
 import (
@@ -41,6 +42,9 @@ func run(pass *analysis.Pass) (any, error) {
 		return nil, nil
 	}
 	for _, file := range pass.Files {
+		if ast.IsGenerated(file) {
+			continue
+		}
 		ast.Inspect(file, func(n ast.Node) bool {
 			switch decl := n.(type) {
 			case *ast.FuncDecl:
