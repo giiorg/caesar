@@ -99,3 +99,7 @@ tasks:
     dir: backend
     cmds:
       - atlas migrate diff {{.CLI_ARGS}} --dir "file://internal/platform/pg/migrations?format=goose" --to "file://internal/platform/pg/schema.sql" --dev-url "docker://postgres/18/dev"
+
+  secrets:
+    cmds:
+      - docker run --rm -u "$(id -u):$(id -g)" -v "{{.ROOT_DIR}}:/repo" {{.GITLEAKS_IMAGE}} git /repo --config /repo/.gitleaks.toml --verbose
