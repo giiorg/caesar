@@ -32,6 +32,12 @@ tasks:
       - go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze
       - go vet -tags integration -vettool=./bin/caesar-analyze ./...
 
+  backend:run:
+    desc: "Run the control plane against the dev database (task db:up first)"
+    dir: backend
+    cmds:
+      - go run ./cmd/caesar serve -config caesar.dev.json
+
   db:up:
     cmds:
       - docker compose -f compose.dev.yaml up -d --wait

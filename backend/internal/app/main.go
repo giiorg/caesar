@@ -31,6 +31,8 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "migrate":
 		return runMigrateCmd(args, stdout, stderr)
+	case "serve":
+		return runServeCmd(args, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", cmd, usage)
 		return 2
