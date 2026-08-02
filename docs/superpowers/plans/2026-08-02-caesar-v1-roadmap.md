@@ -15,7 +15,7 @@ The V1 spec covers one system but many subsystems. Per the writing-plans scope r
 
 | # | Plan | Deliverable when done | Status |
 |---|------|----------------------|--------|
-| 01 | Foundations | Monorepo + Go skeleton: strict JSON config, slog, pg pool + testcontainers, Atlas/goose migration machinery, `/healthz`, architecture tests + custom analyzers, golangci-lint, gitleaks, Dockerfile, CI composite gate. Binary boots, migrates, CI green. | **written** — `2026-08-02-caesar-01-foundations.md` |
+| 01 | Foundations | Monorepo + Go skeleton: strict JSON config, slog, pg pool + testcontainers, Atlas/goose migration machinery, `/healthz`, architecture tests + custom analyzers, golangci-lint, gitleaks, Dockerfile, CI composite gate. Binary boots, migrates, CI green. | **done** — `2026-08-02-caesar-01-foundations.md` |
 | 02 | API, auth & RBAC | Contract pipeline (Go types → OpenAPI 3.1 → TS client, regen-diff gates), sqlc setup with first schema, problem+json envelope, users/sessions (argon2id, `__Host-` cookie), grant ladder, login rate limiting (params pinned here), `caesar admin bootstrap`, audit entries, clock seam. | pending |
 | 03 | Assets & credentials | Projects / repos / credentials (AES-256-GCM envelope encryption, `key_id`) / harness registry; credential-use audit. | pending |
 | 04 | Workflow definitions | Typed definition document, validator with all §2 invariants (typed artifact bindings, linear patch lineage, gate-dominates-exact-patch, one-gate-per-publish, revision-transition dominance, cycle detection), immutable content-hashed versions, single write door. Property (`rapid`) + fuzz coverage begins. | pending |
