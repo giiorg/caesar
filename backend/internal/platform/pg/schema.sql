@@ -1,0 +1,3 @@
+-- caesar desired-state schema (single source for Atlas authoring and, from
+-- Plan 2, sqlc). Empty until the first domain tables land in Plan 2.
+-- Workflow: edit this file, then `task db:new -- <migration_name>`.

@@ -27,3 +27,11 @@ func TestMain_UnknownCommandExitsTwoWithUsage(t *testing.T) {
 		t.Fatalf("stderr = %q, want it to mention %q", errOut.String(), "unknown command")
 	}
 }
+
+func TestMain_MigrateWithBadConfigExitsOne(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := Main([]string{"migrate", "-config", "/nonexistent/caesar.json", "up"}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, errOut.String())
+	}
+}

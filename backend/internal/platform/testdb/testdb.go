@@ -19,6 +19,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/giiorg/caesar/backend/internal/platform/pg"
 )
 
 const templateDB = "caesar_template"
@@ -65,6 +67,27 @@ func ensureStarted(ctx context.Context) error {
 		startErr = fmt.Errorf("testdb: create template: %w", err)
 		return startErr
 	}
+
+	tmplURL, err := url.Parse(adminURL)
+	if err != nil {
+		startErr = fmt.Errorf("testdb: parse admin url: %w", err)
+		return startErr
+	}
+	tmplURL.Path = "/" + templateDB
+	tmpl, err := pgxpool.New(ctx, tmplURL.String())
+	if err != nil {
+		startErr = fmt.Errorf("testdb: template pool: %w", err)
+		return startErr
+	}
+	// Close before any clone: CREATE DATABASE ... TEMPLATE requires zero
+	// live connections on the template.
+	err = pg.Migrate(ctx, tmpl, pg.Migrations())
+	tmpl.Close()
+	if err != nil {
+		startErr = fmt.Errorf("testdb: migrate template: %w", err)
+		return startErr
+	}
+
 	started = true
 	return nil
 }

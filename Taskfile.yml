@@ -44,3 +44,9 @@ tasks:
     dir: backend
     cmds:
       - go test -race -tags integration -count=1 ./...
+
+  db:new:
+    desc: "Author a migration from schema.sql changes: task db:new -- add_users"
+    dir: backend
+    cmds:
+      - atlas migrate diff {{.CLI_ARGS}} --dir "file://internal/platform/pg/migrations?format=goose" --to "file://internal/platform/pg/schema.sql" --dev-url "docker://postgres/18/dev"
