@@ -10,6 +10,13 @@ import (
 	"github.com/google/uuid"
 )
 
+type LoginRate struct {
+	Scope           string
+	Failures        int32
+	WindowStartedAt time.Time
+	LockedUntil     *time.Time
+}
+
 type User struct {
 	ID           uuid.UUID
 	Email        string

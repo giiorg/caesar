@@ -64,3 +64,19 @@ UPDATE sessions SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL;
 
 -- name: RevokeUserSessions :exec
 UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL;
+
+-- name: GetLoginRateForUpdate :one
+SELECT scope, failures, window_started_at, locked_until
+FROM login_rate WHERE scope = $1
+FOR UPDATE;
+
+-- name: UpsertLoginRate :exec
+INSERT INTO login_rate (scope, failures, window_started_at, locked_until)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (scope) DO UPDATE
+SET failures = excluded.failures,
+    window_started_at = excluded.window_started_at,
+    locked_until = excluded.locked_until;
+
+-- name: DeleteLoginRate :exec
+DELETE FROM login_rate WHERE scope = $1;

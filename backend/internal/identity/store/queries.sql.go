@@ -64,6 +64,15 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 	return i, err
 }
 
+const deleteLoginRate = `-- name: DeleteLoginRate :exec
+DELETE FROM login_rate WHERE scope = $1
+`
+
+func (q *Queries) DeleteLoginRate(ctx context.Context, scope string) error {
+	_, err := q.db.Exec(ctx, deleteLoginRate, scope)
+	return err
+}
+
 const getGrantLevel = `-- name: GetGrantLevel :one
 SELECT level FROM grants WHERE user_id = $1 AND project_id = $2
 `
@@ -78,6 +87,24 @@ func (q *Queries) GetGrantLevel(ctx context.Context, arg GetGrantLevelParams) (s
 	var level string
 	err := row.Scan(&level)
 	return level, err
+}
+
+const getLoginRateForUpdate = `-- name: GetLoginRateForUpdate :one
+SELECT scope, failures, window_started_at, locked_until
+FROM login_rate WHERE scope = $1
+FOR UPDATE
+`
+
+func (q *Queries) GetLoginRateForUpdate(ctx context.Context, scope string) (LoginRate, error) {
+	row := q.db.QueryRow(ctx, getLoginRateForUpdate, scope)
+	var i LoginRate
+	err := row.Scan(
+		&i.Scope,
+		&i.Failures,
+		&i.WindowStartedAt,
+		&i.LockedUntil,
+	)
+	return i, err
 }
 
 const getSessionByTokenHash = `-- name: GetSessionByTokenHash :one
@@ -338,4 +365,30 @@ func (q *Queries) UpdateUserRoleActive(ctx context.Context, arg UpdateUserRoleAc
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const upsertLoginRate = `-- name: UpsertLoginRate :exec
+INSERT INTO login_rate (scope, failures, window_started_at, locked_until)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (scope) DO UPDATE
+SET failures = excluded.failures,
+    window_started_at = excluded.window_started_at,
+    locked_until = excluded.locked_until
+`
+
+type UpsertLoginRateParams struct {
+	Scope           string
+	Failures        int32
+	WindowStartedAt time.Time
+	LockedUntil     *time.Time
+}
+
+func (q *Queries) UpsertLoginRate(ctx context.Context, arg UpsertLoginRateParams) error {
+	_, err := q.db.Exec(ctx, upsertLoginRate,
+		arg.Scope,
+		arg.Failures,
+		arg.WindowStartedAt,
+		arg.LockedUntil,
+	)
+	return err
 }
