@@ -103,3 +103,14 @@ tasks:
   secrets:
     cmds:
       - docker run --rm -u "$(id -u):$(id -g)" -v "{{.ROOT_DIR}}:/repo" {{.GITLEAKS_IMAGE}} git /repo --config /repo/.gitleaks.toml --verbose
+
+  image:build:
+    vars:
+      VERSION:
+        sh: git describe --tags --always --dirty
+      COMMIT:
+        sh: git rev-parse --short HEAD
+      DATE:
+        sh: date -u +%Y-%m-%dT%H:%M:%SZ
+    cmds:
+      - docker build --build-arg VERSION={{.VERSION}} --build-arg COMMIT={{.COMMIT}} --build-arg DATE={{.DATE}} -t caesar:dev .
