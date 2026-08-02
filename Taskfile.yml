@@ -25,3 +25,9 @@ tasks:
     dir: backend
     cmds:
       - go test -race ./...
+
+  backend:analyze:
+    dir: backend
+    cmds:
+      - go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze
+      - go vet -tags integration -vettool=./bin/caesar-analyze ./...
