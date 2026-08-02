@@ -1,6 +1,6 @@
 # caesar — V1 decisions record (brainstorming phase)
 
-**Date:** 2026-08-01 · **Updated:** 2026-08-02 (deployment pivot — §3/§8 revised, NATS-free core reaffirmed) · **Status:** LOCKED unless explicitly reopened · **Process:** superpowers:brainstorming, mid-flight (see `2026-08-01-handoff.md`)
+**Date:** 2026-08-01 · **Updated:** 2026-08-02 (deployment pivot — §3/§8 revised, NATS-free core reaffirmed; Supabase considered and rejected — §2) · **Status:** LOCKED unless explicitly reopened · **Process:** superpowers:brainstorming, mid-flight (see `2026-08-01-handoff.md`)
 
 Every decision below was made explicitly with the user during the 2026-08-01 brainstorming session. Do not re-litigate silently; if new evidence challenges one, raise it with the user.
 
@@ -22,6 +22,7 @@ Every decision below was made explicitly with the user during the 2026-08-01 bra
   - Events: append-only `run_events` table written in the same tx as state changes; transactional **outbox** table from day one (future NATS relay attaches there; no semantic change).
   - LISTEN/NOTIFY = **wake-up signal only, never the data** (at-most-once, non-durable). Consumers read state first, then listen; slow fallback polls. Lost notification costs latency, never correctness.
 - **No NATS, no Redis in caesar's core loop** (reaffirmed 2026-08-02 during the deployment pivot). NATS may later relay the outbox for external consumers; Redis unused. **Core external dependencies for any caesar deployment: PostgreSQL + a container runtime. Nothing else.** This is what makes the portable-deployment story work.
+- **No Supabase, self-hosted or otherwise** (considered and rejected 2026-08-02): it solves "don't build a backend," and caesar *is* the backend — the orchestrator/queue/policy engine is untouched by it. GoTrue conflicts with locked auth decisions (bcrypt vs argon2id; token-shaped sessions vs `__Host-` server-side rows — instant revocation would re-add the per-request check we already do); PostgREST inverts single-write-door + Go-types-as-source-of-truth; its Realtime lacks the specified snapshot-then-deltas/`Last-Event-ID` semantics; the minimum self-hosted topology (~6–8 services) breaks the two-dependency contract and widens the trust boundary (RLS-bypassing secret key, basic-auth Studio). Not even dev-only Studio — a generic Postgres GUI covers that with zero added services.
 - **API:** REST + OpenAPI 3.1 on stdlib `net/http` mux. Generated TypeScript client; schema-drift CI gates (port of the bitnet-frontend-admin discipline). Realtime to browser: **SSE** (snapshot-then-deltas, resume via last event id). No GraphQL, no gRPC in V1.
 - **Frontend:** React mobile-first web app (React Native later). See §7/§10.
 - **Repo:** monorepo — `/backend`, `/web`, `/deploy`, `/docs`.
