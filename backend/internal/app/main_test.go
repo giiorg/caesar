@@ -35,3 +35,14 @@ func TestMain_MigrateWithBadConfigExitsOne(t *testing.T) {
 		t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, errOut.String())
 	}
 }
+
+func TestMain_MigrateRejectsArgsAfterDirection(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := Main([]string{"migrate", "up", "-config", "/nonexistent/caesar.json"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "-config") {
+		t.Fatalf("stderr = %q, want it to mention the misplaced flag", errOut.String())
+	}
+}

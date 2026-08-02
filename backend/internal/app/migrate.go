@@ -21,6 +21,10 @@ func runMigrateCmd(args []string, stdout, stderr io.Writer) int {
 	if direction == "" {
 		direction = "status"
 	}
+	if fs.NArg() > 1 {
+		fmt.Fprintf(stderr, "usage: migrate [up|down|status] [-config path]: flags must come before the direction, got trailing args %v\n", fs.Args()[1:])
+		return 2
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {

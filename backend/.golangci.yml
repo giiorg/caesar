@@ -52,6 +52,10 @@ linters-settings:
             desc: no ORMs
           - pkg: entgo.io
             desc: no ORMs
+          - pkg: go.uber.org/fx
+            desc: no DI frameworks — manual composition roots
+          - pkg: go.uber.org/dig
+            desc: no DI frameworks — manual composition roots
           - pkg: go.uber.org/zap
             desc: log/slog only
           - pkg: github.com/sirupsen/logrus
@@ -62,6 +66,8 @@ linters-settings:
             desc: stdlib flag only
           - pkg: github.com/spf13/viper
             desc: strict JSON config only
+          - pkg: github.com/joho/godotenv
+            desc: env access only inside platform/config
           - pkg: github.com/pkg/errors
             desc: stdlib errors + %w
   forbidigo:
