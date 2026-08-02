@@ -1,0 +1,5 @@
+{
+  "server": {"addr": ":8080"},
+  "database": {"url": "postgres://caesar:caesar@localhost:5432/caesar_dev?sslmode=disable"},
+  "log": {"level": "debug"}
+}
