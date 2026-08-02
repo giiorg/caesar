@@ -37,8 +37,12 @@ func TestCheckPlatformPurity_FlagsPlatformImportingContextOrApp(t *testing.T) {
 		m + "/internal/platform/httpx": {m + "/internal/app"},
 	}
 	got := CheckPlatformPurity(g)
-	if len(got) != 2 {
-		t.Fatalf("want 2 violations, got %v", got)
+	want := []string{
+		"internal/platform/httpx imports internal/app: platform is the shared kernel and imports no business code",
+		"internal/platform/pg imports internal/execution: platform is the shared kernel and imports no business code",
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatal(diff)
 	}
 }
 
@@ -46,8 +50,10 @@ func TestCheckNoAppImports_FlagsContextImportingApp(t *testing.T) {
 	g := Graph{
 		m + "/internal/identity": {m + "/internal/app"},
 	}
-	if got := CheckNoAppImports(g); len(got) != 1 {
-		t.Fatalf("want 1 violation, got %v", got)
+	got := CheckNoAppImports(g)
+	want := []string{"internal/identity imports internal/app: contexts never import the composition root"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatal(diff)
 	}
 }
 
@@ -70,7 +76,11 @@ func TestCheckDenyList_FlagsBannedDependencies(t *testing.T) {
 		m + "/internal/platform/pg": {"github.com/jackc/pgx/v5"},
 	}
 	got := CheckDenyList(g)
-	if len(got) != 2 {
-		t.Fatalf("want 2 violations (testify, zap), got %v", got)
+	want := []string{
+		"internal/app imports go.uber.org/zap: log/slog only (decisions §9)",
+		"internal/identity imports github.com/stretchr/testify/require: stdlib asserts + go-cmp only (spec §7)",
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatal(diff)
 	}
 }
