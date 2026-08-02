@@ -5,6 +5,7 @@ vars:
   GOFUMPT_VERSION: v0.7.0
   GOVULNCHECK_VERSION: v1.1.4
   ATLAS_VERSION: v0.34.1
+  SQLC_VERSION: v1.31.1
   GITLEAKS_IMAGE: zricethezav/gitleaks:v8.21.2
   ACTIONLINT_IMAGE: rhysd/actionlint:1.7.4
 
@@ -18,10 +19,12 @@ tasks:
       - bin/golangci-lint version 2>/dev/null | grep -q {{.GOLANGCI_LINT_VERSION}}
       - bin/gofumpt --version 2>/dev/null | grep -q {{.GOFUMPT_VERSION}}
       - bin/govulncheck -version 2>/dev/null | grep -q govulncheck@{{.GOVULNCHECK_VERSION}}
+      - bin/sqlc version 2>/dev/null | grep -q {{.SQLC_VERSION}}
     cmds:
       - go install github.com/golangci/golangci-lint/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}
       - go install mvdan.cc/gofumpt@{{.GOFUMPT_VERSION}}
       - go install golang.org/x/vuln/cmd/govulncheck@{{.GOVULNCHECK_VERSION}}
+      - go install github.com/sqlc-dev/sqlc/cmd/sqlc@{{.SQLC_VERSION}}
 
   backend:fmt:
     deps: [tools]
@@ -99,6 +102,13 @@ tasks:
     dir: backend
     cmds:
       - atlas migrate diff {{.CLI_ARGS}} --dir "file://internal/platform/pg/migrations?format=goose" --to "file://internal/platform/pg/schema.sql" --dev-url "docker://postgres/18/dev"
+
+  db:sqlc:
+    desc: "Regenerate sqlc stores from schema.sql + queries.sql"
+    deps: [tools]
+    dir: backend
+    cmds:
+      - bin/sqlc generate
 
   secrets:
     cmds:

@@ -1,0 +1,32 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema: internal/platform/pg/schema.sql
+    queries: internal/identity/store/queries.sql
+    gen:
+      go:
+        package: store
+        out: internal/identity/store
+        sql_package: pgx/v5
+        omit_unused_structs: true
+        emit_json_tags: false
+        overrides:
+          - db_type: uuid
+            go_type:
+              import: github.com/google/uuid
+              type: UUID
+          - db_type: uuid
+            nullable: true
+            go_type:
+              import: github.com/google/uuid
+              type: NullUUID
+          - db_type: timestamptz
+            go_type:
+              import: time
+              type: Time
+          - db_type: timestamptz
+            nullable: true
+            go_type:
+              import: time
+              type: Time
+              pointer: true
