@@ -1,6 +1,6 @@
 //go:build integration
 
-package api
+package api_test
 
 import (
 	"bytes"
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/giiorg/caesar/backend/internal/identity"
+	identityapi "github.com/giiorg/caesar/backend/internal/identity/api"
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/clock"
 	"github.com/giiorg/caesar/backend/internal/platform/httpx"
@@ -32,9 +33,9 @@ func newTestServer(t *testing.T) (*httptest.Server, *identity.Service) {
 	svc := identity.NewService(pool, fake, audit.NewRecorder(fake), identity.Params{
 		SessionIdleTTL: 14 * 24 * time.Hour, SessionAbsoluteTTL: 90 * 24 * time.Hour,
 	})
-	a := New(svc, 90*24*time.Hour)
+	a := identityapi.New(svc, 90*24*time.Hour)
 	mux := http.NewServeMux()
-	httpx.Mount(mux, Operations(a))
+	httpx.Mount(mux, identityapi.Operations(a))
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	srv := httptest.NewServer(httpx.Chain(mux, httpx.WithCorrelationID, httpx.AccessLog(log), httpx.CheckOrigin("http://caesar.test")))
 	t.Cleanup(srv.Close)
@@ -54,7 +55,7 @@ func do(t *testing.T, method, url, cookie string, body any) *http.Response {
 		t.Fatal(err)
 	}
 	if cookie != "" {
-		req.Header.Set("Cookie", SessionCookie+"="+cookie)
+		req.Header.Set("Cookie", identityapi.SessionCookie+"="+cookie)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -78,7 +79,7 @@ func decodeInto[T any](t *testing.T, resp *http.Response) T {
 func sessionCookie(t *testing.T, resp *http.Response) string {
 	t.Helper()
 	for _, c := range resp.Cookies() {
-		if c.Name == SessionCookie {
+		if c.Name == identityapi.SessionCookie {
 			if !c.HttpOnly || !c.Secure || c.Path != "/" || c.SameSite != http.SameSiteLaxMode {
 				t.Fatalf("cookie attributes wrong: %+v", c)
 			}
@@ -94,7 +95,7 @@ func bootstrapAndLogin(t *testing.T, srv *httptest.Server, svc *identity.Service
 	if _, err := svc.Bootstrap(context.Background(), "root@example.com", testPassword); err != nil {
 		t.Fatal(err)
 	}
-	resp := do(t, http.MethodPost, srv.URL+"/api/v1/auth/login", "", LoginRequest{Email: "root@example.com", Password: testPassword})
+	resp := do(t, http.MethodPost, srv.URL+"/api/v1/auth/login", "", identityapi.LoginRequest{Email: "root@example.com", Password: testPassword})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("login status = %d", resp.StatusCode)
 	}
@@ -109,7 +110,7 @@ func TestAPI_LoginMeLogout(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("me status = %d", resp.StatusCode)
 	}
-	me := decodeInto[MeResponse](t, resp)
+	me := decodeInto[identityapi.MeResponse](t, resp)
 	if me.User.Email != "root@example.com" || me.User.Role != "admin" {
 		t.Fatalf("me = %+v", me)
 	}
@@ -129,7 +130,7 @@ func TestAPI_ProblemEnvelopeShape(t *testing.T) {
 	if _, err := svc.Bootstrap(context.Background(), "root@example.com", testPassword); err != nil {
 		t.Fatal(err)
 	}
-	resp := do(t, http.MethodPost, srv.URL+"/api/v1/auth/login", "", LoginRequest{Email: "root@example.com", Password: "wrong password!!"})
+	resp := do(t, http.MethodPost, srv.URL+"/api/v1/auth/login", "", identityapi.LoginRequest{Email: "root@example.com", Password: "wrong password!!"})
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -147,16 +148,16 @@ func TestAPI_UserAdministration(t *testing.T) {
 	admin := bootstrapAndLogin(t, srv, svc)
 
 	// Create a member.
-	resp := do(t, http.MethodPost, srv.URL+"/api/v1/users", admin, CreateUserRequest{
+	resp := do(t, http.MethodPost, srv.URL+"/api/v1/users", admin, identityapi.CreateUserRequest{
 		Email: "m@example.com", Password: testPassword, Role: "member",
 	})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create status = %d", resp.StatusCode)
 	}
-	member := decodeInto[UserResponse](t, resp)
+	member := decodeInto[identityapi.UserResponse](t, resp)
 
 	// Member logs in; admin endpoints are forbidden to them.
-	resp = do(t, http.MethodPost, srv.URL+"/api/v1/auth/login", "", LoginRequest{Email: "m@example.com", Password: testPassword})
+	resp = do(t, http.MethodPost, srv.URL+"/api/v1/auth/login", "", identityapi.LoginRequest{Email: "m@example.com", Password: testPassword})
 	memberTok := sessionCookie(t, resp)
 	resp = do(t, http.MethodGet, srv.URL+"/api/v1/users", memberTok, nil)
 	if resp.StatusCode != http.StatusForbidden {
@@ -165,7 +166,7 @@ func TestAPI_UserAdministration(t *testing.T) {
 
 	// Unknown JSON fields are rejected (strict decode).
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/users", strings.NewReader(`{"email":"x@example.com","password":"long enough password","role":"member","surprise":true}`))
-	req.Header.Set("Cookie", SessionCookie+"="+admin)
+	req.Header.Set("Cookie", identityapi.SessionCookie+"="+admin)
 	rawResp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +178,7 @@ func TestAPI_UserAdministration(t *testing.T) {
 
 	// Admin lists, gets, patches.
 	resp = do(t, http.MethodGet, srv.URL+"/api/v1/users", admin, nil)
-	if got := decodeInto[UserListResponse](t, resp); len(got.Users) != 2 {
+	if got := decodeInto[identityapi.UserListResponse](t, resp); len(got.Users) != 2 {
 		t.Fatalf("users = %d, want 2", len(got.Users))
 	}
 	resp = do(t, http.MethodGet, srv.URL+"/api/v1/users/"+member.ID, admin, nil)
@@ -185,7 +186,7 @@ func TestAPI_UserAdministration(t *testing.T) {
 		t.Fatalf("get status = %d", resp.StatusCode)
 	}
 	role := "admin"
-	resp = do(t, http.MethodPatch, srv.URL+"/api/v1/users/"+member.ID, admin, UpdateUserRequest{Role: &role})
+	resp = do(t, http.MethodPatch, srv.URL+"/api/v1/users/"+member.ID, admin, identityapi.UpdateUserRequest{Role: &role})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("patch status = %d", resp.StatusCode)
 	}
@@ -200,7 +201,7 @@ func TestAPI_ChangePasswordRotatesCookie(t *testing.T) {
 	srv, svc := newTestServer(t)
 	token := bootstrapAndLogin(t, srv, svc)
 
-	resp := do(t, http.MethodPut, srv.URL+"/api/v1/auth/password", token, ChangePasswordRequest{
+	resp := do(t, http.MethodPut, srv.URL+"/api/v1/auth/password", token, identityapi.ChangePasswordRequest{
 		CurrentPassword: testPassword, NewPassword: "an even better password",
 	})
 	if resp.StatusCode != http.StatusNoContent {
