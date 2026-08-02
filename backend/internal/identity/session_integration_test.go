@@ -1,12 +1,13 @@
 //go:build integration
 
-package identity
+package identity_test
 
 import (
 	"context"
 	"testing"
 	"time"
 
+	"github.com/giiorg/caesar/backend/internal/identity"
 	"github.com/giiorg/caesar/backend/internal/platform/clock"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
@@ -15,7 +16,7 @@ import (
 // MintSessionForTest seam, and everything else here exercises the public
 // surface this task ships: AuthenticateSession, Logout, ChangePassword.
 
-func bootstrapWithSession(t *testing.T) (*Service, AuthSession, string, *clock.Fake) {
+func bootstrapWithSession(t *testing.T) (*identity.Service, identity.AuthSession, string, *clock.Fake) {
 	t.Helper()
 	ctx := context.Background()
 	svc, _, fake := newTestService(t)
@@ -38,7 +39,7 @@ func TestAuthenticateSession_Lifecycle(t *testing.T) {
 	ctx := context.Background()
 	svc, sess, token, fake := bootstrapWithSession(t)
 
-	if sess.Email != "root@example.com" || sess.Role != RoleAdmin {
+	if sess.Email != "root@example.com" || sess.Role != identity.RoleAdmin {
 		t.Fatalf("principal = %+v", sess.Principal)
 	}
 
@@ -111,7 +112,7 @@ func TestUpdateUser_PrivilegeChangeRevokesSessions(t *testing.T) {
 	ctx := context.Background()
 	svc, adminSess, _, _ := bootstrapWithSession(t)
 
-	member, err := svc.CreateUser(ctx, adminSess.Principal, "m@example.com", testPassword, RoleMember)
+	member, err := svc.CreateUser(ctx, adminSess.Principal, "m@example.com", testPassword, identity.RoleMember)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,8 +121,8 @@ func TestUpdateUser_PrivilegeChangeRevokesSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	toAdmin := RoleAdmin
-	if _, err := svc.UpdateUser(ctx, adminSess.Principal, member.ID, UserUpdate{Role: &toAdmin}); err != nil {
+	toAdmin := identity.RoleAdmin
+	if _, err := svc.UpdateUser(ctx, adminSess.Principal, member.ID, identity.UserUpdate{Role: &toAdmin}); err != nil {
 		t.Fatal(err)
 	}
 	_, err = svc.AuthenticateSession(ctx, memberToken)
