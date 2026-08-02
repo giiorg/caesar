@@ -1,0 +1,13 @@
+{
+  "name": "caesar-web",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "api:gen": "openapi-typescript ../backend/api/openapi.json -o src/api/schema.d.ts"
+  },
+  "devDependencies": {
+    "openapi-typescript": "7.13.0"
+  }
+}
