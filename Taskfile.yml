@@ -1,0 +1,27 @@
+version: '3'
+
+vars:
+  GOLANGCI_LINT_VERSION: v1.64.8
+  GOFUMPT_VERSION: v0.7.0
+  GOVULNCHECK_VERSION: v1.1.4
+  ATLAS_VERSION: v0.34.1
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.21.2
+  ACTIONLINT_IMAGE: rhysd/actionlint:1.7.4
+
+tasks:
+  backend:build:
+    dir: backend
+    vars:
+      VERSION:
+        sh: git describe --tags --always --dirty
+      COMMIT:
+        sh: git rev-parse --short HEAD
+      DATE:
+        sh: date -u +%Y-%m-%dT%H:%M:%SZ
+    cmds:
+      - go build -trimpath -ldflags "-s -w -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Version={{.VERSION}} -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Commit={{.COMMIT}} -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Date={{.DATE}}" -o bin/caesar ./cmd/caesar
+
+  backend:test:
+    dir: backend
+    cmds:
+      - go test -race ./...
