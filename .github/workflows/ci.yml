@@ -45,9 +45,28 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: task lint:actions
 
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: task contracts:check
+
   ci-ok:
     # The single required status check; branch protection points here.
-    needs: [backend, secrets, workflow-lint]
+    needs: [backend, secrets, workflow-lint, contracts]
     if: always()
     runs-on: ubuntu-latest
     steps:
