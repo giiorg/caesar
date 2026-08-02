@@ -110,6 +110,12 @@ tasks:
     cmds:
       - bin/sqlc generate
 
+  contracts:openapi:
+    desc: "Regenerate backend/api/openapi.json from the route tables"
+    dir: backend
+    cmds:
+      - go run ./internal/contracts/cmd/openapigen -out api/openapi.json
+
   secrets:
     cmds:
       - docker run --rm -u "$(id -u):$(id -g)" -v "{{.ROOT_DIR}}:/repo" {{.GITLEAKS_IMAGE}} git /repo --config /repo/.gitleaks.toml --verbose

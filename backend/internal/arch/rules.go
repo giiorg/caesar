@@ -18,7 +18,7 @@ const module = "github.com/giiorg/caesar/backend"
 type Graph map[string][]string
 
 // nonContext segments under internal/ that are not bounded contexts.
-var nonContext = map[string]bool{"platform": true, "app": true, "arch": true, "analyzers": true}
+var nonContext = map[string]bool{"platform": true, "app": true, "arch": true, "analyzers": true, "contracts": true}
 
 // contextOf returns the bounded-context segment of a module package path.
 func contextOf(pkg string) (string, bool) {

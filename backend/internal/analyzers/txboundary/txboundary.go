@@ -21,7 +21,7 @@ var Analyzer = &analysis.Analyzer{
 }
 
 // nonContext are the internal/ segments that are not bounded contexts.
-var nonContext = map[string]bool{"platform": true, "app": true, "arch": true, "analyzers": true}
+var nonContext = map[string]bool{"platform": true, "app": true, "arch": true, "analyzers": true, "contracts": true}
 
 // boundedContext extracts the context segment from a package path, if any.
 func boundedContext(pkgPath string) (string, bool) {
