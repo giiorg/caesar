@@ -3,8 +3,9 @@ package envaccess_test
 import (
 	"testing"
 
-	"github.com/giiorg/caesar/backend/internal/analyzers/envaccess"
 	"golang.org/x/tools/go/analysis/analysistest"
+
+	"github.com/giiorg/caesar/backend/internal/analyzers/envaccess"
 )
 
 func TestAnalyzer(t *testing.T) {

@@ -36,6 +36,7 @@ func contextOf(pkg string) (string, bool) {
 func isPlatform(pkg string) bool {
 	return pkg == module+"/internal/platform" || strings.HasPrefix(pkg, module+"/internal/platform/")
 }
+
 func isApp(pkg string) bool {
 	return pkg == module+"/internal/app" || strings.HasPrefix(pkg, module+"/internal/app/")
 }

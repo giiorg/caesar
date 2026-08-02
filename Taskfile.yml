@@ -9,6 +9,49 @@ vars:
   ACTIONLINT_IMAGE: rhysd/actionlint:1.7.4
 
 tasks:
+  tools:
+    dir: backend
+    env:
+      GOBIN: '{{.ROOT_DIR}}/backend/bin'
+    status:
+      # Version-aware: a pin bump makes these fail and reinstalls.
+      - bin/golangci-lint version 2>/dev/null | grep -q {{.GOLANGCI_LINT_VERSION}}
+      - bin/gofumpt --version 2>/dev/null | grep -q {{.GOFUMPT_VERSION}}
+      - bin/govulncheck -version 2>/dev/null | grep -q govulncheck@{{.GOVULNCHECK_VERSION}}
+    cmds:
+      - go install github.com/golangci/golangci-lint/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}
+      - go install mvdan.cc/gofumpt@{{.GOFUMPT_VERSION}}
+      - go install golang.org/x/vuln/cmd/govulncheck@{{.GOVULNCHECK_VERSION}}
+
+  backend:fmt:
+    deps: [tools]
+    dir: backend
+    cmds:
+      - bin/gofumpt -w .
+
+  backend:fmt:check:
+    deps: [tools]
+    dir: backend
+    cmds:
+      - test -z "$(bin/gofumpt -l .)" || (bin/gofumpt -l . && exit 1)
+
+  backend:vet:
+    dir: backend
+    cmds:
+      - go vet -tags integration ./...
+
+  backend:lint:
+    deps: [tools]
+    dir: backend
+    cmds:
+      - bin/golangci-lint run
+
+  backend:vuln:
+    deps: [tools]
+    dir: backend
+    cmds:
+      - bin/govulncheck -tags integration ./...
+
   backend:build:
     dir: backend
     vars:

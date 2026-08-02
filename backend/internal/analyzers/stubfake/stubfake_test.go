@@ -3,8 +3,9 @@ package stubfake_test
 import (
 	"testing"
 
-	"github.com/giiorg/caesar/backend/internal/analyzers/stubfake"
 	"golang.org/x/tools/go/analysis/analysistest"
+
+	"github.com/giiorg/caesar/backend/internal/analyzers/stubfake"
 )
 
 func TestAnalyzer(t *testing.T) {
