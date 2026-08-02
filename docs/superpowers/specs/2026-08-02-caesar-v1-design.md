@@ -1,6 +1,6 @@
 # caesar V1 — design
 
-**Date:** 2026-08-02 · **Status:** all 8 sections approved by the user in the brainstorming sessions of 2026-08-01/02; **self-review not yet performed** (deliberately deferred — review cycles start next session). · **Companion records:** `docs/brainstorm/2026-08-01-decisions.md` (locked decisions, §3/§8 revised 2026-08-02), `docs/research/2026-08-01-*.md` + `2026-08-02-redlight-*.md` (reference corpus).
+**Date:** 2026-08-02 · **Status:** all 8 sections approved by the user in the brainstorming sessions of 2026-08-01/02; self-review performed 2026-08-02 (inline fixes applied); codex artifact-review rounds in progress, user review gate next. · **Companion records:** `docs/brainstorm/2026-08-01-decisions.md` (locked decisions, §3/§8 revised 2026-08-02), `docs/research/2026-08-01-*.md` + `2026-08-02-redlight-*.md` (reference corpus).
 
 caesar is a **deterministic orchestrator of agentic workflows**: workflow definitions are validated *data* interpreted by Go; agents only propose work products; Go owns all control flow and performs every side effect. V1 identity: **engine + agentic library** — the first shipped step vocabulary is repo-centric agentic development (plan / implement / review / gate / git-publish). Month-one success: create a task in the UI, pick a workflow, point at a repo, watch phases live, approve gates from a phone, caesar pushes the branch and opens the PR.
 
@@ -24,7 +24,7 @@ Explicitly deferred from V1: forge-watch intake (webhooks as triggers), React Na
 
 **Identity & access** — **User** (email, argon2id hash, active flag; admin-invite only) · **Session** (server-side row: token hash, expiry, revocation) · **Role/Grant** (global role + per-project grants; ladder in §6).
 
-**Assets** — **Project** (groups repos, policies, grants) · **Repo** (forge kind + slug/URL + default branch + credential ref) · **Credential** (encrypted at rest, referenced by id, never embedded in definitions; every use audited) · **Harness** (admin-registered: kind `claude-code`/`codex`, image ref, provider endpoint, defaults).
+**Assets** — **Project** (groups repos, policies, grants) · **Repo** (forge kind + slug/URL + default branch + credential ref) · **Credential** (encrypted at rest, referenced by id, never embedded in definitions; every use audited) · **Harness** (admin-registered: kind `claude-code`/`codex`, image ref, provider endpoint, a Credential reference for the model API key, defaults).
 
 **Definitions** — **WorkflowDefinition**: a typed, schema-validated document — a DAG with real edges, cycle detection, gates as first-class nodes. Immutable versions, content-hashed; the persisting API is the only write door. UI outline, future canvas/code views, and the assistant are all projections of this document.
 
@@ -50,7 +50,7 @@ Explicitly deferred from V1: forge-watch intake (webhooks as triggers), React Na
 
 **Harness port.** One adapter per harness (Claude Code, Codex CLI), one-shot per phase: a filesystem contract — prompt/context mounted in, declared outputs written to `workspace/.caesar/out/` — plus output parsing into typed results and exit-condition mapping into typed outcomes (transient / permanent / policy-violation; unclassified → permanent). No warm/persistent agent processes.
 
-**Collection & completion.** The runner streams container output into `run_events` (and a log artifact); on exit the orchestrator validates work products (patch applies cleanly against the base SHA; the repo's own build/lint/test where policy requires), persists Artifacts, and CAS-transitions the PhaseRun.
+**Collection & completion.** The runner streams container output into `run_events` (and a log artifact); on exit the orchestrator validates work products: the patch must apply cleanly against the base SHA, and where policy requires it the repo's own build/lint/test runs in a **disposable validation container** with the same hardening as agent runs — repo code is untrusted and never executes in the control-plane process — its egress allowlist extended only by policy-listed toolchain endpoints (package registries). It then persists Artifacts and CAS-transitions the PhaseRun.
 
 **Reconciling.** On lease expiry or restart: look up the attempt-named container/Job in the runtime. Completed with intact outputs → adopt idempotently; anything else → kill-then-inspect; a new attempt starts only after reconciliation concludes.
 
@@ -58,7 +58,7 @@ Explicitly deferred from V1: forge-watch intake (webhooks as triggers), React Na
 
 ## 4. API & realtime
 
-**Shape.** One versioned REST surface — `/api/v1/…` — on the stdlib `net/http` ServeMux (method + wildcard patterns). Resources mirror the domain: `tasks`, `runs`, `approvals`, `workflows` + immutable `versions`, `projects`, `repos`, `credentials`, `policies`, `users`/`sessions`, admin config. No GraphQL, no gRPC. The binary also serves the embedded UI and both realtime endpoints, all same-origin.
+**Shape.** One versioned REST surface — `/api/v1/…` — on the stdlib `net/http` ServeMux (method + wildcard patterns). Resources mirror the domain: `tasks`, `runs`, `approvals`, `workflows` + immutable `versions`, `projects`, `repos`, `credentials`, `policies`, `users`/`sessions`, admin config. No GraphQL, no gRPC. The binary also serves the embedded UI and the realtime endpoints (SSE streams + assistant WebSocket), all same-origin.
 
 **Contract discipline.** Go types → generated OpenAPI 3.1 document → generated TypeScript client. CI carries regenerate-and-diff gates on both artifacts. Definition validation lives on the write path only: the endpoint persisting a WorkflowDefinition version is the single door (schema + DAG edge/cycle checks).
 
@@ -100,7 +100,7 @@ Explicitly deferred from V1: forge-watch intake (webhooks as triggers), React Na
 
 **Requester principal.** Every task records the initiating human; launch requires `run` on the project — agent authority is a projection of human authority, enforced structurally at intake. Gates route to `approve` holders via policy metadata. The requester's identity flows into audit, run records, and published commits/PRs (exact attribution format pinned in the plan).
 
-**Policy engine.** Versioned baselines per repo/category; per-run overrides tighten-only and non-sticky; durable kill switch per repo/category; loosening only by editing the versioned baseline. V1 fields: gate requirements per step class (code-publish gates non-negotiable), `allow_self_approval`, attempt limits, execution-budget and cost ceilings, autonomy-tier thresholds (class-segmented counts computed by the orchestrator from its own observations; docs-level success never unlocks code tiers). Evaluation produces the run's pinned PolicySnapshot.
+**Policy engine.** Versioned baselines per repo/category (categories = the step-class taxonomy — one vocabulary for gate requirements and kill switches); per-run overrides tighten-only and non-sticky; durable kill switch per repo/category; loosening only by editing the versioned baseline. V1 fields: gate requirements per step class (code-publish gates non-negotiable), `allow_self_approval`, attempt limits, execution-budget and cost ceilings, autonomy-tier thresholds — class-segmented success counts, computed by the orchestrator from its own observations, that let the baseline relax gate requirements for lower-risk step classes as tiers are earned (code-publish gates never auto-relax; docs-level success never unlocks code tiers). Evaluation produces the run's pinned PolicySnapshot.
 
 **Credentials at rest.** Envelope encryption per row: AES-256-GCM under a master key from env/file (`key_id` recorded for rotation; KMS/age pluggable behind the same port later). Decrypted material only in memory at use time; every use audited. Agent containers receive only the per-attempt model credential; forge tokens never leave the control plane.
 
@@ -135,7 +135,7 @@ Explicitly deferred from V1: forge-watch intake (webhooks as triggers), React Na
 
 **Trust boundary (approved).** V1 mounts the Docker socket into caesar's container; **the VM is the security boundary, not caesar's container** — caesar is already the trusted control plane holding every secret. Agent containers never see socket, secrets, or a route to caesar. Socket-proxy filtering and rootless runtimes are documented hardening options.
 
-**Config.** One **strict JSON config file** (stdlib `DisallowUnknownFields` — unknown keys rejected) + a small fixed set of env overrides for secrets only (`DATABASE_URL`, `CAESAR_MASTER_KEY`, provider keys). Secrets on the box: chmod-600 `.env`; SOPS+age documented as the optional upgrade.
+**Config.** One **strict JSON config file** (stdlib `DisallowUnknownFields` — unknown keys rejected) + a small fixed set of env overrides for **bootstrap secrets only** (`DATABASE_URL`, `CAESAR_MASTER_KEY`). Model-provider API keys are not env config — they live as encrypted Credential rows referenced by Harness registrations (§2), injected per attempt. Secrets on the box: chmod-600 `.env`; SOPS+age documented as the optional upgrade.
 
 **Networking.** Cloudflared is outbound-only — zero listening ports beyond SSH; UI reachable exclusively through the tunnel (+ optional Cloudflare Access). `/metrics` and `/healthz` not tunnel-exposed.
 
@@ -155,4 +155,4 @@ Explicitly deferred from V1: forge-watch intake (webhooks as triggers), React Na
 
 ## Left to the implementation plan (deliberate)
 
-Commit/PR attribution format for requester identity · assistant model/provider + budget mechanics · harness image contents (build from scratch vs adapt) + per-harness FQDN allowlists (incl. telemetry-off defaults) · exact VM sizing/OS + tunnel hostname · golangci-lint config detail · exact policy JSON schema · retention numbers (logs, snapshots, backups, sessions).
+Commit/PR attribution format for requester identity · assistant model/provider + budget mechanics · harness image contents (build from scratch vs adapt) + per-harness FQDN allowlists (incl. telemetry-off defaults) · exact VM sizing/OS + tunnel hostname · golangci-lint config detail · exact policy JSON schema · full status enums + transition tables per entity (the invariants in §2/§6 constrain them) · login rate-limit parameters · retention numbers (logs, snapshots, backups, sessions).
