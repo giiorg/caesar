@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -91,8 +90,8 @@ func (c Config) validate() error {
 	if c.Database.URL == "" {
 		problems = append(problems, "database.url is required (file or DATABASE_URL)")
 	}
-	var lvl slog.Level
-	if err := lvl.UnmarshalText([]byte(c.Log.Level)); err != nil {
+	validLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+	if !validLevels[c.Log.Level] {
 		problems = append(problems, fmt.Sprintf("log.level %q is not one of debug|info|warn|error", c.Log.Level))
 	}
 	if len(problems) > 0 {

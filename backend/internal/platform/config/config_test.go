@@ -89,6 +89,8 @@ func TestLoad_FailsClosed(t *testing.T) {
 		{"missing database url", `{"server": {"addr": ":1"}}`, "database.url"},
 		{"empty addr", `{"server": {"addr": ""}, "database": {"url": "postgres://x"}}`, "server.addr"},
 		{"bad log level", `{"database": {"url": "postgres://x"}, "log": {"level": "loud"}}`, "log.level"},
+		{"log level with offset +", `{"database": {"url": "postgres://x"}, "log": {"level": "info+4"}}`, "log.level"},
+		{"log level with offset -", `{"database": {"url": "postgres://x"}, "log": {"level": "warn-100"}}`, "log.level"},
 		{"bad duration", `{"server": {"shutdown_timeout": "fast"}, "database": {"url": "postgres://x"}}`, "duration"},
 		{"malformed json", `{`, "parse"},
 	}
