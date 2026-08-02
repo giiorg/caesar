@@ -64,9 +64,6 @@ func saveRate(ctx context.Context, q *store.Queries, scope string, st rateState)
 // locked FOR UPDATE (serializing concurrent attempts per scope), failure
 // counters and the session mint commit atomically with their audit rows.
 func (s *Service) Login(ctx context.Context, email, password, ip string) (User, string, error) {
-	if len(password) > MaxPasswordLen {
-		return User{}, "", errBadCredentials
-	}
 	accountScope := "account:" + strings.ToLower(email)
 	ipScope := "ip:" + ip
 	now := s.clock.Now()
@@ -77,6 +74,14 @@ func (s *Service) Login(ctx context.Context, email, password, ip string) (User, 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
+
+	// Ensure rate rows exist before locking to prevent concurrent first-failure race.
+	if err := q.EnsureLoginRate(ctx, store.EnsureLoginRateParams{Scope: accountScope, WindowStartedAt: now}); err != nil {
+		return User{}, "", fmt.Errorf("identity: ensure account rate: %w", err)
+	}
+	if err := q.EnsureLoginRate(ctx, store.EnsureLoginRateParams{Scope: ipScope, WindowStartedAt: now}); err != nil {
+		return User{}, "", fmt.Errorf("identity: ensure ip rate: %w", err)
+	}
 
 	// Deterministic lock order: account scope, then ip scope.
 	accountRate, err := loadRate(ctx, q, accountScope)
@@ -91,18 +96,24 @@ func (s *Service) Login(ctx context.Context, email, password, ip string) (User, 
 		return User{}, "", errLoginLocked
 	}
 
-	row, lookupErr := q.GetUserByEmail(ctx, email)
+	var row store.User
 	authenticated := false
-	if lookupErr == nil {
-		ok, verr := VerifyPassword(row.PasswordHash, password)
-		if verr != nil {
-			return User{}, "", fmt.Errorf("identity: verify: %w", verr)
+	if len(password) <= MaxPasswordLen {
+		var lookupErr error
+		row, lookupErr = q.GetUserByEmail(ctx, email)
+		if lookupErr == nil {
+			ok, verr := VerifyPassword(row.PasswordHash, password)
+			if verr != nil {
+				return User{}, "", fmt.Errorf("identity: verify: %w", verr)
+			}
+			authenticated = ok && row.Active
+		} else if errors.Is(lookupErr, pgx.ErrNoRows) {
+			dummyVerify(password)
+		} else {
+			return User{}, "", fmt.Errorf("identity: user lookup: %w", lookupErr)
 		}
-		authenticated = ok && row.Active
-	} else if errors.Is(lookupErr, pgx.ErrNoRows) {
-		dummyVerify(password)
 	} else {
-		return User{}, "", fmt.Errorf("identity: user lookup: %w", lookupErr)
+		dummyVerify(password)
 	}
 
 	if !authenticated {

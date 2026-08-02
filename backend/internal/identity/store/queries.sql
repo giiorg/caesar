@@ -80,3 +80,8 @@ SET failures = excluded.failures,
 
 -- name: DeleteLoginRate :exec
 DELETE FROM login_rate WHERE scope = $1;
+
+-- name: EnsureLoginRate :exec
+INSERT INTO login_rate (scope, failures, window_started_at, locked_until)
+VALUES ($1, 0, $2, NULL)
+ON CONFLICT (scope) DO NOTHING;

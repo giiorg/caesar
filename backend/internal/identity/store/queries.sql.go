@@ -73,6 +73,22 @@ func (q *Queries) DeleteLoginRate(ctx context.Context, scope string) error {
 	return err
 }
 
+const ensureLoginRate = `-- name: EnsureLoginRate :exec
+INSERT INTO login_rate (scope, failures, window_started_at, locked_until)
+VALUES ($1, 0, $2, NULL)
+ON CONFLICT (scope) DO NOTHING
+`
+
+type EnsureLoginRateParams struct {
+	Scope           string
+	WindowStartedAt time.Time
+}
+
+func (q *Queries) EnsureLoginRate(ctx context.Context, arg EnsureLoginRateParams) error {
+	_, err := q.db.Exec(ctx, ensureLoginRate, arg.Scope, arg.WindowStartedAt)
+	return err
+}
+
 const getGrantLevel = `-- name: GetGrantLevel :one
 SELECT level FROM grants WHERE user_id = $1 AND project_id = $2
 `

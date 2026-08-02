@@ -5,6 +5,7 @@ package identity_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -108,5 +109,87 @@ func TestLogin_IPLockoutSpansAccounts(t *testing.T) {
 	// A different IP is unaffected.
 	if _, _, err := svc.Login(ctx, "root@example.com", testPassword, "198.51.100.7"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLogin_ConcurrentFirstFailuresBothCount(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+	email := "concurrent@example.com"
+	ip := "192.0.2.1"
+	accountScope := "account:" + email
+
+	// Two goroutines concurrently attempt login with wrong password.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer wg.Done()
+			_, _, _ = svc.Login(ctx, email, "wrong password", ip)
+		}()
+	}
+	wg.Wait()
+
+	// Both failures must be counted in the login_rate row.
+	rows, err := pool.Query(ctx,
+		"SELECT failures FROM login_rate WHERE scope = $1",
+		accountScope,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("login_rate row not found")
+	}
+	var failures int32
+	if err := rows.Scan(&failures); err != nil {
+		t.Fatal(err)
+	}
+	if failures != 2 {
+		t.Fatalf("concurrent failures = %d, want 2", failures)
+	}
+}
+
+func TestLogin_OversizedPasswordIsRateLimitedAndAudited(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+	if _, err := svc.Bootstrap(ctx, "root@example.com", testPassword); err != nil {
+		t.Fatal(err)
+	}
+
+	// Login with a password way over the limit (>512 chars).
+	oversized := string(make([]byte, 600))
+	for i := range oversized {
+		oversized := []rune(oversized)
+		oversized[i] = 'x'
+	}
+	_, _, err := svc.Login(ctx, "root@example.com", oversized, "192.0.2.2")
+	wantClass(t, err, xerrors.ClassUnauthenticated)
+
+	// IP rate counter incremented.
+	rows, err := pool.Query(ctx,
+		"SELECT failures FROM login_rate WHERE scope = $1",
+		"ip:192.0.2.2",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("login_rate row for IP not found")
+	}
+	var failures int32
+	if err := rows.Scan(&failures); err != nil {
+		t.Fatal(err)
+	}
+	if failures != 1 {
+		t.Fatalf("ip failures = %d, want 1", failures)
+	}
+
+	// Audit entry recorded.
+	auditRows, aerr := audit.New(pool).ListAuditEntriesByAction(ctx, "auth.login_failed")
+	if aerr != nil || len(auditRows) != 1 {
+		t.Fatalf("auth.login_failed audit rows = %d (want 1), err %v", len(auditRows), aerr)
 	}
 }
