@@ -43,10 +43,10 @@ func TestVerifyPassword_RejectsMalformedPHC(t *testing.T) {
 	tests := []string{
 		"",
 		"not a phc string",
-		"$argon2i$v=19$m=19456,t=2,p=1$AAAA$AAAA",       // wrong variant
-		"$argon2id$v=18$m=19456,t=2,p=1$AAAA$AAAA",      // wrong version
-		"$argon2id$v=19$m=19456,t=2$AAAA$AAAA",          // missing param
-		"$argon2id$v=19$m=19456,t=2,p=1$!notb64!$AAAA",  // bad salt encoding
+		"$argon2i$v=19$m=19456,t=2,p=1$AAAA$AAAA",      // wrong variant
+		"$argon2id$v=18$m=19456,t=2,p=1$AAAA$AAAA",     // wrong version
+		"$argon2id$v=19$m=19456,t=2$AAAA$AAAA",         // missing param
+		"$argon2id$v=19$m=19456,t=2,p=1$!notb64!$AAAA", // bad salt encoding
 	}
 	for _, phc := range tests {
 		if _, err := identity.VerifyPassword(phc, "whatever"); err == nil {
