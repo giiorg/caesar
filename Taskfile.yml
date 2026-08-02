@@ -31,3 +31,16 @@ tasks:
     cmds:
       - go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze
       - go vet -tags integration -vettool=./bin/caesar-analyze ./...
+
+  db:up:
+    cmds:
+      - docker compose -f compose.dev.yaml up -d --wait
+
+  db:down:
+    cmds:
+      - docker compose -f compose.dev.yaml down
+
+  backend:test:integration:
+    dir: backend
+    cmds:
+      - go test -race -tags integration -count=1 ./...
