@@ -52,7 +52,10 @@ func loadRate(ctx context.Context, q *store.Queries, scope string) (rateState, e
 
 func saveRate(ctx context.Context, q *store.Queries, scope string, st rateState) error {
 	err := q.UpsertLoginRate(ctx, store.UpsertLoginRateParams{
-		Scope: scope, Failures: int32(st.Failures), WindowStartedAt: st.WindowStart, LockedUntil: st.LockedUntil,
+		// st.Failures only advances through rateFail's lock ladder (30s->15m
+		// backoff per failure once locked), so reaching anywhere near
+		// int32's range would take longer than any real attack window.
+		Scope: scope, Failures: int32(st.Failures), WindowStartedAt: st.WindowStart, LockedUntil: st.LockedUntil, //nolint:gosec // bounded by rateFail's lock ladder, see comment above
 	})
 	if err != nil {
 		return fmt.Errorf("identity: rate upsert: %w", err)
@@ -101,15 +104,16 @@ func (s *Service) Login(ctx context.Context, email, password, ip string) (User, 
 	if len(password) <= MaxPasswordLen {
 		var lookupErr error
 		row, lookupErr = q.GetUserByEmail(ctx, email)
-		if lookupErr == nil {
+		switch {
+		case lookupErr == nil:
 			ok, verr := VerifyPassword(row.PasswordHash, password)
 			if verr != nil {
 				return User{}, "", fmt.Errorf("identity: verify: %w", verr)
 			}
 			authenticated = ok && row.Active
-		} else if errors.Is(lookupErr, pgx.ErrNoRows) {
+		case errors.Is(lookupErr, pgx.ErrNoRows):
 			dummyVerify(password)
-		} else {
+		default:
 			return User{}, "", fmt.Errorf("identity: user lookup: %w", lookupErr)
 		}
 	} else {

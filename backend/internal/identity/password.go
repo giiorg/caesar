@@ -64,6 +64,9 @@ func VerifyPassword(phc, pw string) (bool, error) {
 	if err != nil {
 		return false, errors.New("identity: malformed hash key")
 	}
-	got := argon2.IDKey([]byte(pw), salt, t, m, p, uint32(len(want)))
+	// want is decoded from a PHC hash we always produce via HashPassword,
+	// which fixes the key at argonKeyLen (32) bytes, so len(want) never
+	// approaches uint32's range.
+	got := argon2.IDKey([]byte(pw), salt, t, m, p, uint32(len(want))) //nolint:gosec // fixed-length key, see comment above
 	return subtle.ConstantTimeCompare(got, want) == 1, nil
 }
