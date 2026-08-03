@@ -84,6 +84,42 @@ func (q *Queries) CreateProject(ctx context.Context, arg CreateProjectParams) (P
 	return i, err
 }
 
+const createRepo = `-- name: CreateRepo :one
+INSERT INTO repos (project_id, forge_kind, slug, default_branch, credential_id)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, project_id, forge_kind, slug, default_branch, credential_id, created_at, updated_at
+`
+
+type CreateRepoParams struct {
+	ProjectID     uuid.UUID
+	ForgeKind     string
+	Slug          string
+	DefaultBranch string
+	CredentialID  uuid.UUID
+}
+
+func (q *Queries) CreateRepo(ctx context.Context, arg CreateRepoParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, createRepo,
+		arg.ProjectID,
+		arg.ForgeKind,
+		arg.Slug,
+		arg.DefaultBranch,
+		arg.CredentialID,
+	)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ProjectID,
+		&i.ForgeKind,
+		&i.Slug,
+		&i.DefaultBranch,
+		&i.CredentialID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const deleteCredential = `-- name: DeleteCredential :execrows
 DELETE FROM credentials WHERE id = $1
 `
@@ -102,6 +138,18 @@ DELETE FROM projects WHERE id = $1
 
 func (q *Queries) DeleteProject(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteProject, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteRepo = `-- name: DeleteRepo :execrows
+DELETE FROM repos WHERE id = $1
+`
+
+func (q *Queries) DeleteRepo(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRepo, id)
 	if err != nil {
 		return 0, err
 	}
@@ -169,6 +217,27 @@ func (q *Queries) GetProject(ctx context.Context, id uuid.UUID) (Project, error)
 		&i.ID,
 		&i.Name,
 		&i.Description,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getRepo = `-- name: GetRepo :one
+SELECT id, project_id, forge_kind, slug, default_branch, credential_id, created_at, updated_at
+FROM repos WHERE id = $1
+`
+
+func (q *Queries) GetRepo(ctx context.Context, id uuid.UUID) (Repo, error) {
+	row := q.db.QueryRow(ctx, getRepo, id)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ProjectID,
+		&i.ForgeKind,
+		&i.Slug,
+		&i.DefaultBranch,
+		&i.CredentialID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -313,6 +382,40 @@ func (q *Queries) ListProjectsByIDs(ctx context.Context, ids []uuid.UUID) ([]Pro
 	return items, nil
 }
 
+const listReposByProject = `-- name: ListReposByProject :many
+SELECT id, project_id, forge_kind, slug, default_branch, credential_id, created_at, updated_at
+FROM repos WHERE project_id = $1 ORDER BY slug
+`
+
+func (q *Queries) ListReposByProject(ctx context.Context, projectID uuid.UUID) ([]Repo, error) {
+	rows, err := q.db.Query(ctx, listReposByProject, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Repo
+	for rows.Next() {
+		var i Repo
+		if err := rows.Scan(
+			&i.ID,
+			&i.ProjectID,
+			&i.ForgeKind,
+			&i.Slug,
+			&i.DefaultBranch,
+			&i.CredentialID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const projectExists = `-- name: ProjectExists :one
 SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)
 `
@@ -392,6 +495,42 @@ func (q *Queries) UpdateProject(ctx context.Context, arg UpdateProjectParams) (P
 		&i.ID,
 		&i.Name,
 		&i.Description,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateRepo = `-- name: UpdateRepo :one
+UPDATE repos SET slug = $2, default_branch = $3, credential_id = $4, updated_at = $5
+WHERE id = $1
+RETURNING id, project_id, forge_kind, slug, default_branch, credential_id, created_at, updated_at
+`
+
+type UpdateRepoParams struct {
+	ID            uuid.UUID
+	Slug          string
+	DefaultBranch string
+	CredentialID  uuid.UUID
+	UpdatedAt     time.Time
+}
+
+func (q *Queries) UpdateRepo(ctx context.Context, arg UpdateRepoParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, updateRepo,
+		arg.ID,
+		arg.Slug,
+		arg.DefaultBranch,
+		arg.CredentialID,
+		arg.UpdatedAt,
+	)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ProjectID,
+		&i.ForgeKind,
+		&i.Slug,
+		&i.DefaultBranch,
+		&i.CredentialID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

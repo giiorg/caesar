@@ -58,3 +58,24 @@ RETURNING id, name, kind, key_id, created_at, updated_at;
 
 -- name: DeleteCredential :execrows
 DELETE FROM credentials WHERE id = $1;
+
+-- name: CreateRepo :one
+INSERT INTO repos (project_id, forge_kind, slug, default_branch, credential_id)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, project_id, forge_kind, slug, default_branch, credential_id, created_at, updated_at;
+
+-- name: ListReposByProject :many
+SELECT id, project_id, forge_kind, slug, default_branch, credential_id, created_at, updated_at
+FROM repos WHERE project_id = $1 ORDER BY slug;
+
+-- name: GetRepo :one
+SELECT id, project_id, forge_kind, slug, default_branch, credential_id, created_at, updated_at
+FROM repos WHERE id = $1;
+
+-- name: UpdateRepo :one
+UPDATE repos SET slug = $2, default_branch = $3, credential_id = $4, updated_at = $5
+WHERE id = $1
+RETURNING id, project_id, forge_kind, slug, default_branch, credential_id, created_at, updated_at;
+
+-- name: DeleteRepo :execrows
+DELETE FROM repos WHERE id = $1;

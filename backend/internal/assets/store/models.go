@@ -28,3 +28,14 @@ type Project struct {
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
+
+type Repo struct {
+	ID            uuid.UUID
+	ProjectID     uuid.UUID
+	ForgeKind     string
+	Slug          string
+	DefaultBranch string
+	CredentialID  uuid.UUID
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
