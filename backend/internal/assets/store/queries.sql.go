@@ -12,6 +12,51 @@ import (
 	"github.com/google/uuid"
 )
 
+const createCredential = `-- name: CreateCredential :one
+INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, name, kind, key_id, created_at, updated_at
+`
+
+type CreateCredentialParams struct {
+	ID         uuid.UUID
+	Name       string
+	Kind       string
+	KeyID      string
+	WrappedDek []byte
+	Ciphertext []byte
+}
+
+type CreateCredentialRow struct {
+	ID        uuid.UUID
+	Name      string
+	Kind      string
+	KeyID     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+func (q *Queries) CreateCredential(ctx context.Context, arg CreateCredentialParams) (CreateCredentialRow, error) {
+	row := q.db.QueryRow(ctx, createCredential,
+		arg.ID,
+		arg.Name,
+		arg.Kind,
+		arg.KeyID,
+		arg.WrappedDek,
+		arg.Ciphertext,
+	)
+	var i CreateCredentialRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Kind,
+		&i.KeyID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const createProject = `-- name: CreateProject :one
 
 INSERT INTO projects (name, description)
@@ -39,6 +84,18 @@ func (q *Queries) CreateProject(ctx context.Context, arg CreateProjectParams) (P
 	return i, err
 }
 
+const deleteCredential = `-- name: DeleteCredential :execrows
+DELETE FROM credentials WHERE id = $1
+`
+
+func (q *Queries) DeleteCredential(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteCredential, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteProject = `-- name: DeleteProject :execrows
 DELETE FROM projects WHERE id = $1
 `
@@ -49,6 +106,55 @@ func (q *Queries) DeleteProject(ctx context.Context, id uuid.UUID) (int64, error
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getCredential = `-- name: GetCredential :one
+SELECT id, name, kind, key_id, created_at, updated_at
+FROM credentials WHERE id = $1
+`
+
+type GetCredentialRow struct {
+	ID        uuid.UUID
+	Name      string
+	Kind      string
+	KeyID     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+func (q *Queries) GetCredential(ctx context.Context, id uuid.UUID) (GetCredentialRow, error) {
+	row := q.db.QueryRow(ctx, getCredential, id)
+	var i GetCredentialRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Kind,
+		&i.KeyID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getCredentialRow = `-- name: GetCredentialRow :one
+SELECT id, name, kind, key_id, wrapped_dek, ciphertext, created_at, updated_at
+FROM credentials WHERE id = $1
+`
+
+func (q *Queries) GetCredentialRow(ctx context.Context, id uuid.UUID) (Credential, error) {
+	row := q.db.QueryRow(ctx, getCredentialRow, id)
+	var i Credential
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Kind,
+		&i.KeyID,
+		&i.WrappedDek,
+		&i.Ciphertext,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const getProject = `-- name: GetProject :one
@@ -67,6 +173,82 @@ func (q *Queries) GetProject(ctx context.Context, id uuid.UUID) (Project, error)
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const listCredentialRowsForUpdate = `-- name: ListCredentialRowsForUpdate :many
+SELECT id, name, kind, key_id, wrapped_dek, ciphertext, created_at, updated_at
+FROM credentials ORDER BY id
+FOR UPDATE
+`
+
+func (q *Queries) ListCredentialRowsForUpdate(ctx context.Context) ([]Credential, error) {
+	rows, err := q.db.Query(ctx, listCredentialRowsForUpdate)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Credential
+	for rows.Next() {
+		var i Credential
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Kind,
+			&i.KeyID,
+			&i.WrappedDek,
+			&i.Ciphertext,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCredentials = `-- name: ListCredentials :many
+SELECT id, name, kind, key_id, created_at, updated_at
+FROM credentials ORDER BY name
+`
+
+type ListCredentialsRow struct {
+	ID        uuid.UUID
+	Name      string
+	Kind      string
+	KeyID     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+func (q *Queries) ListCredentials(ctx context.Context) ([]ListCredentialsRow, error) {
+	rows, err := q.db.Query(ctx, listCredentials)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCredentialsRow
+	for rows.Next() {
+		var i ListCredentialsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Kind,
+			&i.KeyID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listProjects = `-- name: ListProjects :many
@@ -140,6 +322,49 @@ func (q *Queries) ProjectExists(ctx context.Context, id uuid.UUID) (bool, error)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const updateCredentialSecret = `-- name: UpdateCredentialSecret :one
+UPDATE credentials SET key_id = $2, wrapped_dek = $3, ciphertext = $4, updated_at = $5
+WHERE id = $1
+RETURNING id, name, kind, key_id, created_at, updated_at
+`
+
+type UpdateCredentialSecretParams struct {
+	ID         uuid.UUID
+	KeyID      string
+	WrappedDek []byte
+	Ciphertext []byte
+	UpdatedAt  time.Time
+}
+
+type UpdateCredentialSecretRow struct {
+	ID        uuid.UUID
+	Name      string
+	Kind      string
+	KeyID     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+func (q *Queries) UpdateCredentialSecret(ctx context.Context, arg UpdateCredentialSecretParams) (UpdateCredentialSecretRow, error) {
+	row := q.db.QueryRow(ctx, updateCredentialSecret,
+		arg.ID,
+		arg.KeyID,
+		arg.WrappedDek,
+		arg.Ciphertext,
+		arg.UpdatedAt,
+	)
+	var i UpdateCredentialSecretRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Kind,
+		&i.KeyID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const updateProject = `-- name: UpdateProject :one

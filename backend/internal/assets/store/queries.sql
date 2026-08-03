@@ -28,3 +28,33 @@ DELETE FROM projects WHERE id = $1;
 
 -- name: ProjectExists :one
 SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1);
+
+-- name: CreateCredential :one
+INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, name, kind, key_id, created_at, updated_at;
+
+-- name: ListCredentials :many
+SELECT id, name, kind, key_id, created_at, updated_at
+FROM credentials ORDER BY name;
+
+-- name: GetCredential :one
+SELECT id, name, kind, key_id, created_at, updated_at
+FROM credentials WHERE id = $1;
+
+-- name: GetCredentialRow :one
+SELECT id, name, kind, key_id, wrapped_dek, ciphertext, created_at, updated_at
+FROM credentials WHERE id = $1;
+
+-- name: ListCredentialRowsForUpdate :many
+SELECT id, name, kind, key_id, wrapped_dek, ciphertext, created_at, updated_at
+FROM credentials ORDER BY id
+FOR UPDATE;
+
+-- name: UpdateCredentialSecret :one
+UPDATE credentials SET key_id = $2, wrapped_dek = $3, ciphertext = $4, updated_at = $5
+WHERE id = $1
+RETURNING id, name, kind, key_id, created_at, updated_at;
+
+-- name: DeleteCredential :execrows
+DELETE FROM credentials WHERE id = $1;
