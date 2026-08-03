@@ -123,8 +123,9 @@ CREATE TABLE harnesses (
 -- Workflow definitions (spec §2). Plan 04: a workflow names a family of
 -- immutable, content-hashed versions; the API write door validates every
 -- document before insert, and version rows are never updated. Plan 05
--- will reference workflow_versions (id) from runs with ON DELETE
--- RESTRICT; until then deleting a workflow cascades its versions.
+-- references workflow_versions (id) from tasks with ON DELETE RESTRICT,
+-- so a workflow with runs can no longer be deleted; without them the
+-- delete still cascades its versions.
 CREATE TABLE workflows (
     id          uuid PRIMARY KEY DEFAULT uuidv7(),
     name        text NOT NULL UNIQUE,
@@ -139,10 +140,124 @@ CREATE TABLE workflows (
 CREATE TABLE workflow_versions (
     id           uuid PRIMARY KEY DEFAULT uuidv7(),
     workflow_id  uuid NOT NULL REFERENCES workflows (id) ON DELETE CASCADE,
-    version      integer NOT NULL,
+    version      integer NOT NULL CHECK (version > 0),
     content_hash text NOT NULL,
     document     jsonb NOT NULL,
     created_at   timestamptz NOT NULL DEFAULT now(),
     UNIQUE (workflow_id, version),
     UNIQUE (workflow_id, content_hash)
 );
+
+-- Execution spine (spec §2). Plan 05: PhaseRun IS the queue — immutable
+-- attempt rows claimed FOR UPDATE SKIP LOCKED; no separate jobs table.
+-- All FKs RESTRICT: spine rows are history, never cascade-deleted.
+
+CREATE TABLE tasks (
+    id                  uuid PRIMARY KEY DEFAULT uuidv7(),
+    project_id          uuid NOT NULL REFERENCES projects (id) ON DELETE RESTRICT,
+    repo_id             uuid NOT NULL REFERENCES repos (id) ON DELETE RESTRICT,
+    workflow_version_id uuid NOT NULL REFERENCES workflow_versions (id) ON DELETE RESTRICT,
+    title               text NOT NULL,
+    inputs              jsonb NOT NULL DEFAULT '{}'::jsonb,
+    requester_id        uuid NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
+    created_at          timestamptz NOT NULL
+);
+
+CREATE INDEX tasks_project_id_idx ON tasks (project_id);
+
+-- A run pins definition hash, policy snapshot (jsonb record), and the
+-- denormalized budget/deadline columns every deciding statement
+-- predicates on against the DATABASE clock (spec §3 Budgets).
+CREATE TABLE runs (
+    id                  uuid PRIMARY KEY DEFAULT uuidv7(),
+    task_id             uuid NOT NULL REFERENCES tasks (id) ON DELETE RESTRICT,
+    status              text NOT NULL CHECK (status IN ('pending', 'running', 'waiting', 'succeeded', 'failed', 'superseded', 'dead')),
+    definition_hash     text NOT NULL,
+    base_sha            text NOT NULL,
+    policy_snapshot     jsonb NOT NULL,
+    execution_budget_ms bigint NOT NULL CHECK (execution_budget_ms > 0),
+    execution_used_ms   bigint NOT NULL DEFAULT 0 CHECK (execution_used_ms >= 0),
+    wall_deadline       timestamptz NOT NULL,
+    outcome             jsonb,
+    created_at          timestamptz NOT NULL,
+    started_at          timestamptz,
+    finished_at         timestamptz
+);
+
+CREATE INDEX runs_task_id_idx ON runs (task_id);
+-- Supersede-before-work: at most one live run per task.
+CREATE UNIQUE INDEX runs_task_live_key ON runs (task_id)
+    WHERE status IN ('pending', 'running', 'waiting');
+
+-- Immutable attempt rows (spec §2): one row per (run, node, attempt); at
+-- most one non-terminal row per (run, node); a retry is a NEW row
+-- inserted in the same tx that terminalizes its predecessor.
+CREATE TABLE phase_runs (
+    id           uuid PRIMARY KEY DEFAULT uuidv7(),
+    run_id       uuid NOT NULL REFERENCES runs (id) ON DELETE RESTRICT,
+    node_id      text NOT NULL,
+    attempt      integer NOT NULL CHECK (attempt >= 1),
+    max_attempts integer NOT NULL CHECK (max_attempts >= 1),
+    status       text NOT NULL CHECK (status IN ('pending', 'running', 'reconciling', 'succeeded', 'failed', 'dead', 'superseded')),
+    worker_id    text,
+    leased_until timestamptz,
+    claimed_at   timestamptz,
+    finished_at  timestamptz,
+    outcome      jsonb,
+    created_at   timestamptz NOT NULL,
+    UNIQUE (run_id, node_id, attempt)
+);
+
+CREATE UNIQUE INDEX phase_runs_live_key ON phase_runs (run_id, node_id)
+    WHERE status IN ('pending', 'running', 'reconciling');
+CREATE INDEX phase_runs_claim_idx ON phase_runs (created_at) WHERE status = 'pending';
+CREATE INDEX phase_runs_lease_idx ON phase_runs (leased_until) WHERE status = 'running';
+
+-- Attempt-scoped durable work products with recorded lineage (spec §2).
+-- parent_ids: jsonb array of artifact uuid strings (plan decision 8).
+CREATE TABLE artifacts (
+    id         uuid PRIMARY KEY,
+    run_id     uuid NOT NULL REFERENCES runs (id) ON DELETE RESTRICT,
+    node_id    text NOT NULL,
+    attempt    integer NOT NULL,
+    type       text NOT NULL CHECK (type IN ('plan', 'patch', 'review_verdict', 'log_ref', 'failure_snapshot')),
+    payload    jsonb NOT NULL,
+    parent_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    created_at timestamptz NOT NULL
+);
+
+CREATE INDEX artifacts_run_id_idx ON artifacts (run_id);
+
+-- Commit-ordered event ids (spec §2): allocated from this single row,
+-- locked FOR UPDATE inside the mutation tx. Sequences allocate in
+-- non-commit order and would let a tailer cursor skip a late commit;
+-- the serialization cost is accepted at V1 scale.
+CREATE TABLE run_event_counter (
+    onerow  boolean PRIMARY KEY DEFAULT true CHECK (onerow),
+    next_id bigint NOT NULL
+);
+
+CREATE TABLE run_events (
+    id             bigint PRIMARY KEY,
+    run_id         uuid NOT NULL REFERENCES runs (id) ON DELETE RESTRICT,
+    project_id     uuid NOT NULL,
+    kind           text NOT NULL,
+    payload        jsonb NOT NULL DEFAULT '{}'::jsonb,
+    occurred_at    timestamptz NOT NULL,
+    correlation_id text NOT NULL DEFAULT ''
+);
+
+CREATE INDEX run_events_run_id_idx ON run_events (run_id, id);
+CREATE INDEX run_events_project_id_idx ON run_events (project_id, id);
+
+-- Same-tx outbox envelope (spec §2): one row per run event, no consumer
+-- in V1; the retention sweeper prunes by age — never an immortal table.
+CREATE TABLE outbox (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_id   bigint NOT NULL REFERENCES run_events (id) ON DELETE CASCADE,
+    kind       text NOT NULL,
+    payload    jsonb NOT NULL,
+    created_at timestamptz NOT NULL
+);
+
+CREATE INDEX outbox_created_at_idx ON outbox (created_at);

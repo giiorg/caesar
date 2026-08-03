@@ -184,6 +184,10 @@ func (s *Service) UpdateWorkflow(ctx context.Context, actor authn.Principal, id 
 func (s *Service) DeleteWorkflow(ctx context.Context, actor authn.Principal, id uuid.UUID) error {
 	return pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		n, err := store.New(tx).DeleteWorkflow(ctx, id)
+		// Versions cascade, but a task pins one with ON DELETE RESTRICT.
+		if isFKViolation(err) {
+			return xerrors.E(xerrors.ClassConflict, "workflow has runs; delete is blocked")
+		}
 		if err != nil {
 			return fmt.Errorf("workflows: delete: %w", err)
 		}
