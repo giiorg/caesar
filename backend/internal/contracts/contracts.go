@@ -16,6 +16,7 @@ import (
 	assetsapi "github.com/giiorg/caesar/backend/internal/assets/api"
 	identityapi "github.com/giiorg/caesar/backend/internal/identity/api"
 	"github.com/giiorg/caesar/backend/internal/platform/httpx"
+	workflowsapi "github.com/giiorg/caesar/backend/internal/workflows/api"
 )
 
 // idParams declares the {id} path parameter for operations whose pattern
@@ -66,6 +67,23 @@ type grantMemberParams struct {
 	UserID string `path:"user_id" description:"user id (uuid)"`
 }
 
+type idAndUpdateWorkflow struct {
+	idParams
+	workflowsapi.UpdateWorkflowRequest
+}
+
+type idAndCreateWorkflowVersion struct {
+	idParams
+	workflowsapi.CreateWorkflowVersionRequest
+}
+
+// workflowVersionParams covers GET …/{id}/versions/{version} — two path
+// parameters, no body.
+type workflowVersionParams struct {
+	idParams
+	Version string `path:"version" description:"version number"`
+}
+
 // requestOverrides maps operation IDs whose request combines a body with
 // path parameters onto their wrapper structs. Every new id-bearing body
 // gets an entry; requestStructure panics loudly otherwise.
@@ -78,6 +96,9 @@ var requestOverrides = map[string]any{
 	"updateHarness":          idAndUpdateHarness{},
 	"setGrant":               idAndSetGrant{},
 	"deleteGrant":            grantMemberParams{},
+	"updateWorkflow":         idAndUpdateWorkflow{},
+	"createWorkflowVersion":  idAndCreateWorkflowVersion{},
+	"getWorkflowVersion":     workflowVersionParams{},
 }
 
 // operationTables collects every context's route table with nil
@@ -86,6 +107,7 @@ func operationTables() [][]httpx.Operation {
 	return [][]httpx.Operation{
 		identityapi.Operations(identityapi.New(nil, 0, nil)),
 		assetsapi.Operations(assetsapi.New(nil, nil, nil, nil)),
+		workflowsapi.Operations(workflowsapi.New(nil, nil)),
 	}
 }
 
