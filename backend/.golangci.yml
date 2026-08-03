@@ -4,6 +4,7 @@ run:
   timeout: 5m
   build-tags:
     - integration
+    - property
 
 linters:
   disable-all: true

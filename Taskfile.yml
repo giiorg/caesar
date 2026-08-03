@@ -41,7 +41,7 @@ tasks:
   backend:vet:
     dir: backend
     cmds:
-      - go vet -tags integration ./...
+      - go vet -tags integration,property ./...
 
   backend:lint:
     deps: [tools]
@@ -53,7 +53,7 @@ tasks:
     deps: [tools]
     dir: backend
     cmds:
-      - bin/govulncheck -tags integration ./...
+      - bin/govulncheck -tags integration,property ./...
 
   backend:build:
     dir: backend
@@ -76,7 +76,7 @@ tasks:
     dir: backend
     cmds:
       - go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze
-      - go vet -tags integration -vettool=./bin/caesar-analyze ./...
+      - go vet -tags integration,property -vettool=./bin/caesar-analyze ./...
 
   backend:run:
     desc: "Run the control plane against the dev database (task db:up first)"
@@ -96,6 +96,12 @@ tasks:
     dir: backend
     cmds:
       - go test -race -tags integration -count=1 ./...
+
+  backend:test:property:
+    desc: "Property tests (rapid): pinned seed by default; RAPID_SEED=0 randomizes (nightly)"
+    dir: backend
+    cmds:
+      - go test -race -tags property -count=1 ./internal/workflows/ -rapid.seed={{.RAPID_SEED | default "1"}} -rapid.checks={{.RAPID_CHECKS | default "100"}}
 
   db:new:
     desc: "Author a migration from schema.sql changes: task db:new -- add_users"
@@ -159,6 +165,7 @@ tasks:
       - task: backend:lint
       - task: backend:analyze
       - task: backend:test
+      - task: backend:test:property
       - task: backend:test:integration
       - task: backend:vuln
       - task: backend:build

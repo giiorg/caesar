@@ -155,15 +155,15 @@ func normalize(path string) string {
 }
 
 // LoadGraph builds the import graph of every package in the module,
-// including integration-tagged files and test files. The module-path
-// pattern (not "./...") makes the load independent of the test's working
-// directory (internal/arch), covering the whole module.
+// including integration- and property-tagged files and test files. The
+// module-path pattern (not "./...") makes the load independent of the
+// test's working directory (internal/arch), covering the whole module.
 func LoadGraph() (Graph, error) {
 	cfg := &packages.Config{
 		Mode:       packages.NeedName | packages.NeedImports,
 		Dir:        ".",
 		Tests:      true,
-		BuildFlags: []string{"-tags", "integration"},
+		BuildFlags: []string{"-tags", "integration,property"},
 	}
 	pkgs, err := packages.Load(cfg, module+"/...")
 	if err != nil {
