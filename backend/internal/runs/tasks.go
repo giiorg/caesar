@@ -255,18 +255,43 @@ func (s *Service) CreateTask(ctx context.Context, actor authn.Principal, in NewT
 }
 
 // Rerun supersedes a pending current run (supersede-before-work,
-// invariant 12) or refuses a live one, then mints the next run. The
-// task's newest run is locked FOR UPDATE: two concurrent reruns
-// serialize, the loser sees the winner's pending run and refuses.
+// invariant 12) or refuses a live one, then mints the next run.
+//
+// Pins are re-resolved through the ports before the transaction opens —
+// the same resolve-then-transact shape as CreateTask. A port call from
+// inside the transaction would hold a pooled connection, and the run's
+// row lock, across a peer-context query or a forge round-trip; since
+// those adapters draw on this same pool, a saturated pool would
+// self-deadlock. The task's repo and pinned version are immutable after
+// intake, so reading them up front is safe.
+//
+// Inside the transaction the task's newest run is locked FOR UPDATE for
+// the whole supersede-then-insert decision: two concurrent reruns
+// serialize, and the loser sees the winner's pending run and refuses.
 func (s *Service) Rerun(ctx context.Context, actor authn.Principal, taskID uuid.UUID) (Run, error) {
+	taskRow, err := store.New(s.pool).GetTask(ctx, taskID)
+	if err != nil {
+		return Run{}, notFound(err, "no such task")
+	}
+	// Re-resolve pins fresh (plan decision 4). Version is pinned on the
+	// task; look its coordinates up via the definition source.
+	repo, err := s.repos.Repo(ctx, taskRow.RepoID)
+	if err != nil {
+		return Run{}, err
+	}
+	def, err := s.definitionByVersionID(ctx, taskRow.WorkflowVersionID)
+	if err != nil {
+		return Run{}, err
+	}
+	baseSHA, err := s.forge.ResolveHead(ctx, repo)
+	if err != nil {
+		return Run{}, fmt.Errorf("runs: resolve head: %w", err)
+	}
+
 	correlationID := httpx.CorrelationID(ctx)
 	var run Run
-	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+	err = pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		q := store.New(tx)
-		taskRow, err := q.GetTask(ctx, taskID)
-		if err != nil {
-			return notFound(err, "no such task")
-		}
 		latest, err := q.LatestRunForUpdate(ctx, taskID)
 		if err != nil {
 			return fmt.Errorf("runs: latest run: %w", err)
@@ -303,20 +328,6 @@ func (s *Service) Rerun(ctx context.Context, actor authn.Principal, taskID uuid.
 			return xerrors.E(xerrors.ClassConflict, "run is in flight; cancel arrives in Plan 09")
 		}
 
-		// Re-resolve pins fresh (plan decision 4). Version is pinned on
-		// the task; look its coordinates up via the definition source.
-		repo, err := s.repos.Repo(ctx, taskRow.RepoID)
-		if err != nil {
-			return err
-		}
-		def, err := s.definitionByVersionID(ctx, taskRow.WorkflowVersionID)
-		if err != nil {
-			return err
-		}
-		baseSHA, err := s.forge.ResolveHead(ctx, repo)
-		if err != nil {
-			return fmt.Errorf("runs: resolve head: %w", err)
-		}
 		run, err = s.insertRun(ctx, tx, taskID, taskRow.ProjectID, def, baseSHA, correlationID)
 		if err != nil {
 			return err
