@@ -103,6 +103,12 @@ tasks:
     cmds:
       - go test -race -tags property -count=1 ./internal/workflows/ -rapid.seed={{.RAPID_SEED | default "1"}} -rapid.checks={{.RAPID_CHECKS | default "100"}}
 
+  backend:fuzz:
+    desc: "Run the fuzz targets for FUZZTIME each (nightly; default 2m)"
+    dir: backend
+    cmds:
+      - go test -run '^$' -fuzz '^FuzzParseDocument$' -fuzztime {{.FUZZTIME | default "2m"}} ./internal/workflows/
+
   db:new:
     desc: "Author a migration from schema.sql changes: task db:new -- add_users"
     dir: backend
