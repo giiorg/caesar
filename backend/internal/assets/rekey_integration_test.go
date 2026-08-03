@@ -65,4 +65,12 @@ func TestRekeyCredentials_RewrapsUnderActiveKey(t *testing.T) {
 	if got := auditCount(t, pool, "credential.rekeyed"); got != 2 {
 		t.Fatalf("rekeyed audits = %d, want 2", got)
 	}
+	var allActorsNull bool
+	if err := pool.QueryRow(ctx,
+		"SELECT bool_and(actor_user_id IS NULL) FROM audit_entries WHERE action = 'credential.rekeyed'").Scan(&allActorsNull); err != nil {
+		t.Fatal(err)
+	}
+	if !allActorsNull {
+		t.Fatal("credential.rekeyed audits must have a NULL actor_user_id (system-triggered)")
+	}
 }

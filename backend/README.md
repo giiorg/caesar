@@ -64,7 +64,9 @@ Rotate the credential master key with `caesar admin rekey -config
 <path>`: prepend the new key to `CAESAR_MASTER_KEY` (or
 `security.master_key`) ahead of the current one, run the rekey (it
 re-wraps every credential envelope under the now-active key), then
-drop the old key from the keyset.
+drop the old key from the keyset. Only drop the old key once `caesar
+admin rekey` has exited 0 — dropping it beforehand strands any
+credential not yet re-wrapped.
 
 ## API
 

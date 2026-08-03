@@ -52,6 +52,14 @@ func TestCredentials_SecretIsEncryptedAtRestAndUseIsAudited(t *testing.T) {
 	if purpose != "test-clone" {
 		t.Fatalf("audited purpose = %q", purpose)
 	}
+	var actorIsNull bool
+	if err := pool.QueryRow(ctx,
+		"SELECT actor_user_id IS NULL FROM audit_entries WHERE action = 'credential.used'").Scan(&actorIsNull); err != nil {
+		t.Fatal(err)
+	}
+	if !actorIsNull {
+		t.Fatal("credential.used audit must have a NULL actor_user_id (system-triggered)")
+	}
 }
 
 func TestCredentials_RotateDeleteAndGuards(t *testing.T) {

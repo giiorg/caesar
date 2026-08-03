@@ -186,6 +186,9 @@ func (s *Service) UpdateRepo(ctx context.Context, actor authn.Principal, id uuid
 		if isUniqueViolation(err) {
 			return xerrors.E(xerrors.ClassConflict, "repo already registered on this project")
 		}
+		if _, fk := fkViolation(err); fk {
+			return xerrors.E(xerrors.ClassNotFound, "no such credential")
+		}
 		if err != nil {
 			return fmt.Errorf("assets: update repo: %w", err)
 		}

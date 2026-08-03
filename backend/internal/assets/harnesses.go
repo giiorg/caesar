@@ -131,6 +131,9 @@ func (s *Service) RegisterHarness(ctx context.Context, actor authn.Principal, in
 		if isUniqueViolation(err) {
 			return xerrors.E(xerrors.ClassConflict, "harness name already taken")
 		}
+		if _, fk := fkViolation(err); fk {
+			return xerrors.E(xerrors.ClassNotFound, "no such credential")
+		}
 		if err != nil {
 			return fmt.Errorf("assets: register harness: %w", err)
 		}
@@ -223,6 +226,9 @@ func (s *Service) UpdateHarness(ctx context.Context, actor authn.Principal, id u
 		})
 		if isUniqueViolation(err) {
 			return xerrors.E(xerrors.ClassConflict, "harness name already taken")
+		}
+		if _, fk := fkViolation(err); fk {
+			return xerrors.E(xerrors.ClassNotFound, "no such credential")
 		}
 		if err != nil {
 			return fmt.Errorf("assets: update harness: %w", err)
