@@ -101,7 +101,7 @@ tasks:
     desc: "Property tests (rapid): pinned seed by default; RAPID_SEED=0 randomizes (nightly)"
     dir: backend
     cmds:
-      - go test -race -tags property -count=1 ./internal/workflows/ -rapid.seed={{.RAPID_SEED | default "1"}} -rapid.checks={{.RAPID_CHECKS | default "100"}}
+      - go test -race -tags property -count=1 ./internal/workflows/ ./internal/runs/ -rapid.seed={{.RAPID_SEED | default "1"}} -rapid.checks={{.RAPID_CHECKS | default "100"}}
 
   backend:fuzz:
     desc: "Run the fuzz targets for FUZZTIME each (nightly; default 2m)"
