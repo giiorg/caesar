@@ -4,6 +4,7 @@ package assets_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -71,6 +72,16 @@ func TestRepos_CRUDWithGuards(t *testing.T) {
 		Forge: assets.ForgeGitHub, Slug: "a/b", CredentialID: uuid.New(),
 	}); xerrors.ClassOf(err) != xerrors.ClassNotFound {
 		t.Fatal("unknown credential must be not found")
+	}
+	if _, err := svc.CreateRepo(ctx, admin, p.ID, assets.NewRepo{
+		Forge: assets.ForgeGitHub, Slug: "a/b", CredentialID: forgeCred.ID, DefaultBranch: "release branch",
+	}); xerrors.ClassOf(err) != xerrors.ClassInvalid {
+		t.Fatal("default branch with whitespace must be invalid")
+	}
+	if _, err := svc.CreateRepo(ctx, admin, p.ID, assets.NewRepo{
+		Forge: assets.ForgeGitHub, Slug: "a/b", CredentialID: forgeCred.ID, DefaultBranch: strings.Repeat("x", 201),
+	}); xerrors.ClassOf(err) != xerrors.ClassInvalid {
+		t.Fatal("default branch over max length must be invalid")
 	}
 
 	// GitLab nested-group slug is legal.
