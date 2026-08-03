@@ -24,6 +24,21 @@ CI. Fix the code, never the rule.
     task backend:test:integration  # real postgres via testcontainers
     task ci                        # exactly what CI runs
 
+## Config
+
+Strict JSON config (`caesar.dev.json` locally); unknown keys are
+rejected. Two env vars override file values, for bootstrap secrets
+only:
+
+- `DATABASE_URL` — overrides `database.url`.
+- `CAESAR_MASTER_KEY` — overrides `security.master_key`: the credential
+  master keyset, `key_id:base64-32B[,key_id:base64-32B...]`
+  (comma-separated, first entry active — it encrypts new envelopes,
+  the rest stay decrypt-only for reads). Generate a key with
+  `openssl rand -base64 32`; the dev keyset already lives in
+  `caesar.dev.json`. `serve` and `admin rekey` require it; `migrate`
+  and `admin bootstrap` do not.
+
 ## Migrations
 
 Desired state lives in `internal/platform/pg/schema.sql`. Author with
@@ -45,6 +60,12 @@ rules. Create the first admin with:
 
     caesar admin bootstrap -email <email> < password.txt
 
+Rotate the credential master key with `caesar admin rekey -config
+<path>`: prepend the new key to `CAESAR_MASTER_KEY` (or
+`security.master_key`) ahead of the current one, run the rekey (it
+re-wraps every credential envelope under the now-active key), then
+drop the old key from the keyset.
+
 ## API
 
 Routes live under `/api/v1`. Errors are RFC 9457 problem+json
@@ -52,7 +73,9 @@ Routes live under `/api/v1`. Errors are RFC 9457 problem+json
 Each endpoint is one `httpx.Operation` declaration — route and OpenAPI
 document come from the same source, so they can't drift. stdlib's own
 405 responses (method not allowed on a registered path) are plain text,
-not problem+json — an accepted V1 limitation.
+not problem+json — an accepted V1 limitation. Resources: identity
+(users, sessions, grants) and assets (projects, repos, credentials,
+harnesses).
 
 ## Contracts
 
@@ -69,7 +92,7 @@ typed Go from the queries).
 
 ## Conventions
 
-- Strict JSON config; env overrides only DATABASE_URL (+ CAESAR_MASTER_KEY from Plan 3).
+- Strict JSON config; env overrides only DATABASE_URL and CAESAR_MASTER_KEY.
 - slog JSON to stdout; correlation id on every request and log line.
 - TDD; table-driven tests; behavioral names; stdlib asserts + go-cmp.
 - Tool versions pinned in the root Taskfile; `task tools` installs to backend/bin.
