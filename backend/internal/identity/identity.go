@@ -7,50 +7,29 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/giiorg/caesar/backend/internal/platform/authn"
 )
 
-type Role string
+// The RBAC vocabulary moved to platform/authn in Plan 03 (shared kernel)
+// so peer contexts can consume it. Aliases keep identity's API unchanged.
+type (
+	Role        = authn.Role
+	GrantLevel  = authn.GrantLevel
+	Principal   = authn.Principal
+	AuthSession = authn.AuthSession
+	Grant       = authn.Grant
+)
 
 const (
-	RoleAdmin  Role = "admin"
-	RoleMember Role = "member"
+	RoleAdmin  = authn.RoleAdmin
+	RoleMember = authn.RoleMember
+
+	GrantView    = authn.GrantView
+	GrantRun     = authn.GrantRun
+	GrantApprove = authn.GrantApprove
+	GrantManage  = authn.GrantManage
 )
-
-func (r Role) Valid() bool { return r == RoleAdmin || r == RoleMember }
-
-// GrantLevel is the per-project inclusive ladder (spec §6):
-// view ⊂ run ⊂ approve ⊂ manage. Checks are always AtLeast.
-type GrantLevel string
-
-const (
-	GrantView    GrantLevel = "view"
-	GrantRun     GrantLevel = "run"
-	GrantApprove GrantLevel = "approve"
-	GrantManage  GrantLevel = "manage"
-)
-
-var grantRank = map[GrantLevel]int{GrantView: 1, GrantRun: 2, GrantApprove: 3, GrantManage: 4}
-
-func (g GrantLevel) Valid() bool { return grantRank[g] != 0 }
-
-func (g GrantLevel) AtLeast(min GrantLevel) bool {
-	return grantRank[g] != 0 && grantRank[min] != 0 && grantRank[g] >= grantRank[min]
-}
-
-// Principal is the authenticated human riding the request context — the
-// requester principal of spec §6.
-type Principal struct {
-	UserID uuid.UUID
-	Email  string
-	Role   Role
-}
-
-// AuthSession is a principal plus the session that authenticated it —
-// what logout and rotation operate on.
-type AuthSession struct {
-	Principal
-	SessionID uuid.UUID
-}
 
 // User is the domain view of a user row (never exposes the hash).
 type User struct {
@@ -60,10 +39,4 @@ type User struct {
 	Active    bool
 	CreatedAt time.Time
 	UpdatedAt time.Time
-}
-
-// Grant is one rung of the ladder on one project.
-type Grant struct {
-	ProjectID uuid.UUID
-	Level     GrantLevel
 }

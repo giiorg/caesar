@@ -9,12 +9,13 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/giiorg/caesar/backend/internal/identity"
+	"github.com/giiorg/caesar/backend/internal/platform/authn"
 	"github.com/giiorg/caesar/backend/internal/platform/httpx"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
 
-// SessionCookie is the pinned __Host- session cookie name (spec §6).
-const SessionCookie = "__Host-caesar_session"
+// SessionCookie aliases the shared pinned cookie name (platform/authn).
+const SessionCookie = authn.SessionCookie
 
 type API struct {
 	svc        *identity.Service
