@@ -256,6 +256,50 @@ export interface paths {
         patch: operations["updateProject"];
         trace?: never;
     };
+    "/api/v1/projects/{id}/grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a project's grants (manage)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["listGrants"];
+        /**
+         * Set a user's grant on a project (manage)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        put: operations["setGrant"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{id}/grants/{user_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a user's grant (manage)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        delete: operations["deleteGrant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/projects/{id}/repos": {
         parameters: {
             query?: never;
@@ -391,6 +435,9 @@ export interface components {
             /** Format: date-time */
             updated_at?: string;
         };
+        ApiGrantListResponse: {
+            grants?: components["schemas"]["ApiProjectGrantResponse"][] | null;
+        };
         ApiGrantResponse: {
             level?: string;
             project_id?: string;
@@ -420,6 +467,11 @@ export interface components {
         ApiMeResponse: {
             grants?: components["schemas"]["ApiGrantResponse"][] | null;
             user?: components["schemas"]["ApiUserResponse"];
+        };
+        ApiProjectGrantResponse: {
+            email?: string;
+            level?: string;
+            user_id?: string;
         };
         ApiProjectListResponse: {
             projects?: components["schemas"]["ApiProjectResponse"][] | null;
@@ -479,6 +531,10 @@ export interface components {
         };
         ContractsIdAndRotateSecret: {
             secret?: string;
+        };
+        ContractsIdAndSetGrant: {
+            level?: string;
+            user_id?: string;
         };
         ContractsIdAndUpdateHarness: {
             credential_id?: null | string;
@@ -1111,6 +1167,104 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ApiProjectResponse"];
                 };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    listGrants: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiGrantListResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    setGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ContractsIdAndSetGrant"];
+            };
+        };
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    deleteGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+                /** @description user id (uuid) */
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Bad Request */
             400: {

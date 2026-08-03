@@ -64,6 +64,23 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 	return i, err
 }
 
+const deleteGrant = `-- name: DeleteGrant :execrows
+DELETE FROM grants WHERE user_id = $1 AND project_id = $2
+`
+
+type DeleteGrantParams struct {
+	UserID    uuid.UUID
+	ProjectID uuid.UUID
+}
+
+func (q *Queries) DeleteGrant(ctx context.Context, arg DeleteGrantParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteGrant, arg.UserID, arg.ProjectID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteLoginRate = `-- name: DeleteLoginRate :exec
 DELETE FROM login_rate WHERE scope = $1
 `
@@ -256,6 +273,39 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) (u
 	return id, err
 }
 
+const listProjectGrants = `-- name: ListProjectGrants :many
+SELECT g.user_id, u.email, g.level
+FROM grants g JOIN users u ON u.id = g.user_id
+WHERE g.project_id = $1
+ORDER BY u.email
+`
+
+type ListProjectGrantsRow struct {
+	UserID uuid.UUID
+	Email  string
+	Level  string
+}
+
+func (q *Queries) ListProjectGrants(ctx context.Context, projectID uuid.UUID) ([]ListProjectGrantsRow, error) {
+	rows, err := q.db.Query(ctx, listProjectGrants, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListProjectGrantsRow
+	for rows.Next() {
+		var i ListProjectGrantsRow
+		if err := rows.Scan(&i.UserID, &i.Email, &i.Level); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUsers = `-- name: ListUsers :many
 SELECT id, email, password_hash, role, active, created_at, updated_at
 FROM users
@@ -407,6 +457,23 @@ func (q *Queries) UpdateUserRoleActive(ctx context.Context, arg UpdateUserRoleAc
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const upsertGrant = `-- name: UpsertGrant :exec
+INSERT INTO grants (user_id, project_id, level)
+VALUES ($1, $2, $3)
+ON CONFLICT (user_id, project_id) DO UPDATE SET level = excluded.level
+`
+
+type UpsertGrantParams struct {
+	UserID    uuid.UUID
+	ProjectID uuid.UUID
+	Level     string
+}
+
+func (q *Queries) UpsertGrant(ctx context.Context, arg UpsertGrantParams) error {
+	_, err := q.db.Exec(ctx, upsertGrant, arg.UserID, arg.ProjectID, arg.Level)
+	return err
 }
 
 const upsertLoginRate = `-- name: UpsertLoginRate :exec

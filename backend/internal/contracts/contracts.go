@@ -54,6 +54,18 @@ type idAndUpdateHarness struct {
 	assetsapi.UpdateHarnessRequest
 }
 
+type idAndSetGrant struct {
+	idParams
+	identityapi.SetGrantRequest
+}
+
+// grantMemberParams covers DELETE …/{id}/grants/{user_id} — two path
+// parameters, no body.
+type grantMemberParams struct {
+	idParams
+	UserID string `path:"user_id" description:"user id (uuid)"`
+}
+
 // requestOverrides maps operation IDs whose request combines a body with
 // path parameters onto their wrapper structs. Every new id-bearing body
 // gets an entry; requestStructure panics loudly otherwise.
@@ -64,13 +76,15 @@ var requestOverrides = map[string]any{
 	"updateRepo":             idAndUpdateRepo{},
 	"rotateCredentialSecret": idAndRotateSecret{},
 	"updateHarness":          idAndUpdateHarness{},
+	"setGrant":               idAndSetGrant{},
+	"deleteGrant":            grantMemberParams{},
 }
 
 // operationTables collects every context's route table with nil
 // dependencies — metadata only; handlers never run during generation.
 func operationTables() [][]httpx.Operation {
 	return [][]httpx.Operation{
-		identityapi.Operations(identityapi.New(nil, 0)),
+		identityapi.Operations(identityapi.New(nil, 0, nil)),
 		assetsapi.Operations(assetsapi.New(nil, nil, nil, nil)),
 	}
 }

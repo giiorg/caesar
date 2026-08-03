@@ -685,6 +685,132 @@
         }
       }
     },
+    "/api/v1/projects/{id}/grants": {
+      "get": {
+        "summary": "List a project's grants (manage)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "listGrants",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiGrantListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Set a user's grant on a project (manage)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "setGrant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContractsIdAndSetGrant"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/grants/{user_id}": {
+      "delete": {
+        "summary": "Remove a user's grant (manage)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "deleteGrant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "user id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "user id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/projects/{id}/repos": {
       "get": {
         "summary": "List a project's repos (view)",
@@ -1141,6 +1267,20 @@
         },
         "type": "object"
       },
+      "ApiGrantListResponse": {
+        "properties": {
+          "grants": {
+            "items": {
+              "$ref": "#/components/schemas/ApiProjectGrantResponse"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ApiGrantResponse": {
         "properties": {
           "level": {
@@ -1228,6 +1368,20 @@
           },
           "user": {
             "$ref": "#/components/schemas/ApiUserResponse"
+          }
+        },
+        "type": "object"
+      },
+      "ApiProjectGrantResponse": {
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "level": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
           }
         },
         "type": "object"
@@ -1396,6 +1550,17 @@
       "ContractsIdAndRotateSecret": {
         "properties": {
           "secret": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ContractsIdAndSetGrant": {
+        "properties": {
+          "level": {
+            "type": "string"
+          },
+          "user_id": {
             "type": "string"
           }
         },

@@ -72,7 +72,6 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		SessionIdleTTL:     cfg.Auth.SessionIdleTTL.Std(),
 		SessionAbsoluteTTL: cfg.Auth.SessionAbsoluteTTL.Std(),
 	})
-	ops := identityapi.Operations(identityapi.New(svc, cfg.Auth.SessionAbsoluteTTL.Std()))
 
 	if cfg.Security.MasterKey == "" {
 		return errors.New("serve: security.master_key (or CAESAR_MASTER_KEY) is required")
@@ -82,8 +81,12 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		return fmt.Errorf("serve: %w", err)
 	}
 	assetsSvc := assets.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}), keys)
-	// identity.Service serves as authenticator, authorizer, and grant
-	// source for the assets API (the authn ports, wired here only).
+
+	// assetsSvc implements identityapi.ProjectChecker (grant endpoints 404
+	// on unknown projects); identity.Service serves as authenticator,
+	// authorizer, and grant source for the assets API (the authn ports,
+	// wired here only).
+	ops := identityapi.Operations(identityapi.New(svc, cfg.Auth.SessionAbsoluteTTL.Std(), assetsSvc))
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, svc, svc, svc))...)
 
 	srv := &http.Server{

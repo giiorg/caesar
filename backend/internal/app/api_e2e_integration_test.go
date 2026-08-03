@@ -49,7 +49,7 @@ func TestAppRoutes_AuthLoopEndToEnd(t *testing.T) {
 	}
 	assetsSvc := assets.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}), keys)
 
-	ops := identityapi.Operations(identityapi.New(svc, 90*24*time.Hour))
+	ops := identityapi.Operations(identityapi.New(svc, 90*24*time.Hour, assetsSvc))
 	// identity.Service serves as authenticator, authorizer, and grant
 	// source for the assets API, exactly as serve.go wires it.
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, svc, svc, svc))...)
