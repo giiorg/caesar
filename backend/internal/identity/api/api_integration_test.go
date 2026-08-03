@@ -14,6 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/giiorg/caesar/backend/internal/identity"
 	identityapi "github.com/giiorg/caesar/backend/internal/identity/api"
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
@@ -24,22 +27,33 @@ import (
 
 const testPassword = "a long enough password"
 
+// dbProjects is a test-local ProjectChecker: identity tests may not import
+// assets, so existence is checked directly against the shared projects
+// table rather than through assets.Service.
+type dbProjects struct{ pool *pgxpool.Pool }
+
+func (d dbProjects) ProjectExists(ctx context.Context, id uuid.UUID) (bool, error) {
+	var ok bool
+	err := d.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)", id).Scan(&ok)
+	return ok, err
+}
+
 // newTestServer mirrors app wiring: correlation → access log → origin →
 // mounted operations. The app-level e2e (Task 12) covers the real Routes.
-func newTestServer(t *testing.T) (*httptest.Server, *identity.Service) {
+func newTestServer(t *testing.T) (*httptest.Server, *identity.Service, *pgxpool.Pool) {
 	t.Helper()
 	pool := testdb.New(t)
 	fake := clock.NewFake(time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC))
 	svc := identity.NewService(pool, fake, audit.NewRecorder(fake), identity.Params{
 		SessionIdleTTL: 14 * 24 * time.Hour, SessionAbsoluteTTL: 90 * 24 * time.Hour,
 	})
-	a := identityapi.New(svc, 90*24*time.Hour)
+	a := identityapi.New(svc, 90*24*time.Hour, dbProjects{pool})
 	mux := http.NewServeMux()
 	httpx.Mount(mux, identityapi.Operations(a))
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	srv := httptest.NewServer(httpx.Chain(mux, httpx.WithCorrelationID, httpx.AccessLog(log), httpx.CheckOrigin("http://caesar.test")))
 	t.Cleanup(srv.Close)
-	return srv, svc
+	return srv, svc, pool
 }
 
 func do(t *testing.T, method, url, cookie string, body any) *http.Response {
@@ -103,7 +117,7 @@ func bootstrapAndLogin(t *testing.T, srv *httptest.Server, svc *identity.Service
 }
 
 func TestAPI_LoginMeLogout(t *testing.T) {
-	srv, svc := newTestServer(t)
+	srv, svc, _ := newTestServer(t)
 	token := bootstrapAndLogin(t, srv, svc)
 
 	resp := do(t, http.MethodGet, srv.URL+"/api/v1/auth/me", token, nil)
@@ -126,7 +140,7 @@ func TestAPI_LoginMeLogout(t *testing.T) {
 }
 
 func TestAPI_ProblemEnvelopeShape(t *testing.T) {
-	srv, svc := newTestServer(t)
+	srv, svc, _ := newTestServer(t)
 	if _, err := svc.Bootstrap(context.Background(), "root@example.com", testPassword); err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +158,7 @@ func TestAPI_ProblemEnvelopeShape(t *testing.T) {
 }
 
 func TestAPI_UserAdministration(t *testing.T) {
-	srv, svc := newTestServer(t)
+	srv, svc, _ := newTestServer(t)
 	admin := bootstrapAndLogin(t, srv, svc)
 
 	// Create a member.
@@ -198,7 +212,7 @@ func TestAPI_UserAdministration(t *testing.T) {
 }
 
 func TestAPI_ChangePasswordRotatesCookie(t *testing.T) {
-	srv, svc := newTestServer(t)
+	srv, svc, _ := newTestServer(t)
 	token := bootstrapAndLogin(t, srv, svc)
 
 	resp := do(t, http.MethodPut, srv.URL+"/api/v1/auth/password", token, identityapi.ChangePasswordRequest{
@@ -216,5 +230,51 @@ func TestAPI_ChangePasswordRotatesCookie(t *testing.T) {
 	}
 	if resp := do(t, http.MethodGet, srv.URL+"/api/v1/auth/me", fresh, nil); resp.StatusCode != http.StatusOK {
 		t.Fatal("fresh session must work")
+	}
+}
+
+func TestAPI_GrantAdministration(t *testing.T) {
+	srv, svc, pool := newTestServer(t)
+	admin := bootstrapAndLogin(t, srv, svc)
+
+	resp := do(t, http.MethodPost, srv.URL+"/api/v1/users", admin, identityapi.CreateUserRequest{
+		Email: "m@example.com", Password: testPassword, Role: "member",
+	})
+	member := decodeInto[identityapi.UserResponse](t, resp)
+	var projectID uuid.UUID
+	if err := pool.QueryRow(context.Background(), "INSERT INTO projects (name) VALUES ('p') RETURNING id").Scan(&projectID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unknown project 404s before anything else.
+	if resp := do(t, http.MethodPut, srv.URL+"/api/v1/projects/"+uuid.NewString()+"/grants", admin,
+		identityapi.SetGrantRequest{UserID: member.ID, Level: "view"}); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown project = %d, want 404", resp.StatusCode)
+	}
+
+	// Admin grants approve; /auth/me reflects it.
+	if resp := do(t, http.MethodPut, srv.URL+"/api/v1/projects/"+projectID.String()+"/grants", admin,
+		identityapi.SetGrantRequest{UserID: member.ID, Level: "approve"}); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("set grant = %d", resp.StatusCode)
+	}
+	resp = do(t, http.MethodPost, srv.URL+"/api/v1/auth/login", "", identityapi.LoginRequest{Email: "m@example.com", Password: testPassword})
+	memberTok := sessionCookie(t, resp)
+	me := decodeInto[identityapi.MeResponse](t, do(t, http.MethodGet, srv.URL+"/api/v1/auth/me", memberTok, nil))
+	if len(me.Grants) != 1 || me.Grants[0].Level != "approve" {
+		t.Fatalf("me grants = %+v", me.Grants)
+	}
+
+	// approve < manage: the member cannot administer grants.
+	if resp := do(t, http.MethodGet, srv.URL+"/api/v1/projects/"+projectID.String()+"/grants", memberTok, nil); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("approve-level list grants = %d, want 403", resp.StatusCode)
+	}
+
+	// List then delete as admin.
+	got := decodeInto[identityapi.GrantListResponse](t, do(t, http.MethodGet, srv.URL+"/api/v1/projects/"+projectID.String()+"/grants", admin, nil))
+	if len(got.Grants) != 1 || got.Grants[0].Email != "m@example.com" {
+		t.Fatalf("grants = %+v", got.Grants)
+	}
+	if resp := do(t, http.MethodDelete, srv.URL+"/api/v1/projects/"+projectID.String()+"/grants/"+member.ID, admin, nil); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete grant = %d", resp.StatusCode)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/giiorg/caesar/backend/internal/identity/store"
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/httpx"
+	"github.com/giiorg/caesar/backend/internal/platform/pg"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
 
@@ -94,34 +95,37 @@ func (s *Service) AuthenticateSession(ctx context.Context, token string) (AuthSe
 
 // Logout revokes the calling session.
 func (s *Service) Logout(ctx context.Context, sess AuthSession) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("identity: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	q := store.New(tx)
-	now := s.clock.Now()
-	if err := q.RevokeSession(ctx, store.RevokeSessionParams{ID: sess.SessionID, RevokedAt: &now}); err != nil {
-		return fmt.Errorf("identity: revoke session: %w", err)
-	}
-	err = s.audit.Record(ctx, tx, audit.Entry{
-		Actor:  uuid.NullUUID{UUID: sess.UserID, Valid: true},
-		Action: "auth.logout", SubjectKind: "session", SubjectID: sess.SessionID.String(),
-		CorrelationID: httpx.CorrelationID(ctx),
+	return pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		q := store.New(tx)
+		now := s.clock.Now()
+		if err := q.RevokeSession(ctx, store.RevokeSessionParams{ID: sess.SessionID, RevokedAt: &now}); err != nil {
+			return fmt.Errorf("identity: revoke session: %w", err)
+		}
+		if err := s.audit.Record(ctx, tx, audit.Entry{
+			Actor:  uuid.NullUUID{UUID: sess.UserID, Valid: true},
+			Action: "auth.logout", SubjectKind: "session", SubjectID: sess.SessionID.String(),
+			CorrelationID: httpx.CorrelationID(ctx),
+		}); err != nil {
+			return err
+		}
+		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
 }
 
 // ChangePassword verifies the current password, rewrites the hash,
 // revokes every session of the user, and mints a replacement for the
-// caller (rotation on privilege change, spec §6).
+// caller (rotation on privilege change, spec §6). Current-password
+// guesses are throttled through login_rate scope "pwchange:<user_id>"
+// with the account ladder and audited — a stolen session must not be a
+// free brute-force oracle. Failure paths COMMIT their rate/audit rows,
+// so this keeps an explicit transaction (not pg.WithTx).
 func (s *Service) ChangePassword(ctx context.Context, sess AuthSession, current, newPassword string) (string, error) {
 	if err := validatePassword(newPassword); err != nil {
 		return "", err
 	}
+	scope := "pwchange:" + sess.UserID.String()
+	now := s.clock.Now()
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("identity: begin: %w", err)
@@ -129,22 +133,68 @@ func (s *Service) ChangePassword(ctx context.Context, sess AuthSession, current,
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
 
+	if err := q.EnsureLoginRate(ctx, store.EnsureLoginRateParams{Scope: scope, WindowStartedAt: now}); err != nil {
+		return "", fmt.Errorf("identity: ensure pwchange rate: %w", err)
+	}
+	rate, err := loadRate(ctx, q, scope)
+	if err != nil {
+		return "", err
+	}
+	if rateBlocked(rate, now) {
+		return "", errLoginLocked
+	}
+
 	row, err := q.GetUserByID(ctx, sess.UserID)
 	if err != nil {
 		return "", fmt.Errorf("identity: get user: %w", err)
 	}
-	ok, err := VerifyPassword(row.PasswordHash, current)
-	if err != nil {
-		return "", fmt.Errorf("identity: verify: %w", err)
+	ok := false
+	if len(current) <= MaxPasswordLen {
+		ok, err = VerifyPassword(row.PasswordHash, current)
+		if err != nil {
+			return "", fmt.Errorf("identity: verify: %w", err)
+		}
+	} else {
+		dummyVerify(current)
 	}
+
 	if !ok {
+		next := rateFail(rateAccount, rate, now)
+		if err := saveRate(ctx, q, scope, next); err != nil {
+			return "", err
+		}
+		entries := []audit.Entry{{
+			Actor:  uuid.NullUUID{UUID: sess.UserID, Valid: true},
+			Action: "auth.password_change_failed", SubjectKind: "user", SubjectID: sess.UserID.String(),
+			CorrelationID: httpx.CorrelationID(ctx),
+		}}
+		if rateBlocked(next, now) && !rateBlocked(rate, now) {
+			entries = append(entries, audit.Entry{
+				Actor:  uuid.NullUUID{UUID: sess.UserID, Valid: true},
+				Action: "auth.rate_limited", SubjectKind: "user", SubjectID: sess.UserID.String(),
+				CorrelationID: httpx.CorrelationID(ctx),
+				Detail:        map[string]any{"scope": "pwchange"},
+			})
+		}
+		for _, e := range entries {
+			if err := s.audit.Record(ctx, tx, e); err != nil {
+				return "", err
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return "", fmt.Errorf("identity: commit: %w", err)
+		}
+		s.purgeStaleLoginRate(ctx)
 		return "", xerrors.E(xerrors.ClassUnauthenticated, "current password is incorrect")
+	}
+
+	if err := q.DeleteLoginRate(ctx, scope); err != nil {
+		return "", fmt.Errorf("identity: rate reset: %w", err)
 	}
 	hash, err := HashPassword(newPassword)
 	if err != nil {
 		return "", err
 	}
-	now := s.clock.Now()
 	if err := q.UpdateUserPassword(ctx, store.UpdateUserPasswordParams{ID: sess.UserID, PasswordHash: hash, UpdatedAt: now}); err != nil {
 		return "", fmt.Errorf("identity: update password: %w", err)
 	}
@@ -155,12 +205,11 @@ func (s *Service) ChangePassword(ctx context.Context, sess AuthSession, current,
 	if err != nil {
 		return "", err
 	}
-	err = s.audit.Record(ctx, tx, audit.Entry{
+	if err := s.audit.Record(ctx, tx, audit.Entry{
 		Actor:  uuid.NullUUID{UUID: sess.UserID, Valid: true},
 		Action: "auth.password_changed", SubjectKind: "user", SubjectID: sess.UserID.String(),
 		CorrelationID: httpx.CorrelationID(ctx),
-	})
-	if err != nil {
+	}); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(ctx); err != nil {

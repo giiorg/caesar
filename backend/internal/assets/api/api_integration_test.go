@@ -1,0 +1,232 @@
+//go:build integration
+
+package api_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/giiorg/caesar/backend/internal/assets"
+	assetsapi "github.com/giiorg/caesar/backend/internal/assets/api"
+	"github.com/giiorg/caesar/backend/internal/platform/audit"
+	"github.com/giiorg/caesar/backend/internal/platform/authn"
+	"github.com/giiorg/caesar/backend/internal/platform/clock"
+	"github.com/giiorg/caesar/backend/internal/platform/httpx"
+	"github.com/giiorg/caesar/backend/internal/platform/secrets"
+	"github.com/giiorg/caesar/backend/internal/platform/testdb"
+	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
+)
+
+// fakePorts implements the authn ports and GrantSource without identity:
+// assets tests may never import the identity context (arch law). Real
+// wiring is exercised by the app e2e (Task 12).
+type fakePorts struct {
+	sessions map[string]authn.AuthSession
+	grants   map[uuid.UUID][]authn.Grant
+}
+
+func (f *fakePorts) AuthenticateSession(_ context.Context, token string) (authn.AuthSession, error) {
+	s, ok := f.sessions[token]
+	if !ok {
+		return authn.AuthSession{}, xerrors.E(xerrors.ClassUnauthenticated, "invalid or expired session")
+	}
+	return s, nil
+}
+
+func (f *fakePorts) Authorize(_ context.Context, p authn.Principal, projectID uuid.UUID, min authn.GrantLevel) (bool, error) {
+	if p.Role == authn.RoleAdmin {
+		return true, nil
+	}
+	for _, g := range f.grants[p.UserID] {
+		if g.ProjectID == projectID && g.Level.AtLeast(min) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakePorts) GrantsForUser(_ context.Context, userID uuid.UUID) ([]authn.Grant, error) {
+	return f.grants[userID], nil
+}
+
+func seedUser(t *testing.T, pool *pgxpool.Pool, email string, role authn.Role) authn.Principal {
+	t.Helper()
+	var id uuid.UUID
+	err := pool.QueryRow(context.Background(),
+		"INSERT INTO users (email, password_hash, role) VALUES ($1, 'x', $2) RETURNING id",
+		email, string(role)).Scan(&id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authn.Principal{UserID: id, Email: email, Role: role}
+}
+
+func newTestServer(t *testing.T) (*httptest.Server, *assets.Service, *pgxpool.Pool, *fakePorts) {
+	t.Helper()
+	pool := testdb.New(t)
+	fake := clock.NewFake(time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC))
+	keys, err := secrets.ParseKeyset("test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := assets.NewService(pool, fake, audit.NewRecorder(fake), keys)
+	ports := &fakePorts{sessions: map[string]authn.AuthSession{}, grants: map[uuid.UUID][]authn.Grant{}}
+
+	mux := http.NewServeMux()
+	httpx.Mount(mux, assetsapi.Operations(assetsapi.New(svc, ports, ports, ports)))
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	srv := httptest.NewServer(httpx.Chain(mux, httpx.WithCorrelationID, httpx.AccessLog(log), httpx.CheckOrigin("http://caesar.test")))
+	t.Cleanup(srv.Close)
+	return srv, svc, pool, ports
+}
+
+func login(ports *fakePorts, token string, p authn.Principal) {
+	ports.sessions[token] = authn.AuthSession{Principal: p, SessionID: uuid.New()}
+}
+
+func do(t *testing.T, method, url, token string, body any) *http.Response {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req, err := http.NewRequest(method, url, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Cookie", authn.SessionCookie+"="+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+func decodeInto[T any](t *testing.T, resp *http.Response) T {
+	t.Helper()
+	var v T
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func TestAssetsAPI_ProjectVisibilityFollowsGrants(t *testing.T) {
+	srv, _, pool, ports := newTestServer(t)
+	admin := seedUser(t, pool, "root@example.com", authn.RoleAdmin)
+	member := seedUser(t, pool, "m@example.com", authn.RoleMember)
+	login(ports, "admin-tok", admin)
+	login(ports, "member-tok", member)
+
+	// Admin creates two projects over the API; member creation is 403.
+	resp := do(t, http.MethodPost, srv.URL+"/api/v1/projects", "admin-tok", assetsapi.CreateProjectRequest{Name: "alpha"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create = %d", resp.StatusCode)
+	}
+	alpha := decodeInto[assetsapi.ProjectResponse](t, resp)
+	if resp := do(t, http.MethodPost, srv.URL+"/api/v1/projects", "admin-tok", assetsapi.CreateProjectRequest{Name: "beta"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create beta = %d", resp.StatusCode)
+	}
+	if resp := do(t, http.MethodPost, srv.URL+"/api/v1/projects", "member-tok", assetsapi.CreateProjectRequest{Name: "gamma"}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("member create = %d, want 403", resp.StatusCode)
+	}
+
+	// No grant: empty list, 403 on get.
+	if got := decodeInto[assetsapi.ProjectListResponse](t, do(t, http.MethodGet, srv.URL+"/api/v1/projects", "member-tok", nil)); len(got.Projects) != 0 {
+		t.Fatalf("ungranted member sees %d projects", len(got.Projects))
+	}
+	if resp := do(t, http.MethodGet, srv.URL+"/api/v1/projects/"+alpha.ID, "member-tok", nil); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("ungranted get = %d, want 403", resp.StatusCode)
+	}
+
+	// View grant on alpha: visible, readable, still not writable.
+	alphaID := uuid.MustParse(alpha.ID)
+	ports.grants[member.UserID] = []authn.Grant{{ProjectID: alphaID, Level: authn.GrantView}}
+	if got := decodeInto[assetsapi.ProjectListResponse](t, do(t, http.MethodGet, srv.URL+"/api/v1/projects", "member-tok", nil)); len(got.Projects) != 1 || got.Projects[0].Name != "alpha" {
+		t.Fatalf("granted member list = %+v", got.Projects)
+	}
+	if resp := do(t, http.MethodGet, srv.URL+"/api/v1/projects/"+alpha.ID, "member-tok", nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("granted get = %d", resp.StatusCode)
+	}
+	if resp := do(t, http.MethodPatch, srv.URL+"/api/v1/projects/"+alpha.ID, "member-tok", assetsapi.UpdateProjectRequest{}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("view-level patch = %d, want 403", resp.StatusCode)
+	}
+
+	// Admin lists everything; no cookie is 401.
+	if got := decodeInto[assetsapi.ProjectListResponse](t, do(t, http.MethodGet, srv.URL+"/api/v1/projects", "admin-tok", nil)); len(got.Projects) != 2 {
+		t.Fatalf("admin list = %d", len(got.Projects))
+	}
+	if resp := do(t, http.MethodGet, srv.URL+"/api/v1/projects", "", nil); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("anonymous = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestAssetsAPI_RepoEndpointsEnforceManage(t *testing.T) {
+	ctx := context.Background()
+	srv, svc, pool, ports := newTestServer(t)
+	admin := seedUser(t, pool, "root@example.com", authn.RoleAdmin)
+	member := seedUser(t, pool, "m@example.com", authn.RoleMember)
+	login(ports, "admin-tok", admin)
+	login(ports, "member-tok", member)
+
+	p, err := svc.CreateProject(ctx, admin, "p", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := svc.CreateCredential(ctx, admin, "gh", assets.CredentialForgeToken, []byte("tok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// manage grant → member can register a repo.
+	ports.grants[member.UserID] = []authn.Grant{{ProjectID: p.ID, Level: authn.GrantManage}}
+	resp := do(t, http.MethodPost, srv.URL+"/api/v1/projects/"+p.ID.String()+"/repos", "member-tok", assetsapi.CreateRepoRequest{
+		Forge: "github", Slug: "giiorg/caesar", CredentialID: cred.ID.String(),
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create repo = %d", resp.StatusCode)
+	}
+	repo := decodeInto[assetsapi.RepoResponse](t, resp)
+
+	// Downgrade to run: reads still work, writes are 403.
+	ports.grants[member.UserID] = []authn.Grant{{ProjectID: p.ID, Level: authn.GrantRun}}
+	if resp := do(t, http.MethodGet, srv.URL+"/api/v1/repos/"+repo.ID, "member-tok", nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("get repo = %d", resp.StatusCode)
+	}
+	if resp := do(t, http.MethodGet, srv.URL+"/api/v1/projects/"+p.ID.String()+"/repos", "member-tok", nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("list repos = %d", resp.StatusCode)
+	}
+	if resp := do(t, http.MethodDelete, srv.URL+"/api/v1/repos/"+repo.ID, "member-tok", nil); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("run-level delete = %d, want 403", resp.StatusCode)
+	}
+
+	// Bad path uuid → 404 problem, unknown body field → 400.
+	if resp := do(t, http.MethodGet, srv.URL+"/api/v1/repos/not-a-uuid", "admin-tok", nil); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("bad uuid = %d", resp.StatusCode)
+	}
+	raw, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/projects", bytes.NewReader([]byte(`{"name":"x","surprise":1}`)))
+	raw.Header.Set("Cookie", authn.SessionCookie+"=admin-tok")
+	rawResp, err := http.DefaultClient.Do(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawResp.Body.Close()
+	if rawResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown field = %d", rawResp.StatusCode)
+	}
+}

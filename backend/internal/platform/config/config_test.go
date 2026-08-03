@@ -136,3 +136,44 @@ func TestLoad_MissingFileErrors(t *testing.T) {
 		t.Fatal("want error for missing file")
 	}
 }
+
+func TestLoad_MasterKeyFromFileAndEnvOverride(t *testing.T) {
+	path := writeFile(t, `{
+	  "database": {"url": "postgres://x"},
+	  "security": {"master_key": "file:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
+	}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.MasterKey != "file:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" {
+		t.Fatalf("master key = %q", cfg.Security.MasterKey)
+	}
+
+	t.Setenv("CAESAR_MASTER_KEY", "env:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.MasterKey != "env:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" {
+		t.Fatalf("env must override file, got %q", cfg.Security.MasterKey)
+	}
+}
+
+func TestLoad_RejectsMalformedMasterKey(t *testing.T) {
+	path := writeFile(t, `{
+	  "database": {"url": "postgres://x"},
+	  "security": {"master_key": "not-a-keyset"}
+	}`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("malformed keyset must fail validation")
+	}
+}
+
+func TestLoad_MasterKeyIsOptionalAtLoadTime(t *testing.T) {
+	// migrate/bootstrap run without it; serve enforces presence itself.
+	path := writeFile(t, `{"database": {"url": "postgres://x"}}`)
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+}

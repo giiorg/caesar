@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -9,20 +10,29 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/giiorg/caesar/backend/internal/identity"
+	"github.com/giiorg/caesar/backend/internal/platform/authn"
 	"github.com/giiorg/caesar/backend/internal/platform/httpx"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
 
-// SessionCookie is the pinned __Host- session cookie name (spec §6).
-const SessionCookie = "__Host-caesar_session"
+// SessionCookie aliases the shared pinned cookie name (platform/authn).
+const SessionCookie = authn.SessionCookie
+
+// ProjectChecker reports whether a project exists — implemented by the
+// assets context's service, wired in app. Grant endpoints 404 on unknown
+// projects without identity touching assets' tables.
+type ProjectChecker interface {
+	ProjectExists(ctx context.Context, id uuid.UUID) (bool, error)
+}
 
 type API struct {
 	svc        *identity.Service
 	sessionTTL time.Duration // cookie Max-Age; server-side expiry is authoritative
+	projects   ProjectChecker
 }
 
-func New(svc *identity.Service, sessionTTL time.Duration) *API {
-	return &API{svc: svc, sessionTTL: sessionTTL}
+func New(svc *identity.Service, sessionTTL time.Duration, projects ProjectChecker) *API {
+	return &API{svc: svc, sessionTTL: sessionTTL, projects: projects}
 }
 
 // Operations is the single route table: mux registration (httpx.Mount)
@@ -68,6 +78,21 @@ func Operations(a *API) []httpx.Operation {
 			Pattern: "PATCH /api/v1/users/{id}", ID: "updateUser", Summary: "Update role or active flag (admin)",
 			Request: UpdateUserRequest{}, Response: UserResponse{}, Status: http.StatusOK,
 			Handler: a.adminOnly(a.handleUpdateUser),
+		},
+		{
+			Pattern: "GET /api/v1/projects/{id}/grants", ID: "listGrants", Summary: "List a project's grants (manage)",
+			Response: GrantListResponse{}, Status: http.StatusOK,
+			Handler: a.authenticated(a.handleListGrants),
+		},
+		{
+			Pattern: "PUT /api/v1/projects/{id}/grants", ID: "setGrant", Summary: "Set a user's grant on a project (manage)",
+			Request: SetGrantRequest{}, Status: http.StatusNoContent,
+			Handler: a.authenticated(a.handleSetGrant),
+		},
+		{
+			Pattern: "DELETE /api/v1/projects/{id}/grants/{user_id}", ID: "deleteGrant", Summary: "Remove a user's grant (manage)",
+			Status:  http.StatusNoContent,
+			Handler: a.authenticated(a.handleDeleteGrant),
 		},
 	}
 }
@@ -261,4 +286,90 @@ func (a *API) handleUpdateUser(w http.ResponseWriter, r *http.Request, sess iden
 		return
 	}
 	httpx.JSON(w, http.StatusOK, userResponse(user))
+}
+
+// grantScoped resolves {id}, 404s unknown projects via the ProjectChecker
+// port, and enforces manage (global admins pass inside Authorize).
+func (a *API) grantScoped(w http.ResponseWriter, r *http.Request, sess identity.AuthSession) (uuid.UUID, bool) {
+	projectID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		httpx.Problem(w, r, xerrors.E(xerrors.ClassNotFound, "no such project"))
+		return uuid.UUID{}, false
+	}
+	exists, err := a.projects.ProjectExists(r.Context(), projectID)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return uuid.UUID{}, false
+	}
+	if !exists {
+		httpx.Problem(w, r, xerrors.E(xerrors.ClassNotFound, "no such project"))
+		return uuid.UUID{}, false
+	}
+	ok, err := a.svc.Authorize(r.Context(), sess.Principal, projectID, identity.GrantManage)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return uuid.UUID{}, false
+	}
+	if !ok {
+		httpx.Problem(w, r, xerrors.E(xerrors.ClassForbidden, "insufficient project grant"))
+		return uuid.UUID{}, false
+	}
+	return projectID, true
+}
+
+func (a *API) handleListGrants(w http.ResponseWriter, r *http.Request, sess identity.AuthSession) {
+	projectID, ok := a.grantScoped(w, r, sess)
+	if !ok {
+		return
+	}
+	grants, err := a.svc.ListGrants(r.Context(), projectID)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	out := GrantListResponse{Grants: make([]ProjectGrantResponse, 0, len(grants))}
+	for _, g := range grants {
+		out.Grants = append(out.Grants, ProjectGrantResponse{UserID: g.UserID.String(), Email: g.Email, Level: string(g.Level)})
+	}
+	httpx.JSON(w, http.StatusOK, out)
+}
+
+func (a *API) handleSetGrant(w http.ResponseWriter, r *http.Request, sess identity.AuthSession) {
+	projectID, ok := a.grantScoped(w, r, sess)
+	if !ok {
+		return
+	}
+	req, err := decode[SetGrantRequest](r)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	userID, err := uuid.Parse(req.UserID)
+	if err != nil {
+		httpx.Problem(w, r, xerrors.E(xerrors.ClassInvalid, "validation failed").
+			WithFields(xerrors.FieldError{Field: "user_id", Message: "must be a uuid"}))
+		return
+	}
+	if err := a.svc.SetGrant(r.Context(), sess.Principal, projectID, userID, identity.GrantLevel(req.Level)); err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) handleDeleteGrant(w http.ResponseWriter, r *http.Request, sess identity.AuthSession) {
+	projectID, ok := a.grantScoped(w, r, sess)
+	if !ok {
+		return
+	}
+	userID, err := uuid.Parse(r.PathValue("user_id"))
+	if err != nil {
+		httpx.Problem(w, r, xerrors.E(xerrors.ClassNotFound, "no such grant"))
+		return
+	}
+	if err := a.svc.DeleteGrant(r.Context(), sess.Principal, projectID, userID); err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

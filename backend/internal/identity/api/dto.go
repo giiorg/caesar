@@ -52,6 +52,21 @@ type ChangePasswordRequest struct {
 	NewPassword     string `json:"new_password"`
 }
 
+type ProjectGrantResponse struct {
+	UserID string `json:"user_id"`
+	Email  string `json:"email"`
+	Level  string `json:"level"`
+}
+
+type GrantListResponse struct {
+	Grants []ProjectGrantResponse `json:"grants"`
+}
+
+type SetGrantRequest struct {
+	UserID string `json:"user_id"`
+	Level  string `json:"level"`
+}
+
 func userResponse(u identity.User) UserResponse {
 	return UserResponse{
 		ID: u.ID.String(), Email: u.Email, Role: string(u.Role), Active: u.Active,

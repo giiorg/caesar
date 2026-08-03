@@ -97,3 +97,17 @@ WHERE scope IN (
       AND window_started_at < sqlc.arg(cutoff)::timestamptz
     FOR UPDATE SKIP LOCKED
 );
+
+-- name: UpsertGrant :exec
+INSERT INTO grants (user_id, project_id, level)
+VALUES ($1, $2, $3)
+ON CONFLICT (user_id, project_id) DO UPDATE SET level = excluded.level;
+
+-- name: DeleteGrant :execrows
+DELETE FROM grants WHERE user_id = $1 AND project_id = $2;
+
+-- name: ListProjectGrants :many
+SELECT g.user_id, u.email, g.level
+FROM grants g JOIN users u ON u.id = g.user_id
+WHERE g.project_id = $1
+ORDER BY u.email;
