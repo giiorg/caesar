@@ -9,5 +9,5 @@ import (
 )
 
 func TestAnalyzer(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), txboundary.Analyzer, "internal/billing")
+	analysistest.Run(t, analysistest.TestData(), txboundary.Analyzer, "internal/billing", "internal/testcontext")
 }

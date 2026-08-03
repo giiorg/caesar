@@ -12,7 +12,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/giiorg/caesar/backend/internal/identity"
+	identityapi "github.com/giiorg/caesar/backend/internal/identity/api"
+	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/buildinfo"
+	"github.com/giiorg/caesar/backend/internal/platform/clock"
 	"github.com/giiorg/caesar/backend/internal/platform/config"
 	"github.com/giiorg/caesar/backend/internal/platform/logging"
 	"github.com/giiorg/caesar/backend/internal/platform/pg"
@@ -61,9 +65,15 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	}
 	log.Info("migrations applied")
 
+	svc := identity.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}), identity.Params{
+		SessionIdleTTL:     cfg.Auth.SessionIdleTTL.Std(),
+		SessionAbsoluteTTL: cfg.Auth.SessionAbsoluteTTL.Std(),
+	})
+	ops := identityapi.Operations(identityapi.New(svc, cfg.Auth.SessionAbsoluteTTL.Std()))
+
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           Routes(log, pool),
+		Handler:           Routes(log, pool, ops, cfg.Server.AppOrigin),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		// WriteTimeout deliberately unset: SSE streams (Plan 10) are

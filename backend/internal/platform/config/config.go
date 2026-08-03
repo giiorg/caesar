@@ -18,15 +18,22 @@ type Config struct {
 	Server   Server   `json:"server"`
 	Database Database `json:"database"`
 	Log      Log      `json:"log"`
+	Auth     Auth     `json:"auth"`
 }
 
 type Server struct {
 	Addr            string   `json:"addr"`
 	ShutdownTimeout Duration `json:"shutdown_timeout"`
+	AppOrigin       string   `json:"app_origin"`
 }
 
 type Database struct {
 	URL string `json:"url"`
+}
+
+type Auth struct {
+	SessionIdleTTL     Duration `json:"session_idle_ttl"`
+	SessionAbsoluteTTL Duration `json:"session_absolute_ttl"`
 }
 
 type Log struct {
@@ -53,8 +60,9 @@ func (d Duration) Std() time.Duration { return time.Duration(d) }
 
 func defaults() Config {
 	return Config{
-		Server: Server{Addr: ":8080", ShutdownTimeout: Duration(15 * time.Second)},
+		Server: Server{Addr: ":8080", ShutdownTimeout: Duration(15 * time.Second), AppOrigin: "http://localhost:8080"},
 		Log:    Log{Level: "info"},
+		Auth:   Auth{SessionIdleTTL: Duration(14 * 24 * time.Hour), SessionAbsoluteTTL: Duration(90 * 24 * time.Hour)},
 	}
 }
 
@@ -93,6 +101,15 @@ func (c Config) validate() error {
 	validLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLevels[c.Log.Level] {
 		problems = append(problems, fmt.Sprintf("log.level %q is not one of debug|info|warn|error", c.Log.Level))
+	}
+	if c.Server.AppOrigin == "" {
+		problems = append(problems, "server.app_origin must not be empty")
+	}
+	if c.Auth.SessionIdleTTL.Std() <= 0 {
+		problems = append(problems, "auth.session_idle_ttl must be positive")
+	}
+	if c.Auth.SessionAbsoluteTTL.Std() < c.Auth.SessionIdleTTL.Std() {
+		problems = append(problems, "auth.session_absolute_ttl must be >= auth.session_idle_ttl")
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))

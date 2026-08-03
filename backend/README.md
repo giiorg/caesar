@@ -31,6 +31,42 @@ Desired state lives in `internal/platform/pg/schema.sql`. Author with
 `internal/platform/pg/migrations/`). Runtime: embedded goose under a Postgres
 advisory lock at startup, or `caesar migrate up|down|status`.
 
+## Auth
+
+Passwords hash with argon2id: memory 19456 KiB, time 2, parallelism 1, salt
+16 B, key 32 B, stored as a PHC string. Sessions live in a `__Host-` cookie
+(`__Host-caesar_session`; `Path=/; Secure; HttpOnly; SameSite=Lax`) with idle
+and absolute TTLs from `auth.session_idle_ttl` / `auth.session_absolute_ttl`
+(336h / 2160h by default). Login rate limiting is dual-scope: per-account
+locks after 5 consecutive failures, backoff `30s × 2^(n−5)` capped at 15
+minutes, reset on success; per-IP is a fixed 15-minute window, 30 failures
+locks it for 15 minutes. Passwords must be 12–512 characters; no composition
+rules. Create the first admin with:
+
+    caesar admin bootstrap -email <email> < password.txt
+
+## API
+
+Routes live under `/api/v1`. Errors are RFC 9457 problem+json
+(`type`, `title`, `status`, `detail`, `correlation_id`, `errors[]`).
+Each endpoint is one `httpx.Operation` declaration — route and OpenAPI
+document come from the same source, so they can't drift. stdlib's own
+405 responses (method not allowed on a registered path) are plain text,
+not problem+json — an accepted V1 limitation.
+
+## Contracts
+
+`task contracts:gen` regenerates the OpenAPI document and the TS client
+types from the Go operation table; `task contracts:check` fails on drift.
+Generated artifacts are committed and never hand-edited. The TS lane
+needs Node ≥ 20.
+
+## sqlc
+
+Edit `internal/platform/pg/schema.sql` and the relevant `queries.sql`,
+then `task db:new -- <name>` (migration) and `task db:sqlc` (regenerate
+typed Go from the queries).
+
 ## Conventions
 
 - Strict JSON config; env overrides only DATABASE_URL (+ CAESAR_MASTER_KEY from Plan 3).

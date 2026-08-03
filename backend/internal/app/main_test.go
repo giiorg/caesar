@@ -8,7 +8,7 @@ import (
 
 func TestMain_VersionPrintsBuildInfoAndExitsZero(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := Main([]string{"version"}, &out, &errOut)
+	code := Main([]string{"version"}, strings.NewReader(""), &out, &errOut)
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, errOut.String())
 	}
@@ -19,7 +19,7 @@ func TestMain_VersionPrintsBuildInfoAndExitsZero(t *testing.T) {
 
 func TestMain_UnknownCommandExitsTwoWithUsage(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := Main([]string{"frobnicate"}, &out, &errOut)
+	code := Main([]string{"frobnicate"}, strings.NewReader(""), &out, &errOut)
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2", code)
 	}
@@ -30,7 +30,7 @@ func TestMain_UnknownCommandExitsTwoWithUsage(t *testing.T) {
 
 func TestMain_MigrateWithBadConfigExitsOne(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := Main([]string{"migrate", "-config", "/nonexistent/caesar.json", "up"}, &out, &errOut)
+	code := Main([]string{"migrate", "-config", "/nonexistent/caesar.json", "up"}, strings.NewReader(""), &out, &errOut)
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, errOut.String())
 	}
@@ -38,7 +38,7 @@ func TestMain_MigrateWithBadConfigExitsOne(t *testing.T) {
 
 func TestMain_MigrateRejectsArgsAfterDirection(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := Main([]string{"migrate", "up", "-config", "/nonexistent/caesar.json"}, &out, &errOut)
+	code := Main([]string{"migrate", "up", "-config", "/nonexistent/caesar.json"}, strings.NewReader(""), &out, &errOut)
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, errOut.String())
 	}

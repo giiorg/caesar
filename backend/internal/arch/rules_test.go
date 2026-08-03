@@ -8,6 +8,35 @@ import (
 
 const m = "github.com/giiorg/caesar/backend"
 
+func TestNormalize_StripsTestVariants(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{m + "/internal/identity", m + "/internal/identity"},
+		{m + "/internal/identity_test", m + "/internal/identity"},
+		{m + "/internal/identity.test", m + "/internal/identity"},
+		{m + "/internal/identity_test.test", m + "/internal/identity"},
+	}
+	for _, tt := range tests {
+		if got := normalize(tt.input); got != tt.want {
+			t.Errorf("normalize(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestCheckContextIsolation_AllowsNormalizedExternalTestPackages(t *testing.T) {
+	// Regression test: external test packages like identity_test are normalized
+	// to their base context (identity) in LoadGraph, so a synthetic graph with
+	// normalized paths should allow identity importing identity_test because both
+	// normalize to the same context.
+	g := Graph{
+		m + "/internal/identity": {m + "/internal/identity", m + "/internal/platform/pg"},
+	}
+	if got := CheckContextIsolation(g); len(got) != 0 {
+		t.Fatalf("want clean (identity and identity_test are same context after normalization), got %v", got)
+	}
+}
+
 func TestCheckContextIsolation_FlagsCrossContextImports(t *testing.T) {
 	g := Graph{
 		m + "/internal/execution":        {m + "/internal/identity", m + "/internal/platform/pg"},

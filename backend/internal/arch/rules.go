@@ -18,7 +18,7 @@ const module = "github.com/giiorg/caesar/backend"
 type Graph map[string][]string
 
 // nonContext segments under internal/ that are not bounded contexts.
-var nonContext = map[string]bool{"platform": true, "app": true, "arch": true, "analyzers": true}
+var nonContext = map[string]bool{"platform": true, "app": true, "arch": true, "analyzers": true, "contracts": true}
 
 // contextOf returns the bounded-context segment of a module package path.
 func contextOf(pkg string) (string, bool) {
@@ -146,6 +146,14 @@ func CheckDenyList(g Graph) []string {
 	return out
 }
 
+// normalize maps test-binary and external-test-package variants back to
+// the package they test ("p.test", "p_test" → "p"), so synthetic test
+// edges never masquerade as cross-context imports.
+func normalize(path string) string {
+	path = strings.TrimSuffix(path, ".test")
+	return strings.TrimSuffix(path, "_test")
+}
+
 // LoadGraph builds the import graph of every package in the module,
 // including integration-tagged files and test files. The module-path
 // pattern (not "./...") makes the load independent of the test's working
@@ -166,9 +174,9 @@ func LoadGraph() (Graph, error) {
 	}
 	g := Graph{}
 	for _, p := range pkgs {
-		path := strings.TrimSuffix(p.PkgPath, ".test")
-		path = strings.TrimSuffix(path, "_test")
+		path := normalize(p.PkgPath)
 		for imp := range p.Imports {
+			imp = normalize(imp)
 			g[path] = append(g[path], imp)
 		}
 	}

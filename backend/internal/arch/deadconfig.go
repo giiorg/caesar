@@ -2,6 +2,7 @@ package arch
 
 import (
 	"fmt"
+	"go/ast"
 	"go/types"
 	"sort"
 
@@ -60,13 +61,29 @@ func CheckDeadConfig(dir, configPkgPath, configTypeName string) ([]string, error
 
 	used := map[types.Object]bool{}
 	packages.Visit(pkgs, func(p *packages.Package) bool {
-		if p.PkgPath == configPkgPath || p.TypesInfo == nil {
+		// Skip the config package itself, packages without syntax, and
+		// test variants: with Tests:true the plain package (ID == PkgPath)
+		// excludes _test.go files, so restricting to it excludes test-only
+		// reads wholesale ("pkg [pkg.test]" and "pkg_test" IDs differ).
+		if p.PkgPath == configPkgPath || p.TypesInfo == nil || p.ID != p.PkgPath {
 			return true
 		}
-		for _, o := range p.TypesInfo.Uses {
-			if _, tracked := fields[o]; tracked {
-				used[o] = true
-			}
+		for _, file := range p.Syntax {
+			nonReads := nonReadSelections(file)
+			ast.Inspect(file, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				obj := p.TypesInfo.Uses[sel.Sel]
+				if obj == nil || nonReads[sel.Sel] {
+					return true
+				}
+				if _, tracked := fields[obj]; tracked {
+					used[obj] = true
+				}
+				return true
+			})
 		}
 		return true
 	}, nil)
@@ -79,6 +96,33 @@ func CheckDeadConfig(dir, configPkgPath, configTypeName string) ([]string, error
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// nonReadSelections collects selector identifiers that appear in non-read
+// positions: assignment left-hand sides and composite-literal keys. A field
+// that only ever appears there has no read site (no dead config).
+func nonReadSelections(file *ast.File) map[*ast.Ident]bool {
+	out := map[*ast.Ident]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range node.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok {
+					out[sel.Sel] = true
+				}
+			}
+		case *ast.CompositeLit:
+			for _, elt := range node.Elts {
+				if kv, ok := elt.(*ast.KeyValueExpr); ok {
+					if key, ok := kv.Key.(*ast.Ident); ok {
+						out[key] = true
+					}
+				}
+			}
+		}
+		return true
+	})
+	return out
 }
 
 func collectLeafFields(st *types.Struct, prefix string, home *types.Package, into map[types.Object]string) {
