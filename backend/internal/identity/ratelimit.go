@@ -1,6 +1,12 @@
 package identity
 
-import "time"
+import (
+	"context"
+	"log/slog"
+	"time"
+
+	"github.com/giiorg/caesar/backend/internal/identity/store"
+)
 
 // Pinned login rate-limit parameters (plan header). DB-backed via the
 // login_rate table so they survive restarts and hold across processes.
@@ -11,6 +17,14 @@ const (
 	ipWindow             = 15 * time.Minute
 	ipLockThreshold      = 30
 	ipLockDuration       = 15 * time.Minute
+
+	// loginRateRetention: a login_rate row is eligible for purge once its
+	// lock (if any) has expired and its window is older than this. Without
+	// it the table grows without bound from unauthenticated traffic: every
+	// failed attempt against an arbitrary email leaves a permanent
+	// account:<email> row, and every successful login leaves a permanent
+	// ip:<addr> row (success only clears the account scope).
+	loginRateRetention = 24 * time.Hour
 )
 
 type rateKind int
@@ -64,4 +78,33 @@ func rateFail(kind rateKind, st rateState, now time.Time) rateState {
 		}
 	}
 	return st
+}
+
+// purgeStaleLoginRate opportunistically reclaims stale login_rate rows.
+// Called after Login's own transaction has already committed — never from
+// inside it — so a best-effort cleanup can't add lock-wait latency or
+// deadlock risk to the hot login path, and its own SKIP LOCKED means it
+// never blocks on a row a concurrent login holds FOR UPDATE. A purge
+// failure must not fail the login that triggered it; it's logged instead
+// of swallowed so it stays observable.
+func (s *Service) purgeStaleLoginRate(ctx context.Context) {
+	now := s.clock.Now()
+	cutoff := now.Add(-loginRateRetention)
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		slog.Default().WarnContext(ctx, "identity: purge login_rate: begin failed", "error", err)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := store.New(tx).PurgeStaleLoginRate(ctx, store.PurgeStaleLoginRateParams{
+		Now: now, Cutoff: cutoff,
+	}); err != nil {
+		slog.Default().WarnContext(ctx, "identity: purge login_rate: delete failed", "error", err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Default().WarnContext(ctx, "identity: purge login_rate: commit failed", "error", err)
+	}
 }

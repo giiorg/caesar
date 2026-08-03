@@ -66,6 +66,8 @@ func saveRate(ctx context.Context, q *store.Queries, scope string, st rateState)
 // Login authenticates email+password from ip. One transaction: rate rows
 // locked FOR UPDATE (serializing concurrent attempts per scope), failure
 // counters and the session mint commit atomically with their audit rows.
+// After that transaction commits, a stale login_rate purge runs opportunistically
+// in its own short transaction — see purgeStaleLoginRate.
 func (s *Service) Login(ctx context.Context, email, password, ip string) (User, string, error) {
 	accountScope := "account:" + strings.ToLower(email)
 	ipScope := "ip:" + ip
@@ -152,6 +154,7 @@ func (s *Service) Login(ctx context.Context, email, password, ip string) (User, 
 		if err := tx.Commit(ctx); err != nil {
 			return User{}, "", fmt.Errorf("identity: commit: %w", err)
 		}
+		s.purgeStaleLoginRate(ctx)
 		return User{}, "", errBadCredentials
 	}
 
@@ -176,5 +179,6 @@ func (s *Service) Login(ctx context.Context, email, password, ip string) (User, 
 	if err := tx.Commit(ctx); err != nil {
 		return User{}, "", fmt.Errorf("identity: commit: %w", err)
 	}
+	s.purgeStaleLoginRate(ctx)
 	return userFromRow(row), token, nil
 }

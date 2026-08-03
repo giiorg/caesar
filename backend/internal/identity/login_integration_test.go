@@ -193,3 +193,59 @@ func TestLogin_OversizedPasswordIsRateLimitedAndAudited(t *testing.T) {
 		t.Fatalf("auth.login_failed audit rows = %d (want 1), err %v", len(auditRows), aerr)
 	}
 }
+
+func TestLogin_PurgesStaleLoginRateRows(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, fake := newTestService(t)
+	if _, err := svc.Bootstrap(ctx, "root@example.com", testPassword); err != nil {
+		t.Fatal(err)
+	}
+	t0 := fake.Now()
+
+	// Stale, unlocked: a failed attempt against an arbitrary (unauthenticated,
+	// attacker-controlled) email leaves a permanent row absent a purge.
+	_, _, err := svc.Login(ctx, "stale@example.com", "wrong password!!", "203.0.113.1")
+	wantClass(t, err, xerrors.ClassUnauthenticated)
+
+	// Directly craft a row that's still actively locked despite an old
+	// window, to prove an active lock protects a row regardless of window
+	// age (an in-flight lock must never be purged out from under it).
+	lockedUntil := t0.Add(25 * time.Hour).Add(time.Minute)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO login_rate (scope, failures, window_started_at, locked_until) VALUES ($1, $2, $3, $4)`,
+		"account:locked@example.com", 5, t0, lockedUntil,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance the clock past the retention window for the stale row above.
+	fake.Advance(25 * time.Hour)
+
+	// Fresh row created after the advance: recent window, must survive.
+	_, _, err = svc.Login(ctx, "fresh@example.com", "wrong password!!", "203.0.113.2")
+	wantClass(t, err, xerrors.ClassUnauthenticated)
+
+	// Any login (success or failure) triggers the opportunistic purge,
+	// and login itself must keep working.
+	if _, _, err := svc.Login(ctx, "root@example.com", testPassword, "203.0.113.3"); err != nil {
+		t.Fatal(err)
+	}
+
+	scopeExists := func(scope string) bool {
+		t.Helper()
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM login_rate WHERE scope = $1`, scope).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count == 1
+	}
+	if scopeExists("account:stale@example.com") {
+		t.Fatal("stale unlocked row should have been purged")
+	}
+	if !scopeExists("account:fresh@example.com") {
+		t.Fatal("fresh row should survive purge")
+	}
+	if !scopeExists("account:locked@example.com") {
+		t.Fatal("actively locked row should survive purge despite old window")
+	}
+}

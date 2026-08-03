@@ -85,3 +85,15 @@ DELETE FROM login_rate WHERE scope = $1;
 INSERT INTO login_rate (scope, failures, window_started_at, locked_until)
 VALUES ($1, 0, $2, NULL)
 ON CONFLICT (scope) DO NOTHING;
+
+-- name: PurgeStaleLoginRate :execrows
+-- Reclaims rows whose lock (if any) has expired and whose window is older
+-- than the retention cutoff. SKIP LOCKED so this never blocks on a row a
+-- concurrent login holds FOR UPDATE.
+DELETE FROM login_rate
+WHERE scope IN (
+    SELECT scope FROM login_rate
+    WHERE (locked_until IS NULL OR locked_until < sqlc.arg(now)::timestamptz)
+      AND window_started_at < sqlc.arg(cutoff)::timestamptz
+    FOR UPDATE SKIP LOCKED
+);

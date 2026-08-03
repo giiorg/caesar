@@ -290,6 +290,32 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 	return items, nil
 }
 
+const purgeStaleLoginRate = `-- name: PurgeStaleLoginRate :execrows
+DELETE FROM login_rate
+WHERE scope IN (
+    SELECT scope FROM login_rate
+    WHERE (locked_until IS NULL OR locked_until < $1::timestamptz)
+      AND window_started_at < $2::timestamptz
+    FOR UPDATE SKIP LOCKED
+)
+`
+
+type PurgeStaleLoginRateParams struct {
+	Now    time.Time
+	Cutoff time.Time
+}
+
+// Reclaims rows whose lock (if any) has expired and whose window is older
+// than the retention cutoff. SKIP LOCKED so this never blocks on a row a
+// concurrent login holds FOR UPDATE.
+func (q *Queries) PurgeStaleLoginRate(ctx context.Context, arg PurgeStaleLoginRateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeStaleLoginRate, arg.Now, arg.Cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const revokeSession = `-- name: RevokeSession :exec
 UPDATE sessions SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL
 `
