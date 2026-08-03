@@ -146,7 +146,7 @@ tasks:
     desc: "Regenerate all contracts and fail on drift"
     cmds:
       - task: contracts:gen
-      - git diff --exit-code -- backend/api/openapi.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store
+      - git diff --exit-code -- backend/api/openapi.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store backend/internal/workflows/store
       - test -z "$(git status --porcelain -- backend/api web/src/api)"
 
   secrets:

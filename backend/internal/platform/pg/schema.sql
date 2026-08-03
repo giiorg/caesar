@@ -119,3 +119,30 @@ CREATE TABLE harnesses (
     created_at        timestamptz NOT NULL DEFAULT now(),
     updated_at        timestamptz NOT NULL DEFAULT now()
 );
+
+-- Workflow definitions (spec §2). Plan 04: a workflow names a family of
+-- immutable, content-hashed versions; the API write door validates every
+-- document before insert, and version rows are never updated. Plan 05
+-- will reference workflow_versions (id) from runs with ON DELETE
+-- RESTRICT; until then deleting a workflow cascades its versions.
+CREATE TABLE workflows (
+    id          uuid PRIMARY KEY DEFAULT uuidv7(),
+    name        text NOT NULL UNIQUE,
+    description text NOT NULL DEFAULT '',
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- content_hash = hex SHA-256 of the canonical document bytes (computed
+-- app-side from the parsed struct — jsonb storage re-normalizes bytes,
+-- so the hash is never recomputed from this column directly).
+CREATE TABLE workflow_versions (
+    id           uuid PRIMARY KEY DEFAULT uuidv7(),
+    workflow_id  uuid NOT NULL REFERENCES workflows (id) ON DELETE CASCADE,
+    version      integer NOT NULL,
+    content_hash text NOT NULL,
+    document     jsonb NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workflow_id, version),
+    UNIQUE (workflow_id, content_hash)
+);
