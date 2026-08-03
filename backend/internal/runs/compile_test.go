@@ -54,6 +54,41 @@ func TestCompileOrdersAndBinds(t *testing.T) {
 	}
 }
 
+// A gate that examines both a plan and a patch must pass each artifact
+// back to its true producer. Resolving by edge-list position instead of
+// artifact type binds whichever producer happens to be listed first.
+func TestCompileResolvesGateOriginByArtifactType(t *testing.T) {
+	doc := runs.DefinitionDoc{
+		Nodes: []runs.DefNode{
+			{ID: "planner", Kind: runs.KindPlan, Harness: "cc"},
+			{ID: "impl", Kind: runs.KindImplement, Harness: "cc"},
+			{ID: "gate", Kind: runs.KindGate},
+			{ID: "publish", Kind: runs.KindGitPublish},
+			{ID: "replan", Kind: runs.KindImplement, Harness: "cc"},
+		},
+		Edges: []runs.DefEdge{
+			// The plan edge is listed first on purpose: position must not
+			// decide which producer the outgoing patch resolves to.
+			{From: "planner", To: "gate", Artifact: runs.ArtifactKindPlan},
+			{From: "impl", To: "gate", Artifact: runs.ArtifactKindPatch},
+			{From: "gate", To: "publish", Artifact: runs.ArtifactKindPatch},
+			{From: "gate", To: "replan", Artifact: runs.ArtifactKindPlan},
+		},
+	}
+	plan, err := runs.Compile(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPublish := []runs.PlanInput{{Origin: "impl", From: "gate", Artifact: runs.ArtifactKindPatch}}
+	if diff := cmp.Diff(wantPublish, plan.Nodes["publish"].Inputs); diff != "" {
+		t.Errorf("publish inputs (-want +got):\n%s", diff)
+	}
+	wantReplan := []runs.PlanInput{{Origin: "planner", From: "gate", Artifact: runs.ArtifactKindPlan}}
+	if diff := cmp.Diff(wantReplan, plan.Nodes["replan"].Inputs); diff != "" {
+		t.Errorf("replan inputs (-want +got):\n%s", diff)
+	}
+}
+
 func TestCompileRootsAndReadiness(t *testing.T) {
 	plan, err := runs.Compile(conveyor())
 	if err != nil {

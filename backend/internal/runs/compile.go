@@ -174,18 +174,32 @@ func topoOrder(nodes []DefNode, in, out map[string][]DefEdge) ([]string, error) 
 // a gate missing its examined input is corruption.
 func resolveOrigin(byID map[string]DefNode, in map[string][]DefEdge, e DefEdge) (string, error) {
 	for byID[e.From].Kind == KindGate {
-		found := false
-		for _, ge := range in[e.From] {
-			if ge.Artifact == ArtifactKindPlan || ge.Artifact == ArtifactKindPatch {
-				e, found = ge, true
-				break
-			}
+		gate := e.From
+		next, ok := passThrough(in[gate], e.Artifact)
+		if !ok {
+			return "", fmt.Errorf("runs: compile: gate %q has no examined input", gate)
 		}
-		if !found {
-			return "", fmt.Errorf("runs: compile: gate %q has no examined input", e.From)
-		}
+		e = next
 	}
 	return e.From, nil
+}
+
+// passThrough picks the gate input that carries the outgoing artifact:
+// the same artifact type where the gate examines one, else the single
+// examined work product. Matching on type first keeps a gate that sees
+// both a plan and a patch from binding the wrong producer.
+func passThrough(inputs []DefEdge, artifact string) (DefEdge, bool) {
+	for _, ge := range inputs {
+		if ge.Artifact == artifact {
+			return ge, true
+		}
+	}
+	for _, ge := range inputs {
+		if ge.Artifact == ArtifactKindPlan || ge.Artifact == ArtifactKindPatch {
+			return ge, true
+		}
+	}
+	return DefEdge{}, false
 }
 
 // Roots are the nodes materialized when a run starts.
