@@ -7,6 +7,9 @@ RETURNING *;
 SELECT * FROM tasks WHERE id = $1;
 
 -- name: ListTasks :many
+-- The inner JOIN LATERAL is deliberate, not an oversight: intake inserts a
+-- task and its first run in one transaction (durable-before-acknowledge),
+-- so a run-less task is unrepresentable and no row can be dropped here.
 SELECT sqlc.embed(t), r.id AS latest_run_id, r.status AS latest_run_status
 FROM tasks t
 JOIN LATERAL (
@@ -15,6 +18,8 @@ JOIN LATERAL (
 ORDER BY t.created_at DESC;
 
 -- name: ListTasksByProjects :many
+-- Inner JOIN LATERAL for the same reason as ListTasks: intake commits the
+-- task and its first run together, so every task has at least one run.
 SELECT sqlc.embed(t), r.id AS latest_run_id, r.status AS latest_run_status
 FROM tasks t
 JOIN LATERAL (

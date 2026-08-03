@@ -854,6 +854,9 @@ type ListTasksRow struct {
 	LatestRunStatus string
 }
 
+// The inner JOIN LATERAL is deliberate, not an oversight: intake inserts a
+// task and its first run in one transaction (durable-before-acknowledge),
+// so a run-less task is unrepresentable and no row can be dropped here.
 func (q *Queries) ListTasks(ctx context.Context) ([]ListTasksRow, error) {
 	rows, err := q.db.Query(ctx, listTasks)
 	if err != nil {
@@ -901,6 +904,8 @@ type ListTasksByProjectsRow struct {
 	LatestRunStatus string
 }
 
+// Inner JOIN LATERAL for the same reason as ListTasks: intake commits the
+// task and its first run together, so every task has at least one run.
 func (q *Queries) ListTasksByProjects(ctx context.Context, projectIds []uuid.UUID) ([]ListTasksByProjectsRow, error) {
 	rows, err := q.db.Query(ctx, listTasksByProjects, projectIds)
 	if err != nil {
