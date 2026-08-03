@@ -21,6 +21,18 @@ type Credential struct {
 	UpdatedAt  time.Time
 }
 
+type Harness struct {
+	ID               uuid.UUID
+	Name             string
+	Kind             string
+	ImageRef         string
+	ProviderEndpoint string
+	CredentialID     uuid.UUID
+	Defaults         []byte
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
 type Project struct {
 	ID          uuid.UUID
 	Name        string

@@ -132,6 +132,18 @@ func (q *Queries) DeleteCredential(ctx context.Context, id uuid.UUID) (int64, er
 	return result.RowsAffected(), nil
 }
 
+const deleteHarness = `-- name: DeleteHarness :execrows
+DELETE FROM harnesses WHERE id = $1
+`
+
+func (q *Queries) DeleteHarness(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteHarness, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteProject = `-- name: DeleteProject :execrows
 DELETE FROM projects WHERE id = $1
 `
@@ -199,6 +211,28 @@ func (q *Queries) GetCredentialRow(ctx context.Context, id uuid.UUID) (Credentia
 		&i.KeyID,
 		&i.WrappedDek,
 		&i.Ciphertext,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getHarness = `-- name: GetHarness :one
+SELECT id, name, kind, image_ref, provider_endpoint, credential_id, defaults, created_at, updated_at
+FROM harnesses WHERE id = $1
+`
+
+func (q *Queries) GetHarness(ctx context.Context, id uuid.UUID) (Harness, error) {
+	row := q.db.QueryRow(ctx, getHarness, id)
+	var i Harness
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Kind,
+		&i.ImageRef,
+		&i.ProviderEndpoint,
+		&i.CredentialID,
+		&i.Defaults,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -320,6 +354,41 @@ func (q *Queries) ListCredentials(ctx context.Context) ([]ListCredentialsRow, er
 	return items, nil
 }
 
+const listHarnesses = `-- name: ListHarnesses :many
+SELECT id, name, kind, image_ref, provider_endpoint, credential_id, defaults, created_at, updated_at
+FROM harnesses ORDER BY name
+`
+
+func (q *Queries) ListHarnesses(ctx context.Context) ([]Harness, error) {
+	rows, err := q.db.Query(ctx, listHarnesses)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Harness
+	for rows.Next() {
+		var i Harness
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Kind,
+			&i.ImageRef,
+			&i.ProviderEndpoint,
+			&i.CredentialID,
+			&i.Defaults,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listProjects = `-- name: ListProjects :many
 SELECT id, name, description, created_at, updated_at
 FROM projects ORDER BY name
@@ -427,6 +496,45 @@ func (q *Queries) ProjectExists(ctx context.Context, id uuid.UUID) (bool, error)
 	return exists, err
 }
 
+const registerHarness = `-- name: RegisterHarness :one
+INSERT INTO harnesses (name, kind, image_ref, provider_endpoint, credential_id, defaults)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, name, kind, image_ref, provider_endpoint, credential_id, defaults, created_at, updated_at
+`
+
+type RegisterHarnessParams struct {
+	Name             string
+	Kind             string
+	ImageRef         string
+	ProviderEndpoint string
+	CredentialID     uuid.UUID
+	Defaults         []byte
+}
+
+func (q *Queries) RegisterHarness(ctx context.Context, arg RegisterHarnessParams) (Harness, error) {
+	row := q.db.QueryRow(ctx, registerHarness,
+		arg.Name,
+		arg.Kind,
+		arg.ImageRef,
+		arg.ProviderEndpoint,
+		arg.CredentialID,
+		arg.Defaults,
+	)
+	var i Harness
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Kind,
+		&i.ImageRef,
+		&i.ProviderEndpoint,
+		&i.CredentialID,
+		&i.Defaults,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const updateCredentialSecret = `-- name: UpdateCredentialSecret :one
 UPDATE credentials SET key_id = $2, wrapped_dek = $3, ciphertext = $4, updated_at = $5
 WHERE id = $1
@@ -464,6 +572,47 @@ func (q *Queries) UpdateCredentialSecret(ctx context.Context, arg UpdateCredenti
 		&i.Name,
 		&i.Kind,
 		&i.KeyID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateHarness = `-- name: UpdateHarness :one
+UPDATE harnesses SET name = $2, image_ref = $3, provider_endpoint = $4, credential_id = $5, defaults = $6, updated_at = $7
+WHERE id = $1
+RETURNING id, name, kind, image_ref, provider_endpoint, credential_id, defaults, created_at, updated_at
+`
+
+type UpdateHarnessParams struct {
+	ID               uuid.UUID
+	Name             string
+	ImageRef         string
+	ProviderEndpoint string
+	CredentialID     uuid.UUID
+	Defaults         []byte
+	UpdatedAt        time.Time
+}
+
+func (q *Queries) UpdateHarness(ctx context.Context, arg UpdateHarnessParams) (Harness, error) {
+	row := q.db.QueryRow(ctx, updateHarness,
+		arg.ID,
+		arg.Name,
+		arg.ImageRef,
+		arg.ProviderEndpoint,
+		arg.CredentialID,
+		arg.Defaults,
+		arg.UpdatedAt,
+	)
+	var i Harness
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Kind,
+		&i.ImageRef,
+		&i.ProviderEndpoint,
+		&i.CredentialID,
+		&i.Defaults,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
