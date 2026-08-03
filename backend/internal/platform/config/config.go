@@ -1,6 +1,6 @@
 // Package config loads caesar's single strict JSON config file. Unknown keys
 // are rejected (default-deny). Environment overrides exist for bootstrap
-// secrets only: DATABASE_URL here, CAESAR_MASTER_KEY when credentials land.
+// secrets only: DATABASE_URL and CAESAR_MASTER_KEY.
 // This is the only package allowed to touch the process environment
 // (enforced by the envaccess analyzer).
 package config
@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/giiorg/caesar/backend/internal/platform/secrets"
 )
 
 type Config struct {
@@ -19,6 +21,7 @@ type Config struct {
 	Database Database `json:"database"`
 	Log      Log      `json:"log"`
 	Auth     Auth     `json:"auth"`
+	Security Security `json:"security"`
 }
 
 type Server struct {
@@ -38,6 +41,14 @@ type Auth struct {
 
 type Log struct {
 	Level string `json:"level"`
+}
+
+// Security carries the credential master keyset (spec §8 bootstrap
+// secret): "id:base64key[,id:base64key...]", first entry active. The
+// CAESAR_MASTER_KEY env var overrides; serve and admin rekey require it,
+// migrate and bootstrap do not.
+type Security struct {
+	MasterKey string `json:"master_key"`
 }
 
 // Duration is a time.Duration that unmarshals from JSON strings like "15s".
@@ -83,6 +94,9 @@ func Load(path string) (Config, error) {
 	if url := os.Getenv("DATABASE_URL"); url != "" {
 		cfg.Database.URL = url
 	}
+	if key := os.Getenv("CAESAR_MASTER_KEY"); key != "" {
+		cfg.Security.MasterKey = key
+	}
 
 	if err := cfg.validate(); err != nil {
 		return Config{}, fmt.Errorf("config: %w", err)
@@ -110,6 +124,11 @@ func (c Config) validate() error {
 	}
 	if c.Auth.SessionAbsoluteTTL.Std() < c.Auth.SessionIdleTTL.Std() {
 		problems = append(problems, "auth.session_absolute_ttl must be >= auth.session_idle_ttl")
+	}
+	if c.Security.MasterKey != "" {
+		if _, err := secrets.ParseKeyset(c.Security.MasterKey); err != nil {
+			problems = append(problems, fmt.Sprintf("security.master_key: %v", err))
+		}
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))

@@ -16,10 +16,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/giiorg/caesar/backend/internal/app"
+	"github.com/giiorg/caesar/backend/internal/assets"
+	assetsapi "github.com/giiorg/caesar/backend/internal/assets/api"
 	"github.com/giiorg/caesar/backend/internal/identity"
 	identityapi "github.com/giiorg/caesar/backend/internal/identity/api"
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/clock"
+	"github.com/giiorg/caesar/backend/internal/platform/secrets"
 	"github.com/giiorg/caesar/backend/internal/platform/testdb"
 )
 
@@ -40,7 +43,16 @@ func TestAppRoutes_AuthLoopEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	keys, err := secrets.ParseKeyset("test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assetsSvc := assets.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}), keys)
+
 	ops := identityapi.Operations(identityapi.New(svc, 90*24*time.Hour))
+	// identity.Service serves as authenticator, authorizer, and grant
+	// source for the assets API, exactly as serve.go wires it.
+	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, svc, svc, svc))...)
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	srv := httptest.NewServer(app.Routes(log, pool, ops, "http://caesar.test"))
 	t.Cleanup(srv.Close)
@@ -73,6 +85,53 @@ func TestAppRoutes_AuthLoopEndToEnd(t *testing.T) {
 	defer me.Body.Close()
 	if me.StatusCode != http.StatusOK {
 		t.Fatalf("me = %d", me.StatusCode)
+	}
+
+	// The bootstrapped admin can create a project through the real
+	// identity↔assets wiring (identity.Service as authenticator,
+	// authorizer, and grant source all at once).
+	createBody, _ := json.Marshal(assetsapi.CreateProjectRequest{Name: "alpha"})
+	createReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/projects", bytes.NewReader(createBody))
+	createReq.Header.Set("Cookie", identityapi.SessionCookie+"="+token)
+	createReq.Header.Set("Content-Type", "application/json")
+	created, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer created.Body.Close()
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("create project = %d", created.StatusCode)
+	}
+	var project assetsapi.ProjectResponse
+	if err := json.NewDecoder(created.Body).Decode(&project); err != nil {
+		t.Fatal(err)
+	}
+	if project.Name != "alpha" {
+		t.Fatalf("created project name = %q, want alpha", project.Name)
+	}
+
+	listReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/projects", nil)
+	listReq.Header.Set("Cookie", identityapi.SessionCookie+"="+token)
+	list, err := http.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("list projects = %d", list.StatusCode)
+	}
+	var listed assetsapi.ProjectListResponse
+	if err := json.NewDecoder(list.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range listed.Projects {
+		if p.ID == project.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("created project %s not found in list %+v", project.ID, listed.Projects)
 	}
 
 	// Unknown API path → problem+json 404, not the stdlib text page.

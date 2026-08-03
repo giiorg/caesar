@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ func TestRunServe_BootsMigratesAndShutsDownOnCancel(t *testing.T) {
 	cfg.Server.Addr = "127.0.0.1:0"
 	cfg.Server.ShutdownTimeout = config.Duration(5 * time.Second)
 	cfg.Database.URL = testdb.NewURL(t)
+	cfg.Security.MasterKey = "dev:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -31,6 +33,18 @@ func TestRunServe_BootsMigratesAndShutsDownOnCancel(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("runServe did not return after cancel")
+	}
+}
+
+func TestRunServe_RefusesToBootWithoutMasterKey(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.ShutdownTimeout = config.Duration(5 * time.Second)
+	cfg.Database.URL = testdb.NewURL(t)
+
+	err := runServe(context.Background(), cfg, discard())
+	if err == nil || !strings.Contains(err.Error(), "security.master_key") {
+		t.Fatalf("runServe = %v, want error mentioning security.master_key", err)
 	}
 }
 
