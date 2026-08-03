@@ -161,3 +161,186 @@ func TestValidateShape_ConsumptionMultiplicities(t *testing.T) {
 		})
 	}
 }
+
+func TestValidate_AcceptsTheConveyor(t *testing.T) {
+	if vs := Validate(conveyor()); len(vs) != 0 {
+		t.Fatalf("conveyor rejected: %+v", vs)
+	}
+}
+
+func TestValidate_AcceptsChainedImplements(t *testing.T) {
+	// plan → impl1 → impl2 → review → gate → publish: two patch
+	// producers in ONE lineage — a chain, not a merge.
+	d := Document{
+		Schema: SchemaVersion,
+		Nodes: []Node{
+			{ID: "plan", Type: NodePlan, Harness: "cc", Instructions: "x"},
+			{ID: "impl1", Type: NodeImplement, Harness: "cc", Instructions: "x"},
+			{ID: "impl2", Type: NodeImplement, Harness: "cc", Instructions: "x"},
+			{ID: "review", Type: NodeReview, Harness: "cc", Instructions: "x"},
+			{ID: "gate", Type: NodeGate},
+			{ID: "publish", Type: NodeGitPublish},
+		},
+		Edges: []Edge{
+			{From: "plan", To: "impl1", Artifact: ArtifactPlan},
+			{From: "impl1", To: "impl2", Artifact: ArtifactPatch},
+			{From: "impl2", To: "review", Artifact: ArtifactPatch},
+			{From: "impl2", To: "gate", Artifact: ArtifactPatch},
+			{From: "review", To: "gate", Artifact: ArtifactReviewVerdict},
+			{From: "gate", To: "publish", Artifact: ArtifactPatch},
+		},
+	}
+	if vs := Validate(d); len(vs) != 0 {
+		t.Fatalf("chained implements rejected: %+v", vs)
+	}
+}
+
+func TestValidate_ReportsCyclesAndStopsThere(t *testing.T) {
+	// gate → impl is shape-legal (implement consumes ≤1 patch, the gate
+	// passes through its examined type), so the cycle phase is genuinely
+	// what rejects it — and it short-circuits the later phases.
+	d := conveyor()
+	d.Edges = append(d.Edges, Edge{From: "gate", To: "impl", Artifact: ArtifactPatch})
+	vs := Validate(d)
+	if len(vs) != 1 || vs[0].Path != "edges" || !strings.Contains(vs[0].Message, "acyclic") {
+		t.Fatalf("want exactly the cycle violation, got %+v", vs)
+	}
+}
+
+func TestValidate_RejectsDivergentPatchLineages(t *testing.T) {
+	// plan fans out to implA and implB; the gate examines implA's patch
+	// but consumes a verdict about implB's — the artifact-divergence bug
+	// class §2 exists to kill.
+	d := Document{
+		Schema: SchemaVersion,
+		Nodes: []Node{
+			{ID: "plan", Type: NodePlan, Harness: "cc", Instructions: "x"},
+			{ID: "impl_a", Type: NodeImplement, Harness: "cc", Instructions: "x"},
+			{ID: "impl_b", Type: NodeImplement, Harness: "cc", Instructions: "x"},
+			{ID: "review_b", Type: NodeReview, Harness: "cc", Instructions: "x"},
+			{ID: "gate", Type: NodeGate},
+		},
+		Edges: []Edge{
+			{From: "plan", To: "impl_a", Artifact: ArtifactPlan},
+			{From: "plan", To: "impl_b", Artifact: ArtifactPlan},
+			{From: "impl_a", To: "gate", Artifact: ArtifactPatch},
+			{From: "impl_b", To: "review_b", Artifact: ArtifactPatch},
+			{From: "review_b", To: "gate", Artifact: ArtifactReviewVerdict},
+		},
+	}
+	wantViolation(t, Validate(d), "nodes[4]", "divergent patch lineages")
+}
+
+func TestValidate_GatePassThroughTypeIsPinned(t *testing.T) {
+	// The gate examines a patch but one outgoing edge claims to carry a
+	// plan.
+	d := conveyor()
+	d.Nodes = append(d.Nodes, Node{ID: "impl2", Type: NodeImplement, Harness: "cc", Instructions: "x"})
+	d.Edges = append(d.Edges, Edge{From: "gate", To: "impl2", Artifact: ArtifactPlan})
+	wantViolation(t, Validate(d), "edges[5].artifact", "passes through patch")
+}
+
+func TestValidate_RevisionTransitionRules(t *testing.T) {
+	t.Run("target must be agentic", func(t *testing.T) {
+		d := conveyor()
+		d.Nodes[3].OnRequestChanges.Target = "publish"
+		wantViolation(t, Validate(d), "nodes[3].on_request_changes.target", "agentic")
+	})
+	t.Run("target must dominate the gate", func(t *testing.T) {
+		d := conveyor()
+		// review does NOT dominate the gate: the impl→gate patch edge
+		// bypasses it.
+		d.Nodes[3].OnRequestChanges.Target = "review"
+		wantViolation(t, Validate(d), "nodes[3].on_request_changes.target", "dominate")
+	})
+	t.Run("overlapping loops rejected", func(t *testing.T) {
+		// impl → gate1 → gate2, both looping back to impl: gate1's slice
+		// {impl, gate1} sits inside gate2's {impl, gate1, gate2}.
+		d := Document{
+			Schema: SchemaVersion,
+			Nodes: []Node{
+				{ID: "impl", Type: NodeImplement, Harness: "cc", Instructions: "x"},
+				{ID: "gate1", Type: NodeGate, OnRequestChanges: &RevisionTransition{Target: "impl", MaxRounds: 2}},
+				{ID: "gate2", Type: NodeGate, OnRequestChanges: &RevisionTransition{Target: "impl", MaxRounds: 2}},
+			},
+			Edges: []Edge{
+				{From: "impl", To: "gate1", Artifact: ArtifactPatch},
+				{From: "gate1", To: "gate2", Artifact: ArtifactPatch},
+			},
+		}
+		wantViolation(t, Validate(d), "nodes[2].on_request_changes", "overlap")
+	})
+}
+
+func TestValidate_PublishRules(t *testing.T) {
+	t.Run("publish without a dominating gate", func(t *testing.T) {
+		d := Document{
+			Schema: SchemaVersion,
+			Nodes: []Node{
+				{ID: "impl", Type: NodeImplement, Harness: "cc", Instructions: "x"},
+				{ID: "publish", Type: NodeGitPublish},
+			},
+			Edges: []Edge{{From: "impl", To: "publish", Artifact: ArtifactPatch}},
+		}
+		wantViolation(t, Validate(d), "nodes[1]", "dominated by a gate")
+	})
+	t.Run("implement between gate and publish diverges the artifact", func(t *testing.T) {
+		// gate approves impl1's patch, but impl2 rewrites it before
+		// publish: the published artifact is not the examined one.
+		d := Document{
+			Schema: SchemaVersion,
+			Nodes: []Node{
+				{ID: "impl1", Type: NodeImplement, Harness: "cc", Instructions: "x"},
+				{ID: "gate", Type: NodeGate},
+				{ID: "impl2", Type: NodeImplement, Harness: "cc", Instructions: "x"},
+				{ID: "publish", Type: NodeGitPublish},
+			},
+			Edges: []Edge{
+				{From: "impl1", To: "gate", Artifact: ArtifactPatch},
+				{From: "gate", To: "impl2", Artifact: ArtifactPatch},
+				{From: "impl2", To: "publish", Artifact: ArtifactPatch},
+			},
+		}
+		wantViolation(t, Validate(d), "nodes[3]", "dominated by a gate")
+	})
+	t.Run("one gate cannot authorize two publishes", func(t *testing.T) {
+		d := Document{
+			Schema: SchemaVersion,
+			Nodes: []Node{
+				{ID: "impl", Type: NodeImplement, Harness: "cc", Instructions: "x"},
+				{ID: "gate", Type: NodeGate},
+				{ID: "pub1", Type: NodeGitPublish},
+				{ID: "pub2", Type: NodeGitPublish},
+			},
+			Edges: []Edge{
+				{From: "impl", To: "gate", Artifact: ArtifactPatch},
+				{From: "gate", To: "pub1", Artifact: ArtifactPatch},
+				{From: "gate", To: "pub2", Artifact: ArtifactPatch},
+			},
+		}
+		wantViolation(t, Validate(d), "nodes[3]", "already authorizes")
+	})
+	t.Run("chained gates each authorize their own publish", func(t *testing.T) {
+		// impl → gate1 → gate2; gate1 authorizes pub1, gate2 (nearest to
+		// pub2) authorizes pub2. Same patch, two approvals — legal.
+		d := Document{
+			Schema: SchemaVersion,
+			Nodes: []Node{
+				{ID: "impl", Type: NodeImplement, Harness: "cc", Instructions: "x"},
+				{ID: "gate1", Type: NodeGate},
+				{ID: "gate2", Type: NodeGate},
+				{ID: "pub1", Type: NodeGitPublish},
+				{ID: "pub2", Type: NodeGitPublish},
+			},
+			Edges: []Edge{
+				{From: "impl", To: "gate1", Artifact: ArtifactPatch},
+				{From: "gate1", To: "gate2", Artifact: ArtifactPatch},
+				{From: "gate1", To: "pub1", Artifact: ArtifactPatch},
+				{From: "gate2", To: "pub2", Artifact: ArtifactPatch},
+			},
+		}
+		if vs := Validate(d); len(vs) != 0 {
+			t.Fatalf("chained gates rejected: %+v", vs)
+		}
+	})
+}

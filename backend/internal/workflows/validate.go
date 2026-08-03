@@ -3,6 +3,7 @@ package workflows
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -218,6 +219,196 @@ func validateConsumption(path string, n Node, in map[ArtifactType]int) []Violati
 		if plans > 0 || verdicts > 0 {
 			vs = append(vs, Violation{Path: path, Message: "git-publish consumes only a patch"})
 		}
+	}
+	return vs
+}
+
+// Validate checks d against every §2 invariant (plan header, pinned
+// formalizations). Shape violations short-circuit — the graph phases
+// assume well-formed nodes and edges; a cycle short-circuits the
+// path-based phases. An empty result means the document is valid.
+func Validate(d Document) []Violation {
+	if vs := validateShape(d); len(vs) > 0 {
+		return vs
+	}
+	g := newGraph(d)
+	if stuck := g.cycle(); stuck != nil {
+		return []Violation{{Path: "edges", Message: "the dataflow graph must be acyclic; unresolvable nodes: " + strings.Join(stuck, ", ")}}
+	}
+	var vs []Violation
+	vs = append(vs, g.validateGatePassThrough()...)
+	vs = append(vs, g.validateLineage()...)
+	dom := g.dominators()
+	vs = append(vs, g.validateRevisions(dom)...)
+	vs = append(vs, g.validatePublishes(dom)...)
+	return vs
+}
+
+// validateGatePassThrough pins decision 2: a gate's outgoing edges all
+// carry exactly its examined artifact type.
+func (g *graph) validateGatePassThrough() []Violation {
+	var vs []Violation
+	for _, n := range g.d.Nodes {
+		if n.Type != NodeGate {
+			continue
+		}
+		ex := g.examined(n.ID)
+		for j, e := range g.d.Edges {
+			if e.From == n.ID && e.Artifact != ex.Artifact {
+				vs = append(vs, Violation{
+					Path:    fmt.Sprintf("edges[%d].artifact", j),
+					Message: fmt.Sprintf("gate %q passes through %s, not %s", n.ID, ex.Artifact, e.Artifact),
+				})
+			}
+		}
+	}
+	return vs
+}
+
+// validateLineage pins decision 3: per node, the implement nodes in its
+// strict ancestry must be totally ordered by ancestry — one lineage,
+// never a merge of two.
+func (g *graph) validateLineage() []Violation {
+	anc := make(map[string]map[string]bool, len(g.d.Nodes))
+	for _, n := range g.d.Nodes {
+		anc[n.ID] = g.ancestors(n.ID)
+	}
+	var vs []Violation
+	for i, n := range g.d.Nodes {
+		var producers []string
+		for _, p := range g.d.Nodes { // document order → deterministic pairs
+			if p.Type == NodeImplement && anc[n.ID][p.ID] {
+				producers = append(producers, p.ID)
+			}
+		}
+		for a := 0; a < len(producers); a++ {
+			for b := a + 1; b < len(producers); b++ {
+				pa, pb := producers[a], producers[b]
+				if !anc[pa][pb] && !anc[pb][pa] {
+					vs = append(vs, Violation{
+						Path:    fmt.Sprintf("nodes[%d]", i),
+						Message: fmt.Sprintf("%q merges divergent patch lineages: implement ancestors %q and %q are unordered (V1: patch lineage is linear)", n.ID, pa, pb),
+					})
+				}
+			}
+		}
+	}
+	return vs
+}
+
+// validateRevisions pins invariant 5: agentic target, strict dominance,
+// pairwise-disjoint loop slices.
+func (g *graph) validateRevisions(dom map[string]map[string]bool) []Violation {
+	var vs []Violation
+	type loop struct {
+		gateID string
+		slice  map[string]bool
+	}
+	var loops []loop
+	for i, n := range g.d.Nodes {
+		if n.Type != NodeGate || n.OnRequestChanges == nil {
+			continue
+		}
+		path := fmt.Sprintf("nodes[%d].on_request_changes", i)
+		target := n.OnRequestChanges.Target
+		if !g.node(target).Type.Agentic() {
+			vs = append(vs, Violation{Path: path + ".target", Message: "revision target must be an agentic node"})
+			continue
+		}
+		if !dom[n.ID][target] {
+			vs = append(vs, Violation{Path: path + ".target", Message: fmt.Sprintf("revision target %q must dominate its gate %q", target, n.ID)})
+			continue
+		}
+		slice := map[string]bool{target: true, n.ID: true}
+		desc := g.descendants(target)
+		for a := range g.ancestors(n.ID) {
+			if desc[a] {
+				slice[a] = true
+			}
+		}
+		for _, prior := range loops {
+			var shared []string
+			for id := range slice {
+				if prior.slice[id] {
+					shared = append(shared, id)
+				}
+			}
+			if len(shared) > 0 {
+				sort.Strings(shared)
+				vs = append(vs, Violation{
+					Path:    path,
+					Message: fmt.Sprintf("revision loops of gates %q and %q overlap on %s (V1: loops are disjoint)", prior.gateID, n.ID, strings.Join(shared, ", ")),
+				})
+			}
+		}
+		loops = append(loops, loop{gateID: n.ID, slice: slice})
+	}
+	return vs
+}
+
+// validatePublishes pins invariants 6 and 7: every git-publish has an
+// eligible dominating gate examining exactly the patch it consumes, and
+// no gate authorizes two publishes (nearest-eligible assignment).
+func (g *graph) validatePublishes(dom map[string]map[string]bool) []Violation {
+	var vs []Violation
+	claimed := map[string]string{} // gate id → publish id
+	for i, n := range g.d.Nodes {
+		if n.Type != NodeGitPublish {
+			continue
+		}
+		path := fmt.Sprintf("nodes[%d]", i)
+		var patchEdge Edge
+		for _, e := range g.in[n.ID] {
+			if e.Artifact == ArtifactPatch {
+				patchEdge = e
+				break
+			}
+		}
+		origin := g.origin(patchEdge)
+		anc := g.ancestors(n.ID)
+
+		var nearest string
+		nearestDepth := -1
+		for _, cand := range g.d.Nodes {
+			if cand.Type != NodeGate || !dom[n.ID][cand.ID] {
+				continue
+			}
+			ex := g.examined(cand.ID)
+			if ex.Artifact != ArtifactPatch || g.origin(ex) != origin {
+				continue
+			}
+			between := g.descendants(cand.ID)
+			divergent := false
+			for id := range between {
+				if anc[id] && g.node(id).Type == NodeImplement {
+					divergent = true
+					break
+				}
+			}
+			if divergent {
+				continue
+			}
+			// dom(P) is a chain, so depth (= |dom(G)|) orders candidates;
+			// the deepest eligible gate is the nearest one.
+			if depth := len(dom[cand.ID]); depth > nearestDepth {
+				nearest, nearestDepth = cand.ID, depth
+			}
+		}
+		if nearest == "" {
+			vs = append(vs, Violation{
+				Path:    path,
+				Message: fmt.Sprintf("%q must be dominated by a gate examining exactly the patch it publishes (spec §2: never publish-then-gate)", n.ID),
+			})
+			continue
+		}
+		if other, taken := claimed[nearest]; taken {
+			vs = append(vs, Violation{
+				Path:    path,
+				Message: fmt.Sprintf("gate %q already authorizes %q; an ApprovedPatch authorization is single-use, so each publish needs its own gate", nearest, other),
+			})
+			continue
+		}
+		claimed[nearest] = n.ID
 	}
 	return vs
 }
