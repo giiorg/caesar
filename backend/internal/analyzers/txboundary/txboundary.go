@@ -3,7 +3,9 @@
 // method, or interface method declared inside a bounded context may mention
 // a pgx transaction type in its signature. Transactions stay an internal
 // implementation detail of the context that opened them. Generated files
-// (e.g. sqlc output) are skipped since the rule targets hand-written APIs.
+// (e.g. sqlc output) are skipped since the rule targets hand-written APIs,
+// as are _test.go files: their exported identifiers are unreachable from
+// any other package, so a test-only seam cannot span contexts.
 package txboundary
 
 import (
@@ -42,7 +44,7 @@ func run(pass *analysis.Pass) (any, error) {
 		return nil, nil
 	}
 	for _, file := range pass.Files {
-		if ast.IsGenerated(file) {
+		if ast.IsGenerated(file) || strings.HasSuffix(pass.Fset.Position(file.Pos()).Filename, "_test.go") {
 			continue
 		}
 		ast.Inspect(file, func(n ast.Node) bool {
