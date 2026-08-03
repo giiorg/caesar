@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/giiorg/caesar/backend/internal/identity/store"
+	"github.com/giiorg/caesar/backend/internal/platform/pg"
 )
 
 // Pinned login rate-limit parameters (plan header). DB-backed via the
@@ -91,20 +94,13 @@ func (s *Service) purgeStaleLoginRate(ctx context.Context) {
 	now := s.clock.Now()
 	cutoff := now.Add(-loginRateRetention)
 
-	tx, err := s.pool.Begin(ctx)
+	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		_, err := store.New(tx).PurgeStaleLoginRate(ctx, store.PurgeStaleLoginRateParams{
+			Now: now, Cutoff: cutoff,
+		})
+		return err
+	})
 	if err != nil {
-		slog.Default().WarnContext(ctx, "identity: purge login_rate: begin failed", "error", err)
-		return
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := store.New(tx).PurgeStaleLoginRate(ctx, store.PurgeStaleLoginRateParams{
-		Now: now, Cutoff: cutoff,
-	}); err != nil {
-		slog.Default().WarnContext(ctx, "identity: purge login_rate: delete failed", "error", err)
-		return
-	}
-	if err := tx.Commit(ctx); err != nil {
-		slog.Default().WarnContext(ctx, "identity: purge login_rate: commit failed", "error", err)
+		slog.Default().WarnContext(ctx, "identity: purge login_rate failed", "error", err)
 	}
 }

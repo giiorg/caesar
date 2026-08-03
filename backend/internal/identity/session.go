@@ -15,6 +15,7 @@ import (
 	"github.com/giiorg/caesar/backend/internal/identity/store"
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/httpx"
+	"github.com/giiorg/caesar/backend/internal/platform/pg"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
 
@@ -94,25 +95,21 @@ func (s *Service) AuthenticateSession(ctx context.Context, token string) (AuthSe
 
 // Logout revokes the calling session.
 func (s *Service) Logout(ctx context.Context, sess AuthSession) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("identity: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	q := store.New(tx)
-	now := s.clock.Now()
-	if err := q.RevokeSession(ctx, store.RevokeSessionParams{ID: sess.SessionID, RevokedAt: &now}); err != nil {
-		return fmt.Errorf("identity: revoke session: %w", err)
-	}
-	err = s.audit.Record(ctx, tx, audit.Entry{
-		Actor:  uuid.NullUUID{UUID: sess.UserID, Valid: true},
-		Action: "auth.logout", SubjectKind: "session", SubjectID: sess.SessionID.String(),
-		CorrelationID: httpx.CorrelationID(ctx),
+	return pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		q := store.New(tx)
+		now := s.clock.Now()
+		if err := q.RevokeSession(ctx, store.RevokeSessionParams{ID: sess.SessionID, RevokedAt: &now}); err != nil {
+			return fmt.Errorf("identity: revoke session: %w", err)
+		}
+		if err := s.audit.Record(ctx, tx, audit.Entry{
+			Actor:  uuid.NullUUID{UUID: sess.UserID, Valid: true},
+			Action: "auth.logout", SubjectKind: "session", SubjectID: sess.SessionID.String(),
+			CorrelationID: httpx.CorrelationID(ctx),
+		}); err != nil {
+			return err
+		}
+		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
 }
 
 // ChangePassword verifies the current password, rewrites the hash,
