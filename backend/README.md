@@ -22,7 +22,13 @@ CI. Fix the code, never the rule.
     task backend:run               # serve with caesar.dev.json
     task backend:test              # unit, race
     task backend:test:integration  # real postgres via testcontainers
+    task backend:test:property     # rapid property tests (pinned seed; RAPID_SEED=0 randomizes)
+    task backend:fuzz              # fuzz targets, FUZZTIME each (default 2m)
     task ci                        # exactly what CI runs
+
+Nightly CI runs both the property and fuzz lanes for longer and with a
+randomized seed (`RAPID_SEED=0`, extended `RAPID_CHECKS`/`FUZZTIME`); PR CI
+runs them pinned and short.
 
 ## Config
 
@@ -76,8 +82,9 @@ Each endpoint is one `httpx.Operation` declaration — route and OpenAPI
 document come from the same source, so they can't drift. stdlib's own
 405 responses (method not allowed on a registered path) are plain text,
 not problem+json — an accepted V1 limitation. Resources: identity
-(users, sessions, grants) and assets (projects, repos, credentials,
-harnesses).
+(users, sessions, grants), assets (projects, repos, credentials,
+harnesses), and workflows (`/api/v1/workflows` + `/versions`) — writes
+are admin-only, and the single write door validates every document.
 
 ## Contracts
 
