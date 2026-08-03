@@ -14,7 +14,7 @@ const usage = `caesar — deterministic orchestrator of agentic workflows
 commands:
   serve     start the control plane (default)
   migrate   run database migrations (up|down|status)
-  admin     administrative commands (bootstrap)
+  admin     administrative commands (bootstrap, rekey)
   version   print build information
 `
 
