@@ -44,14 +44,26 @@ type idAndUpdateRepo struct {
 	assetsapi.UpdateRepoRequest
 }
 
+type idAndRotateSecret struct {
+	idParams
+	assetsapi.RotateCredentialSecretRequest
+}
+
+type idAndUpdateHarness struct {
+	idParams
+	assetsapi.UpdateHarnessRequest
+}
+
 // requestOverrides maps operation IDs whose request combines a body with
 // path parameters onto their wrapper structs. Every new id-bearing body
 // gets an entry; requestStructure panics loudly otherwise.
 var requestOverrides = map[string]any{
-	"updateUser":    idAndUpdateUser{},
-	"updateProject": idAndUpdateProject{},
-	"createRepo":    idAndCreateRepo{},
-	"updateRepo":    idAndUpdateRepo{},
+	"updateUser":             idAndUpdateUser{},
+	"updateProject":          idAndUpdateProject{},
+	"createRepo":             idAndCreateRepo{},
+	"updateRepo":             idAndUpdateRepo{},
+	"rotateCredentialSecret": idAndRotateSecret{},
+	"updateHarness":          idAndUpdateHarness{},
 }
 
 // operationTables collects every context's route table with nil

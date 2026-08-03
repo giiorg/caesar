@@ -72,3 +72,74 @@ func repoResponse(r assets.Repo) RepoResponse {
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 	}
 }
+
+type CredentialResponse struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Kind      string    `json:"kind"`
+	KeyID     string    `json:"key_id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type CredentialListResponse struct {
+	Credentials []CredentialResponse `json:"credentials"`
+}
+
+type CreateCredentialRequest struct {
+	Name   string `json:"name"`
+	Kind   string `json:"kind"`
+	Secret string `json:"secret"`
+}
+
+type RotateCredentialSecretRequest struct {
+	Secret string `json:"secret"`
+}
+
+type HarnessResponse struct {
+	ID               string         `json:"id"`
+	Name             string         `json:"name"`
+	Kind             string         `json:"kind"`
+	ImageRef         string         `json:"image_ref"`
+	ProviderEndpoint string         `json:"provider_endpoint"`
+	CredentialID     string         `json:"credential_id"`
+	Defaults         map[string]any `json:"defaults"`
+	CreatedAt        time.Time      `json:"created_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+}
+
+type HarnessListResponse struct {
+	Harnesses []HarnessResponse `json:"harnesses"`
+}
+
+type RegisterHarnessRequest struct {
+	Name             string         `json:"name"`
+	Kind             string         `json:"kind"`
+	ImageRef         string         `json:"image_ref"`
+	ProviderEndpoint string         `json:"provider_endpoint"`
+	CredentialID     string         `json:"credential_id"`
+	Defaults         map[string]any `json:"defaults,omitempty"`
+}
+
+type UpdateHarnessRequest struct {
+	Name             *string         `json:"name,omitempty"`
+	ImageRef         *string         `json:"image_ref,omitempty"`
+	ProviderEndpoint *string         `json:"provider_endpoint,omitempty"`
+	CredentialID     *string         `json:"credential_id,omitempty"`
+	Defaults         *map[string]any `json:"defaults,omitempty"`
+}
+
+func credentialResponse(c assets.Credential) CredentialResponse {
+	return CredentialResponse{
+		ID: c.ID.String(), Name: c.Name, Kind: string(c.Kind), KeyID: c.KeyID,
+		CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt,
+	}
+}
+
+func harnessResponse(h assets.Harness) HarnessResponse {
+	return HarnessResponse{
+		ID: h.ID.String(), Name: h.Name, Kind: string(h.Kind), ImageRef: h.ImageRef,
+		ProviderEndpoint: h.ProviderEndpoint, CredentialID: h.CredentialID.String(), Defaults: h.Defaults,
+		CreatedAt: h.CreatedAt, UpdatedAt: h.UpdatedAt,
+	}
+}

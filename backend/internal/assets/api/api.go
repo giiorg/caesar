@@ -84,6 +84,56 @@ func Operations(a *API) []httpx.Operation {
 			Status:  http.StatusNoContent,
 			Handler: a.authenticated(a.handleDeleteRepo),
 		},
+		{
+			Pattern: "POST /api/v1/credentials", ID: "createCredential", Summary: "Store an encrypted credential (admin)",
+			Request: CreateCredentialRequest{}, Response: CredentialResponse{}, Status: http.StatusCreated,
+			Handler: a.adminOnly(a.handleCreateCredential),
+		},
+		{
+			Pattern: "GET /api/v1/credentials", ID: "listCredentials", Summary: "List credential metadata (admin)",
+			Response: CredentialListResponse{}, Status: http.StatusOK,
+			Handler: a.adminOnly(a.handleListCredentials),
+		},
+		{
+			Pattern: "GET /api/v1/credentials/{id}", ID: "getCredential", Summary: "Get credential metadata (admin)",
+			Response: CredentialResponse{}, Status: http.StatusOK,
+			Handler: a.adminOnly(a.handleGetCredential),
+		},
+		{
+			Pattern: "PUT /api/v1/credentials/{id}/secret", ID: "rotateCredentialSecret", Summary: "Replace the secret value (admin)",
+			Request: RotateCredentialSecretRequest{}, Response: CredentialResponse{}, Status: http.StatusOK,
+			Handler: a.adminOnly(a.handleRotateCredentialSecret),
+		},
+		{
+			Pattern: "DELETE /api/v1/credentials/{id}", ID: "deleteCredential", Summary: "Delete an unreferenced credential (admin)",
+			Status:  http.StatusNoContent,
+			Handler: a.adminOnly(a.handleDeleteCredential),
+		},
+		{
+			Pattern: "POST /api/v1/harnesses", ID: "registerHarness", Summary: "Register a harness (admin)",
+			Request: RegisterHarnessRequest{}, Response: HarnessResponse{}, Status: http.StatusCreated,
+			Handler: a.adminOnly(a.handleRegisterHarness),
+		},
+		{
+			Pattern: "GET /api/v1/harnesses", ID: "listHarnesses", Summary: "List harnesses (admin)",
+			Response: HarnessListResponse{}, Status: http.StatusOK,
+			Handler: a.adminOnly(a.handleListHarnesses),
+		},
+		{
+			Pattern: "GET /api/v1/harnesses/{id}", ID: "getHarness", Summary: "Get a harness (admin)",
+			Response: HarnessResponse{}, Status: http.StatusOK,
+			Handler: a.adminOnly(a.handleGetHarness),
+		},
+		{
+			Pattern: "PATCH /api/v1/harnesses/{id}", ID: "updateHarness", Summary: "Update a harness (admin)",
+			Request: UpdateHarnessRequest{}, Response: HarnessResponse{}, Status: http.StatusOK,
+			Handler: a.adminOnly(a.handleUpdateHarness),
+		},
+		{
+			Pattern: "DELETE /api/v1/harnesses/{id}", ID: "deleteHarness", Summary: "Delete a harness (admin)",
+			Status:  http.StatusNoContent,
+			Handler: a.adminOnly(a.handleDeleteHarness),
+		},
 	}
 }
 
@@ -366,6 +416,171 @@ func (a *API) handleDeleteRepo(w http.ResponseWriter, r *http.Request, sess auth
 		return
 	}
 	if err := a.svc.DeleteRepo(r.Context(), sess.Principal, repo.ID); err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) handleCreateCredential(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	req, err := decode[CreateCredentialRequest](r)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	c, err := a.svc.CreateCredential(r.Context(), sess.Principal, req.Name, assets.CredentialKind(req.Kind), []byte(req.Secret))
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, credentialResponse(c))
+}
+
+func (a *API) handleListCredentials(w http.ResponseWriter, r *http.Request, _ authn.AuthSession) {
+	creds, err := a.svc.ListCredentials(r.Context())
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	out := CredentialListResponse{Credentials: make([]CredentialResponse, 0, len(creds))}
+	for _, c := range creds {
+		out.Credentials = append(out.Credentials, credentialResponse(c))
+	}
+	httpx.JSON(w, http.StatusOK, out)
+}
+
+func (a *API) handleGetCredential(w http.ResponseWriter, r *http.Request, _ authn.AuthSession) {
+	id, err := pathUUID(r, "no such credential")
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	c, err := a.svc.GetCredential(r.Context(), id)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, credentialResponse(c))
+}
+
+func (a *API) handleRotateCredentialSecret(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	id, err := pathUUID(r, "no such credential")
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	req, err := decode[RotateCredentialSecretRequest](r)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	c, err := a.svc.RotateCredentialSecret(r.Context(), sess.Principal, id, []byte(req.Secret))
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, credentialResponse(c))
+}
+
+func (a *API) handleDeleteCredential(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	id, err := pathUUID(r, "no such credential")
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	if err := a.svc.DeleteCredential(r.Context(), sess.Principal, id); err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) handleRegisterHarness(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	req, err := decode[RegisterHarnessRequest](r)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	credID, err := parseUUIDField(req.CredentialID, "credential_id")
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	h, err := a.svc.RegisterHarness(r.Context(), sess.Principal, assets.NewHarness{
+		Name: req.Name, Kind: assets.HarnessKind(req.Kind), ImageRef: req.ImageRef,
+		ProviderEndpoint: req.ProviderEndpoint, CredentialID: credID, Defaults: req.Defaults,
+	})
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, harnessResponse(h))
+}
+
+func (a *API) handleListHarnesses(w http.ResponseWriter, r *http.Request, _ authn.AuthSession) {
+	all, err := a.svc.ListHarnesses(r.Context())
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	out := HarnessListResponse{Harnesses: make([]HarnessResponse, 0, len(all))}
+	for _, h := range all {
+		out.Harnesses = append(out.Harnesses, harnessResponse(h))
+	}
+	httpx.JSON(w, http.StatusOK, out)
+}
+
+func (a *API) handleGetHarness(w http.ResponseWriter, r *http.Request, _ authn.AuthSession) {
+	id, err := pathUUID(r, "no such harness")
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	h, err := a.svc.GetHarness(r.Context(), id)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, harnessResponse(h))
+}
+
+func (a *API) handleUpdateHarness(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	id, err := pathUUID(r, "no such harness")
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	req, err := decode[UpdateHarnessRequest](r)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	upd := assets.HarnessUpdate{
+		Name: req.Name, ImageRef: req.ImageRef, ProviderEndpoint: req.ProviderEndpoint, Defaults: req.Defaults,
+	}
+	if req.CredentialID != nil {
+		credID, err := parseUUIDField(*req.CredentialID, "credential_id")
+		if err != nil {
+			httpx.Problem(w, r, err)
+			return
+		}
+		upd.CredentialID = &credID
+	}
+	h, err := a.svc.UpdateHarness(r.Context(), sess.Principal, id, upd)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, harnessResponse(h))
+}
+
+func (a *API) handleDeleteHarness(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	id, err := pathUUID(r, "no such harness")
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	if err := a.svc.DeleteHarness(r.Context(), sess.Principal, id); err != nil {
 		httpx.Problem(w, r, err)
 		return
 	}

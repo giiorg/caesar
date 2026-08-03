@@ -125,6 +125,380 @@
         }
       }
     },
+    "/api/v1/credentials": {
+      "get": {
+        "summary": "List credential metadata (admin)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "listCredentials",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiCredentialListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Store an encrypted credential (admin)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "createCredential",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiCreateCredentialRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiCredentialResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/credentials/{id}": {
+      "get": {
+        "summary": "Get credential metadata (admin)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "getCredential",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiCredentialResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete an unreferenced credential (admin)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "deleteCredential",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/credentials/{id}/secret": {
+      "put": {
+        "summary": "Replace the secret value (admin)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "rotateCredentialSecret",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContractsIdAndRotateSecret"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiCredentialResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/harnesses": {
+      "get": {
+        "summary": "List harnesses (admin)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "listHarnesses",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiHarnessListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Register a harness (admin)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "registerHarness",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiRegisterHarnessRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiHarnessResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/harnesses/{id}": {
+      "get": {
+        "summary": "Get a harness (admin)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "getHarness",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiHarnessResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a harness (admin)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "deleteHarness",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update a harness (admin)",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "updateHarness",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContractsIdAndUpdateHarness"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiHarnessResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/projects": {
       "get": {
         "summary": "List projects visible to the caller",
@@ -689,6 +1063,20 @@
         },
         "type": "object"
       },
+      "ApiCreateCredentialRequest": {
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "secret": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ApiCreateProjectRequest": {
         "properties": {
           "description": {
@@ -714,12 +1102,103 @@
         },
         "type": "object"
       },
+      "ApiCredentialListResponse": {
+        "properties": {
+          "credentials": {
+            "items": {
+              "$ref": "#/components/schemas/ApiCredentialResponse"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ApiCredentialResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "key_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ApiGrantResponse": {
         "properties": {
           "level": {
             "type": "string"
           },
           "project_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ApiHarnessListResponse": {
+        "properties": {
+          "harnesses": {
+            "items": {
+              "$ref": "#/components/schemas/ApiHarnessResponse"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ApiHarnessResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "credential_id": {
+            "type": "string"
+          },
+          "defaults": {
+            "additionalProperties": {},
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "image_ref": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider_endpoint": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
             "type": "string"
           }
         },
@@ -784,6 +1263,30 @@
           },
           "updated_at": {
             "format": "date-time",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ApiRegisterHarnessRequest": {
+        "properties": {
+          "credential_id": {
+            "type": "string"
+          },
+          "defaults": {
+            "additionalProperties": {},
+            "type": "object"
+          },
+          "image_ref": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider_endpoint": {
             "type": "string"
           }
         },
@@ -886,6 +1389,50 @@
           },
           "slug": {
             "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ContractsIdAndRotateSecret": {
+        "properties": {
+          "secret": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ContractsIdAndUpdateHarness": {
+        "properties": {
+          "credential_id": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "defaults": {
+            "additionalProperties": {},
+            "type": [
+              "null",
+              "object"
+            ]
+          },
+          "image_ref": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "name": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "provider_endpoint": {
+            "type": [
+              "null",
+              "string"
+            ]
           }
         },
         "type": "object"
