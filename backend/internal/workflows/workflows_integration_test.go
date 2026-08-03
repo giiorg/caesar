@@ -8,6 +8,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
 	"github.com/giiorg/caesar/backend/internal/platform/authn"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 	"github.com/giiorg/caesar/backend/internal/workflows"
@@ -211,5 +214,46 @@ func TestUpdateAndDeleteWorkflow_CascadeAndAudit(t *testing.T) {
 	}
 	if err := svc.DeleteWorkflow(ctx, admin, w.ID); xerrors.ClassOf(err) != xerrors.ClassNotFound {
 		t.Fatalf("second delete: %v", err)
+	}
+}
+
+func TestDeleteWorkflowBlockedByRuns(t *testing.T) {
+	svc, pool, _ := newTestService(t)
+	ctx := context.Background()
+	actor := seedActor(t, pool, "blk@example.com", authn.RoleAdmin)
+
+	wf, err := svc.CreateWorkflow(ctx, actor, "spine-block", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, _, err := svc.CreateVersion(ctx, actor, wf.ID, docWith("blocker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A task referencing the version, via raw SQL: workflows never
+	// imports the runs context (arch law), and the FK chain is what is
+	// under test, not the spine service.
+	mustScan := func(row pgx.Row) uuid.UUID {
+		var id uuid.UUID
+		if err := row.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	projectID := mustScan(pool.QueryRow(ctx, `INSERT INTO projects (name) VALUES ('blk') RETURNING id`))
+	credID := mustScan(pool.QueryRow(ctx, `INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext) VALUES (uuidv7(),'blk','forge_token','dev','\x00','\x00') RETURNING id`))
+	repoID := mustScan(pool.QueryRow(ctx, `INSERT INTO repos (project_id, forge_kind, slug, credential_id) VALUES ($1,'github','blk/repo',$2) RETURNING id`, projectID, credID))
+	mustScan(pool.QueryRow(ctx,
+		`INSERT INTO tasks (project_id, repo_id, workflow_version_id, title, requester_id, created_at)
+		 VALUES ($1, $2, $3, 'blocker', $4, now()) RETURNING id`,
+		projectID, repoID, v.ID, actor.UserID))
+
+	err = svc.DeleteWorkflow(ctx, actor, wf.ID)
+	if xerrors.ClassOf(err) != xerrors.ClassConflict {
+		t.Fatalf("delete with runs = %v, want conflict", err)
+	}
+	if _, err := svc.GetWorkflow(ctx, wf.ID); err != nil {
+		t.Fatalf("workflow must survive the blocked delete: %v", err)
 	}
 }
