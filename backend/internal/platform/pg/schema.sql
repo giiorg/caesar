@@ -30,12 +30,14 @@ CREATE TABLE sessions (
 
 CREATE INDEX sessions_user_id_idx ON sessions (user_id);
 
--- Minimal projects table: Plan 03 owns the projects API; the grant ladder
--- needs the foreign key today.
+-- Assets (spec §2). Plan 03: projects grow their API columns; repos,
+-- credentials, harnesses land.
 CREATE TABLE projects (
-    id         uuid PRIMARY KEY DEFAULT uuidv7(),
-    name       text NOT NULL UNIQUE,
-    created_at timestamptz NOT NULL DEFAULT now()
+    id          uuid PRIMARY KEY DEFAULT uuidv7(),
+    name        text NOT NULL UNIQUE,
+    description text NOT NULL DEFAULT '',
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
 );
 
 -- One grant row per (user, project); ladder view ⊂ run ⊂ approve ⊂ manage.
@@ -70,4 +72,50 @@ CREATE TABLE login_rate (
     failures          integer NOT NULL DEFAULT 0,
     window_started_at timestamptz NOT NULL,
     locked_until      timestamptz
+);
+
+-- Encrypted-at-rest secrets (spec §6): per-row AES-256-GCM envelope —
+-- wrapped_dek under master key key_id, ciphertext under the DEK, AAD =
+-- the credential id. Plaintext never lands here; every use is audited.
+CREATE TABLE credentials (
+    id          uuid PRIMARY KEY,
+    name        text NOT NULL UNIQUE,
+    kind        text NOT NULL CHECK (kind IN ('forge_token', 'model_key')),
+    key_id      text NOT NULL,
+    wrapped_dek bytea NOT NULL,
+    ciphertext  bytea NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- Forge repos (spec §2): forge kind + slug + default branch + credential
+-- ref. RESTRICT FKs: a project with repos and a referenced credential
+-- cannot be deleted.
+CREATE TABLE repos (
+    id             uuid PRIMARY KEY DEFAULT uuidv7(),
+    project_id     uuid NOT NULL REFERENCES projects (id) ON DELETE RESTRICT,
+    forge_kind     text NOT NULL CHECK (forge_kind IN ('github', 'gitlab')),
+    slug           text NOT NULL,
+    default_branch text NOT NULL DEFAULT 'main',
+    credential_id  uuid NOT NULL REFERENCES credentials (id) ON DELETE RESTRICT,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (project_id, forge_kind, slug)
+);
+
+CREATE INDEX repos_project_id_idx ON repos (project_id);
+
+-- Admin-registered harness registry (spec §2): kind, image ref, provider
+-- endpoint, the model-key credential the egress broker will use, and
+-- free-form defaults.
+CREATE TABLE harnesses (
+    id                uuid PRIMARY KEY DEFAULT uuidv7(),
+    name              text NOT NULL UNIQUE,
+    kind              text NOT NULL CHECK (kind IN ('claude-code', 'codex')),
+    image_ref         text NOT NULL,
+    provider_endpoint text NOT NULL,
+    credential_id     uuid NOT NULL REFERENCES credentials (id) ON DELETE RESTRICT,
+    defaults          jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now()
 );
