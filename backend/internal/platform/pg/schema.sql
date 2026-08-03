@@ -62,8 +62,9 @@ CREATE TABLE audit_entries (
 
 CREATE INDEX audit_entries_occurred_idx ON audit_entries (occurred_at);
 
--- DB-backed login rate limiting: scope is 'account:<lower(email)>' or
--- 'ip:<host>'. Parameters pinned in the plan header.
+-- DB-backed login rate limiting: scope is 'account:<lower(email)>',
+-- 'ip:<host>', or 'pwchange:<user_id>'. Parameters pinned in the plan
+-- headers (02: login scopes; 03: pwchange).
 CREATE TABLE login_rate (
     scope             text PRIMARY KEY,
     failures          integer NOT NULL DEFAULT 0,
