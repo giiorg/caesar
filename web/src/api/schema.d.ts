@@ -84,6 +84,110 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List projects visible to the caller
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["listProjects"];
+        put?: never;
+        /**
+         * Create a project (admin)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        post: operations["createProject"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a project (view)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["getProject"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete an empty project (manage)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        delete: operations["deleteProject"];
+        options?: never;
+        head?: never;
+        /**
+         * Update name or description (manage)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        patch: operations["updateProject"];
+        trace?: never;
+    };
+    "/api/v1/projects/{id}/repos": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a project's repos (view)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["listProjectRepos"];
+        put?: never;
+        /**
+         * Register a repo on a project (manage)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        post: operations["createRepo"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/repos/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a repo (view)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["getRepo"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete a repo (manage)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        delete: operations["deleteRepo"];
+        options?: never;
+        head?: never;
+        /**
+         * Update a repo (manage)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        patch: operations["updateRepo"];
+        trace?: never;
+    };
     "/api/v1/users": {
         parameters: {
             query?: never;
@@ -140,6 +244,10 @@ export interface components {
             current_password?: string;
             new_password?: string;
         };
+        ApiCreateProjectRequest: {
+            description?: string;
+            name?: string;
+        };
         ApiCreateUserRequest: {
             email?: string;
             password?: string;
@@ -157,6 +265,33 @@ export interface components {
             grants?: components["schemas"]["ApiGrantResponse"][] | null;
             user?: components["schemas"]["ApiUserResponse"];
         };
+        ApiProjectListResponse: {
+            projects?: components["schemas"]["ApiProjectResponse"][] | null;
+        };
+        ApiProjectResponse: {
+            /** Format: date-time */
+            created_at?: string;
+            description?: string;
+            id?: string;
+            name?: string;
+            /** Format: date-time */
+            updated_at?: string;
+        };
+        ApiRepoListResponse: {
+            repos?: components["schemas"]["ApiRepoResponse"][] | null;
+        };
+        ApiRepoResponse: {
+            /** Format: date-time */
+            created_at?: string;
+            credential_id?: string;
+            default_branch?: string;
+            forge?: string;
+            id?: string;
+            project_id?: string;
+            slug?: string;
+            /** Format: date-time */
+            updated_at?: string;
+        };
         ApiUserListResponse: {
             users?: components["schemas"]["ApiUserResponse"][] | null;
         };
@@ -169,6 +304,21 @@ export interface components {
             role?: string;
             /** Format: date-time */
             updated_at?: string;
+        };
+        ContractsIdAndCreateRepo: {
+            credential_id?: string;
+            default_branch?: string;
+            forge?: string;
+            slug?: string;
+        };
+        ContractsIdAndUpdateProject: {
+            description?: null | string;
+            name?: null | string;
+        };
+        ContractsIdAndUpdateRepo: {
+            credential_id?: null | string;
+            default_branch?: null | string;
+            slug?: null | string;
         };
         ContractsIdAndUpdateUser: {
             active?: null | boolean;
@@ -303,6 +453,332 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    listProjects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProjectListResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    createProject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ApiCreateProjectRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProjectResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    getProject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProjectResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    deleteProject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    updateProject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ContractsIdAndUpdateProject"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProjectResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    listProjectRepos: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiRepoListResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    createRepo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ContractsIdAndCreateRepo"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiRepoResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    getRepo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiRepoResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    deleteRepo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    updateRepo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ContractsIdAndUpdateRepo"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiRepoResponse"];
+                };
             };
             /** @description Bad Request */
             400: {
