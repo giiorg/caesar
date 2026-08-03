@@ -23,6 +23,8 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/logging"
 	"github.com/giiorg/caesar/backend/internal/platform/pg"
 	"github.com/giiorg/caesar/backend/internal/platform/secrets"
+	"github.com/giiorg/caesar/backend/internal/workflows"
+	workflowsapi "github.com/giiorg/caesar/backend/internal/workflows/api"
 )
 
 func runServeCmd(args []string, stdout, stderr io.Writer) int {
@@ -81,6 +83,7 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		return fmt.Errorf("serve: %w", err)
 	}
 	assetsSvc := assets.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}), keys)
+	workflowsSvc := workflows.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}))
 
 	// assetsSvc implements identityapi.ProjectChecker (grant endpoints 404
 	// on unknown projects); identity.Service serves as authenticator,
@@ -88,6 +91,7 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	// wired here only).
 	ops := identityapi.Operations(identityapi.New(svc, cfg.Auth.SessionAbsoluteTTL.Std(), assetsSvc))
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, svc, svc, svc))...)
+	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, svc))...)
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
