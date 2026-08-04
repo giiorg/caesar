@@ -40,6 +40,21 @@ func InsertPhaseForTest(ctx context.Context, s *Service, runID uuid.UUID, nodeID
 	return id, err
 }
 
+// CachedPlanCountForTest reports how many runs the orchestrator's plan
+// cache holds. Eviction leaves no trace in Postgres, so this is the only
+// way a test can see it happen.
+func CachedPlanCountForTest(o *Orchestrator) int { return o.cachedPlanCount() }
+
+// LoadPlanForTest populates the plan cache for one run.
+func LoadPlanForTest(ctx context.Context, o *Orchestrator, runID uuid.UUID) error {
+	_, err := o.loadPlan(ctx, runID)
+	return err
+}
+
+// PrunePlanCacheForTest drives the hourly backstop on demand; the
+// janitor's own schedule is far too slow for a test to wait on.
+func PrunePlanCacheForTest(ctx context.Context, o *Orchestrator) { o.prunePlanCache(ctx) }
+
 func FinishPhaseForTest(ctx context.Context, s *Service, phaseID uuid.UUID, from, to, workerID string) (int64, error) {
 	var n int64
 	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {

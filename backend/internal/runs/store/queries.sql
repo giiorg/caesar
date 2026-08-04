@@ -118,6 +118,21 @@ UPDATE phase_runs SET status = 'reconciling'
 WHERE id = $1 AND status = 'running' AND leased_until <= now()
 RETURNING *;
 
+-- name: ClaimStuckReconciling :many
+-- Rows whose owner died between marking 'reconciling' and evaluating:
+-- the lease sweep can't see them (its predicate is status = 'running').
+-- Extending the lease is the CAS that makes concurrent sweepers safe —
+-- one winner per row per grace window.
+UPDATE phase_runs SET leased_until = now() + make_interval(secs => @lease_seconds::float8)
+WHERE id IN (
+    SELECT id FROM phase_runs
+    WHERE status = 'reconciling'
+      AND leased_until < now() - make_interval(secs => @grace_seconds::float8)
+    ORDER BY leased_until
+    LIMIT @max_rows FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+
 -- name: SupersedeLivePhases :many
 UPDATE phase_runs SET status = 'superseded', outcome = $2, finished_at = $3
 WHERE run_id = $1 AND status IN ('pending', 'running', 'reconciling')
@@ -169,6 +184,10 @@ SELECT count(*) FROM outbox;
 
 -- name: PruneOutbox :execrows
 DELETE FROM outbox WHERE created_at < $1;
+
+-- name: ListTerminalRunIDsAmong :many
+SELECT id FROM runs
+WHERE id = ANY(@ids::uuid[]) AND status IN ('succeeded', 'failed', 'superseded', 'dead');
 
 -- name: GetRunProjectID :one
 SELECT t.project_id FROM runs r JOIN tasks t ON t.id = r.task_id WHERE r.id = $1;

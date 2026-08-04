@@ -15,18 +15,25 @@ import (
 	"github.com/giiorg/caesar/backend/internal/runs/fake"
 )
 
-// startOrchestrator boots the loop against a fake executor and returns
-// it; cleanup cancels and waits for drain.
-func startOrchestrator(t *testing.T, svc *runs.Service, ex runs.Executor, lease time.Duration) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	o := runs.NewOrchestrator(svc, ex, runs.AlwaysAdmit{}, runs.OrchestratorConfig{
+// newOrchestrator builds the loop against a fake executor without
+// starting it — for tests that drive one sweep by hand.
+func newOrchestrator(svc *runs.Service, ex runs.Executor, lease time.Duration) *runs.Orchestrator {
+	return runs.NewOrchestrator(svc, ex, runs.AlwaysAdmit{}, runs.OrchestratorConfig{
 		Workers: 2, PollInterval: 20 * time.Millisecond, LeaseTTL: lease,
 		HeartbeatInterval: lease / 3, OutboxRetention: 7 * 24 * time.Hour,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+}
+
+// startOrchestrator boots the loop against a fake executor and returns
+// it; cleanup cancels and waits for drain.
+func startOrchestrator(t *testing.T, svc *runs.Service, ex runs.Executor, lease time.Duration) *runs.Orchestrator {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	o := newOrchestrator(svc, ex, lease)
 	go func() { defer close(done); _ = o.Run(ctx) }()
 	t.Cleanup(func() { cancel(); <-done })
+	return o
 }
 
 // waitForRun polls until the run reaches a terminal status.
@@ -48,6 +55,90 @@ func waitForRun(t *testing.T, svc *runs.Service, runID uuid.UUID, want runs.RunS
 	}
 	t.Fatalf("run never reached %s", want)
 	return runs.Run{}
+}
+
+// waitForCachedPlans polls the orchestrator's plan cache: eviction
+// happens just after the deciding transaction commits, so a run can be
+// terminal for a moment before its entry is gone.
+func waitForCachedPlans(t *testing.T, o *runs.Orchestrator, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if runs.CachedPlanCountForTest(o) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("plan cache holds %d entries, want %d", runs.CachedPlanCountForTest(o), want)
+}
+
+// A terminal run's compiled plan is dead weight: nothing will claim it
+// again, so the cache must let it go however the run died. Left in, the
+// map grows for the lifetime of the process (plan 05 carry-forward).
+func TestOrchestrator_PlanCacheEvictedOnTerminalization(t *testing.T) {
+	tests := []struct {
+		name       string
+		expireWall bool
+		want       runs.RunStatus
+	}{
+		{name: "run succeeds through the workers", want: runs.RunSucceeded},
+		{name: "wall-deadline sweep terminalizes the run", expireWall: true, want: runs.RunDead},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			svc, _ := newService(t, f, agenticDoc(), runs.DefaultSnapshot())
+			ctx := context.Background()
+
+			_, run, err := svc.CreateTask(ctx, principal(f), runs.NewTask{
+				RepoID: f.repoID, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: "evict",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.expireWall {
+				if _, err := f.pool.Exec(ctx,
+					`UPDATE runs SET wall_deadline = now() - interval '1 second' WHERE id = $1`, run.ID,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			o := startOrchestrator(t, svc, fake.NewExecutor(), 30*time.Second)
+			waitForRun(t, svc, run.ID, tc.want)
+			waitForCachedPlans(t, o, 0)
+		})
+	}
+}
+
+// The eviction call sites only fire in the process that decided the run.
+// A run terminalized by another process (or by a rerun's supersede)
+// leaves an entry no local commit will ever drop, so the janitor prunes
+// against the database hourly.
+func TestOrchestrator_PlanCachePrunesRunsTerminalizedElsewhere(t *testing.T) {
+	f := newFixture(t)
+	svc, _ := newService(t, f, agenticDoc(), runs.DefaultSnapshot())
+	ctx := context.Background()
+	_, runID := f.newRunRow(t, "running")
+
+	o := newOrchestrator(svc, fake.NewExecutor(), 30*time.Second)
+	if err := runs.LoadPlanForTest(ctx, o, runID); err != nil {
+		t.Fatal(err)
+	}
+
+	runs.PrunePlanCacheForTest(ctx, o)
+	if n := runs.CachedPlanCountForTest(o); n != 1 {
+		t.Fatalf("plan cache holds %d entries after pruning a live run, want 1", n)
+	}
+
+	if _, err := f.pool.Exec(ctx,
+		`UPDATE runs SET status = 'succeeded', finished_at = now() WHERE id = $1`, runID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	runs.PrunePlanCacheForTest(ctx, o)
+	if n := runs.CachedPlanCountForTest(o); n != 0 {
+		t.Fatalf("plan cache holds %d entries after the run went terminal, want 0", n)
+	}
 }
 
 func TestConveyorRunsToCompletion(t *testing.T) {
@@ -431,6 +522,76 @@ func TestOrchestrator_DeadAttemptArtifactsPersist(t *testing.T) {
 	ids, ok := dead.Payload["artifact_ids"].([]any)
 	if !ok || len(ids) != 1 || ids[0] != artifactID.String() {
 		t.Errorf("phase.dead artifact_ids = %v, want [%s]", dead.Payload["artifact_ids"], artifactID)
+	}
+}
+
+// A process that dies between MarkPhaseReconciling and the evaluation
+// strands the attempt: the row sits 'reconciling' with a dead lease, and
+// the lease sweep can't see it (that predicate only matches 'running'),
+// so nothing decides it before the 24h wall deadline. The janitor's
+// stuck-reconciling sweep is what re-drives it (plan 05 carry-forward).
+func TestOrchestrator_StuckReconcilingIsSweptAndConcluded(t *testing.T) {
+	f := newFixture(t)
+	svc, _ := newService(t, f, agenticDoc(), runs.DefaultSnapshot())
+	ctx := context.Background()
+	_, runID := f.newRunRow(t, "running")
+
+	// The crash window, reproduced: a claimed root attempt already marked
+	// reconciling, its lease long past the sweep's grace.
+	var phaseID uuid.UUID
+	if err := f.pool.QueryRow(ctx,
+		`INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, status,
+		                         worker_id, claimed_at, leased_until, created_at)
+		 VALUES ($1, 'plan', 1, 3, 'reconciling', 'dead-worker',
+		         now() - interval '70 seconds', now() - interval '65 seconds', now())
+		 RETURNING id`, runID,
+	).Scan(&phaseID); err != nil {
+		t.Fatal(err)
+	}
+
+	startOrchestrator(t, svc, fake.NewExecutor(), 30*time.Second)
+
+	// Nothing adoptable exists for the dead attempt, so it concludes
+	// transient reconcile_lost: this attempt fails, the node gets its
+	// next one (spec §3 — reconcile never auto-retries silently).
+	status := "reconciling"
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && status == "reconciling" {
+		if err := f.pool.QueryRow(ctx,
+			`SELECT status FROM phase_runs WHERE id = $1`, phaseID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if status != "failed" {
+		t.Fatalf("stranded attempt status = %q, want failed", status)
+	}
+	var successors int
+	if err := f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM phase_runs WHERE run_id = $1 AND node_id = 'plan' AND attempt = 2`, runID,
+	).Scan(&successors); err != nil {
+		t.Fatal(err)
+	}
+	if successors != 1 {
+		t.Errorf("plan attempt 2 rows = %d, want 1 (a failed attempt always has a successor)", successors)
+	}
+
+	// phase.reconciling belongs to whoever moved the row into the state —
+	// in the real crash, the process that then died. Re-driving must not
+	// append a second one, so a sweep of a row nobody announced (this
+	// setup) leaves the event stream without any.
+	evs, err := svc.ListRunEvents(ctx, runID, 0, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciling := 0
+	for _, e := range evs {
+		if e.Kind == runs.EventPhaseReconciling {
+			reconciling++
+		}
+	}
+	if reconciling != 0 {
+		t.Errorf("phase.reconciling events = %d, want 0 (the sweep must not re-announce)", reconciling)
 	}
 }
 
