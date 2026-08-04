@@ -37,17 +37,27 @@ func TestMain_MigrateWithBadConfigExitsOne(t *testing.T) {
 	}
 }
 
-func TestMain_StageWithoutItsContractFileExitsTwo(t *testing.T) {
-	if _, err := os.Stat(stageInputPath); err == nil {
-		t.Skipf("%s exists on this host, so the missing-input path cannot be exercised", stageInputPath)
+func TestMain_ContractCommandsWithoutTheirInputFileExitTwo(t *testing.T) {
+	tests := []struct {
+		name, command, inputPath string
+	}{
+		{name: "stage", command: "stage", inputPath: stageInputPath},
+		{name: "extract", command: "extract", inputPath: extractInputPath},
 	}
-	var out, errOut bytes.Buffer
-	code := Main([]string{"stage"}, strings.NewReader(""), &out, &errOut)
-	if code != 2 {
-		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, errOut.String())
-	}
-	if !strings.Contains(errOut.String(), stageInputPath) {
-		t.Fatalf("stderr = %q, want it to name %q", errOut.String(), stageInputPath)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := os.Stat(tc.inputPath); err == nil {
+				t.Skipf("%s exists on this host, so the missing-input path cannot be exercised", tc.inputPath)
+			}
+			var out, errOut bytes.Buffer
+			code := Main([]string{tc.command}, strings.NewReader(""), &out, &errOut)
+			if code != 2 {
+				t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, errOut.String())
+			}
+			if !strings.Contains(errOut.String(), tc.inputPath) {
+				t.Fatalf("stderr = %q, want it to name %q", errOut.String(), tc.inputPath)
+			}
+		})
 	}
 }
 
