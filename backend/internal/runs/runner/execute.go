@@ -25,6 +25,10 @@ const (
 	// egress.summary line after TERM before it is killed outright.
 	gatewayStopGrace = 5 * time.Second
 
+	// streamDrainGrace is how long a log stream gets to end on its own once
+	// its container is gone, before the follow is cancelled out from under it.
+	streamDrainGrace = 2 * time.Second
+
 	teardownTimeout = 60 * time.Second
 
 	// maxDenialEvents caps the denial events one attempt may write. An agent
@@ -184,6 +188,20 @@ func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, 
 	streamCtx, stopStreams := context.WithCancel(context.WithoutCancel(ctx))
 	var streams []*logStreamer
 	defer func() {
+		// Each stream gets a moment to end by itself first. Cancelling the
+		// log follow aborts the HTTP read, which discards whatever the daemon
+		// had already flushed — and the last of those bytes is the gateway's
+		// egress.summary, the very line the TERM grace above exists to
+		// produce. The cancel stays as the escape hatch for error paths,
+		// where a container may still be running and nothing will end the
+		// stream on its own.
+		for _, s := range streams {
+			select {
+			case <-s.done:
+			case <-time.After(streamDrainGrace):
+				stopStreams()
+			}
+		}
 		stopStreams()
 		for _, s := range streams {
 			if _, _, err := s.wait(); err != nil {
@@ -332,6 +350,10 @@ func (r *Runner) stopGateway(ctx context.Context, id string) {
 
 // denialReporter turns the gateway's refusals into run events, capped. The
 // counter needs no lock: one log streamer calls this, from one goroutine.
+//
+// The gateway logs its refusal category as `kind`; the event payload names it
+// `reason`, which is the pinned key consumers read. The rename happens here,
+// at the one boundary between the two vocabularies.
 func (r *Runner) denialReporter(ctx context.Context, ref runs.AttemptRef) func(host, kind string) {
 	seen := 0
 	return func(host, kind string) {
@@ -340,8 +362,8 @@ func (r *Runner) denialReporter(ctx context.Context, ref runs.AttemptRef) func(h
 			return
 		}
 		err := r.events.AppendRuntimeEvent(context.WithoutCancel(ctx), ref, "phase.egress_denied", map[string]any{
-			"kind": kind,
-			"host": host,
+			"host":   host,
+			"reason": kind,
 		})
 		if err != nil {
 			r.log.Warn("runner.egress_denied.event", "attempt", ref.String(), "error", err)

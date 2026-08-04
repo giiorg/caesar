@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,7 +64,14 @@ func collectResult(ctx context.Context, r *Runner, req runs.ExecutionRequest, sp
 		artifacts = append(artifacts, runs.NewArtifact{
 			Type: runs.ArtifactKindPatch,
 			Payload: map[string]any{
-				"diff":      string(rep.Diff),
+				// diff is base64 by contract. A patch is arbitrary bytes — a
+				// file in a legacy encoding is diffed as text, so its raw
+				// non-UTF-8 bytes land in the patch — and this payload is
+				// stored as JSON, which replaces invalid UTF-8 in a string
+				// with U+FFFD. That corruption is silent: the mangled patch
+				// still applies. Consumers (Plan 08's publish path) decode
+				// once; nothing round-trips it through a Go string.
+				"diff":      base64.StdEncoding.EncodeToString(rep.Diff),
 				"base_sha":  req.BaseSHA,
 				"tree_hash": rep.TreeHash,
 			},

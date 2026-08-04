@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/giiorg/caesar/backend/internal/runs"
 )
 
@@ -167,6 +169,26 @@ func TestLogStreamer_SurfacesEgressDenials(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("denial %d = %v, want %v", i, got[i], want[i])
 		}
+	}
+}
+
+func TestDenialReporter_EmitsThePinnedPayloadAndCapsTheEventStream(t *testing.T) {
+	sink := &logSink{}
+	r := newLogRunner(t, &logEngine{}, sink, 1<<20)
+	report := r.denialReporter(t.Context(), testRef())
+	for range maxDenialEvents + 5 {
+		report("evil.example", "host")
+	}
+
+	evs := sink.of("phase.egress_denied")
+	if len(evs) != maxDenialEvents {
+		t.Fatalf("emitted %d denial events, want the cap of %d", len(evs), maxDenialEvents)
+	}
+	// The gateway logs the refusal category as "kind"; the event names it
+	// "reason", which is what consumers read.
+	want := map[string]any{"host": "evil.example", "reason": "host"}
+	if diff := cmp.Diff(want, evs[0].Payload); diff != "" {
+		t.Errorf("denial payload (-want +got):\n%s", diff)
 	}
 }
 

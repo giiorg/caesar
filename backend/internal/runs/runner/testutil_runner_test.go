@@ -4,6 +4,7 @@ package runner
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"net/http"
@@ -289,6 +290,22 @@ func readLogFile(t *testing.T, r *Runner, ref runs.AttemptRef, name string) stri
 	raw, err := os.ReadFile(filepath.Join(r.logsDir(ref), name))
 	if err != nil {
 		t.Fatalf("read %s: %v", name, err)
+	}
+	return string(raw)
+}
+
+// decodedDiff reads the patch payload's diff the way every consumer must:
+// the field is base64 by contract, so that a patch carrying non-UTF-8 bytes
+// survives the JSON boundary intact.
+func decodedDiff(t *testing.T, payload map[string]any) string {
+	t.Helper()
+	encoded, ok := payload["diff"].(string)
+	if !ok {
+		t.Fatalf("patch payload has no diff string: %v", payload)
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("patch diff is not base64: %v", err)
 	}
 	return string(raw)
 }
