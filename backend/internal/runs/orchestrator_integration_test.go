@@ -255,6 +255,16 @@ func TestHangingAttemptReconcilesAndExhausts(t *testing.T) {
 	if final.Outcome == nil || final.Outcome.Code != runs.CodeAttemptsExhausted {
 		t.Errorf("outcome = %+v", final.Outcome)
 	}
+	// Single-counting invariant: usage is the sum of disjoint
+	// claim->terminal intervals inside the run's lifetime, so it can
+	// never exceed the run's total wall time. A fenced evaluation (the
+	// hung worker losing to the reconciler) must add nothing.
+	if final.FinishedAt == nil {
+		t.Fatal("failed run must carry finished_at")
+	}
+	if wall := final.FinishedAt.Sub(final.CreatedAt).Milliseconds(); final.ExecutionUsedMS > wall {
+		t.Errorf("execution_used_ms = %d exceeds run wall time %dms — usage double-counted", final.ExecutionUsedMS, wall)
+	}
 	evs, _ := svc.ListRunEvents(ctx, run.ID, 0, 500)
 	reconciling := 0
 	for _, e := range evs {

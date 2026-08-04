@@ -604,12 +604,11 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	if err != nil {
 		return err
 	}
+	// Usage accrues only after winning the fencing CAS below: a fenced
+	// evaluation must leave no trace, or the reconciler and the hung
+	// worker would each account the same claim->terminal interval
+	// (invariant 11: usage accumulates once).
 	q := store.New(tx)
-	if deltaMS > 0 {
-		if _, err := q.AddRunUsage(ctx, store.AddRunUsageParams{ID: c.Ref.RunID, DeltaMs: deltaMS}); err != nil {
-			return err
-		}
-	}
 	if out.Retryable() && c.Ref.Attempt < c.MaxAttempts {
 		// Retry: prior attempt -> failed, next attempt inserted, SAME tx
 		// (spec §2). failed rows always have successors (plan decision 3).
@@ -619,6 +618,11 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		}
 		if n == 0 {
 			return nil // fenced
+		}
+		if deltaMS > 0 {
+			if _, err := q.AddRunUsage(ctx, store.AddRunUsageParams{ID: c.Ref.RunID, DeltaMs: deltaMS}); err != nil {
+				return err
+			}
 		}
 		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, c.Ref.NodeID, c.Ref.Attempt+1, c.MaxAttempts); err != nil {
 			return err
@@ -639,6 +643,11 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	}
 	if n == 0 {
 		return nil // fenced
+	}
+	if deltaMS > 0 {
+		if _, err := q.AddRunUsage(ctx, store.AddRunUsageParams{ID: c.Ref.RunID, DeltaMs: deltaMS}); err != nil {
+			return err
+		}
 	}
 	runOut := out
 	if out.Retryable() { // retryable but exhausted
