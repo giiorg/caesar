@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -204,11 +205,54 @@ func (r *Runner) logRefArtifact(ref runs.AttemptRef) runs.NewArtifact {
 	}
 	return runs.NewArtifact{Type: runs.ArtifactKindLogRef, Payload: map[string]any{
 		"streams": streams,
-		// The gateway's metered usage is harvested into this map by the
-		// enforcement task; the key exists from the start so no consumer has
-		// to special-case its absence.
-		"egress": map[string]any{},
+		"egress":  egressUsage(filepath.Join(r.logsDir(ref), gatewayLogFile)),
 	}}
+}
+
+// egressSummaryTailBytes is how far back into the gateway's log the harvest
+// looks. The summary is written last by construction, so the tail is where it
+// is — and reading a tail keeps a chatty gateway from making this expensive.
+const egressSummaryTailBytes = 64 << 10
+
+// egressSummaryLine is the gateway's final usage line. The field names are
+// the meter's contract (egress.logMeter writes them); this struct is the
+// other end of it.
+type egressSummaryLine struct {
+	Msg           string `json:"msg"`
+	Requests      int64  `json:"requests"`
+	Denied        int64  `json:"denied"`
+	RequestBytes  int64  `json:"request_bytes"`
+	ResponseBytes int64  `json:"response_bytes"`
+	Connects      int64  `json:"connects"`
+	ConnectBytes  int64  `json:"connect_bytes"`
+}
+
+// egressUsage harvests the attempt's egress bill: the last egress.summary
+// line the gateway flushed. A gateway killed before it could flush, or a line
+// torn by the log cap, yields zeroes carrying parse_error — the counters read
+// as unknown, never as "this attempt used nothing".
+func egressUsage(gatewayLog string) map[string]any {
+	raw := readTail(gatewayLog, egressSummaryTailBytes)
+	// Backwards: the last summary is the whole attempt's total, and an
+	// earlier one is a stale reading of the same counters.
+	lines := bytes.Split(raw, []byte("\n"))
+	for i := len(lines) - 1; i >= 0; i-- {
+		var s egressSummaryLine
+		if err := json.Unmarshal(bytes.TrimSpace(lines[i]), &s); err != nil || s.Msg != "egress.summary" {
+			continue
+		}
+		return map[string]any{
+			"requests": s.Requests, "denied": s.Denied,
+			"request_bytes": s.RequestBytes, "response_bytes": s.ResponseBytes,
+			"connects": s.Connects, "connect_bytes": s.ConnectBytes,
+		}
+	}
+	return map[string]any{
+		"requests": int64(0), "denied": int64(0),
+		"request_bytes": int64(0), "response_bytes": int64(0),
+		"connects": int64(0), "connect_bytes": int64(0),
+		"parse_error": true,
+	}
 }
 
 // writeContract hands one input file to a trusted container.

@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,6 +25,12 @@ const (
 	// gatewayStopGrace is how long the gateway gets to flush its final
 	// egress.summary line after TERM before it is killed outright.
 	gatewayStopGrace = 5 * time.Second
+
+	// agentCorpseGrace is how long the daemon gets to finish reaping a killed
+	// agent before it is inspected. Without it the failure snapshot can
+	// describe a container that is still technically running, and report the
+	// exit code of a process that had not exited yet.
+	agentCorpseGrace = 5 * time.Second
 
 	// streamDrainGrace is how long a log stream gets to end on its own once
 	// its container is gone, before the follow is cancelled out from under it.
@@ -89,11 +96,53 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	if err := r.stageAttempt(ctx, ref, spec, clone); err != nil {
 		return runs.ExecutionResult{}, err
 	}
-	exitCode, oom, err := r.runAgentToCompletion(ctx, ref, spec)
+	agent, err := r.runAgentToCompletion(ctx, ref, spec)
 	if err != nil {
-		return runs.ExecutionResult{}, err
+		return r.failureResult(ref, spec, agent), err
 	}
-	return collectResult(ctx, r, req, spec, exitCode, oom)
+	res, err := collectResult(ctx, r, req, spec, agent.exitCode, agent.oom)
+	if err != nil {
+		return r.failureResult(ref, spec, agent), err
+	}
+	return res, nil
+}
+
+// agentOutcome is what the untrusted half of the pipeline left behind: the
+// agent's corpse, inspected before teardown removed it.
+type agentOutcome struct {
+	started  bool // the agent container actually ran
+	inspect  dockerapi.ContainerInspect
+	exitCode int64
+	oom      bool
+}
+
+// failureResult assembles the evidence a failed attempt owes the
+// orchestrator, which persists artifacts that ride a failure return. A
+// failure before the agent ever started carries none: nothing ran, so there
+// is nothing to describe, and an empty snapshot would only look like one.
+func (r *Runner) failureResult(ref runs.AttemptRef, spec RunSpec, agent agentOutcome) runs.ExecutionResult {
+	if !agent.started {
+		return runs.ExecutionResult{}
+	}
+	return runs.ExecutionResult{Artifacts: []runs.NewArtifact{
+		r.logRefArtifact(ref),
+		{
+			Type: runs.ArtifactKindFailureSnapshot,
+			Payload: buildFailureSnapshot(agent.inspect,
+				filepath.Join(r.logsDir(ref), agentLogFile), snapshotTailBytes,
+				filepath.Join(r.attemptDir(ref), gitops.WorkspaceDir),
+				attemptSecrets(spec)),
+		},
+	}}
+}
+
+// attemptSecrets is everything about this attempt that must never reach an
+// artifact: the token the agent authenticates to the gateway with, and the
+// provider credential the gateway holds on its behalf. A snapshot is read by
+// humans and stored beside the run, so anything listed here is redacted out
+// of every string it carries.
+func attemptSecrets(spec RunSpec) []string {
+	return []string{spec.BrokerToken, spec.ProviderCredential}
 }
 
 // ensureNetworks brings up the shared egress network (once per host) and this
@@ -181,7 +230,9 @@ func (r *Runner) stageAttempt(ctx context.Context, ref runs.AttemptRef, spec Run
 // comes up first so the agent never races a missing broker, both containers
 // stream into capped log files, and the gateway is stopped gracefully at the
 // end so its usage summary flushes.
-func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, spec RunSpec) (int64, bool, error) {
+func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, spec RunSpec) (agentOutcome, error) {
+	var out agentOutcome
+
 	// The log streams deliberately do not inherit the attempt's deadline: a
 	// killed agent's last words are exactly what an operator needs. They end
 	// when their container does, or when this function returns.
@@ -212,21 +263,56 @@ func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, 
 
 	gatewayID, err := r.startGateway(ctx, ref, spec)
 	if err != nil {
-		return 0, false, err
+		return out, err
 	}
+	// The gateway's stream carries no flood kill: it is trusted code whose
+	// volume is one line per request, it is already bounded by the per-stream
+	// cap, and it runs before there is an agent to kill.
 	streams = append(streams, r.streamLogs(streamCtx, gatewayID,
-		filepath.Join(r.logsDir(ref), gatewayLogFile), ref, "gateway", r.denialReporter(ctx, ref)))
+		filepath.Join(r.logsDir(ref), gatewayLogFile), ref, streamOpts{
+			stream:   "gateway",
+			onDenied: r.denialReporter(ctx, ref),
+		}))
 
 	agentID, err := r.startAgent(ctx, ref, spec)
 	if err != nil {
-		return 0, false, err
+		return out, err
 	}
+	out.started = true
+
+	// execCtx records why the agent was killed. A killed container exits 137
+	// whatever the reason, so the cause — not the exit code — is what says
+	// which limit it hit. The first cause wins, so an attempt that breaches
+	// two limits at once is still reported as one death.
+	execCtx, cancelCause := context.WithCancelCause(ctx)
+	defer cancelCause(context.Canceled)
+	enforce := func(reason error) {
+		cancelCause(reason)
+		r.log.Warn("runner.enforced", "attempt", ref.String(), "reason", reason.Error())
+		if err := r.engine.ContainerKill(context.WithoutCancel(ctx), agentID, "KILL"); err != nil &&
+			!dockerapi.IsNotFound(err) && !dockerapi.IsConflict(err) {
+			r.log.Warn("runner.agent_kill", "attempt", ref.String(), "error", err)
+		}
+	}
+
 	streams = append(streams, r.streamLogs(streamCtx, agentID,
-		filepath.Join(r.logsDir(ref), agentLogFile), ref, "agent", nil))
+		filepath.Join(r.logsDir(ref), agentLogFile), ref, streamOpts{
+			stream: "agent",
+			onFlood: func() {
+				enforce(permanentf(runs.CodeLogFlood,
+					"agent produced more than %d bytes of log output", r.opts.LogFloodBytes))
+			},
+		}))
 
 	watchCtx, stopWatch := context.WithCancel(streamCtx)
 	defer stopWatch()
-	go r.watchWorkspace(watchCtx, ref)
+	go watchWorkspace(watchCtx, filepath.Join(r.attemptDir(ref), gitops.WorkspaceDir),
+		r.opts.WorkspaceQuotaBytes, r.opts.WorkspaceQuotaFiles, r.opts.QuotaPollInterval,
+		func(st gitops.WalkStats) {
+			enforce(permanentf(runs.CodeWorkspaceQuotaExceeded,
+				"workspace exceeded its quota: %d files, %d bytes past %d files / %d bytes",
+				st.Files, st.Bytes, r.opts.WorkspaceQuotaFiles, r.opts.WorkspaceQuotaBytes))
+		})
 
 	code, waitErr := r.engine.ContainerWait(ctx, agentID)
 	stopWatch()
@@ -238,20 +324,40 @@ func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, 
 		if err := r.engine.ContainerKill(context.WithoutCancel(ctx), agentID, "KILL"); err != nil && !dockerapi.IsNotFound(err) && !dockerapi.IsConflict(err) {
 			r.log.Warn("runner.agent_kill", "attempt", ref.String(), "error", err)
 		}
-	}
-	r.stopGateway(ctx, gatewayID)
-	if expired {
-		return 0, false, ctx.Err()
-	}
-	if waitErr != nil {
-		return 0, false, transientf(runs.CodeHarnessError, "wait for agent: %v", waitErr)
+		// The wait above returned because the deadline passed, not because
+		// the agent stopped; the snapshot below deserves a real corpse.
+		reapCtx, cancelReap := context.WithTimeout(context.WithoutCancel(ctx), agentCorpseGrace)
+		if reaped, err := r.engine.ContainerWait(reapCtx, agentID); err == nil {
+			out.exitCode = reaped
+		}
+		cancelReap()
 	}
 
-	oom := false
-	if insp, err := r.engine.ContainerInspect(context.WithoutCancel(ctx), agentID); err == nil {
-		oom = insp.State.OOMKilled
+	// The corpse is inspected before the gateway is stopped and long before
+	// teardown: after that there is nothing left to ask.
+	if !expired {
+		out.exitCode = code
 	}
-	return code, oom, nil
+	if insp, err := r.engine.ContainerInspect(context.WithoutCancel(ctx), agentID); err == nil {
+		out.inspect, out.oom = insp, insp.State.OOMKilled
+	} else {
+		r.log.Warn("runner.agent_inspect", "attempt", ref.String(), "error", err)
+	}
+	r.stopGateway(ctx, gatewayID)
+
+	// Enforcement speaks first: an agent this runner killed did not fail on
+	// its own terms, and its exit code is an artifact of the signal.
+	var enforced runs.OutcomeError
+	if errors.As(context.Cause(execCtx), &enforced) {
+		return out, enforced
+	}
+	if expired {
+		return out, ctx.Err()
+	}
+	if waitErr != nil {
+		return out, transientf(runs.CodeHarnessError, "wait for agent: %v", waitErr)
+	}
+	return out, nil
 }
 
 // startGateway brings up the attempt's egress process: dual-homed onto the
@@ -367,31 +473,6 @@ func (r *Runner) denialReporter(ctx context.Context, ref runs.AttemptRef) func(h
 		})
 		if err != nil {
 			r.log.Warn("runner.egress_denied.event", "attempt", ref.String(), "error", err)
-		}
-	}
-}
-
-// watchWorkspace samples the agent's workspace against its quota while the
-// agent runs. It observes only: the kill and the typed workspace_quota_exceeded
-// outcome are the enforcement task's, and this is the seam they attach to.
-func (r *Runner) watchWorkspace(ctx context.Context, ref runs.AttemptRef) {
-	ws := filepath.Join(r.attemptDir(ref), gitops.WorkspaceDir)
-	tick := time.NewTicker(r.opts.QuotaPollInterval)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-			st, err := gitops.BoundedWalk(ws, true, r.opts.WorkspaceQuotaFiles, r.opts.WorkspaceQuotaBytes)
-			if err != nil {
-				continue // a workspace churning under the walk is normal
-			}
-			if st.Breached {
-				r.log.Warn("runner.workspace_quota_breached", "attempt", ref.String(),
-					"files", st.Files, "bytes", st.Bytes)
-				return
-			}
 		}
 	}
 }

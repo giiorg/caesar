@@ -68,14 +68,17 @@ func (s *logSink) of(kind string) []recordedEvent {
 	return out
 }
 
-func newLogRunner(t *testing.T, eng Engine, sink EventSink, capBytes int64) *Runner {
+func newLogRunner(t *testing.T, eng Engine, sink EventSink, capBytes, floodBytes int64) *Runner {
 	t.Helper()
+	if floodBytes == 0 {
+		floodBytes = capBytes
+	}
 	r, err := New(eng, nil, nil, nil, sink, Options{
 		CaesarImage:   "caesar:dev",
 		GitImage:      "caesar-git:dev",
 		DataRoot:      t.TempDir(),
 		LogCapBytes:   capBytes,
-		LogFloodBytes: capBytes,
+		LogFloodBytes: floodBytes,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -96,10 +99,10 @@ func TestLogStreamer_CapsTheFileAndReportsTruncationOnce(t *testing.T) {
 	}
 
 	sink := &logSink{}
-	r := newLogRunner(t, &logEngine{body: body.Bytes()}, sink, capBytes)
+	r := newLogRunner(t, &logEngine{body: body.Bytes()}, sink, capBytes, 0)
 	path := filepath.Join(t.TempDir(), "agent.log")
 
-	s := r.streamLogs(t.Context(), "cid", path, testRef(), "agent", nil)
+	s := r.streamLogs(t.Context(), "cid", path, testRef(), streamOpts{stream: "agent"})
 	n, truncated, err := s.wait()
 	if err != nil {
 		t.Fatalf("wait: %v", err)
@@ -124,10 +127,10 @@ func TestLogStreamer_CapsTheFileAndReportsTruncationOnce(t *testing.T) {
 
 func TestLogStreamer_UnderTheCapIsWrittenWholeAndFiresNoEvent(t *testing.T) {
 	sink := &logSink{}
-	r := newLogRunner(t, &logEngine{body: logFrame(1, "hello\n")}, sink, 1<<20)
+	r := newLogRunner(t, &logEngine{body: logFrame(1, "hello\n")}, sink, 1<<20, 0)
 	path := filepath.Join(t.TempDir(), "agent.log")
 
-	n, truncated, err := r.streamLogs(t.Context(), "cid", path, testRef(), "agent", nil).wait()
+	n, truncated, err := r.streamLogs(t.Context(), "cid", path, testRef(), streamOpts{stream: "agent"}).wait()
 	if err != nil || truncated || n != 6 {
 		t.Fatalf("bytes=%d truncated=%v err=%v", n, truncated, err)
 	}
@@ -153,10 +156,12 @@ func TestLogStreamer_SurfacesEgressDenials(t *testing.T) {
 	body.Write(logFrame(1, "not json at all\n"))
 	body.Write(logFrame(2, `{"msg":"egress.denied","kind":"token","host":"api.anthropic.com"}`+"\n"))
 
-	r := newLogRunner(t, &logEngine{body: body.Bytes()}, &logSink{}, 1<<20)
+	r := newLogRunner(t, &logEngine{body: body.Bytes()}, &logSink{}, 1<<20, 0)
 	var got [][2]string
-	s := r.streamLogs(t.Context(), "cid", filepath.Join(t.TempDir(), "gateway.log"), testRef(), "gateway",
-		func(host, kind string) { got = append(got, [2]string{host, kind}) })
+	s := r.streamLogs(t.Context(), "cid", filepath.Join(t.TempDir(), "gateway.log"), testRef(), streamOpts{
+		stream:   "gateway",
+		onDenied: func(host, kind string) { got = append(got, [2]string{host, kind}) },
+	})
 	if _, _, err := s.wait(); err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +179,7 @@ func TestLogStreamer_SurfacesEgressDenials(t *testing.T) {
 
 func TestDenialReporter_EmitsThePinnedPayloadAndCapsTheEventStream(t *testing.T) {
 	sink := &logSink{}
-	r := newLogRunner(t, &logEngine{}, sink, 1<<20)
+	r := newLogRunner(t, &logEngine{}, sink, 1<<20, 0)
 	report := r.denialReporter(t.Context(), testRef())
 	for range maxDenialEvents + 5 {
 		report("evil.example", "host")
@@ -196,9 +201,48 @@ func TestLogStreamer_WithoutADenialCallbackScansNothing(t *testing.T) {
 	// The agent's own stdout must never be able to fabricate an egress event.
 	r := newLogRunner(t, &logEngine{
 		body: logFrame(1, `{"msg":"egress.denied","kind":"host","host":"fabricated"}`+"\n"),
-	}, &logSink{}, 1<<20)
+	}, &logSink{}, 1<<20, 0)
 	if _, _, err := r.streamLogs(t.Context(), "cid",
-		filepath.Join(t.TempDir(), "agent.log"), testRef(), "agent", nil).wait(); err != nil {
+		filepath.Join(t.TempDir(), "agent.log"), testRef(), streamOpts{stream: "agent"}).wait(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLogStreamer_FloodFiresOnceOnTheProducedVolume(t *testing.T) {
+	// The threshold is about what the container produced, not what reached
+	// disk: past the cap the bytes are dropped, and an agent that could
+	// escape the flood kill by exceeding the cap would have it backwards.
+	const capBytes, floodBytes = 100, 300
+	var body bytes.Buffer
+	for range 10 {
+		body.Write(logFrame(1, strings.Repeat("f", 50)))
+	}
+
+	r := newLogRunner(t, &logEngine{body: body.Bytes()}, &logSink{}, capBytes, floodBytes)
+	floods := 0
+	s := r.streamLogs(t.Context(), "cid", filepath.Join(t.TempDir(), "agent.log"), testRef(),
+		streamOpts{stream: "agent", onFlood: func() { floods++ }})
+
+	n, truncated, err := s.wait()
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if n != 500 || !truncated {
+		t.Fatalf("bytes=%d truncated=%v, want the whole produced stream, capped", n, truncated)
+	}
+	if floods != 1 {
+		t.Errorf("flood fired %d times, want exactly once", floods)
+	}
+}
+
+func TestLogStreamer_UnderTheFloodThresholdNeverFires(t *testing.T) {
+	r := newLogRunner(t, &logEngine{body: logFrame(1, strings.Repeat("f", 99))}, &logSink{}, 100, 300)
+	floods := 0
+	if _, _, err := r.streamLogs(t.Context(), "cid", filepath.Join(t.TempDir(), "agent.log"), testRef(),
+		streamOpts{stream: "agent", onFlood: func() { floods++ }}).wait(); err != nil {
+		t.Fatal(err)
+	}
+	if floods != 0 {
+		t.Errorf("flood fired %d times on a stream inside its threshold", floods)
 	}
 }

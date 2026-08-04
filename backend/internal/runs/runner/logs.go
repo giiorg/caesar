@@ -35,23 +35,35 @@ func (s *logStreamer) wait() (int64, bool, error) {
 	return s.bytes, s.truncated, s.err
 }
 
-// streamLogs follows containerID's output into path. stream names the role
-// ("agent"/"gateway") for the truncation event. onDenied, when non-nil, is
-// called for every `egress.denied` line the stream carries — it is wired for
-// the gateway alone, so nothing an agent prints can fabricate a denial event.
+// streamOpts is what one stream needs beyond its container and its file.
+// It is a struct because the callbacks are per-role: only the gateway's
+// stream is scanned for denials, and only the agent's kills on flood.
+type streamOpts struct {
+	// stream names the role ("agent"/"gateway") for the truncation event.
+	stream string
+	// onDenied, when non-nil, is called for every `egress.denied` line the
+	// stream carries. It is wired for the gateway alone, so nothing an agent
+	// prints can fabricate a denial event.
+	onDenied func(host, kind string)
+	// onFlood, when non-nil, fires once when the volume this container has
+	// produced crosses the flood threshold.
+	onFlood func()
+}
+
+// streamLogs follows containerID's output into path.
 func (r *Runner) streamLogs(ctx context.Context, containerID, path string, ref runs.AttemptRef,
-	stream string, onDenied func(host, kind string),
+	opts streamOpts,
 ) *logStreamer {
 	s := &logStreamer{done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
-		s.bytes, s.truncated, s.err = r.copyLogs(ctx, containerID, path, ref, stream, onDenied)
+		s.bytes, s.truncated, s.err = r.copyLogs(ctx, containerID, path, ref, opts)
 	}()
 	return s
 }
 
 func (r *Runner) copyLogs(ctx context.Context, containerID, path string, ref runs.AttemptRef,
-	stream string, onDenied func(host, kind string),
+	opts streamOpts,
 ) (int64, bool, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -60,12 +72,15 @@ func (r *Runner) copyLogs(ctx context.Context, containerID, path string, ref run
 	defer f.Close()
 
 	w := &cappedWriter{w: f, limit: r.opts.LogCapBytes}
-	if onDenied != nil {
+	if opts.onDenied != nil {
 		w.onLine = func(line []byte) {
 			if host, kind, ok := parseDenial(line); ok {
-				onDenied(host, kind)
+				opts.onDenied(host, kind)
 			}
 		}
+	}
+	if opts.onFlood != nil {
+		w.flood, w.onFlood = r.opts.LogFloodBytes, opts.onFlood
 	}
 
 	body, err := r.engine.ContainerLogs(ctx, containerID, true)
@@ -79,7 +94,7 @@ func (r *Runner) copyLogs(ctx context.Context, containerID, path string, ref run
 	copyErr := dockerapi.DemuxLogs(body, w, w)
 	w.flush()
 	if w.truncated {
-		r.emitTruncated(ctx, ref, stream, path, w.total)
+		r.emitTruncated(ctx, ref, opts.stream, path, w.total)
 	}
 	return w.total, w.truncated, copyErr
 }
@@ -115,6 +130,14 @@ type cappedWriter struct {
 	total     int64
 	truncated bool
 
+	// flood is the volume at which onFlood fires, once. It is measured
+	// against total rather than written: past the cap the bytes are dropped,
+	// and an agent that could outrun the flood kill by first exceeding the
+	// truncation cap would have the enforcement exactly backwards.
+	flood   int64
+	onFlood func()
+	flooded bool
+
 	onLine   func([]byte)
 	line     []byte
 	dropping bool
@@ -122,6 +145,10 @@ type cappedWriter struct {
 
 func (c *cappedWriter) Write(p []byte) (int, error) {
 	c.total += int64(len(p))
+	if c.onFlood != nil && !c.flooded && c.flood > 0 && c.total >= c.flood {
+		c.flooded = true
+		c.onFlood()
+	}
 	if c.onLine != nil {
 		c.scan(p)
 	}
