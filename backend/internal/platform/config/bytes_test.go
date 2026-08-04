@@ -35,3 +35,18 @@ func TestBytes_RejectsGarbage(t *testing.T) {
 		}
 	}
 }
+
+func TestBytes_RejectsOverflow(t *testing.T) {
+	// The suffix multiply must not wrap int64 negative past the n < 0 guard;
+	// a value this large has to error, while an in-range value still parses.
+	if err := json.Unmarshal([]byte(`"999999999TiB"`), new(Bytes)); err == nil {
+		t.Error(`"999999999TiB": expected overflow error, got none`)
+	}
+	var b Bytes
+	if err := json.Unmarshal([]byte(`"7TiB"`), &b); err != nil {
+		t.Fatalf(`"7TiB": %v`, err)
+	}
+	if b.Int64() != 7<<40 {
+		t.Errorf(`"7TiB": got %d want %d`, b.Int64(), int64(7)<<40)
+	}
+}

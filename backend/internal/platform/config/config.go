@@ -88,7 +88,12 @@ type Runner struct {
 
 // minRunnerPids floors pids_limit well above a shell + agent's needs so an
 // operator can't accidentally starve the container's process table.
-const minRunnerPids = 64
+// maxRunnerPids caps it (plan Global Constraints) so the process table can't
+// be sized into a local fork-bomb amplifier.
+const (
+	minRunnerPids = 64
+	maxRunnerPids = 4096
+)
 
 // Duration is a time.Duration that unmarshals from JSON strings like "15s".
 type Duration time.Duration
@@ -253,6 +258,9 @@ func (c Config) validate() error {
 	if c.Runner.Enabled && c.Runner.CaesarImage == "" {
 		problems = append(problems, "runner.caesar_image is required when runner.enabled is true")
 	}
+	if c.Runner.Enabled && c.Runner.GitImage == "" {
+		problems = append(problems, "runner.git_image is required when runner.enabled is true")
+	}
 	if c.Runner.LogFloodBytes.Int64() < c.Runner.LogCapBytes.Int64() {
 		problems = append(problems, "runner.log_flood_bytes must be >= runner.log_cap_bytes")
 	}
@@ -261,6 +269,9 @@ func (c Config) validate() error {
 	}
 	if c.Runner.PidsLimit < minRunnerPids {
 		problems = append(problems, fmt.Sprintf("runner.pids_limit must be at least %d", minRunnerPids))
+	}
+	if c.Runner.PidsLimit > maxRunnerPids {
+		problems = append(problems, fmt.Sprintf("runner.pids_limit must be at most %d", maxRunnerPids))
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))

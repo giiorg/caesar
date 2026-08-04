@@ -97,22 +97,42 @@ func (a appCredentialOpener) OpenCredential(ctx context.Context, id uuid.UUID, p
 type appGitSource struct{ svc *assets.Service }
 
 func (a appGitSource) CloneSpec(ctx context.Context, repo runs.RepoRef) (runner.CloneSpec, error) {
-	var base string
-	switch repo.Forge {
-	case "github":
-		base = "https://github.com/"
-	case "gitlab":
-		base = "https://gitlab.com/"
-	default:
-		return runner.CloneSpec{}, fmt.Errorf("app: git source: unsupported forge %q (self-hosted base URLs arrive in Plan 08)", repo.Forge)
+	// Resolve (and validate) the forge before opening the credential: an
+	// unsupported forge must fail without an audited secret use.
+	url, err := cloneURL(repo.Forge, repo.Slug)
+	if err != nil {
+		return runner.CloneSpec{}, err
 	}
 	token, err := a.svc.UseCredential(ctx, repo.CredentialID, "clone:"+repo.Slug)
 	if err != nil {
 		return runner.CloneSpec{}, err
 	}
-	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + string(token)))
 	return runner.CloneSpec{
-		URL:        base + repo.Slug + ".git",
-		AuthHeader: "Authorization: Basic " + auth,
+		URL:        url,
+		AuthHeader: cloneAuthHeader(string(token)),
 	}, nil
+}
+
+// cloneURL builds the hosted HTTPS clone URL for a forge/slug pair, rejecting
+// any forge whose base URL is not yet pinned. Kept pure (no credential, no
+// assets) so the github/gitlab switch is unit-testable on its own.
+func cloneURL(forge, slug string) (string, error) {
+	var base string
+	switch forge {
+	case "github":
+		base = "https://github.com/"
+	case "gitlab":
+		base = "https://gitlab.com/"
+	default:
+		return "", fmt.Errorf("app: git source: unsupported forge %q (self-hosted base URLs arrive in Plan 08)", forge)
+	}
+	return base + slug + ".git", nil
+}
+
+// cloneAuthHeader renders the forge token as a Basic auth header. The token
+// travels here, never inside the URL (a token-in-URL lands in reflogs and
+// process listings).
+func cloneAuthHeader(token string) string {
+	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	return "Authorization: Basic " + auth
 }

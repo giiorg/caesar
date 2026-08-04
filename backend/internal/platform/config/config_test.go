@@ -276,11 +276,13 @@ func TestConfig_RunnerDefaultsAndValidation(t *testing.T) {
 
 	t.Run("fails closed", func(t *testing.T) {
 		tests := []struct{ name, block, wantErr string }{
-			{"enabled without caesar_image", `{"enabled": true}`, "runner.caesar_image"},
+			{"enabled without caesar_image", `{"enabled": true, "git_image": "caesar-git:dev"}`, "runner.caesar_image"},
+			{"enabled without git_image", `{"enabled": true, "caesar_image": "caesar:dev"}`, "runner.git_image"},
 			{"log_flood below log_cap", `{"log_cap_bytes": "16MiB", "log_flood_bytes": "8MiB"}`, "runner.log_flood_bytes"},
 			{"cpus zero", `{"cpus": 0}`, "runner.cpus"},
 			{"cpus over ceiling", `{"cpus": 65}`, "runner.cpus"},
 			{"pids_limit below floor", `{"pids_limit": 8}`, "runner.pids_limit"},
+			{"pids_limit above ceiling", `{"pids_limit": 8192}`, "runner.pids_limit"},
 			{"unknown key inside runner", `{"wat": 1}`, "unknown field"},
 		}
 		for _, tt := range tests {

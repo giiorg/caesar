@@ -234,7 +234,7 @@ runner is unreachable today — the flag exists so config, wiring, and
 validation are real now and the deploy stack flips one boolean. In prod,
 network isolation must not rest on Docker alone: the host firewall must
 deny the agent subnets everything except the gateway (baseline in the
-Plan 13 deployment runbook).
+Plan 14 deployment runbook).
 
 ## Contracts
 

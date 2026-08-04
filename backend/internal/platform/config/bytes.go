@@ -36,6 +36,13 @@ func (b *Bytes) UnmarshalJSON(raw []byte) error {
 	if err != nil || n < 0 {
 		return fmt.Errorf("invalid byte size %q", s)
 	}
+	// The suffix multiply can overflow int64 and wrap negative — past the
+	// n < 0 guard above, which runs before it. A wrapped-negative quota would
+	// sail into the trusted containers and silently disarm the bound, so
+	// reject any product that doesn't divide back to n.
+	if n != 0 && (n*mult)/mult != n {
+		return fmt.Errorf("byte size %q overflows int64", s)
+	}
 	*b = Bytes(n * mult)
 	return nil
 }
