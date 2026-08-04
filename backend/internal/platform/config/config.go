@@ -17,11 +17,12 @@ import (
 )
 
 type Config struct {
-	Server   Server   `json:"server"`
-	Database Database `json:"database"`
-	Log      Log      `json:"log"`
-	Auth     Auth     `json:"auth"`
-	Security Security `json:"security"`
+	Server       Server       `json:"server"`
+	Database     Database     `json:"database"`
+	Log          Log          `json:"log"`
+	Auth         Auth         `json:"auth"`
+	Security     Security     `json:"security"`
+	Orchestrator Orchestrator `json:"orchestrator"`
 }
 
 type Server struct {
@@ -51,6 +52,16 @@ type Security struct {
 	MasterKey string `json:"master_key"`
 }
 
+// Orchestrator tunes the execution spine's queue loop: worker
+// parallelism, poll cadence, lease lifetimes, and outbox retention.
+type Orchestrator struct {
+	Workers           int      `json:"workers"`
+	PollInterval      Duration `json:"poll_interval"`
+	LeaseTTL          Duration `json:"lease_ttl"`
+	HeartbeatInterval Duration `json:"heartbeat_interval"`
+	OutboxRetention   Duration `json:"outbox_retention"`
+}
+
 // Duration is a time.Duration that unmarshals from JSON strings like "15s".
 type Duration time.Duration
 
@@ -74,6 +85,13 @@ func defaults() Config {
 		Server: Server{Addr: ":8080", ShutdownTimeout: Duration(15 * time.Second), AppOrigin: "http://localhost:8080"},
 		Log:    Log{Level: "info"},
 		Auth:   Auth{SessionIdleTTL: Duration(14 * 24 * time.Hour), SessionAbsoluteTTL: Duration(90 * 24 * time.Hour)},
+		Orchestrator: Orchestrator{
+			Workers:           4,
+			PollInterval:      Duration(500 * time.Millisecond),
+			LeaseTTL:          Duration(30 * time.Second),
+			HeartbeatInterval: Duration(10 * time.Second),
+			OutboxRetention:   Duration(168 * time.Hour),
+		},
 	}
 }
 
@@ -124,6 +142,24 @@ func (c Config) validate() error {
 	}
 	if c.Auth.SessionAbsoluteTTL.Std() < c.Auth.SessionIdleTTL.Std() {
 		problems = append(problems, "auth.session_absolute_ttl must be >= auth.session_idle_ttl")
+	}
+	if c.Orchestrator.Workers < 1 || c.Orchestrator.Workers > 64 {
+		problems = append(problems, "orchestrator.workers must be 1-64")
+	}
+	if c.Orchestrator.PollInterval.Std() <= 0 {
+		problems = append(problems, "orchestrator.poll_interval must be positive")
+	}
+	if c.Orchestrator.LeaseTTL.Std() <= 0 {
+		problems = append(problems, "orchestrator.lease_ttl must be positive")
+	}
+	if c.Orchestrator.HeartbeatInterval.Std() <= 0 {
+		problems = append(problems, "orchestrator.heartbeat_interval must be positive")
+	}
+	if c.Orchestrator.OutboxRetention.Std() <= 0 {
+		problems = append(problems, "orchestrator.outbox_retention must be positive")
+	}
+	if c.Orchestrator.HeartbeatInterval.Std() >= c.Orchestrator.LeaseTTL.Std() {
+		problems = append(problems, "orchestrator.heartbeat_interval must be below orchestrator.lease_ttl")
 	}
 	if c.Security.MasterKey != "" {
 		if _, err := secrets.ParseKeyset(c.Security.MasterKey); err != nil {

@@ -1,0 +1,96 @@
+package runs
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/giiorg/caesar/backend/internal/platform/audit"
+	"github.com/giiorg/caesar/backend/internal/platform/authn"
+	"github.com/giiorg/caesar/backend/internal/platform/clock"
+	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
+)
+
+// Params is the injected policy source until Plan 09's engine: app
+// wires DefaultSnapshot(); tests wire short budgets.
+type Params struct {
+	Snapshot PolicySnapshot
+}
+
+type Service struct {
+	pool      *pgxpool.Pool
+	clock     clock.Clock
+	audit     *audit.Recorder
+	defs      DefinitionSource
+	repos     RepoSource
+	harnesses HarnessSource
+	forge     Forge
+	params    Params
+}
+
+func NewService(pool *pgxpool.Pool, c clock.Clock, rec *audit.Recorder,
+	defs DefinitionSource, repos RepoSource, harnesses HarnessSource, forge Forge, p Params,
+) *Service {
+	return &Service{
+		pool: pool, clock: c, audit: rec, defs: defs, repos: repos,
+		harnesses: harnesses, forge: forge, params: p,
+	}
+}
+
+func actorID(p authn.Principal) uuid.NullUUID {
+	return uuid.NullUUID{UUID: p.UserID, Valid: true}
+}
+
+func notFound(err error, msg string) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return xerrors.E(xerrors.ClassNotFound, msg)
+	}
+	return err
+}
+
+// unmarshalMap decodes a jsonb column into a map, tolerating NULL/empty.
+func unmarshalMap(raw []byte) (map[string]any, error) {
+	out := map[string]any{}
+	if len(raw) == 0 {
+		return out, nil
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("runs: unmarshal jsonb: %w", err)
+	}
+	return out, nil
+}
+
+// snapshotFromRow re-parses the pinned snapshot; corruption is internal.
+func snapshotFromRow(raw []byte) (PolicySnapshot, error) {
+	var s PolicySnapshot
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return PolicySnapshot{}, fmt.Errorf("runs: pinned snapshot corrupt: %w", err)
+	}
+	return s, nil
+}
+
+// outcomeFromRow decodes the optional outcome column.
+func outcomeFromRow(raw []byte) (*Outcome, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var o Outcome
+	if err := json.Unmarshal(raw, &o); err != nil {
+		return nil, fmt.Errorf("runs: outcome corrupt: %w", err)
+	}
+	return &o, nil
+}
+
+// compilePinned parses a stored document mirror out of raw store bytes.
+// Failures are internal_error by definition (plan Task 3 note).
+func compilePinned(def PinnedDefinition) (ExecPlan, error) {
+	plan, err := Compile(def.Doc)
+	if err != nil {
+		return ExecPlan{}, fmt.Errorf("runs: stored definition %s: %w", def.VersionID, err)
+	}
+	return plan, nil
+}

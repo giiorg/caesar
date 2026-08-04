@@ -180,6 +180,19 @@ func (s *Service) GetHarness(ctx context.Context, id uuid.UUID) (Harness, error)
 	return harnessFromRow(row)
 }
 
+// GetHarnessByName resolves a definition's harness reference — the
+// execution spine's intake path (wired through app's adapters).
+func (s *Service) GetHarnessByName(ctx context.Context, name string) (Harness, error) {
+	row, err := store.New(s.pool).GetHarnessByName(ctx, name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Harness{}, xerrors.E(xerrors.ClassNotFound, "no such harness")
+	}
+	if err != nil {
+		return Harness{}, fmt.Errorf("assets: get harness by name: %w", err)
+	}
+	return harnessFromRow(row)
+}
+
 func (s *Service) UpdateHarness(ctx context.Context, actor authn.Principal, id uuid.UUID, upd HarnessUpdate) (Harness, error) {
 	var h Harness
 	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {

@@ -16,6 +16,7 @@ import (
 	assetsapi "github.com/giiorg/caesar/backend/internal/assets/api"
 	identityapi "github.com/giiorg/caesar/backend/internal/identity/api"
 	"github.com/giiorg/caesar/backend/internal/platform/httpx"
+	runsapi "github.com/giiorg/caesar/backend/internal/runs/api"
 	workflowsapi "github.com/giiorg/caesar/backend/internal/workflows/api"
 )
 
@@ -84,6 +85,13 @@ type workflowVersionParams struct {
 	Version string `path:"version" description:"version number"`
 }
 
+// runEventsParams covers GET …/runs/{id}/events — one path parameter
+// plus the poll cursor, no body.
+type runEventsParams struct {
+	idParams
+	After string `query:"after" description:"return events with id greater than this"`
+}
+
 // requestOverrides maps operation IDs whose request combines a body with
 // path parameters onto their wrapper structs. Every new id-bearing body
 // gets an entry; requestStructure panics loudly otherwise.
@@ -99,6 +107,7 @@ var requestOverrides = map[string]any{
 	"updateWorkflow":         idAndUpdateWorkflow{},
 	"createWorkflowVersion":  idAndCreateWorkflowVersion{},
 	"getWorkflowVersion":     workflowVersionParams{},
+	"listRunEvents":          runEventsParams{},
 }
 
 // operationTables collects every context's route table with nil
@@ -108,6 +117,7 @@ func operationTables() [][]httpx.Operation {
 		identityapi.Operations(identityapi.New(nil, 0, nil)),
 		assetsapi.Operations(assetsapi.New(nil, nil, nil, nil)),
 		workflowsapi.Operations(workflowsapi.New(nil, nil)),
+		runsapi.Operations(runsapi.New(nil, nil, nil, nil)),
 	}
 }
 

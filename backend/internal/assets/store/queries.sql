@@ -93,6 +93,9 @@ FROM harnesses ORDER BY name;
 SELECT id, name, kind, image_ref, provider_endpoint, credential_id, defaults, created_at, updated_at
 FROM harnesses WHERE id = $1;
 
+-- name: GetHarnessByName :one
+SELECT * FROM harnesses WHERE name = $1;
+
 -- name: UpdateHarness :one
 UPDATE harnesses SET name = $2, image_ref = $3, provider_endpoint = $4, credential_id = $5, defaults = $6, updated_at = $7
 WHERE id = $1

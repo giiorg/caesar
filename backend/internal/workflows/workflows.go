@@ -184,6 +184,10 @@ func (s *Service) UpdateWorkflow(ctx context.Context, actor authn.Principal, id 
 func (s *Service) DeleteWorkflow(ctx context.Context, actor authn.Principal, id uuid.UUID) error {
 	return pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		n, err := store.New(tx).DeleteWorkflow(ctx, id)
+		// Versions cascade, but a task pins one with ON DELETE RESTRICT.
+		if isFKViolation(err) {
+			return xerrors.E(xerrors.ClassConflict, "workflow has runs; delete is blocked")
+		}
 		if err != nil {
 			return fmt.Errorf("workflows: delete: %w", err)
 		}
@@ -283,6 +287,19 @@ func (s *Service) GetVersion(ctx context.Context, workflowID uuid.UUID, version 
 	}
 	if err != nil {
 		return Version{}, fmt.Errorf("workflows: get version: %w", err)
+	}
+	return versionFromRow(r), nil
+}
+
+// GetVersionByID resolves a pinned version directly — the execution
+// spine's re-run and plan-loading path (wired through app's adapters).
+func (s *Service) GetVersionByID(ctx context.Context, id uuid.UUID) (Version, error) {
+	r, err := store.New(s.pool).GetVersionByID(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Version{}, xerrors.E(xerrors.ClassNotFound, "no such workflow version")
+	}
+	if err != nil {
+		return Version{}, fmt.Errorf("workflows: get version by id: %w", err)
 	}
 	return versionFromRow(r), nil
 }

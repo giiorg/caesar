@@ -352,6 +352,114 @@ export interface paths {
         patch: operations["updateRepo"];
         trace?: never;
     };
+    "/api/v1/runs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a run with phases and artifact metadata (view)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["getRun"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/runs/{id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Poll a run's events after an id (view)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["listRunEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List tasks visible to the caller
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["listTasks"];
+        put?: never;
+        /**
+         * Create a task and its first run (run grant)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        post: operations["createTask"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a task (view)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["getTask"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/{id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a task's runs, newest first (view)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["listTaskRuns"];
+        put?: never;
+        /**
+         * Re-run a task, superseding a pending run (run grant)
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        post: operations["rerunTask"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/users": {
         parameters: {
             query?: never;
@@ -500,6 +608,16 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ApiArtifactResponse: {
+            /** Format: int32 */
+            attempt?: number;
+            /** Format: date-time */
+            created_at?: string;
+            id?: string;
+            node_id?: string;
+            parent_ids?: string[] | null;
+            type?: string;
+        };
         ApiChangePasswordRequest: {
             current_password?: string;
             new_password?: string;
@@ -512,6 +630,16 @@ export interface components {
         ApiCreateProjectRequest: {
             description?: string;
             name?: string;
+        };
+        ApiCreateTaskRequest: {
+            inputs?: {
+                [key: string]: unknown;
+            };
+            repo_id?: string;
+            title?: string;
+            workflow_id?: string;
+            /** Format: int32 */
+            workflow_version?: number;
         };
         ApiCreateUserRequest: {
             email?: string;
@@ -568,6 +696,24 @@ export interface components {
             grants?: components["schemas"]["ApiGrantResponse"][] | null;
             user?: components["schemas"]["ApiUserResponse"];
         };
+        ApiOutcomeResponse: {
+            class?: string;
+            code?: string;
+            message?: string;
+        };
+        ApiPhaseResponse: {
+            /** Format: int32 */
+            attempt?: number;
+            /** Format: date-time */
+            created_at?: string;
+            /** Format: date-time */
+            finished_at?: null | string;
+            /** Format: int32 */
+            max_attempts?: number;
+            node_id?: string;
+            outcome?: components["schemas"]["ApiOutcomeResponse"];
+            status?: string;
+        };
         ApiProjectGrantResponse: {
             email?: string;
             level?: string;
@@ -609,6 +755,61 @@ export interface components {
             slug?: string;
             /** Format: date-time */
             updated_at?: string;
+        };
+        ApiRunEventResponse: {
+            /** Format: int64 */
+            id?: number;
+            kind?: string;
+            /** Format: date-time */
+            occurred_at?: string;
+            payload?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiRunEventsResponse: {
+            events?: components["schemas"]["ApiRunEventResponse"][] | null;
+        };
+        ApiRunListResponse: {
+            runs?: components["schemas"]["ApiRunResponse"][] | null;
+        };
+        ApiRunResponse: {
+            artifacts?: components["schemas"]["ApiArtifactResponse"][] | null;
+            base_sha?: string;
+            /** Format: date-time */
+            created_at?: string;
+            definition_hash?: string;
+            /** Format: int64 */
+            execution_used_ms?: number;
+            /** Format: date-time */
+            finished_at?: null | string;
+            id?: string;
+            outcome?: components["schemas"]["ApiOutcomeResponse"];
+            phases?: components["schemas"]["ApiPhaseResponse"][] | null;
+            policy_snapshot?: components["schemas"]["RunsPolicySnapshot"];
+            /** Format: date-time */
+            started_at?: null | string;
+            status?: string;
+            task_id?: string;
+            /** Format: date-time */
+            wall_deadline?: string;
+        };
+        ApiTaskListResponse: {
+            tasks?: components["schemas"]["ApiTaskResponse"][] | null;
+        };
+        ApiTaskResponse: {
+            /** Format: date-time */
+            created_at?: string;
+            id?: string;
+            inputs?: {
+                [key: string]: unknown;
+            } | null;
+            latest_run_id?: string;
+            project_id?: string;
+            repo_id?: string;
+            requester_id?: string;
+            status?: string;
+            title?: string;
+            workflow_version_id?: string;
         };
         ApiUserListResponse: {
             users?: components["schemas"]["ApiUserResponse"][] | null;
@@ -702,6 +903,15 @@ export interface components {
             status?: number;
             title?: string;
             type?: string;
+        };
+        RunsPolicySnapshot: {
+            /** Format: int64 */
+            execution_budget_ms?: number;
+            /** Format: int32 */
+            max_attempts?: number;
+            schema?: number;
+            /** Format: int64 */
+            wall_clock_ms?: number;
         };
         XerrorsFieldError: {
             field?: string;
@@ -1567,6 +1777,231 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApiRepoResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    getRun: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiRunResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    listRunEvents: {
+        parameters: {
+            query?: {
+                /** @description return events with id greater than this */
+                after?: string;
+            };
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiRunEventsResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    listTasks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiTaskListResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    createTask: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ApiCreateTaskRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiTaskResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    getTask: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiTaskResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    listTaskRuns: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiRunListResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    rerunTask: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiRunResponse"];
                 };
             };
             /** @description Bad Request */

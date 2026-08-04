@@ -30,3 +30,12 @@ func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
+
+// isFKViolation reports a blocked delete. The task -> workflow_version FK
+// is ON DELETE RESTRICT, which Postgres raises as 23001
+// (restrict_violation); 23503 (foreign_key_violation) is what NO ACTION
+// constraints raise instead. Accept both.
+func isFKViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "23001" || pgErr.Code == "23503")
+}

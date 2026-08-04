@@ -18,6 +18,13 @@ func TestRunServe_BootsMigratesAndShutsDownOnCancel(t *testing.T) {
 	cfg.Server.ShutdownTimeout = config.Duration(5 * time.Second)
 	cfg.Database.URL = testdb.NewURL(t)
 	cfg.Security.MasterKey = "dev:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	cfg.Orchestrator = config.Orchestrator{
+		Workers:           2,
+		PollInterval:      config.Duration(50 * time.Millisecond),
+		LeaseTTL:          config.Duration(30 * time.Second),
+		HeartbeatInterval: config.Duration(10 * time.Second),
+		OutboxRetention:   config.Duration(168 * time.Hour),
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
