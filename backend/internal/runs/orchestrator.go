@@ -31,6 +31,7 @@ type OrchestratorConfig struct {
 type Orchestrator struct {
 	svc       *Service
 	exec      Executor
+	admission Admission
 	cfg       OrchestratorConfig
 	log       *slog.Logger
 	workerTag string
@@ -45,11 +46,15 @@ type cachedPlan struct {
 	projectID  uuid.UUID
 	taskInputs map[string]any
 	baseSHA    string
+	repo       RepoRef
 }
 
-func NewOrchestrator(svc *Service, exec Executor, cfg OrchestratorConfig, log *slog.Logger) *Orchestrator {
+func NewOrchestrator(svc *Service, exec Executor, admission Admission, cfg OrchestratorConfig, log *slog.Logger) *Orchestrator {
+	if admission == nil {
+		admission = AlwaysAdmit{}
+	}
 	return &Orchestrator{
-		svc: svc, exec: exec, cfg: cfg, log: log,
+		svc: svc, exec: exec, admission: admission, cfg: cfg, log: log,
 		workerTag: uuid.NewString()[:8],
 		plans:     map[uuid.UUID]cachedPlan{},
 	}
@@ -109,6 +114,15 @@ func (o *Orchestrator) workerLoop(ctx context.Context, workerID string) {
 		if ctx.Err() != nil {
 			return
 		}
+		if err := o.admission.AdmitClaim(ctx); err != nil {
+			o.log.Warn("orchestrator: claims refused", "worker", workerID, "reason", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(o.cfg.PollInterval):
+			}
+			continue
+		}
 		c, ok, err := o.svc.claimNext(ctx, workerID, o.cfg.LeaseTTL.Seconds())
 		if err != nil {
 			o.log.Error("orchestrator: claim", "error", err)
@@ -144,6 +158,10 @@ func (o *Orchestrator) loadPlan(ctx context.Context, runID uuid.UUID) (cachedPla
 	if err != nil {
 		return cachedPlan{}, fmt.Errorf("runs: load task: %w", err)
 	}
+	repo, err := o.svc.repos.Repo(ctx, taskRow.RepoID)
+	if err != nil {
+		return cachedPlan{}, err
+	}
 	def, err := o.svc.defs.DefinitionByVersionID(ctx, taskRow.WorkflowVersionID)
 	if err != nil {
 		return cachedPlan{}, err
@@ -156,7 +174,10 @@ func (o *Orchestrator) loadPlan(ctx context.Context, runID uuid.UUID) (cachedPla
 	if err != nil {
 		return cachedPlan{}, err
 	}
-	cp := cachedPlan{plan: plan, projectID: taskRow.ProjectID, taskInputs: inputs, baseSHA: runRow.BaseSha}
+	cp := cachedPlan{
+		plan: plan, projectID: taskRow.ProjectID, taskInputs: inputs,
+		baseSHA: runRow.BaseSha, repo: repo,
+	}
 	o.planMu.Lock()
 	o.plans[runID] = cp
 	o.planMu.Unlock()
@@ -409,7 +430,7 @@ func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) 
 // origin, harness resolved fresh against the registry.
 func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node PlanNode, ref AttemptRef, deadline time.Time) (ExecutionRequest, error) {
 	req := ExecutionRequest{
-		Ref: ref, Kind: node.Kind, Instructions: node.Instructions,
+		Ref: ref, Kind: node.Kind, Repo: cp.repo, Instructions: node.Instructions,
 		TaskInputs: cp.taskInputs, BaseSHA: cp.baseSHA, Deadline: deadline,
 	}
 	if node.Harness != "" {
@@ -452,7 +473,7 @@ func (o *Orchestrator) evaluate(ctx context.Context, workerID string, cp cachedP
 		if execErr == nil {
 			return o.evaluateSuccess(ctx, tx, workerID, cp, c, fromStatus, res, now, deltaMS)
 		}
-		return o.evaluateFailure(ctx, tx, workerID, cp, c, fromStatus, ClassifyOutcome(execErr), now, deltaMS)
+		return o.evaluateFailure(ctx, tx, workerID, cp, c, fromStatus, res, ClassifyOutcome(execErr), now, deltaMS)
 	})
 	if err != nil {
 		o.log.Error("orchestrator: evaluate", "ref", c.Ref.String(), "error", err)
@@ -488,23 +509,9 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 	if err != nil {
 		return err
 	}
-	var artifactIDs []string
-	for _, a := range res.Artifacts {
-		rawPayload, err := json.Marshal(a.Payload)
-		if err != nil {
-			return fmt.Errorf("runs: marshal artifact payload: %w", err)
-		}
-		id, err := uuid.NewV7()
-		if err != nil {
-			return err
-		}
-		if _, err := q.InsertArtifact(ctx, store.InsertArtifactParams{
-			ID: id, RunID: c.Ref.RunID, NodeID: c.Ref.NodeID, Attempt: c.Ref.Attempt,
-			Type: a.Type, Payload: rawPayload, ParentIds: rawParents, CreatedAt: now,
-		}); err != nil {
-			return fmt.Errorf("runs: insert artifact: %w", err)
-		}
-		artifactIDs = append(artifactIDs, id.String())
+	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, res.Artifacts, rawParents, now)
+	if err != nil {
+		return err
 	}
 
 	usage, err := q.AddRunUsage(ctx, store.AddRunUsageParams{ID: c.Ref.RunID, DeltaMs: deltaMS})
@@ -562,6 +569,34 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 	return appendEvents(ctx, tx, now, evs)
 }
 
+// insertArtifacts persists one attempt's work products under the
+// caller's tx and returns their ids for the event payload. Lineage is
+// the caller's call: successes descend from their inputs, failures from
+// nothing.
+func insertArtifacts(ctx context.Context, q *store.Queries, ref AttemptRef,
+	artifacts []NewArtifact, rawParents []byte, now time.Time,
+) ([]string, error) {
+	var ids []string
+	for _, a := range artifacts {
+		rawPayload, err := json.Marshal(a.Payload)
+		if err != nil {
+			return nil, fmt.Errorf("runs: marshal artifact payload: %w", err)
+		}
+		id, err := uuid.NewV7()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := q.InsertArtifact(ctx, store.InsertArtifactParams{
+			ID: id, RunID: ref.RunID, NodeID: ref.NodeID, Attempt: ref.Attempt,
+			Type: a.Type, Payload: rawPayload, ParentIds: rawParents, CreatedAt: now,
+		}); err != nil {
+			return nil, fmt.Errorf("runs: insert artifact: %w", err)
+		}
+		ids = append(ids, id.String())
+	}
+	return ids, nil
+}
+
 // finishRunTx completes/fails the run inside the caller's tx, appending
 // the accumulated events first so ordering reads naturally.
 func (o *Orchestrator) finishRunTx(ctx context.Context, tx pgx.Tx, cp cachedPlan, runID uuid.UUID,
@@ -606,13 +641,18 @@ func (o *Orchestrator) finishRunTx(ctx context.Context, tx pgx.Tx, cp cachedPlan
 	})
 }
 
+// evaluateFailure terminalizes or retries a failed attempt. An executor
+// may return artifacts alongside its error (logs, failure snapshots):
+// those are persisted once the fencing CAS proves this evaluation is the
+// one that counts — parentless, because a failure descends from nothing.
 func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID string,
-	cp cachedPlan, c claimed, fromStatus PhaseStatus, out Outcome, now time.Time, deltaMS int64,
+	cp cachedPlan, c claimed, fromStatus PhaseStatus, res ExecutionResult, out Outcome, now time.Time, deltaMS int64,
 ) error {
 	rawOut, err := json.Marshal(out)
 	if err != nil {
 		return err
 	}
+	noParents := []byte("[]") // a failure artifact descends from nothing
 	// Usage accrues only after winning the fencing CAS below: a fenced
 	// evaluation must leave no trace, or the reconciler and the hung
 	// worker would each account the same claim->terminal interval
@@ -645,6 +685,10 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		if n == 0 {
 			return nil // fenced
 		}
+		artifactIDs, err := insertArtifacts(ctx, q, c.Ref, res.Artifacts, noParents, now)
+		if err != nil {
+			return err
+		}
 		if deltaMS > 0 {
 			if _, err := q.AddRunUsage(ctx, store.AddRunUsageParams{ID: c.Ref.RunID, DeltaMs: deltaMS}); err != nil {
 				return err
@@ -653,12 +697,16 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, c.Ref.NodeID, c.Ref.Attempt+1, c.MaxAttempts); err != nil {
 			return err
 		}
+		payload := map[string]any{
+			"node_id": c.Ref.NodeID, "attempt": c.Ref.Attempt,
+			"next_attempt": c.Ref.Attempt + 1, "outcome": out.Map(),
+		}
+		if len(artifactIDs) > 0 {
+			payload["artifact_ids"] = artifactIDs
+		}
 		return appendEvents(ctx, tx, now, []Event{{
-			RunID: c.Ref.RunID, ProjectID: cp.projectID, Kind: EventPhaseRetried, CorrelationID: c.Ref.String(),
-			Payload: map[string]any{
-				"node_id": c.Ref.NodeID, "attempt": c.Ref.Attempt,
-				"next_attempt": c.Ref.Attempt + 1, "outcome": out.Map(),
-			},
+			RunID: c.Ref.RunID, ProjectID: cp.projectID, Kind: EventPhaseRetried,
+			CorrelationID: c.Ref.String(), Payload: payload,
 		}})
 	}
 
@@ -669,6 +717,10 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	}
 	if n == 0 {
 		return nil // fenced
+	}
+	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, res.Artifacts, noParents, now)
+	if err != nil {
+		return err
 	}
 	if deltaMS > 0 {
 		if _, err := q.AddRunUsage(ctx, store.AddRunUsageParams{ID: c.Ref.RunID, DeltaMs: deltaMS}); err != nil {
@@ -685,9 +737,13 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 			Message: fmt.Sprintf("node %s exhausted %d attempts", c.Ref.NodeID, c.MaxAttempts),
 		}
 	}
+	deadPayload := map[string]any{"node_id": c.Ref.NodeID, "attempt": c.Ref.Attempt, "outcome": out.Map()}
+	if len(artifactIDs) > 0 {
+		deadPayload["artifact_ids"] = artifactIDs
+	}
 	evs := []Event{{
-		RunID: c.Ref.RunID, ProjectID: cp.projectID, Kind: EventPhaseDead, CorrelationID: c.Ref.String(),
-		Payload: map[string]any{"node_id": c.Ref.NodeID, "attempt": c.Ref.Attempt, "outcome": out.Map()},
+		RunID: c.Ref.RunID, ProjectID: cp.projectID, Kind: EventPhaseDead,
+		CorrelationID: c.Ref.String(), Payload: deadPayload,
 	}}
 	return o.finishRunTx(ctx, tx, cp, c.Ref.RunID, RunFailed, runOut, EventRunFailed, now, evs)
 }

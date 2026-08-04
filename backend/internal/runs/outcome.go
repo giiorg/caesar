@@ -30,6 +30,17 @@ const (
 	CodeWallDeadlineExceeded = "wall_deadline_exceeded"
 	CodeFenced               = "fenced"
 	CodeSuperseded           = "superseded"
+
+	// Plan 06 runner codes.
+	CodeImageUnavailable          = "image_unavailable"
+	CodeStagingFailed             = "staging_failed"
+	CodeStagingVerificationFailed = "staging_verification_failed"
+	CodeBaseSHAUnavailable        = "base_sha_unavailable"
+	CodeWorkspaceQuotaExceeded    = "workspace_quota_exceeded"
+	CodeLogFlood                  = "log_flood"
+	CodeExtractionFailed          = "extraction_failed"
+	CodePatchTooLarge             = "patch_too_large"
+	CodeEmbeddedRepo              = "embedded_repo"
 )
 
 // Outcome is a typed terminal result for an attempt or a run.

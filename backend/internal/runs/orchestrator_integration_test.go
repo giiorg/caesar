@@ -21,7 +21,7 @@ func startOrchestrator(t *testing.T, svc *runs.Service, ex runs.Executor, lease 
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	o := runs.NewOrchestrator(svc, ex, runs.OrchestratorConfig{
+	o := runs.NewOrchestrator(svc, ex, runs.AlwaysAdmit{}, runs.OrchestratorConfig{
 		Workers: 2, PollInterval: 20 * time.Millisecond, LeaseTTL: lease,
 		HeartbeatInterval: lease / 3, OutboxRetention: 7 * 24 * time.Hour,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
@@ -310,6 +310,127 @@ func TestBudgetBreachOnRetryFailsTheRun(t *testing.T) {
 	}
 	if phases[0].NodeID != "plan" || phases[0].Status != runs.PhaseDead {
 		t.Errorf("attempt row = %s/%s, want plan/dead", phases[0].NodeID, phases[0].Status)
+	}
+}
+
+// logOnFailureExecutor hands back a log_ref artifact ALONGSIDE a
+// transient failure on the first attempt of one node — the runner's
+// shape: an attempt that dies still produced logs worth keeping.
+type logOnFailureExecutor struct {
+	inner  runs.Executor
+	nodeID string
+}
+
+func (e logOnFailureExecutor) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.ExecutionResult, error) {
+	if req.Ref.NodeID == e.nodeID && req.Ref.Attempt == 1 {
+		return runs.ExecutionResult{Artifacts: []runs.NewArtifact{{
+				Type:    runs.ArtifactKindLogRef,
+				Payload: map[string]any{"streams": map[string]any{}},
+			}}}, runs.OutcomeError{Outcome: runs.Outcome{
+				Class: runs.OutcomeTransient, Code: runs.CodeHarnessError, Message: "harness died mid-attempt",
+			}}
+	}
+	return e.inner.Execute(ctx, req)
+}
+
+func (e logOnFailureExecutor) Inspect(ctx context.Context, ref runs.AttemptRef) (runs.InspectResult, error) {
+	return e.inner.Inspect(ctx, ref)
+}
+
+// A failed attempt's artifacts survive it: the evidence of why an
+// attempt died is exactly what a dead attempt leaves behind, so
+// evaluateFailure persists them (parentless — they descend from nothing)
+// and the phase.retried event names their ids.
+func TestOrchestrator_FailureArtifactsPersist(t *testing.T) {
+	f := newFixture(t)
+	svc, _ := newService(t, f, agenticDoc(), runs.DefaultSnapshot())
+	startOrchestrator(t, svc, logOnFailureExecutor{inner: fake.NewExecutor(), nodeID: "impl"}, 30*time.Second)
+	ctx := context.Background()
+
+	_, run, err := svc.CreateTask(ctx, principal(f), runs.NewTask{
+		RepoID: f.repoID, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: "failure-artifacts",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRun(t, svc, run.ID, runs.RunSucceeded)
+
+	var artifactID uuid.UUID
+	var parents []byte
+	err = f.pool.QueryRow(ctx,
+		`SELECT id, parent_ids FROM artifacts
+		 WHERE run_id = $1 AND node_id = 'impl' AND attempt = 1 AND type = $2`,
+		run.ID, runs.ArtifactKindLogRef,
+	).Scan(&artifactID, &parents)
+	if err != nil {
+		t.Fatalf("failed attempt's log_ref must persist: %v", err)
+	}
+	if string(parents) != "[]" {
+		t.Errorf("parent_ids = %s, want [] (a failure artifact descends from nothing)", parents)
+	}
+
+	evs, err := svc.ListRunEvents(ctx, run.ID, 0, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retried *runs.RunEventRecord
+	for i, e := range evs {
+		if e.Kind == runs.EventPhaseRetried {
+			retried = &evs[i]
+		}
+	}
+	if retried == nil {
+		t.Fatal("no phase.retried event")
+	}
+	ids, ok := retried.Payload["artifact_ids"].([]any)
+	if !ok || len(ids) != 1 || ids[0] != artifactID.String() {
+		t.Errorf("phase.retried artifact_ids = %v, want [%s]", retried.Payload["artifact_ids"], artifactID)
+	}
+}
+
+// The dead path keeps them too: an attempt with nowhere left to retry is
+// exactly the one whose logs matter most.
+func TestOrchestrator_DeadAttemptArtifactsPersist(t *testing.T) {
+	f := newFixture(t)
+	snap := runs.DefaultSnapshot()
+	snap.MaxAttempts = 1 // attempt 1 has no successor: fail once, die.
+	svc, _ := newService(t, f, agenticDoc(), snap)
+	startOrchestrator(t, svc, logOnFailureExecutor{inner: fake.NewExecutor(), nodeID: "plan"}, 30*time.Second)
+	ctx := context.Background()
+
+	_, run, err := svc.CreateTask(ctx, principal(f), runs.NewTask{
+		RepoID: f.repoID, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: "dead-artifacts",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRun(t, svc, run.ID, runs.RunFailed)
+
+	var artifactID uuid.UUID
+	err = f.pool.QueryRow(ctx,
+		`SELECT id FROM artifacts WHERE run_id = $1 AND node_id = 'plan' AND attempt = 1 AND type = $2`,
+		run.ID, runs.ArtifactKindLogRef,
+	).Scan(&artifactID)
+	if err != nil {
+		t.Fatalf("dead attempt's log_ref must persist: %v", err)
+	}
+
+	evs, err := svc.ListRunEvents(ctx, run.ID, 0, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dead *runs.RunEventRecord
+	for i, e := range evs {
+		if e.Kind == runs.EventPhaseDead {
+			dead = &evs[i]
+		}
+	}
+	if dead == nil {
+		t.Fatal("no phase.dead event")
+	}
+	ids, ok := dead.Payload["artifact_ids"].([]any)
+	if !ok || len(ids) != 1 || ids[0] != artifactID.String() {
+		t.Errorf("phase.dead artifact_ids = %v, want [%s]", dead.Payload["artifact_ids"], artifactID)
 	}
 }
 

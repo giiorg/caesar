@@ -169,3 +169,6 @@ SELECT count(*) FROM outbox;
 
 -- name: PruneOutbox :execrows
 DELETE FROM outbox WHERE created_at < $1;
+
+-- name: GetRunProjectID :one
+SELECT t.project_id FROM runs r JOIN tasks t ON t.id = r.task_id WHERE r.id = $1;

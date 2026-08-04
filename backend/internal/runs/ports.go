@@ -86,6 +86,7 @@ type ExecutionRequest struct {
 	Ref          AttemptRef
 	Kind         string
 	HarnessID    uuid.UUID
+	Repo         RepoRef
 	Instructions string
 	Inputs       []ArtifactInput
 	TaskInputs   map[string]any
@@ -136,3 +137,15 @@ func (NotImplementedExecutor) Inspect(context.Context, AttemptRef) (InspectResul
 		Message: xerrors.NotImplemented("runs: executor inspect (Plan 06)").Error(),
 	}}
 }
+
+// Admission gates claiming on runner capacity (spec §8: the runner
+// refuses new claims under a free-space watermark — typed backpressure,
+// checked BEFORE a claim burns an attempt's lease).
+type Admission interface {
+	AdmitClaim(ctx context.Context) error
+}
+
+// AlwaysAdmit is the no-runner posture (and the fake-driven tests').
+type AlwaysAdmit struct{}
+
+func (AlwaysAdmit) AdmitClaim(context.Context) error { return nil }

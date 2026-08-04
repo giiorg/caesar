@@ -103,7 +103,7 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		unavailableForge{}, runs.Params{Snapshot: runs.DefaultSnapshot()})
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc))...)
 
-	orch := runs.NewOrchestrator(runsSvc, runs.NotImplementedExecutor{}, runs.OrchestratorConfig{
+	orch := runs.NewOrchestrator(runsSvc, runs.NotImplementedExecutor{}, runs.AlwaysAdmit{}, runs.OrchestratorConfig{
 		Workers:           cfg.Orchestrator.Workers,
 		PollInterval:      cfg.Orchestrator.PollInterval.Std(),
 		LeaseTTL:          cfg.Orchestrator.LeaseTTL.Std(),

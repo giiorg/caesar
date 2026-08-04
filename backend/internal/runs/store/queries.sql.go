@@ -306,6 +306,17 @@ func (q *Queries) GetRunForUpdate(ctx context.Context, id uuid.UUID) (Run, error
 	return i, err
 }
 
+const getRunProjectID = `-- name: GetRunProjectID :one
+SELECT t.project_id FROM runs r JOIN tasks t ON t.id = r.task_id WHERE r.id = $1
+`
+
+func (q *Queries) GetRunProjectID(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getRunProjectID, id)
+	var project_id uuid.UUID
+	err := row.Scan(&project_id)
+	return project_id, err
+}
+
 const getTask = `-- name: GetTask :one
 SELECT id, project_id, repo_id, workflow_version_id, title, inputs, requester_id, created_at FROM tasks WHERE id = $1
 `
