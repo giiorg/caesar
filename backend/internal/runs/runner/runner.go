@@ -1,0 +1,208 @@
+// Package runner executes phase attempts as Docker containers: a staged
+// workspace, an agent container with no route to the internet, and an
+// egress gateway that is the only way out (spec §3). It is a runs
+// subpackage because it implements that context's Executor and Admission
+// ports; the daemon itself is reached through platform/dockerapi.
+package runner
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
+	"github.com/giiorg/caesar/backend/internal/runs"
+)
+
+// Engine is the runner's port onto the container runtime; dockerapi.Client
+// satisfies it, unit tests fake it. Ping is deliberately absent: liveness is
+// the composition root's concern at wiring time, not the runner's per-attempt
+// concern.
+type Engine interface {
+	ImageInspect(ctx context.Context, ref string) (dockerapi.ImageInspect, error)
+	ImagePull(ctx context.Context, ref string) error
+	NetworkCreate(ctx context.Context, name string, internal bool, labels map[string]string) (string, error)
+	NetworkRemove(ctx context.Context, id string) error
+	NetworkInspect(ctx context.Context, name string) (dockerapi.NetworkInspect, error)
+	ContainerCreate(ctx context.Context, name string, cfg dockerapi.ContainerConfig, host dockerapi.HostConfig, networks map[string]dockerapi.EndpointSettings) (string, error)
+	ContainerStart(ctx context.Context, id string) error
+	ContainerWait(ctx context.Context, id string) (int64, error)
+	ContainerKill(ctx context.Context, id, signal string) error
+	ContainerRemove(ctx context.Context, id string, force bool) error
+	ContainerInspect(ctx context.Context, idOrName string) (dockerapi.ContainerInspect, error)
+	ContainerLogs(ctx context.Context, id string, follow bool) (io.ReadCloser, error)
+	ContainerListByLabel(ctx context.Context, kv string) ([]dockerapi.ContainerSummary, error)
+	NetworkListByLabel(ctx context.Context, kv string) ([]dockerapi.NetworkSummary, error)
+}
+
+// The production engine must keep satisfying the port without an adapter.
+var _ Engine = (*dockerapi.Client)(nil)
+
+// HarnessSpec is everything the runner needs to start one harness: which
+// image, which provider it talks to, and which credential unlocks it.
+// Entrypoint and Cmd are nil in production (the image's own defaults win);
+// test resolvers script them.
+type HarnessSpec struct {
+	Kind             string
+	ImageRef         string
+	ProviderEndpoint string
+	CredentialID     uuid.UUID
+	Entrypoint       []string
+	Cmd              []string
+}
+
+// HarnessResolver resolves the harness a phase pinned. The runs context
+// never imports assets, so the composition root supplies this.
+type HarnessResolver interface {
+	HarnessSpec(ctx context.Context, id uuid.UUID) (HarnessSpec, error)
+}
+
+// CredentialOpener opens a stored secret for one stated purpose. The plaintext
+// never reaches the agent container — only the gateway holds it.
+type CredentialOpener interface {
+	OpenCredential(ctx context.Context, id uuid.UUID, purpose string) ([]byte, error)
+}
+
+// CloneSpec is how the stage container reaches a repo. The credential travels
+// as a header, never inside the URL: a token in a URL lands in reflogs, remote
+// config, and process listings.
+type CloneSpec struct {
+	URL        string // credential-free always (token-in-URL banned)
+	AuthHeader string // full header line value for http.extraheader, "" = none
+	BindDir    string // non-empty = mount RO at /remote (test fixtures; URL then file:///remote/...)
+}
+
+// GitSource turns a repo reference into a clone the stage container can run.
+type GitSource interface {
+	CloneSpec(ctx context.Context, repo runs.RepoRef) (CloneSpec, error)
+}
+
+// EventSink is the runner's write path onto the run's event stream, for the
+// things only the runtime knows (log truncation, egress denials).
+type EventSink interface {
+	AppendRuntimeEvent(ctx context.Context, ref runs.AttemptRef, kind string, payload map[string]any) error
+}
+
+// Options configures one runner. Every zero field takes the pinned default
+// below, so a caller that supplies only the two image refs gets the shipped
+// posture rather than a runner with zero-sized quotas.
+type Options struct {
+	DataRoot, DataHostRoot, CaesarImage, GitImage, EgressNetwork         string
+	WorkspaceQuotaBytes, WorkspaceQuotaFiles, LogCapBytes, LogFloodBytes int64
+	FreeBytesWatermark, MemoryBytes, NanoCPUs, PidsLimit                 int64
+	QuotaPollInterval                                                    time.Duration
+	ConnectAllow                                                         []string
+}
+
+// Pinned defaults (plan Global Constraints). Config may override them; a
+// zero field never means "unlimited".
+const (
+	defaultDataRoot      = "/var/lib/caesar"
+	defaultEgressNetwork = "caesar-egress"
+
+	defaultWorkspaceQuotaBytes = 2 << 30 // 2 GiB
+	defaultWorkspaceQuotaFiles = 200_000
+	defaultLogCapBytes         = 16 << 20 // per stream
+	defaultLogFloodBytes       = 64 << 20 // kill threshold
+	defaultFreeBytesWatermark  = 10 << 30 // free on data_root
+	defaultMemoryBytes         = 4 << 30
+	defaultNanoCPUs            = 2_000_000_000 // 2.0 CPUs
+	defaultPidsLimit           = 512
+	defaultQuotaPollInterval   = 2 * time.Second
+)
+
+func (o Options) withDefaults() Options {
+	if o.DataRoot == "" {
+		o.DataRoot = defaultDataRoot
+	}
+	if o.DataHostRoot == "" {
+		o.DataHostRoot = o.DataRoot
+	}
+	if o.EgressNetwork == "" {
+		o.EgressNetwork = defaultEgressNetwork
+	}
+	if o.WorkspaceQuotaBytes == 0 {
+		o.WorkspaceQuotaBytes = defaultWorkspaceQuotaBytes
+	}
+	if o.WorkspaceQuotaFiles == 0 {
+		o.WorkspaceQuotaFiles = defaultWorkspaceQuotaFiles
+	}
+	if o.LogCapBytes == 0 {
+		o.LogCapBytes = defaultLogCapBytes
+	}
+	if o.LogFloodBytes == 0 {
+		o.LogFloodBytes = defaultLogFloodBytes
+	}
+	if o.FreeBytesWatermark == 0 {
+		o.FreeBytesWatermark = defaultFreeBytesWatermark
+	}
+	if o.MemoryBytes == 0 {
+		o.MemoryBytes = defaultMemoryBytes
+	}
+	if o.NanoCPUs == 0 {
+		o.NanoCPUs = defaultNanoCPUs
+	}
+	if o.PidsLimit == 0 {
+		o.PidsLimit = defaultPidsLimit
+	}
+	if o.QuotaPollInterval == 0 {
+		o.QuotaPollInterval = defaultQuotaPollInterval
+	}
+	return o
+}
+
+// Runner is the Docker-backed executor. freeBytes is a field so the
+// watermark logic is testable without a nearly-full disk.
+type Runner struct {
+	engine    Engine
+	harnesses HarnessResolver
+	creds     CredentialOpener
+	git       GitSource
+	events    EventSink
+	opts      Options
+	log       *slog.Logger
+	uid, gid  int
+	freeBytes func(string) (int64, error)
+}
+
+// New validates the posture the whole isolation story rests on before any
+// attempt runs: the control plane is not root (decision 4 — attempt
+// containers run as this process's uid:gid, and uid 0 would hand the agent
+// root on every bind mount), both images are pinned by the operator, and the
+// flood threshold is not below the truncation cap.
+func New(engine Engine, harnesses HarnessResolver, creds CredentialOpener, git GitSource,
+	events EventSink, opts Options, log *slog.Logger,
+) (*Runner, error) {
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid == 0 {
+		return nil, errors.New("runner: refusing to start as root: attempt containers run as the control plane's uid:gid")
+	}
+	opts = opts.withDefaults()
+	if opts.CaesarImage == "" {
+		return nil, errors.New("runner: caesar image is required")
+	}
+	if opts.GitImage == "" {
+		return nil, errors.New("runner: git image is required")
+	}
+	if opts.LogFloodBytes < opts.LogCapBytes {
+		return nil, fmt.Errorf("runner: log flood threshold %d is below the per-stream log cap %d", opts.LogFloodBytes, opts.LogCapBytes)
+	}
+	return &Runner{
+		engine:    engine,
+		harnesses: harnesses,
+		creds:     creds,
+		git:       git,
+		events:    events,
+		opts:      opts,
+		log:       log,
+		uid:       uid,
+		gid:       gid,
+		freeBytes: diskFreeBytes,
+	}, nil
+}

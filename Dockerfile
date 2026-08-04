@@ -13,6 +13,15 @@ RUN CGO_ENABLED=0 go build -trimpath \
       -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Date=${DATE}" \
     -o /out/caesar ./cmd/caesar
 
+# The git stage is the runner's stage/extract image: caesar's own binary plus
+# a real git. It is not the last stage, so a bare `docker build .` still
+# produces the control-plane runtime image.
+FROM alpine:3.22 AS git
+RUN apk add --no-cache git
+COPY --from=build /out/caesar /usr/local/bin/caesar
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/caesar"]
+
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/caesar /usr/local/bin/caesar
 ENTRYPOINT ["/usr/local/bin/caesar"]
