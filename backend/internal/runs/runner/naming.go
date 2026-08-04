@@ -38,6 +38,18 @@ func (r *Runner) logsDir(ref runs.AttemptRef) string {
 	return filepath.Join(r.opts.DataRoot, "logs", ref.String())
 }
 
+// relPath renders a path the way artifacts and events carry it: relative to
+// the data root, so a stored reference survives the root being remounted
+// somewhere else. A path outside the root is carried whole — inventing a
+// relative spelling for it would point at the wrong file.
+func (r *Runner) relPath(p string) string {
+	rel, err := filepath.Rel(r.opts.DataRoot, p)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return p
+	}
+	return rel
+}
+
 // hostPath translates a path this process sees into the path the Docker
 // daemon sees. Bind sources are resolved by the daemon, so a containerized
 // control plane must hand over the host's spelling of its data root. Paths

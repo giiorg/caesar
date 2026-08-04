@@ -28,6 +28,7 @@ type Engine interface {
 	ImageInspect(ctx context.Context, ref string) (dockerapi.ImageInspect, error)
 	ImagePull(ctx context.Context, ref string) error
 	NetworkCreate(ctx context.Context, name string, internal bool, labels map[string]string) (string, error)
+	NetworkConnect(ctx context.Context, network, containerID string, aliases []string) error
 	NetworkRemove(ctx context.Context, id string) error
 	NetworkInspect(ctx context.Context, name string) (dockerapi.NetworkInspect, error)
 	ContainerCreate(ctx context.Context, name string, cfg dockerapi.ContainerConfig, host dockerapi.HostConfig, networks map[string]dockerapi.EndpointSettings) (string, error)
@@ -98,6 +99,13 @@ type Options struct {
 	FreeBytesWatermark, MemoryBytes, NanoCPUs, PidsLimit                 int64
 	QuotaPollInterval                                                    time.Duration
 	ConnectAllow                                                         []string
+
+	// testHostAccess maps host.docker.internal onto the host gateway for the
+	// egress gateway container alone. It exists so the runner integration
+	// suite can point an attempt at a fake provider running in the test
+	// process; it is unexported, so no production wiring can set it, and no
+	// agent container ever receives the mapping either way.
+	testHostAccess bool
 }
 
 // Pinned defaults (plan Global Constraints). Config may override them; a

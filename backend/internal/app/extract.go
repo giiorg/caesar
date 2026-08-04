@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	extractInputPath  = attemptDir + "/extract.json"
-	extractReportPath = attemptDir + "/extract.report.json"
+	extractInputPath  = attemptDir + "/" + gitops.ExtractInputFile
+	extractReportPath = attemptDir + "/" + gitops.ExtractReportFile
 )
 
 // runExtractCmd is the trusted extraction container's entrypoint: read

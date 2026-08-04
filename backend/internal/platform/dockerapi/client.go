@@ -183,6 +183,18 @@ func (c *Client) NetworkCreate(ctx context.Context, name string, internal bool, 
 	return out.ID, err
 }
 
+// NetworkConnect attaches an existing container to a second network, with
+// the given DNS aliases. The create call takes only one endpoint at this API
+// version, so a dual-homed container — the egress gateway, and nothing else —
+// is created on one network and joined to the other here, before it starts.
+func (c *Client) NetworkConnect(ctx context.Context, network, containerID string, aliases []string) error {
+	in := struct {
+		Container      string           `json:"Container"`
+		EndpointConfig EndpointSettings `json:"EndpointConfig"`
+	}{Container: containerID, EndpointConfig: EndpointSettings{Aliases: aliases}}
+	return c.do(ctx, http.MethodPost, "/networks/"+network+"/connect", nil, in, nil)
+}
+
 // NetworkRemove deletes a network by id.
 func (c *Client) NetworkRemove(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/networks/"+id, nil, nil, nil)

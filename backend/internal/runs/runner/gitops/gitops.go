@@ -16,6 +16,23 @@ import (
 	"github.com/giiorg/caesar/backend/internal/runs"
 )
 
+// The attempt directory as the trusted containers see it, and the names of
+// the contract files inside it. They live here because both halves of every
+// contract need the same spelling: the container-side command writes the
+// report, the runner writes the input and reads the report back, and the
+// runner may not import the composition root that hosts the commands.
+const (
+	AttemptMount      = "/attempt"
+	StageInputFile    = "stage.json"
+	StageReportFile   = "stage.report.json"
+	ExtractInputFile  = "extract.json"
+	ExtractReportFile = "extract.report.json"
+
+	// WorkspaceDir is the staged workspace inside the attempt directory: the
+	// one path the agent container shares with the control plane.
+	WorkspaceDir = "workspace"
+)
+
 // TypedError carries a typed outcome out of a git operation. The runner
 // re-wraps it as runs.OutcomeError; the trusted containers marshal it into
 // their report file, which is the only failure signal the runner trusts.
@@ -30,6 +47,11 @@ func typed(class runs.OutcomeClass, code, format string, args ...any) TypedError
 // baseEnv is the whole world a git process gets: the git binary's directory,
 // a HOME inside the attempt dir (so anything git parks there is caught by the
 // negative scan), no global or system config, and no terminal prompt.
+//
+// The identity is pinned rather than left to git. Left to itself, git builds
+// a default committer from the host — and canonicalizing that hostname is a
+// DNS lookup, which in a container with no route to its nameserver stalls
+// every reflog-writing command for the resolver's full timeout.
 func baseEnv(home string) []string {
 	gitBin, _ := exec.LookPath("git")
 	return []string{
@@ -38,6 +60,8 @@ func baseEnv(home string) []string {
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_TERMINAL_PROMPT=0",
+		"GIT_AUTHOR_NAME=caesar", "GIT_AUTHOR_EMAIL=caesar@invalid",
+		"GIT_COMMITTER_NAME=caesar", "GIT_COMMITTER_EMAIL=caesar@invalid",
 	}
 }
 

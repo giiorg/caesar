@@ -14,7 +14,11 @@ import (
 // the control plane, and the gateway is the only host it can name.
 const (
 	workspaceDir = "/workspace"
-	brokerURL    = "http://egress:8080"
+	// gatewayAlias is the gateway's DNS name on the attempt network. The
+	// broker URL is built from it so the alias and the address the agent is
+	// handed can never drift apart.
+	gatewayAlias = "egress"
+	brokerURL    = "http://" + gatewayAlias + ":8080"
 	agentHome    = "/tmp" // the only writable path on a read-only rootfs
 	agentPath    = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
@@ -35,7 +39,13 @@ type RunSpec struct {
 	BrokerTokenSHA                     string
 	ProviderOps                        []egress.Op
 	CredentialHeader, CredentialPrefix string
-	Deadline                           time.Time
+	// ProviderCredential is the opened provider secret. It is filled in by
+	// Execute (buildSpec never touches the credential store) and travels
+	// exactly one place: the gateway container's environment. Nothing may
+	// log a RunSpec.
+	ProviderCredential string
+	BaseSHA            string
+	Deadline           time.Time
 }
 
 // buildSpec resolves everything an attempt needs before anything starts:
@@ -75,6 +85,7 @@ func (r *Runner) buildSpec(ctx context.Context, req runs.ExecutionRequest, hs Ha
 		ProviderOps:      ops,
 		CredentialHeader: header,
 		CredentialPrefix: prefix,
+		BaseSHA:          req.BaseSHA,
 		Deadline:         req.Deadline,
 	}, nil
 }

@@ -58,7 +58,7 @@ func TestNew_FillsEveryZeroKnobWithItsPinnedDefault(t *testing.T) {
 		NanoCPUs: 2_000_000_000, PidsLimit: 512,
 		QuotaPollInterval: 2 * time.Second,
 	}
-	if diff := cmp.Diff(want, r.opts); diff != "" {
+	if diff := cmp.Diff(want, r.opts, cmp.AllowUnexported(Options{})); diff != "" {
 		t.Errorf("defaults mismatch (-want +got):\n%s", diff)
 	}
 	if r.uid != os.Getuid() || r.gid != os.Getgid() {

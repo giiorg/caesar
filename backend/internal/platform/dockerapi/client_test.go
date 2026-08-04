@@ -222,6 +222,19 @@ func TestEndpoints_IssueTheRequestsTheDaemonExpects(t *testing.T) {
 			},
 		},
 		{
+			name:       "network connect joins a created container with its aliases",
+			respStatus: http.StatusOK,
+			call: func(_ *testing.T, c *Client) error {
+				return c.NetworkConnect(t.Context(), "caesar-egress", "c1", []string{"egress"})
+			},
+			wantMethod: http.MethodPost,
+			wantPath:   "/v1.43/networks/caesar-egress/connect",
+			wantBody: map[string]any{
+				"Container":      "c1",
+				"EndpointConfig": map[string]any{"Aliases": []any{"egress"}},
+			},
+		},
+		{
 			name:       "network remove deletes by id",
 			respStatus: http.StatusNoContent,
 			call: func(_ *testing.T, c *Client) error {

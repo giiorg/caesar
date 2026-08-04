@@ -136,18 +136,20 @@ func StageEnvFromProcess() []string {
 	return out
 }
 
-// egressConfigEnv carries the whole configuration of one attempt's egress
+// EgressConfigEnv carries the whole configuration of one attempt's egress
 // gateway. The gateway runs as its own process in its own container with no
-// config file and no database, so this variable is all it is given.
-const egressConfigEnv = "CAESAR_EGRESS_CONFIG"
+// config file and no database, so this variable is all it is given. It is
+// exported because the runner constructs that container's environment and
+// must name the same variable the gateway reads — one spelling, one place.
+const EgressConfigEnv = "CAESAR_EGRESS_CONFIG"
 
 // EgressProxyEnv returns that document verbatim. Decoding it belongs to the
 // package that owns the gateway's vocabulary; reading the environment belongs
 // here, and nowhere else (envaccess law).
 func EgressProxyEnv() (string, error) {
-	raw := os.Getenv(egressConfigEnv)
+	raw := os.Getenv(EgressConfigEnv)
 	if raw == "" {
-		return "", fmt.Errorf("config: %s is required: the egress gateway is configured entirely through it", egressConfigEnv)
+		return "", fmt.Errorf("config: %s is required: the egress gateway is configured entirely through it", EgressConfigEnv)
 	}
 	return raw, nil
 }

@@ -17,10 +17,12 @@ import (
 
 // The attempt directory as the trusted containers see it: one input file in,
 // one report file out. The runner reads the report whatever the exit code is.
+// The literals themselves live in gitops, which the runner may import: both
+// sides of the contract must spell these the same way.
 const (
-	attemptDir      = "/attempt"
-	stageInputPath  = attemptDir + "/stage.json"
-	stageReportPath = attemptDir + "/stage.report.json"
+	attemptDir      = gitops.AttemptMount
+	stageInputPath  = attemptDir + "/" + gitops.StageInputFile
+	stageReportPath = attemptDir + "/" + gitops.StageReportFile
 
 	// contractFileLimit caps what a contract file may be: these are a
 	// handful of fields, never a stream.

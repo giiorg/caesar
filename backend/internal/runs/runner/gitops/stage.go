@@ -17,7 +17,7 @@ import (
 // workspace materialized from it.
 const (
 	baseRepoDir   = "base.git"
-	workspaceName = "workspace"
+	workspaceName = WorkspaceDir
 )
 
 // StageInput is the staging contract's input file. The forge credential is
