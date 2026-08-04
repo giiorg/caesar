@@ -84,7 +84,62 @@ document come from the same source, so they can't drift. stdlib's own
 not problem+json — an accepted V1 limitation. Resources: identity
 (users, sessions, grants), assets (projects, repos, credentials,
 harnesses), and workflows (`/api/v1/workflows` + `/versions`) — writes
-are admin-only, and the single write door validates every document.
+are admin-only, and the single write door validates every document. The
+execution spine adds `/api/v1/tasks` and `/api/v1/runs`: reads need the
+`view` grant on the project, creating and re-running a task needs `run`.
+
+## Execution spine (Plan 05)
+
+Tasks, runs, attempt rows, artifacts and run events live in
+`internal/runs`. A task pins its repo, its workflow version and a
+`PolicySnapshot` at intake; each run pins the base SHA and carries the
+snapshot as jsonb plus the denormalized budget and deadline columns
+every deciding SQL statement predicates on. Status vocabularies and the
+transition tables for runs and attempt rows are
+`internal/runs/status.go` — the source of truth that the CAS sites, the
+property suite, and the schema's CHECK constraints all follow.
+
+PhaseRun *is* the queue; there is no jobs table. Claiming is one
+statement: a locking CTE (`FOR UPDATE ... SKIP LOCKED`) takes the oldest
+pending attempt whose run is running with its wall deadline unexpired
+and its budget unexhausted, and the same statement takes the lease.
+Heartbeats extend `leased_until`; a heartbeat that matches no row means
+the worker is fenced and must abandon the attempt. Lease expiry never
+auto-retries — the janitor moves the row to `reconciling` and asks the
+executor's `Inspect` first: a completed attempt with intact outputs is
+adopted idempotently, anything else fails transient (`reconcile_lost`).
+A retry is then a NEW attempt row inserted in the same transaction that
+terminalizes its predecessor, so attempt rows are immutable history;
+partial unique indexes keep at most one live run per task and at most
+one live attempt per (run, node).
+
+Two clocks bound a run. The wall deadline is a column compared against
+the **database** clock (`now()`) inside every deciding statement, so
+there is no read-then-decide race. The execution budget is milliseconds
+accumulated claim→terminal on the **service** clock, added and checked
+in the same transaction that terminalizes the attempt. A worker's
+attempt context deadline is whichever of the two comes first. Both
+numbers come from the run's pinned snapshot (3 attempts, 2h budget, 24h
+wall by default); Plan 09 replaces the evaluation, never the pinning.
+
+Every state change appends its run events in the same transaction. Ids
+are allocated from the single `run_event_counter` row locked FOR UPDATE,
+so id order is commit order — a sequence would let a tailer's cursor
+skip a late commit — and each event also writes one outbox envelope. V1
+has no outbox consumer (Plan 10's SSE tailer is the first); the janitor
+prunes envelopes older than `orchestrator.outbox_retention`, 7 days by
+default. The rest of the queue loop is tuned under the same config key:
+`workers`, `poll_interval`, `lease_ttl`, `heartbeat_interval`.
+
+The production posture is honest, not simulated. `serve` wires
+`runs.NotImplementedExecutor` and a forge that refuses to resolve a
+head, so task intake fails with "forge adapters arrive in Plan 08" (no
+run can pin a base SHA), a definition containing gate or `git-publish`
+nodes is rejected at intake (`waiting` stays unreachable until Plan 08),
+and any phase claimed under production wiring dies `not_implemented`
+until Plan 06's Docker runner lands. Stubs never fake success. The
+deterministic fakes in `internal/runs/fake` are what drive the
+golden-set integration test, which takes a run end-to-end in CI.
 
 ## Contracts
 
