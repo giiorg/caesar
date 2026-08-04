@@ -15,6 +15,7 @@ commands:
   serve     start the control plane (default)
   migrate   run database migrations (up|down|status)
   admin     administrative commands (bootstrap, rekey)
+  stage     clone and verify an attempt workspace (runs inside the stage container)
   version   print build information
 `
 
@@ -36,6 +37,8 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runServeCmd(args, stdout, stderr)
 	case "admin":
 		return runAdminCmd(args, stdin, stdout, stderr)
+	case "stage":
+		return runStageCmd(stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", cmd, usage)
 		return 2

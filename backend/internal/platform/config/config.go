@@ -122,6 +122,20 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
+// StageEnvFromProcess forwards the git auth env config into a constructed
+// child env (envaccess law: this package alone reads the environment). The
+// forge credential reaches the staging container this way and no other, so it
+// never exists as a file anywhere in the attempt.
+func StageEnvFromProcess() []string {
+	var out []string
+	for _, k := range []string{"GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"} {
+		if v := os.Getenv(k); v != "" {
+			out = append(out, k+"="+v)
+		}
+	}
+	return out
+}
+
 func (c Config) validate() error {
 	var problems []string
 	if c.Server.Addr == "" {

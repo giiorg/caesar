@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 func writeFile(t *testing.T, content string) string {
@@ -217,5 +219,18 @@ func TestLoad_MasterKeyIsOptionalAtLoadTime(t *testing.T) {
 	path := writeFile(t, `{"database": {"url": "postgres://x"}}`)
 	if _, err := Load(path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStageEnvFromProcess_ForwardsOnlyTheGitAuthKeysThatAreSet(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "http.extraheader")
+	t.Setenv("GIT_CONFIG_VALUE_0", "")
+	t.Setenv("DATABASE_URL", "postgres://must-not-be-forwarded")
+
+	got := StageEnvFromProcess()
+	want := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.extraheader"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("stage env mismatch (-want +got):\n%s", diff)
 	}
 }

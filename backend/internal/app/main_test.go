@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 )
@@ -33,6 +34,20 @@ func TestMain_MigrateWithBadConfigExitsOne(t *testing.T) {
 	code := Main([]string{"migrate", "-config", "/nonexistent/caesar.json", "up"}, strings.NewReader(""), &out, &errOut)
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, errOut.String())
+	}
+}
+
+func TestMain_StageWithoutItsContractFileExitsTwo(t *testing.T) {
+	if _, err := os.Stat(stageInputPath); err == nil {
+		t.Skipf("%s exists on this host, so the missing-input path cannot be exercised", stageInputPath)
+	}
+	var out, errOut bytes.Buffer
+	code := Main([]string{"stage"}, strings.NewReader(""), &out, &errOut)
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), stageInputPath) {
+		t.Fatalf("stderr = %q, want it to name %q", errOut.String(), stageInputPath)
 	}
 }
 
