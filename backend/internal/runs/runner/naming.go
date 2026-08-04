@@ -19,6 +19,23 @@ func extractName(ref runs.AttemptRef) string  { return ref.String() + "-extract"
 func validateName(ref runs.AttemptRef) string { return ref.String() + "-validate" }
 func networkName(ref runs.AttemptRef) string  { return ref.String() + "-net" }
 
+// A validation run is a second, later pipeline over the same ref (Plan 08),
+// so its resources are named off the validation container rather than the
+// attempt: a validation may run while nothing else does, and must never
+// collide with the attempt's own network or gateway.
+func validateGatewayName(ref runs.AttemptRef) string { return validateName(ref) + "-egress" }
+func validateNetworkName(ref runs.AttemptRef) string { return validateName(ref) + "-net" }
+
+// managedLabel selects everything this runner created, on any host it shares
+// with anything else. It is the whole basis of the orphan sweep, so it is
+// written once here and never spelled out at a call site.
+const managedLabel = "caesar.managed=true"
+
+// runAs is the identity every container in the pipeline runs under: this
+// process's own uid:gid, so a bind-mounted workspace is owned by neither more
+// nor less than the control plane itself (decision 4).
+func (r *Runner) runAs() string { return strconv.Itoa(r.uid) + ":" + strconv.Itoa(r.gid) }
+
 func labels(ref runs.AttemptRef) map[string]string {
 	return map[string]string{
 		"caesar.managed": "true",

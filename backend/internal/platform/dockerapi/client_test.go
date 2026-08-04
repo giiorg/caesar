@@ -71,6 +71,60 @@ func TestContainerCreate_SendsHardeningAndName(t *testing.T) {
 	}
 }
 
+// The daemon reads a null command as "keep the image's own" and an empty one
+// as "the image has none". Callers depend on both readings: an agent inherits
+// the harness image's entrypoint, while a validation run replaces it whole
+// and must not have the image's cmd appended as arguments.
+func TestContainerCreate_NullCommandInheritsAndEmptyCommandClears(t *testing.T) {
+	tests := []struct {
+		name           string
+		cfg            ContainerConfig
+		wantEntrypoint any
+		wantCmd        any
+	}{
+		{
+			name:           "nil leaves the image's own command in place",
+			cfg:            ContainerConfig{Image: "img"},
+			wantEntrypoint: nil,
+			wantCmd:        nil,
+		},
+		{
+			name:           "an empty slice clears what the image baked in",
+			cfg:            ContainerConfig{Image: "img", Entrypoint: []string{"/bin/sh", "-c", "make"}, Cmd: []string{}},
+			wantEntrypoint: []any{"/bin/sh", "-c", "make"},
+			wantCmd:        []any{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			sock := fakeDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"Id":"abc123"}`))
+			})
+			if _, err := New(sock).ContainerCreate(t.Context(), "c", tc.cfg, HostConfig{}, nil); err != nil {
+				t.Fatal(err)
+			}
+			// The keys must be present either way: an absent key and a null
+			// one mean the same thing to the daemon, but only a present one
+			// proves this client is stating its intent.
+			if _, ok := body["Entrypoint"]; !ok {
+				t.Fatal("Entrypoint was omitted from the request")
+			}
+			if _, ok := body["Cmd"]; !ok {
+				t.Fatal("Cmd was omitted from the request")
+			}
+			if diff := cmp.Diff(tc.wantEntrypoint, body["Entrypoint"]); diff != "" {
+				t.Errorf("Entrypoint (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantCmd, body["Cmd"]); diff != "" {
+				t.Errorf("Cmd (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestErrors_NotFoundAndConflictAreTyped(t *testing.T) {
 	sock := fakeDaemon(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)

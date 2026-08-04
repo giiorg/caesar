@@ -42,8 +42,14 @@ type Engine interface {
 	NetworkListByLabel(ctx context.Context, kv string) ([]dockerapi.NetworkSummary, error)
 }
 
-// The production engine must keep satisfying the port without an adapter.
-var _ Engine = (*dockerapi.Client)(nil)
+// The production engine must keep satisfying the port without an adapter,
+// and the runner must keep satisfying the orchestrator's executor port: both
+// halves of the contract are pinned here rather than discovered at wiring
+// time in the composition root.
+var (
+	_ Engine        = (*dockerapi.Client)(nil)
+	_ runs.Executor = (*Runner)(nil)
+)
 
 // HarnessSpec is everything the runner needs to start one harness: which
 // image, which provider it talks to, and which credential unlocks it.

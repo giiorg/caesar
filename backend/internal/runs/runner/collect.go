@@ -34,24 +34,36 @@ const (
 	declaredArtifactsPath  = ".caesar/out/artifacts.json"
 )
 
+// collection is the whole of what turning a finished agent into a result
+// takes. It is deliberately not the RunSpec: reconciliation's adoption path
+// meets a container this process never started, and rebuilding a RunSpec to
+// extract a patch would mean resolving a harness and opening a provider
+// credential that no container is going to be handed. Everything here is
+// either the ref itself or recoverable from the attempt directory.
+type collection struct {
+	Ref      runs.AttemptRef
+	BaseSHA  string
+	User     string
+	ExitCode int64
+	OOM      bool
+}
+
 // collectResult turns a finished agent container into the attempt's result:
 // the canonical patch from a trusted extraction container, whatever the
 // harness declared, and the log reference. It is shared with reconciliation's
 // adoption path, which arrives here with an exit code it read off a container
 // this process never started.
-func collectResult(ctx context.Context, r *Runner, req runs.ExecutionRequest, spec RunSpec,
-	exitCode int64, oom bool,
-) (runs.ExecutionResult, error) {
-	ref := req.Ref
+func (r *Runner) collectResult(ctx context.Context, c collection) (runs.ExecutionResult, error) {
+	ref := c.Ref
 	// A nonzero exit is transient here on purpose: this layer knows only
 	// that the process failed. Reading meaning into a harness's exit codes
 	// is the harness adapter's job (Plan 07).
-	if exitCode != 0 {
+	if c.ExitCode != 0 {
 		return runs.ExecutionResult{}, transientf(runs.CodeHarnessError,
-			"harness exited %d (oom_killed=%v)", exitCode, oom)
+			"harness exited %d (oom_killed=%v)", c.ExitCode, c.OOM)
 	}
 
-	rep, err := r.extractPatch(ctx, ref, spec)
+	rep, err := r.extractPatch(ctx, ref, c.BaseSHA, c.User)
 	if err != nil {
 		return runs.ExecutionResult{}, err
 	}
@@ -73,7 +85,7 @@ func collectResult(ctx context.Context, r *Runner, req runs.ExecutionRequest, sp
 				// still applies. Consumers (Plan 08's publish path) decode
 				// once; nothing round-trips it through a Go string.
 				"diff":      base64.StdEncoding.EncodeToString(rep.Diff),
-				"base_sha":  req.BaseSHA,
+				"base_sha":  c.BaseSHA,
 				"tree_hash": rep.TreeHash,
 			},
 		})
@@ -86,10 +98,10 @@ func collectResult(ctx context.Context, r *Runner, req runs.ExecutionRequest, sp
 // extractPatch runs the trusted extraction container: no network, the whole
 // attempt directory bound, and git pointed at the mirror the agent never
 // touched. Its report is the only thing believed about the workspace.
-func (r *Runner) extractPatch(ctx context.Context, ref runs.AttemptRef, spec RunSpec) (gitops.ExtractReport, error) {
+func (r *Runner) extractPatch(ctx context.Context, ref runs.AttemptRef, baseSHA, user string) (gitops.ExtractReport, error) {
 	dir := r.attemptDir(ref)
 	in := gitops.ExtractInput{
-		BaseSHA:       spec.BaseSHA,
+		BaseSHA:       baseSHA,
 		MaxFiles:      r.opts.WorkspaceQuotaFiles,
 		MaxBytes:      r.opts.WorkspaceQuotaBytes,
 		MaxPatchBytes: maxPatchBytes,
@@ -101,10 +113,10 @@ func (r *Runner) extractPatch(ctx context.Context, ref runs.AttemptRef, spec Run
 	code, runErr := r.runToCompletion(ctx, extractName(ref), dockerapi.ContainerConfig{
 		Image:  r.opts.GitImage,
 		Cmd:    []string{"extract"},
-		User:   spec.User,
+		User:   user,
 		Labels: labels(ref),
 	}, r.hardenedHost([]string{r.hostPath(dir) + ":" + gitops.AttemptMount},
-		noNetwork, gitMemoryBytes, gitNanoCPUs, gitPidsLimit), nil, extractTimeout)
+		noNetwork, gitMemoryBytes, gitNanoCPUs, gitPidsLimit), nil, extractTimeout, nil)
 
 	rep, readErr := readContract[gitops.ExtractReport](filepath.Join(dir, gitops.ExtractReportFile), extractReportLimit)
 	if readErr != nil {

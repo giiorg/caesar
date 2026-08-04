@@ -100,7 +100,10 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	if err != nil {
 		return r.failureResult(ref, spec, agent), err
 	}
-	res, err := collectResult(ctx, r, req, spec, agent.exitCode, agent.oom)
+	res, err := r.collectResult(ctx, collection{
+		Ref: ref, BaseSHA: spec.BaseSHA, User: spec.User,
+		ExitCode: agent.exitCode, OOM: agent.oom,
+	})
 	if err != nil {
 		return r.failureResult(ref, spec, agent), err
 	}
@@ -146,23 +149,32 @@ func attemptSecrets(spec RunSpec) []string {
 }
 
 // ensureNetworks brings up the shared egress network (once per host) and this
-// attempt's own internal network. The shared one is created on demand and
-// raced against every other attempt starting at the same moment, so an
-// already-exists answer is success.
+// attempt's own internal network.
 func (r *Runner) ensureNetworks(ctx context.Context, ref runs.AttemptRef) error {
-	if _, err := r.engine.NetworkInspect(ctx, r.opts.EgressNetwork); err != nil {
-		if !dockerapi.IsNotFound(err) {
-			return transientf(runs.CodeInternalError, "inspect network %s: %v", r.opts.EgressNetwork, err)
-		}
-		_, err := r.engine.NetworkCreate(ctx, r.opts.EgressNetwork, false, map[string]string{"caesar.managed": "true"})
-		if err != nil && !dockerapi.IsConflict(err) {
-			return transientf(runs.CodeInternalError, "create network %s: %v", r.opts.EgressNetwork, err)
-		}
+	if err := r.ensureEgressNetwork(ctx); err != nil {
+		return err
 	}
 	// internal=true is the isolation: nothing on this network has a route
 	// off the host except through the dual-homed gateway.
 	if _, err := r.engine.NetworkCreate(ctx, networkName(ref), true, labels(ref)); err != nil {
 		return transientf(runs.CodeInternalError, "create network %s: %v", networkName(ref), err)
+	}
+	return nil
+}
+
+// ensureEgressNetwork brings up the one network with a route off the host.
+// It is created on demand and raced against every other attempt — and every
+// validation run — starting at the same moment, so an already-exists answer
+// is success.
+func (r *Runner) ensureEgressNetwork(ctx context.Context) error {
+	if _, err := r.engine.NetworkInspect(ctx, r.opts.EgressNetwork); err == nil {
+		return nil
+	} else if !dockerapi.IsNotFound(err) {
+		return transientf(runs.CodeInternalError, "inspect network %s: %v", r.opts.EgressNetwork, err)
+	}
+	_, err := r.engine.NetworkCreate(ctx, r.opts.EgressNetwork, false, map[string]string{"caesar.managed": "true"})
+	if err != nil && !dockerapi.IsConflict(err) {
+		return transientf(runs.CodeInternalError, "create network %s: %v", r.opts.EgressNetwork, err)
 	}
 	return nil
 }
@@ -207,7 +219,7 @@ func (r *Runner) stageAttempt(ctx context.Context, ref runs.AttemptRef, spec Run
 		Env:    env,
 		User:   spec.User,
 		Labels: labels(ref),
-	}, r.hardenedHost(binds, network, gitMemoryBytes, gitNanoCPUs, gitPidsLimit), nil, stageTimeout)
+	}, r.hardenedHost(binds, network, gitMemoryBytes, gitNanoCPUs, gitPidsLimit), nil, stageTimeout, nil)
 
 	rep, readErr := readContract[gitops.StageReport](filepath.Join(dir, gitops.StageReportFile), stageReportLimit)
 	if readErr != nil {
@@ -238,28 +250,7 @@ func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, 
 	// when their container does, or when this function returns.
 	streamCtx, stopStreams := context.WithCancel(context.WithoutCancel(ctx))
 	var streams []*logStreamer
-	defer func() {
-		// Each stream gets a moment to end by itself first. Cancelling the
-		// log follow aborts the HTTP read, which discards whatever the daemon
-		// had already flushed — and the last of those bytes is the gateway's
-		// egress.summary, the very line the TERM grace above exists to
-		// produce. The cancel stays as the escape hatch for error paths,
-		// where a container may still be running and nothing will end the
-		// stream on its own.
-		for _, s := range streams {
-			select {
-			case <-s.done:
-			case <-time.After(streamDrainGrace):
-				stopStreams()
-			}
-		}
-		stopStreams()
-		for _, s := range streams {
-			if _, _, err := s.wait(); err != nil {
-				r.log.Warn("runner.log_stream", "attempt", ref.String(), "error", err)
-			}
-		}
-	}()
+	defer func() { r.drainStreams(ref, streams, stopStreams) }()
 
 	gatewayID, err := r.startGateway(ctx, ref, spec)
 	if err != nil {
@@ -477,6 +468,30 @@ func (r *Runner) denialReporter(ctx context.Context, ref runs.AttemptRef) func(h
 	}
 }
 
+// drainStreams ends the log follows one container set produced. Each stream
+// gets a moment to end by itself first: cancelling a log follow aborts the
+// HTTP read, which discards whatever the daemon had already flushed — and the
+// last of those bytes is the gateway's egress.summary, the very line the TERM
+// grace exists to produce. The cancel stays as the escape hatch for error
+// paths, where a container may still be running and nothing will end the
+// stream on its own. Calling it twice is safe: the second pass finds every
+// stream already done.
+func (r *Runner) drainStreams(ref runs.AttemptRef, streams []*logStreamer, stop context.CancelFunc) {
+	for _, s := range streams {
+		select {
+		case <-s.done:
+		case <-time.After(streamDrainGrace):
+			stop()
+		}
+	}
+	stop()
+	for _, s := range streams {
+		if _, _, err := s.wait(); err != nil {
+			r.log.Warn("runner.log_stream", "attempt", ref.String(), "error", err)
+		}
+	}
+}
+
 // teardown removes everything one attempt created, tolerating anything that
 // is already gone. It runs on every return path, including the panicking one,
 // and the logs directory deliberately survives it: logs are evidence.
@@ -484,14 +499,9 @@ func (r *Runner) teardown(ctx context.Context, ref runs.AttemptRef) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), teardownTimeout)
 	defer cancel()
 
-	for _, name := range []string{extractName(ref), agentName(ref), gatewayName(ref), stageName(ref)} {
-		if err := r.engine.ContainerRemove(ctx, name, true); err != nil && !dockerapi.IsNotFound(err) {
-			r.log.Warn("runner.teardown.container", "attempt", ref.String(), "container", name, "error", err)
-		}
-	}
-	if err := r.engine.NetworkRemove(ctx, networkName(ref)); err != nil && !dockerapi.IsNotFound(err) {
-		r.log.Warn("runner.teardown.network", "attempt", ref.String(), "network", networkName(ref), "error", err)
-	}
+	r.removeByName(ctx,
+		[]string{extractName(ref), agentName(ref), gatewayName(ref), stageName(ref)},
+		[]string{networkName(ref)})
 	if err := os.RemoveAll(r.attemptDir(ref)); err != nil {
 		r.log.Warn("runner.teardown.attempt_dir", "attempt", ref.String(), "error", err)
 	}

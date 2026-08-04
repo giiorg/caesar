@@ -57,11 +57,16 @@ func (r *Runner) hardenedHost(binds []string, network string, mem, cpus, pids in
 // runToCompletion creates, starts and waits out one short-lived container,
 // removing it on every path — including the paths where the wait itself
 // failed, because a container nobody is waiting for is an orphan. It serves
-// the trusted containers (stage, extract, and Plan 08's validation); the
-// agent and the gateway keep explicit lifecycles in execute.go, where the log
-// streaming and the kill windows differ.
+// the trusted containers (stage, extract, validation); the agent and the
+// gateway keep explicit lifecycles in execute.go, where the log streaming and
+// the kill windows differ.
+//
+// started, when non-nil, is called with the container's id the moment it is
+// running and before the wait — the only window in which a caller can follow
+// its logs, since the container is gone by the time this returns.
 func (r *Runner) runToCompletion(ctx context.Context, name string, cfg dockerapi.ContainerConfig,
 	host dockerapi.HostConfig, networks map[string]dockerapi.EndpointSettings, timeout time.Duration,
+	started func(id string),
 ) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -74,6 +79,9 @@ func (r *Runner) runToCompletion(ctx context.Context, name string, cfg dockerapi
 
 	if err := r.engine.ContainerStart(ctx, id); err != nil {
 		return 0, fmt.Errorf("start %s: %w", name, err)
+	}
+	if started != nil {
+		started(id)
 	}
 	code, err := r.engine.ContainerWait(ctx, id)
 	if err != nil {

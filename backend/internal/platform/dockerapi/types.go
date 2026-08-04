@@ -15,10 +15,16 @@ type ImageInspect struct {
 }
 
 // ContainerConfig is the container-level half of a create request.
+//
+// Entrypoint and Cmd distinguish nil from empty, which is why neither carries
+// omitempty: nil encodes as null and the image's own value stands, while an
+// explicitly empty slice encodes as [] and clears it. A caller handing over a
+// whole command line needs that difference — without it an image's baked-in
+// CMD would be appended to the command it meant to replace.
 type ContainerConfig struct {
 	Image      string            `json:"Image"`
-	Entrypoint []string          `json:"Entrypoint,omitempty"`
-	Cmd        []string          `json:"Cmd,omitempty"`
+	Entrypoint []string          `json:"Entrypoint"`
+	Cmd        []string          `json:"Cmd"`
 	Env        []string          `json:"Env,omitempty"`
 	User       string            `json:"User,omitempty"`
 	WorkingDir string            `json:"WorkingDir,omitempty"`

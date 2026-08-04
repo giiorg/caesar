@@ -68,7 +68,7 @@ func (r *Runner) buildSpec(ctx context.Context, req runs.ExecutionRequest, hs Ha
 		Ref:         req.Ref,
 		ImageDigest: digest,
 		Harness:     hs,
-		User:        fmt.Sprintf("%d:%d", r.uid, r.gid),
+		User:        r.runAs(),
 		Env: []string{
 			"CAESAR_ATTEMPT=" + req.Ref.String(),
 			"CAESAR_WORKSPACE=" + workspaceDir,
