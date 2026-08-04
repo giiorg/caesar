@@ -82,6 +82,48 @@ func TestLoad_AppliesDefaultsForOmittedFields(t *testing.T) {
 	}
 }
 
+func TestLoad_OrchestratorDefaultsWhenBlockAbsent(t *testing.T) {
+	cfg, err := Load(writeFile(t, `{"database": {"url": "postgres://x"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Orchestrator.Workers != 4 {
+		t.Errorf("default Workers = %d, want 4", cfg.Orchestrator.Workers)
+	}
+	if cfg.Orchestrator.PollInterval.Std() != 500*time.Millisecond {
+		t.Errorf("default PollInterval = %v, want 500ms", cfg.Orchestrator.PollInterval.Std())
+	}
+	if cfg.Orchestrator.LeaseTTL.Std() != 30*time.Second {
+		t.Errorf("default LeaseTTL = %v, want 30s", cfg.Orchestrator.LeaseTTL.Std())
+	}
+	if cfg.Orchestrator.HeartbeatInterval.Std() != 10*time.Second {
+		t.Errorf("default HeartbeatInterval = %v, want 10s", cfg.Orchestrator.HeartbeatInterval.Std())
+	}
+	if cfg.Orchestrator.OutboxRetention.Std() != 168*time.Hour {
+		t.Errorf("default OutboxRetention = %v, want 168h", cfg.Orchestrator.OutboxRetention.Std())
+	}
+}
+
+func TestLoad_OrchestratorFailsClosed(t *testing.T) {
+	tests := []struct{ name, block, wantErr string }{
+		{"zero workers", `{"workers": 0}`, "orchestrator.workers"},
+		{"too many workers", `{"workers": 65}`, "orchestrator.workers"},
+		{"heartbeat not below lease", `{"lease_ttl": "10s", "heartbeat_interval": "10s"}`, "orchestrator.heartbeat_interval"},
+		{"zero poll interval", `{"poll_interval": "0s"}`, "orchestrator.poll_interval"},
+		{"negative lease ttl", `{"lease_ttl": "-1s"}`, "orchestrator.lease_ttl"},
+		{"zero outbox retention", `{"outbox_retention": "0h"}`, "orchestrator.outbox_retention"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := `{"database": {"url": "postgres://x"}, "orchestrator": ` + tt.block + `}`
+			_, err := Load(writeFile(t, body))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want mention of %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoad_ParsesExplicitAuthTTLs(t *testing.T) {
 	body := `{"database": {"url": "postgres://x"}, "auth": {"session_idle_ttl": "1h", "session_absolute_ttl": "2h"}}`
 	cfg, err := Load(writeFile(t, body))

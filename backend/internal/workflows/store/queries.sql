@@ -57,3 +57,6 @@ ORDER BY version DESC;
 -- name: GetVersion :one
 SELECT * FROM workflow_versions
 WHERE workflow_id = $1 AND version = $2;
+
+-- name: GetVersionByID :one
+SELECT * FROM workflow_versions WHERE id = $1;

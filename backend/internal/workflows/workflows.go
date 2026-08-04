@@ -290,3 +290,16 @@ func (s *Service) GetVersion(ctx context.Context, workflowID uuid.UUID, version 
 	}
 	return versionFromRow(r), nil
 }
+
+// GetVersionByID resolves a pinned version directly — the execution
+// spine's re-run and plan-loading path (wired through app's adapters).
+func (s *Service) GetVersionByID(ctx context.Context, id uuid.UUID) (Version, error) {
+	r, err := store.New(s.pool).GetVersionByID(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Version{}, xerrors.E(xerrors.ClassNotFound, "no such workflow version")
+	}
+	if err != nil {
+		return Version{}, fmt.Errorf("workflows: get version by id: %w", err)
+	}
+	return versionFromRow(r), nil
+}

@@ -159,6 +159,35 @@ func TestGetVersion_HashRecomputesFromStoredDocument(t *testing.T) {
 	}
 }
 
+func TestGetVersionByID_ReturnsDocumentOrNotFound(t *testing.T) {
+	svc, pool, _ := newTestService(t)
+	ctx := context.Background()
+	admin := seedActor(t, pool, "admin@example.com", authn.RoleAdmin)
+	w, _ := svc.CreateWorkflow(ctx, admin, "conveyor", "")
+	made, _, err := svc.CreateVersion(ctx, admin, w.ID, docWith("first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svc.GetVersionByID(ctx, made.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != made.ID || got.WorkflowID != w.ID || got.Version != made.Version || got.ContentHash != made.ContentHash {
+		t.Fatalf("version = %+v, want identity of %+v", got, made)
+	}
+	if len(got.Document) == 0 {
+		t.Fatal("document must be returned")
+	}
+	if doc, err := workflows.ParseDocument(got.Document); err != nil || doc.Hash() != got.ContentHash {
+		t.Fatalf("stored document must reparse to the stored hash: %v", err)
+	}
+
+	if _, err := svc.GetVersionByID(ctx, uuid.New()); xerrors.ClassOf(err) != xerrors.ClassNotFound {
+		t.Fatalf("unknown id: %v, want not_found", err)
+	}
+}
+
 func TestListVersions_MetadataOnlyNewestFirst(t *testing.T) {
 	svc, pool, _ := newTestService(t)
 	ctx := context.Background()

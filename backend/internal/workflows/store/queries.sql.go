@@ -96,6 +96,24 @@ func (q *Queries) GetVersionByHash(ctx context.Context, arg GetVersionByHashPara
 	return i, err
 }
 
+const getVersionByID = `-- name: GetVersionByID :one
+SELECT id, workflow_id, version, content_hash, document, created_at FROM workflow_versions WHERE id = $1
+`
+
+func (q *Queries) GetVersionByID(ctx context.Context, id uuid.UUID) (WorkflowVersion, error) {
+	row := q.db.QueryRow(ctx, getVersionByID, id)
+	var i WorkflowVersion
+	err := row.Scan(
+		&i.ID,
+		&i.WorkflowID,
+		&i.Version,
+		&i.ContentHash,
+		&i.Document,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getWorkflow = `-- name: GetWorkflow :one
 SELECT w.id, w.name, w.description, w.created_at, w.updated_at,
        COALESCE(MAX(v.version), 0)::int AS latest_version

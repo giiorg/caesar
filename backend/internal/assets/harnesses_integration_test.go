@@ -11,6 +11,38 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
 
+func TestGetHarnessByName_RoundTripsOrNotFound(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+
+	modelCred, err := svc.CreateCredential(ctx, admin, "ant", assets.CredentialModelKey, []byte("sk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	made, err := svc.RegisterHarness(ctx, admin, assets.NewHarness{
+		Name: "cc", Kind: assets.HarnessClaudeCode,
+		ImageRef:         "ghcr.io/giiorg/caesar-harness-claude@sha256:abc",
+		ProviderEndpoint: "https://api.anthropic.com",
+		CredentialID:     modelCred.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svc.GetHarnessByName(ctx, "cc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != made.ID || got.Name != "cc" || got.Kind != assets.HarnessClaudeCode || got.CredentialID != modelCred.ID {
+		t.Fatalf("harness = %+v, want the registered one", got)
+	}
+
+	if _, err := svc.GetHarnessByName(ctx, "nope"); xerrors.ClassOf(err) != xerrors.ClassNotFound {
+		t.Fatalf("unknown name: %v, want not_found", err)
+	}
+}
+
 func TestHarnesses_RegistryCRUDWithGuards(t *testing.T) {
 	ctx := context.Background()
 	svc, pool, _ := newTestService(t)

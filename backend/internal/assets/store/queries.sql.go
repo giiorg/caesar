@@ -239,6 +239,27 @@ func (q *Queries) GetHarness(ctx context.Context, id uuid.UUID) (Harness, error)
 	return i, err
 }
 
+const getHarnessByName = `-- name: GetHarnessByName :one
+SELECT id, name, kind, image_ref, provider_endpoint, credential_id, defaults, created_at, updated_at FROM harnesses WHERE name = $1
+`
+
+func (q *Queries) GetHarnessByName(ctx context.Context, name string) (Harness, error) {
+	row := q.db.QueryRow(ctx, getHarnessByName, name)
+	var i Harness
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Kind,
+		&i.ImageRef,
+		&i.ProviderEndpoint,
+		&i.CredentialID,
+		&i.Defaults,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getProject = `-- name: GetProject :one
 SELECT id, name, description, created_at, updated_at
 FROM projects WHERE id = $1

@@ -23,6 +23,8 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/logging"
 	"github.com/giiorg/caesar/backend/internal/platform/pg"
 	"github.com/giiorg/caesar/backend/internal/platform/secrets"
+	"github.com/giiorg/caesar/backend/internal/runs"
+	runsapi "github.com/giiorg/caesar/backend/internal/runs/api"
 	"github.com/giiorg/caesar/backend/internal/workflows"
 	workflowsapi "github.com/giiorg/caesar/backend/internal/workflows/api"
 )
@@ -93,6 +95,24 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, svc, svc, svc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, svc))...)
 
+	// The execution spine: real peer-context adapters, the honest
+	// not-implemented executor and forge until Plans 06/08. identity.Service
+	// serves as authenticator, authorizer, and grant source here too.
+	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
+		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
+		unavailableForge{}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc))...)
+
+	orch := runs.NewOrchestrator(runsSvc, runs.NotImplementedExecutor{}, runs.OrchestratorConfig{
+		Workers:           cfg.Orchestrator.Workers,
+		PollInterval:      cfg.Orchestrator.PollInterval.Std(),
+		LeaseTTL:          cfg.Orchestrator.LeaseTTL.Std(),
+		HeartbeatInterval: cfg.Orchestrator.HeartbeatInterval.Std(),
+		OutboxRetention:   cfg.Orchestrator.OutboxRetention.Std(),
+	}, log)
+	orchDone := make(chan struct{})
+	go func() { defer close(orchDone); _ = orch.Run(ctx) }()
+
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
 		Handler:           Routes(log, pool, ops, cfg.Server.AppOrigin),
@@ -120,6 +140,7 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
 	}
+	<-orchDone
 	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
