@@ -107,6 +107,17 @@ wget -qO /workspace/models.json --header "x-api-key: $CAESAR_BROKER_TOKEN" "$CAE
 	if !strings.Contains(diff, "models.json") || !strings.Contains(diff, "claude-fable-5") {
 		t.Errorf("brokered response never reached the workspace: %q", diff)
 	}
+
+	// The credential lives in the gateway's environment and nowhere that
+	// outlives the attempt: not in either captured stream, not in the patch.
+	if strings.Contains(diff, "real-provider-key") {
+		t.Error("the provider credential reached the patch")
+	}
+	for _, name := range []string{agentLogFile, gatewayLogFile} {
+		if strings.Contains(readLogFile(t, r, ref, name), "real-provider-key") {
+			t.Errorf("%s contains the provider credential", name)
+		}
+	}
 }
 
 func TestExecute_AgentNonzeroExitClassifiesHarnessError(t *testing.T) {
