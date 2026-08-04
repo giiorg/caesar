@@ -53,6 +53,9 @@ func NewGateway(cfg Config, log *slog.Logger) (*Gateway, error) {
 	if cfg.TokenSHA256 == "" && cfg.Provider.Endpoint != "" {
 		return nil, errors.New("egress: a gateway without a token digest may not hold a provider credential")
 	}
+	if cfg.MeterSeconds <= 0 {
+		return nil, errors.New("egress: meter_seconds must be positive")
+	}
 	resolver := &net.Resolver{}
 	dialer := &net.Dialer{Timeout: dialTimeout}
 	return &Gateway{

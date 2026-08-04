@@ -266,12 +266,25 @@ func TestConnect_OpenModeSkipsAuthWhenNoProviderConfigured(t *testing.T) {
 	}
 }
 
-func TestNewGateway_RejectsOpenModeWithAProvider(t *testing.T) {
-	_, err := NewGateway(Config{
-		Attempt:  "a",
-		Provider: Provider{Endpoint: "https://api.anthropic.com", Credential: "real-key", CredentialHeader: "x-api-key"},
-	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
-	if err == nil {
-		t.Fatal("NewGateway accepted an unauthenticated broker holding a provider credential")
+func TestNewGateway_RejectsUnrunnableConfigurations(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+	}{
+		{
+			"an unauthenticated broker holding a provider credential",
+			Config{Attempt: "a", Provider: Provider{Endpoint: "https://api.anthropic.com", Credential: "real-key", CredentialHeader: "x-api-key"}},
+		},
+		{
+			"a meter that would never tick",
+			Config{Attempt: "a", TokenSHA256: shaOf(tok), MeterSeconds: -1},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := NewGateway(c.cfg, slog.New(slog.NewJSONHandler(io.Discard, nil))); err == nil {
+				t.Fatal("NewGateway accepted it")
+			}
+		})
 	}
 }
