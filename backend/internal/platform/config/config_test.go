@@ -222,6 +222,90 @@ func TestLoad_MasterKeyIsOptionalAtLoadTime(t *testing.T) {
 	}
 }
 
+func TestConfig_RunnerDefaultsAndValidation(t *testing.T) {
+	t.Run("defaults when block absent and disabled", func(t *testing.T) {
+		cfg, err := Load(writeFile(t, `{"database": {"url": "postgres://x"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Runner.Enabled {
+			t.Error("runner must ship disabled")
+		}
+		if cfg.Runner.DataRoot != "/var/lib/caesar" {
+			t.Errorf("default DataRoot = %q, want /var/lib/caesar", cfg.Runner.DataRoot)
+		}
+		if cfg.Runner.WorkspaceQuotaBytes.Int64() != 2<<30 {
+			t.Errorf("default WorkspaceQuotaBytes = %d, want 2GiB", cfg.Runner.WorkspaceQuotaBytes.Int64())
+		}
+		if cfg.Runner.LogCapBytes.Int64() != 16<<20 {
+			t.Errorf("default LogCapBytes = %d, want 16MiB", cfg.Runner.LogCapBytes.Int64())
+		}
+		if cfg.Runner.FreeBytesWatermark.Int64() != 10<<30 {
+			t.Errorf("default FreeBytesWatermark = %d, want 10GiB", cfg.Runner.FreeBytesWatermark.Int64())
+		}
+		if cfg.Runner.Cpus != 2.0 {
+			t.Errorf("default Cpus = %v, want 2.0", cfg.Runner.Cpus)
+		}
+		if cfg.Runner.PidsLimit != 512 {
+			t.Errorf("default PidsLimit = %d, want 512", cfg.Runner.PidsLimit)
+		}
+		if cfg.Runner.EgressNetwork != "caesar-egress" {
+			t.Errorf("default EgressNetwork = %q, want caesar-egress", cfg.Runner.EgressNetwork)
+		}
+	})
+
+	t.Run("data_host_root empty defaults to data_root", func(t *testing.T) {
+		cfg, err := Load(writeFile(t, `{"database": {"url": "postgres://x"}, "runner": {"data_root": "/data/caesar"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Runner.DataHostRoot != "/data/caesar" {
+			t.Errorf("DataHostRoot = %q, want it to default to DataRoot /data/caesar", cfg.Runner.DataHostRoot)
+		}
+	})
+
+	t.Run("data_host_root honoured when set", func(t *testing.T) {
+		cfg, err := Load(writeFile(t, `{"database": {"url": "postgres://x"}, "runner": {"data_root": "/local", "data_host_root": "/host"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Runner.DataHostRoot != "/host" {
+			t.Errorf("DataHostRoot = %q, want /host", cfg.Runner.DataHostRoot)
+		}
+	})
+
+	t.Run("fails closed", func(t *testing.T) {
+		tests := []struct{ name, block, wantErr string }{
+			{"enabled without caesar_image", `{"enabled": true}`, "runner.caesar_image"},
+			{"log_flood below log_cap", `{"log_cap_bytes": "16MiB", "log_flood_bytes": "8MiB"}`, "runner.log_flood_bytes"},
+			{"cpus zero", `{"cpus": 0}`, "runner.cpus"},
+			{"cpus over ceiling", `{"cpus": 65}`, "runner.cpus"},
+			{"pids_limit below floor", `{"pids_limit": 8}`, "runner.pids_limit"},
+			{"unknown key inside runner", `{"wat": 1}`, "unknown field"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				body := `{"database": {"url": "postgres://x"}, "runner": ` + tt.block + `}`
+				_, err := Load(writeFile(t, body))
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want mention of %q", err, tt.wantErr)
+				}
+			})
+		}
+	})
+
+	t.Run("enabled with caesar_image loads", func(t *testing.T) {
+		body := `{"database": {"url": "postgres://x"}, "runner": {"enabled": true, "caesar_image": "caesar:dev", "git_image": "caesar-git:dev"}}`
+		cfg, err := Load(writeFile(t, body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.Runner.Enabled || cfg.Runner.CaesarImage != "caesar:dev" {
+			t.Fatalf("runner = %+v, want enabled with caesar:dev", cfg.Runner)
+		}
+	})
+}
+
 func TestStageEnvFromProcess_ForwardsOnlyTheGitAuthKeysThatAreSet(t *testing.T) {
 	t.Setenv("GIT_CONFIG_COUNT", "1")
 	t.Setenv("GIT_CONFIG_KEY_0", "http.extraheader")

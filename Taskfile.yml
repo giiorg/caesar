@@ -101,7 +101,10 @@ tasks:
     desc: "Runner integration suite (needs Docker + task image:build)"
     dir: backend
     cmds:
-      - go test -race -tags runnerintegration -count=1 -timeout 20m ./internal/runs/runner/... ./internal/runs/egress/...
+      # -p 1: every package in this lane spins real containers, so their test
+      # binaries run one at a time. Concurrent binaries storm the daemon and
+      # make timing-sensitive tests (e.g. deadline kills) flake on small hosts.
+      - go test -race -tags runnerintegration -count=1 -timeout 20m -p 1 ./internal/runs/runner/... ./internal/runs/egress/... ./internal/app/
 
   backend:test:property:
     desc: "Property tests (rapid): pinned seed by default; RAPID_SEED=0 randomizes (nightly)"

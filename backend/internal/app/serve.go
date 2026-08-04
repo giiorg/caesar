@@ -103,7 +103,25 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		unavailableForge{}, runs.Params{Snapshot: runs.DefaultSnapshot()})
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc))...)
 
-	orch := runs.NewOrchestrator(runsSvc, runs.NotImplementedExecutor{}, runs.AlwaysAdmit{}, runs.OrchestratorConfig{
+	// Plan 06: the real Docker runner when configured. Disabled by default —
+	// production intake is refused until Plan 08's forge adapters, so the
+	// honest stub stays the default posture (stubs never fake success).
+	var executor runs.Executor = runs.NotImplementedExecutor{}
+	var admission runs.Admission = runs.AlwaysAdmit{}
+	runnerDone := make(chan struct{})
+	close(runnerDone) // no-op wait unless a runner replaces it below
+	if cfg.Runner.Enabled {
+		rnr, err := buildRunner(cfg.Runner, assetsSvc, runsSvc, log)
+		if err != nil {
+			return fmt.Errorf("serve: runner: %w", err)
+		}
+		executor, admission = rnr, rnr
+		runnerDone = make(chan struct{})
+		go func() { defer close(runnerDone); _ = rnr.Run(ctx) }()
+		log.Info("docker runner enabled", "data_root", cfg.Runner.DataRoot)
+	}
+
+	orch := runs.NewOrchestrator(runsSvc, executor, admission, runs.OrchestratorConfig{
 		Workers:           cfg.Orchestrator.Workers,
 		PollInterval:      cfg.Orchestrator.PollInterval.Std(),
 		LeaseTTL:          cfg.Orchestrator.LeaseTTL.Std(),
@@ -141,6 +159,7 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	<-orchDone
+	<-runnerDone
 	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

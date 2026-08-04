@@ -1,4 +1,4 @@
-//go:build integration
+//go:build integration || runnerintegration
 
 // Package testdb hands each test an isolated Postgres database. One
 // postgres:18-alpine container starts per test process (reaped by

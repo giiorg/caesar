@@ -23,6 +23,7 @@ type Config struct {
 	Auth         Auth         `json:"auth"`
 	Security     Security     `json:"security"`
 	Orchestrator Orchestrator `json:"orchestrator"`
+	Runner       Runner       `json:"runner"`
 }
 
 type Server struct {
@@ -62,6 +63,33 @@ type Orchestrator struct {
 	OutboxRetention   Duration `json:"outbox_retention"`
 }
 
+// Runner configures the Docker execution runner (Plan 06). It ships
+// disabled: production intake is refused until Plan 08's forge adapters, so
+// enabling it is an explicit operator act. Every byte/cpu/pids knob has a
+// pinned default (plan Global Constraints); zero never means "unlimited".
+type Runner struct {
+	Enabled             bool     `json:"enabled"`
+	DataRoot            string   `json:"data_root"`
+	DataHostRoot        string   `json:"data_host_root"`
+	CaesarImage         string   `json:"caesar_image"`
+	GitImage            string   `json:"git_image"`
+	EgressNetwork       string   `json:"egress_network"`
+	Cpus                float64  `json:"cpus"`
+	MemoryBytes         Bytes    `json:"memory_bytes"`
+	WorkspaceQuotaBytes Bytes    `json:"workspace_quota_bytes"`
+	WorkspaceQuotaFiles int64    `json:"workspace_quota_files"`
+	LogCapBytes         Bytes    `json:"log_cap_bytes"`
+	LogFloodBytes       Bytes    `json:"log_flood_bytes"`
+	FreeBytesWatermark  Bytes    `json:"free_bytes_watermark"`
+	PidsLimit           int64    `json:"pids_limit"`
+	QuotaPollInterval   Duration `json:"quota_poll_interval"`
+	ConnectAllow        []string `json:"connect_allow"`
+}
+
+// minRunnerPids floors pids_limit well above a shell + agent's needs so an
+// operator can't accidentally starve the container's process table.
+const minRunnerPids = 64
+
 // Duration is a time.Duration that unmarshals from JSON strings like "15s".
 type Duration time.Duration
 
@@ -92,6 +120,19 @@ func defaults() Config {
 			HeartbeatInterval: Duration(10 * time.Second),
 			OutboxRetention:   Duration(168 * time.Hour),
 		},
+		Runner: Runner{
+			DataRoot:            "/var/lib/caesar",
+			EgressNetwork:       "caesar-egress",
+			Cpus:                2.0,
+			MemoryBytes:         Bytes(4 << 30),
+			WorkspaceQuotaBytes: Bytes(2 << 30),
+			WorkspaceQuotaFiles: 200_000,
+			LogCapBytes:         Bytes(16 << 20),
+			LogFloodBytes:       Bytes(64 << 20),
+			FreeBytesWatermark:  Bytes(10 << 30),
+			PidsLimit:           512,
+			QuotaPollInterval:   Duration(2 * time.Second),
+		},
 	}
 }
 
@@ -114,6 +155,14 @@ func Load(path string) (Config, error) {
 	}
 	if key := os.Getenv("CAESAR_MASTER_KEY"); key != "" {
 		cfg.Security.MasterKey = key
+	}
+
+	// data_host_root is the daemon-side spelling of data_root; when the
+	// control plane and daemon share a filesystem the two coincide, so an
+	// unset host root mirrors the local one rather than forcing operators to
+	// repeat it.
+	if cfg.Runner.DataHostRoot == "" {
+		cfg.Runner.DataHostRoot = cfg.Runner.DataRoot
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -197,6 +246,21 @@ func (c Config) validate() error {
 		if _, err := secrets.ParseKeyset(c.Security.MasterKey); err != nil {
 			problems = append(problems, fmt.Sprintf("security.master_key: %v", err))
 		}
+	}
+	// Runner: caesar_image is only meaningful once enabled; the byte, cpu,
+	// and pids invariants hold whether enabled or not (the shipped defaults
+	// satisfy them), so a disabled block still fails closed on a bad knob.
+	if c.Runner.Enabled && c.Runner.CaesarImage == "" {
+		problems = append(problems, "runner.caesar_image is required when runner.enabled is true")
+	}
+	if c.Runner.LogFloodBytes.Int64() < c.Runner.LogCapBytes.Int64() {
+		problems = append(problems, "runner.log_flood_bytes must be >= runner.log_cap_bytes")
+	}
+	if c.Runner.Cpus <= 0 || c.Runner.Cpus > 64 {
+		problems = append(problems, "runner.cpus must be greater than 0 and at most 64")
+	}
+	if c.Runner.PidsLimit < minRunnerPids {
+		problems = append(problems, fmt.Sprintf("runner.pids_limit must be at least %d", minRunnerPids))
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
