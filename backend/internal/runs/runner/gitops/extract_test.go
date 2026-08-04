@@ -1,6 +1,8 @@
 package gitops
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -93,7 +95,9 @@ func assertPatchApplies(t *testing.T, dir, baseSHA string, rep ExtractReport) {
 		t.Fatal(err)
 	}
 	patch := filepath.Join(fresh, "patch.diff")
-	writeFile(t, patch, rep.Diff)
+	if err := os.WriteFile(patch, rep.Diff, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := runGit(t.Context(), fresh, env, "-C", checkout, "apply", "--index", "--binary", patch); err != nil {
 		t.Fatalf("the canonical patch does not apply to a pristine base: %v", err)
 	}
@@ -112,7 +116,7 @@ func TestExtract_NoChangesYieldsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.Changed || rep.Diff != "" {
+	if rep.Changed || len(rep.Diff) != 0 {
 		t.Fatalf("report = %+v, want an unchanged workspace with no patch", rep)
 	}
 	if rep.BaseSHA != sha || rep.TreeHash == "" {
@@ -129,7 +133,7 @@ func TestExtract_ModifiedAndNewFilesProduceApplyingPatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rep.Changed || rep.TreeHash == "" || rep.Diff == "" {
+	if !rep.Changed || rep.TreeHash == "" || len(rep.Diff) == 0 {
 		t.Fatalf("report = %+v, want a changed tree with a patch", rep)
 	}
 	assertPatchApplies(t, dir, sha, rep)
@@ -144,7 +148,7 @@ func TestExtract_DeletionsAreInThePatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rep.Changed || !strings.Contains(rep.Diff, "deleted file mode") {
+	if !rep.Changed || !bytes.Contains(rep.Diff, []byte("deleted file mode")) {
 		t.Fatalf("report = %+v, want the deletion in the patch", rep)
 	}
 	assertPatchApplies(t, dir, sha, rep)
@@ -169,7 +173,7 @@ func TestExtract_PoisonedWorkspaceGitConfigIsInert(t *testing.T) {
 	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
 		t.Fatal("the hostile .git executed code during extraction")
 	}
-	if strings.Contains(rep.Diff, ".git/config") || strings.Contains(rep.Diff, ".git/hooks") {
+	if bytes.Contains(rep.Diff, []byte(".git/config")) || bytes.Contains(rep.Diff, []byte(".git/hooks")) {
 		t.Fatalf("the workspace .git leaked into the patch:\n%s", rep.Diff)
 	}
 	assertPatchApplies(t, dir, sha, rep)
@@ -260,7 +264,7 @@ func TestExtract_RenameIsDetectedInThePatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"rename from README.md", "rename to docs/README.md"} {
-		if !strings.Contains(rep.Diff, want) {
+		if !bytes.Contains(rep.Diff, []byte(want)) {
 			t.Errorf("patch is missing %q:\n%s", want, rep.Diff)
 		}
 	}
@@ -282,11 +286,41 @@ func TestExtract_SymlinkModeAndBinaryContentSurvive(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"120000", "100755", "GIT binary patch"} {
-		if !strings.Contains(rep.Diff, want) {
+		if !bytes.Contains(rep.Diff, []byte(want)) {
 			t.Errorf("patch is missing %q:\n%s", want, rep.Diff)
 		}
 	}
 	assertPatchApplies(t, dir, sha, rep)
+}
+
+// A text file in a legacy encoding has no NUL early on, so git diffs it as
+// text and its raw bytes land in the patch verbatim. The patch is only worth
+// anything if those bytes survive the contract file byte for byte.
+func TestExtract_NonUTF8PatchSurvivesTheContractRoundTrip(t *testing.T) {
+	dir, sha := stagedDir(t)
+	writeFile(t, filepath.Join(dir, workspaceName, "latin1.txt"), "caf\xe9 na\xefve\n")
+	rep, err := Extract(t.Context(), dir, defaultCaps(sha))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(rep.Diff, []byte("+caf\xe9 na\xefve")) {
+		t.Fatalf("the fixture did not put raw non-UTF-8 bytes in the patch:\n%q", rep.Diff)
+	}
+
+	blob, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back ExtractReport
+	if err := json.Unmarshal(blob, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(back.Diff, rep.Diff) {
+		t.Fatalf("the patch did not survive the contract round trip:\n sent %q\n back %q", rep.Diff, back.Diff)
+	}
+	// And the round-tripped patch — the one Task 8 actually applies — still
+	// reproduces the agent's tree exactly.
+	assertPatchApplies(t, dir, sha, back)
 }
 
 func TestExtract_CapsAreTyped(t *testing.T) {
@@ -333,6 +367,29 @@ func TestExtract_NonPositiveCapsAreRefused(t *testing.T) {
 			var te TypedError
 			if !errors.As(err, &te) || te.Outcome.Code != runs.CodeExtractionFailed {
 				t.Fatalf("err = %v, want %s", err, runs.CodeExtractionFailed)
+			}
+		})
+	}
+}
+
+func TestParseObjectID_AcceptsOnlyAnObjectID(t *testing.T) {
+	sha1, sha256 := strings.Repeat("a1", 20), strings.Repeat("b2", 32)
+	tests := []struct {
+		name, out, want string
+		ok              bool
+	}{
+		{name: "a sha-1 id with git's trailing newline", out: sha1 + "\n", want: sha1, ok: true},
+		{name: "a sha-256 id", out: sha256, want: sha256, ok: true},
+		{name: "a warning printed ahead of the id", out: "warning: something\n" + sha1 + "\n"},
+		{name: "uppercase hex is not what git prints", out: strings.ToUpper(sha1)},
+		{name: "a truncated id", out: sha1[:39]},
+		{name: "nothing at all", out: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseObjectID(tc.out)
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("parseObjectID(%q) = %q, %v; want %q, %v", tc.out, got, ok, tc.want, tc.ok)
 			}
 		})
 	}

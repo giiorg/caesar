@@ -30,9 +30,16 @@ type ExtractInput struct {
 
 // ExtractReport is the extraction contract's output file. A typed failure
 // sets Outcome; the runner reads this file whatever the exit code was.
+//
+// Diff is bytes, not a string, and its wire form is therefore base64: a patch
+// is arbitrary bytes (a text file in a legacy encoding is diffed as text, so
+// its raw non-UTF-8 bytes land in the patch), and encoding/json replaces
+// invalid UTF-8 in a string with U+FFFD. That corruption is silent — the
+// mangled patch still applies — so the runner-side reader consumes this field
+// as base64 and must never round-trip it through a string.
 type ExtractReport struct {
 	Outcome  *runs.Outcome `json:"outcome,omitempty"`
-	Diff     string        `json:"diff,omitempty"`
+	Diff     []byte        `json:"diff,omitempty"`
 	BaseSHA  string        `json:"base_sha,omitempty"`
 	TreeHash string        `json:"tree_hash,omitempty"`
 	Changed  bool          `json:"changed"`
@@ -99,12 +106,21 @@ func Extract(ctx context.Context, dir string, in ExtractInput) (ExtractReport, e
 	if err != nil {
 		return ExtractReport{}, typed(runs.OutcomePermanent, runs.CodeExtractionFailed, "write tree: %v", err)
 	}
-	tree := strings.TrimSpace(treeOut)
 	baseTreeOut, err := runGit(ctx, dir, env, "rev-parse", in.BaseSHA+"^{tree}")
 	if err != nil {
 		return ExtractReport{}, typed(runs.OutcomePermanent, runs.CodeExtractionFailed, "resolve base tree %s: %v", in.BaseSHA, err)
 	}
-	rep := ExtractReport{BaseSHA: in.BaseSHA, TreeHash: tree, Changed: tree != strings.TrimSpace(baseTreeOut)}
+	// Both come out of combined output, so a stray git warning would otherwise
+	// be compared as if it were an object id.
+	tree, ok := parseObjectID(treeOut)
+	if !ok {
+		return ExtractReport{}, typed(runs.OutcomePermanent, runs.CodeExtractionFailed, "write-tree did not produce an object id")
+	}
+	baseTree, ok := parseObjectID(baseTreeOut)
+	if !ok {
+		return ExtractReport{}, typed(runs.OutcomePermanent, runs.CodeExtractionFailed, "base tree of %s did not resolve to an object id", in.BaseSHA)
+	}
+	rep := ExtractReport{BaseSHA: in.BaseSHA, TreeHash: tree, Changed: tree != baseTree}
 	if !rep.Changed {
 		return rep, nil
 	}
@@ -123,9 +139,27 @@ func Extract(ctx context.Context, dir string, in ExtractInput) (ExtractReport, e
 	return rep, nil
 }
 
+// parseObjectID accepts only what git prints for an object id — 40 hex digits
+// under SHA-1, 64 under SHA-256 — so nothing else can be carried as one.
+func parseObjectID(out string) (string, bool) {
+	id := strings.TrimSpace(out)
+	if len(id) != 40 && len(id) != 64 {
+		return "", false
+	}
+	for _, c := range id {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return id, true
+}
+
 // firstGitlink reports the first `git ls-files -s` entry recorded as a nested
 // repository. The mode is the first field of every line, so a path with any
-// character in it cannot confuse the scan.
+// character in it cannot confuse the scan. Note that only an embedded repo git
+// can read gets this far: one whose config is unparseable aborts `git add -A`
+// instead, and so reports extraction_failed. Both are permanent; the
+// distinction is diagnostic, not behavioural.
 func firstGitlink(entries string) (string, bool) {
 	for _, line := range strings.Split(entries, "\n") {
 		mode, rest, ok := strings.Cut(line, " ")
@@ -142,10 +176,10 @@ func firstGitlink(entries string) (string, bool) {
 // patch that will be rejected for size is never held in memory in full.
 // stdout is captured alone: the patch must be exactly what git wrote, with no
 // warning interleaved into it.
-func gitDiffCapped(ctx context.Context, dir string, env []string, limit int64, baseSHA, tree string) (string, bool, error) {
+func gitDiffCapped(ctx context.Context, dir string, env []string, limit int64, baseSHA, tree string) ([]byte, bool, error) {
 	gitBin, err := exec.LookPath("git")
 	if err != nil {
-		return "", false, fmt.Errorf("gitops: git binary: %w", err)
+		return nil, false, fmt.Errorf("gitops: git binary: %w", err)
 	}
 	cmd := exec.CommandContext(ctx, gitBin,
 		"diff-tree", "-p", "--binary", "--full-index", "-M50", baseSHA, tree)
@@ -156,9 +190,9 @@ func gitDiffCapped(ctx context.Context, dir string, env []string, limit int64, b
 	cmd.Stdout = out
 	cmd.Stderr = &errOut
 	if err := cmd.Run(); err != nil {
-		return "", false, fmt.Errorf("gitops: git diff-tree: %w: %s", err, errOut.String())
+		return nil, false, fmt.Errorf("gitops: git diff-tree: %w: %s", err, errOut.String())
 	}
-	return out.String(), out.over, nil
+	return out.buf, out.over, nil
 }
 
 // cappedBuffer keeps the first limit bytes written to it and remembers that
@@ -183,5 +217,3 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
-
-func (b *cappedBuffer) String() string { return string(b.buf) }
