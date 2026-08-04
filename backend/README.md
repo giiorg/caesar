@@ -91,10 +91,10 @@ execution spine adds `/api/v1/tasks` and `/api/v1/runs`: reads need the
 ## Execution spine (Plan 05)
 
 Tasks, runs, attempt rows, artifacts and run events live in
-`internal/runs`. A task pins its repo, its workflow version and a
-`PolicySnapshot` at intake; each run pins the base SHA and carries the
-snapshot as jsonb plus the denormalized budget and deadline columns
-every deciding SQL statement predicates on. Status vocabularies and the
+`internal/runs`. A task pins its repo and workflow version; each run
+pins the base SHA and the `PolicySnapshot` in force at intake, carried
+as jsonb plus the denormalized budget and deadline columns every
+deciding SQL statement predicates on. Status vocabularies and the
 transition tables for runs and attempt rows are
 `internal/runs/status.go` — the source of truth that the CAS sites, the
 property suite, and the schema's CHECK constraints all follow.
@@ -122,7 +122,10 @@ attempt context deadline is whichever of the two comes first. Both
 numbers come from the run's pinned snapshot (3 attempts, 2h budget, 24h
 wall by default); Plan 09 replaces the evaluation, never the pinning.
 
-Every state change appends its run events in the same transaction. Ids
+Every terminal state change and materialization appends its run events
+in the same transaction; the two observational events (`phase.started`,
+`phase.reconciling`) are appended in a transaction adjacent to the claim
+statement and the reconciling flip. Ids
 are allocated from the single `run_event_counter` row locked FOR UPDATE,
 so id order is commit order — a sequence would let a tailer's cursor
 skip a late commit — and each event also writes one outbox envelope. V1

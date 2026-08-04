@@ -91,7 +91,7 @@ func validateNewTask(in NewTask) error {
 	e := xerrors.E(xerrors.ClassInvalid, "validation failed")
 	ok := true
 	if in.Title == "" || len(in.Title) > maxTitleLen {
-		e = e.WithFields(xerrors.FieldError{Field: "title", Message: fmt.Sprintf("must be 1-%d characters", maxTitleLen)})
+		e = e.WithFields(xerrors.FieldError{Field: "title", Message: fmt.Sprintf("must be 1-%d bytes", maxTitleLen)})
 		ok = false
 	}
 	if in.WorkflowVersion < 1 {

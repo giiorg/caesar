@@ -237,6 +237,12 @@ func (o *Orchestrator) sweepExpiredRuns(ctx context.Context) error {
 
 // terminalizeRun is the shared one-tx run death: CAS the run, supersede
 // live phases, append events, audit run.finished (actor NULL).
+// Lock order here is run -> phases, while evaluateSuccess goes phase ->
+// run (finishPhase, then AddRunUsage); a wall-deadline sweep racing a
+// worker's terminal evaluation of the same run can deadlock on that
+// inversion. Postgres detects it and kills one side, and both recover —
+// the sweeper on its next tick, the worker via lease expiry ->
+// reconcile — so the inversion is documented rather than reordered.
 func (o *Orchestrator) terminalizeRun(ctx context.Context, runID uuid.UUID, to RunStatus, out Outcome, eventKind string) error {
 	cp, err := o.loadPlan(ctx, runID)
 	if err != nil {
@@ -339,8 +345,11 @@ func claimedFromRow(row store.PhaseRun) claimed {
 func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) {
 	cp, err := o.loadPlan(ctx, c.Ref.RunID)
 	if err != nil {
+		// Never evaluate without a plan: a transient definition-source blip
+		// would classify permanent and kill the run with project-less
+		// events. Walk away instead — the lease expires and the reconcile
+		// path retries honestly (transient reconcile_lost).
 		o.log.Error("orchestrator: plan load", "run", c.Ref.RunID, "error", err)
-		o.evaluate(ctx, workerID, cachedPlan{}, c, PhaseRunning, ExecutionResult{}, err)
 		return
 	}
 	node := cp.plan.Nodes[c.Ref.NodeID]
@@ -609,7 +618,24 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	// worker would each account the same claim->terminal interval
 	// (invariant 11: usage accumulates once).
 	q := store.New(tx)
-	if out.Retryable() && c.Ref.Attempt < c.MaxAttempts {
+	retry := out.Retryable() && c.Ref.Attempt < c.MaxAttempts
+	budgetBreached := false
+	if retry {
+		// The fencing CAS must pick failed vs dead up front (failed ->
+		// dead is not a legal transition), and a delta that crosses the
+		// budget must not insert a successor the claim predicate
+		// (execution_used_ms < execution_budget_ms) would refuse forever.
+		// The run-row lock makes the read race-free; usage itself is
+		// still only added after the CAS wins.
+		runRow, err := q.GetRunForUpdate(ctx, c.Ref.RunID)
+		if err != nil {
+			return err
+		}
+		if runRow.ExecutionUsedMs+max(deltaMS, 0) >= runRow.ExecutionBudgetMs {
+			retry, budgetBreached = false, true
+		}
+	}
+	if retry {
 		// Retry: prior attempt -> failed, next attempt inserted, SAME tx
 		// (spec §2). failed rows always have successors (plan decision 3).
 		n, err := o.svc.finishPhase(ctx, tx, c.PhaseID, fromStatus, PhaseFailed, workerID, rawOut)
@@ -650,7 +676,10 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		}
 	}
 	runOut := out
-	if out.Retryable() { // retryable but exhausted
+	switch {
+	case budgetBreached:
+		runOut = Outcome{Class: OutcomePermanent, Code: CodeBudgetExhausted, Message: "execution budget exhausted"}
+	case out.Retryable(): // retryable but exhausted
 		runOut = Outcome{
 			Class: OutcomePermanent, Code: CodeAttemptsExhausted,
 			Message: fmt.Sprintf("node %s exhausted %d attempts", c.Ref.NodeID, c.MaxAttempts),

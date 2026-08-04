@@ -14,7 +14,7 @@ import (
 )
 
 const addRunUsage = `-- name: AddRunUsage :one
-UPDATE runs SET execution_used_ms = LEAST(execution_used_ms + $2, 9223372036854775807)
+UPDATE runs SET execution_used_ms = LEAST(execution_used_ms + GREATEST($2, 0), 9223372036854775807)
 WHERE id = $1
 RETURNING execution_used_ms, execution_budget_ms
 `
@@ -29,6 +29,9 @@ type AddRunUsageRow struct {
 	ExecutionBudgetMs int64
 }
 
+// GREATEST clamps a negative service-clock delta (reconciler adoption
+// across DB-roundtripped timestamps; no monotonic clock) so it can never
+// violate runs_execution_used_ms_check and roll back an adoption.
 func (q *Queries) AddRunUsage(ctx context.Context, arg AddRunUsageParams) (AddRunUsageRow, error) {
 	row := q.db.QueryRow(ctx, addRunUsage, arg.ID, arg.DeltaMs)
 	var i AddRunUsageRow

@@ -277,6 +277,42 @@ func TestHangingAttemptReconcilesAndExhausts(t *testing.T) {
 	}
 }
 
+// TestBudgetBreachOnRetryFailsTheRun crosses the budget on a transient
+// failure: the retry path must not insert a successor the claim
+// predicate would refuse forever — the attempt dies and the run fails
+// budget_exhausted promptly, not at the 24h wall deadline.
+func TestBudgetBreachOnRetryFailsTheRun(t *testing.T) {
+	f := newFixture(t)
+	doc := agenticDoc()
+	doc.Nodes[0].Instructions = "Plan.\ncaesar-fake: fail attempts=99 class=transient code=harness_error"
+	snap := runs.DefaultSnapshot()
+	snap.ExecutionBudgetMS = 1 // any real attempt costs more than 1ms
+	svc, _ := newService(t, f, doc, snap)
+	startOrchestrator(t, svc, fake.NewExecutor(), 30*time.Second)
+	ctx := context.Background()
+
+	_, run, err := svc.CreateTask(ctx, principal(f), runs.NewTask{
+		RepoID: f.repoID, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: "budget-retry",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := waitForRun(t, svc, run.ID, runs.RunFailed)
+	if final.Outcome == nil || final.Outcome.Code != runs.CodeBudgetExhausted {
+		t.Errorf("outcome = %+v, want budget_exhausted", final.Outcome)
+	}
+	_, phases, _, err := svc.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(phases) != 1 {
+		t.Fatalf("phases = %d, want 1 (a breach must not insert a successor)", len(phases))
+	}
+	if phases[0].NodeID != "plan" || phases[0].Status != runs.PhaseDead {
+		t.Errorf("attempt row = %s/%s, want plan/dead", phases[0].NodeID, phases[0].Status)
+	}
+}
+
 func TestBudgetBreachFailsTheRun(t *testing.T) {
 	f := newFixture(t)
 	snap := runs.DefaultSnapshot()
