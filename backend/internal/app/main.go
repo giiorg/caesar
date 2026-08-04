@@ -12,12 +12,13 @@ import (
 const usage = `caesar — deterministic orchestrator of agentic workflows
 
 commands:
-  serve     start the control plane (default)
-  migrate   run database migrations (up|down|status)
-  admin     administrative commands (bootstrap, rekey)
-  stage     clone and verify an attempt workspace (runs inside the stage container)
-  extract   compute the canonical patch for an attempt (runs inside the extract container)
-  version   print build information
+  serve         start the control plane (default)
+  migrate       run database migrations (up|down|status)
+  admin         administrative commands (bootstrap, rekey)
+  stage         clone and verify an attempt workspace (runs inside the stage container)
+  extract       compute the canonical patch for an attempt (runs inside the extract container)
+  egress-proxy  broker and tunnel an attempt's only route off its network (runs inside the gateway container)
+  version       print build information
 `
 
 // Main dispatches subcommands. It returns the process exit code; main() is
@@ -42,6 +43,8 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runStageCmd(stdout, stderr)
 	case "extract":
 		return runExtractCmd(stdout, stderr)
+	case "egress-proxy":
+		return runEgressProxyCmd(stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", cmd, usage)
 		return 2

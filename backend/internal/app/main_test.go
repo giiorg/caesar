@@ -61,6 +61,34 @@ func TestMain_ContractCommandsWithoutTheirInputFileExitTwo(t *testing.T) {
 	}
 }
 
+func TestMain_EgressProxyWithoutAUsableConfigExitsOne(t *testing.T) {
+	tests := []struct {
+		name, env, wantErr string
+	}{
+		{name: "no config at all", env: "", wantErr: "CAESAR_EGRESS_CONFIG"},
+		{name: "config is not JSON", env: "not json", wantErr: "parse"},
+		{name: "config names no attempt", env: `{"connect_allow":["registry.npmjs.org"]}`, wantErr: "attempt"},
+		{
+			name:    "an unauthenticated gateway may not hold a credential",
+			env:     `{"attempt":"a","provider":{"endpoint":"https://api.anthropic.com","credential":"k","credential_header":"x-api-key"}}`,
+			wantErr: "credential",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CAESAR_EGRESS_CONFIG", tc.env)
+			var out, errOut bytes.Buffer
+			code := Main([]string{"egress-proxy"}, strings.NewReader(""), &out, &errOut)
+			if code != 1 {
+				t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, errOut.String())
+			}
+			if !strings.Contains(errOut.String(), tc.wantErr) {
+				t.Fatalf("stderr = %q, want it to mention %q", errOut.String(), tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestMain_MigrateRejectsArgsAfterDirection(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := Main([]string{"migrate", "up", "-config", "/nonexistent/caesar.json"}, strings.NewReader(""), &out, &errOut)
