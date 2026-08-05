@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/giiorg/caesar/backend/internal/platform/pg"
@@ -152,5 +153,76 @@ func TestEventIDsAreCommitOrdered(t *testing.T) {
 	}
 	if len(kinds) != 2 || kinds[0] != "test.a" || kinds[1] != "test.b" {
 		t.Errorf("kinds by id = %v, want [test.a test.b]", kinds)
+	}
+}
+
+// The runner appends bounded runtime observations mid-attempt, outside
+// any outcome transaction: each lands in its own tx, scoped to the run's
+// project (resolved from the row, never passed in) and correlated by the
+// attempt ref, in call order.
+func TestAppendRuntimeEvent_OwnTxProjectScopedAndOrdered(t *testing.T) {
+	f := newFixture(t)
+	svc, _ := newService(t, f, agenticDoc(), runs.DefaultSnapshot())
+	ctx := t.Context()
+	_, runID := f.newRunRow(t, "running")
+	ref := runs.AttemptRef{RunID: runID, NodeID: "impl", Attempt: 2}
+
+	if err := svc.AppendRuntimeEvent(ctx, ref, runs.EventPhaseLogTruncated, map[string]any{
+		"node_id": ref.NodeID, "attempt": ref.Attempt, "stream": "agent", "cap_bytes": 16777216,
+	}); err != nil {
+		t.Fatalf("append runtime event: %v", err)
+	}
+	if err := svc.AppendRuntimeEvent(ctx, ref, runs.EventPhaseEgressDenied, map[string]any{
+		"node_id": ref.NodeID, "attempt": ref.Attempt, "host": "evil.example.com",
+	}); err != nil {
+		t.Fatalf("append runtime event: %v", err)
+	}
+
+	rows, err := f.pool.Query(ctx,
+		`SELECT kind, project_id, correlation_id FROM run_events WHERE run_id = $1 ORDER BY id`, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	type row struct {
+		kind        string
+		projectID   uuid.UUID
+		correlation string
+	}
+	var got []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.kind, &r.projectID, &r.correlation); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("events = %d, want 2", len(got))
+	}
+	if got[0].kind != runs.EventPhaseLogTruncated || got[1].kind != runs.EventPhaseEgressDenied {
+		t.Errorf("kinds by id = %s, %s, want %s, %s",
+			got[0].kind, got[1].kind, runs.EventPhaseLogTruncated, runs.EventPhaseEgressDenied)
+	}
+	for _, r := range got {
+		if r.projectID != f.projectID {
+			t.Errorf("%s: project id not resolved: %s", r.kind, r.projectID)
+		}
+		if r.correlation != ref.String() {
+			t.Errorf("%s: correlation = %s, want %s", r.kind, r.correlation, ref.String())
+		}
+	}
+
+	// Own tx means committed and visible on its own — outbox envelopes
+	// land with them, exactly one per event.
+	var outbox int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM outbox`).Scan(&outbox); err != nil {
+		t.Fatal(err)
+	}
+	if outbox != 2 {
+		t.Errorf("outbox rows = %d, want 2", outbox)
 	}
 }

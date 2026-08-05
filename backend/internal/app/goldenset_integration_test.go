@@ -143,7 +143,7 @@ func TestGoldenSet_MonthOneLoopThroughRealRoutes(t *testing.T) {
 	srv := httptest.NewServer(Routes(discard(), pool, ops, "http://caesar.test"))
 	t.Cleanup(srv.Close)
 
-	orch := runs.NewOrchestrator(runsSvc, fake.NewExecutor(), runs.OrchestratorConfig{
+	orch := runs.NewOrchestrator(runsSvc, fake.NewExecutor(), runs.AlwaysAdmit{}, runs.OrchestratorConfig{
 		Workers: 2, PollInterval: 20 * time.Millisecond, LeaseTTL: 30 * time.Second,
 		HeartbeatInterval: 10 * time.Second, OutboxRetention: 168 * time.Hour,
 	}, discard())

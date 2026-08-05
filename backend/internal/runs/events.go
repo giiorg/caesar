@@ -27,6 +27,8 @@ const (
 	EventPhaseRetried      = "phase.retried"
 	EventPhaseSucceeded    = "phase.succeeded"
 	EventPhaseDead         = "phase.dead"
+	EventPhaseLogTruncated = "phase.log_truncated"
+	EventPhaseEgressDenied = "phase.egress_denied"
 )
 
 // Event is one observation appended in the same tx as its state change.

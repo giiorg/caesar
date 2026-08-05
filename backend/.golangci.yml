@@ -5,6 +5,7 @@ run:
   build-tags:
     - integration
     - property
+    - runnerintegration
 
 linters:
   disable-all: true

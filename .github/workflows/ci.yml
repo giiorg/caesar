@@ -23,6 +23,22 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: task backend:ci
 
+  runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: task image:build
+      - run: task backend:test:runner
+
   secrets:
     runs-on: ubuntu-latest
     steps:
@@ -66,7 +82,7 @@ jobs:
 
   ci-ok:
     # The single required status check; branch protection points here.
-    needs: [backend, secrets, workflow-lint, contracts]
+    needs: [backend, runner, secrets, workflow-lint, contracts]
     if: always()
     runs-on: ubuntu-latest
     steps:

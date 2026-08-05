@@ -1,6 +1,7 @@
 package runs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +13,9 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/authn"
 	"github.com/giiorg/caesar/backend/internal/platform/clock"
+	"github.com/giiorg/caesar/backend/internal/platform/pg"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
+	"github.com/giiorg/caesar/backend/internal/runs/store"
 )
 
 // Params is the injected policy source until Plan 09's engine: app
@@ -39,6 +42,25 @@ func NewService(pool *pgxpool.Pool, c clock.Clock, rec *audit.Recorder,
 		pool: pool, clock: c, audit: rec, defs: defs, repos: repos,
 		harnesses: harnesses, forge: forge, params: p,
 	}
+}
+
+// AppendRuntimeEvent records one bounded runtime observation (log
+// truncation, egress denial) in its own transaction. The runner calls
+// this mid-attempt; volume is capped by the caller (plan: ≤20 denials
+// per attempt), so bulk agent output can never bloat the dispatch
+// database (spec §3 collection).
+func (s *Service) AppendRuntimeEvent(ctx context.Context, ref AttemptRef, kind string, payload map[string]any) error {
+	projectID, err := store.New(s.pool).GetRunProjectID(ctx, ref.RunID)
+	if err != nil {
+		return fmt.Errorf("runs: runtime event project: %w", err)
+	}
+	now := s.clock.Now()
+	return pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		return appendEvents(ctx, tx, now, []Event{{
+			RunID: ref.RunID, ProjectID: projectID, Kind: kind,
+			CorrelationID: ref.String(), Payload: payload,
+		}})
+	})
 }
 
 func actorID(p authn.Principal) uuid.NullUUID {

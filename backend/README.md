@@ -144,6 +144,98 @@ until Plan 06's Docker runner lands. Stubs never fake success. The
 deterministic fakes in `internal/runs/fake` are what drive the
 golden-set integration test, which takes a run end-to-end in CI.
 
+## Docker runner and egress gateway (Plan 06)
+
+`internal/runs/runner` implements `runs.Executor` for real: every claimed
+phase becomes a four-container pipeline on the host Docker daemon
+(hand-rolled Engine API client in `internal/platform/dockerapi`, pinned
+`v1.43`, no moby dependency):
+
+1. **stage** (`caesar-git` image) — clones the repo at the pinned base
+   SHA, sanitizes, verifies, and lays out the workspace. Only container
+   that ever sees the forge credential (env only, never argv or disk).
+2. **egress gateway** (`caesar egress-proxy`, distroless image) — the
+   credential broker + CONNECT proxy. Holds the provider credential and
+   only the SHA-256 of the attempt-scoped broker token.
+3. **agent** (harness image) — runs the coding agent against
+   `/workspace`, the only mount it gets. No credentials; talks to the
+   world exclusively through the gateway.
+4. **extract** (`caesar-git` image, networkless) — computes the
+   canonical patch against the trusted base mirror.
+
+Two networks per attempt: the agent and gateway share a fresh
+`internal: true` attempt network (no route out), and the gateway is
+additionally attached to the shared `caesar-egress` bridge — it is
+dual-homed precisely so that the *only* path from the agent to the
+internet is through a process we wrote, which enforces per-provider
+operation allowlists (broker) and an exact-hostname, 443-only CONNECT
+allowlist that refuses private/loopback/link-local ranges and dials the
+vetted IP directly. Every container runs the full hardening profile:
+`CapDrop ALL`, `no-new-privileges`, default seccomp, read-only rootfs,
+tmpfs `/tmp`, non-root (the runner refuses to start as uid 0),
+mem/cpu/pids limits.
+
+The staging contract (`gitops.Stage`, run as `caesar stage` inside the
+stage container) has five clauses, in order:
+
+1. **Auth never in the URL** — userinfo in the clone URL fails typed
+   before any git runs; the credential travels only via env-config
+   `http.extraheader`, which git never persists to disk.
+2. **Clone bare + verify the pin** — `git clone --bare` to `base.git`,
+   then `cat-file -e <sha>^{commit}`; a missing pin is permanent
+   `base_sha_unavailable`.
+3. **Materialize** — local clone of `base.git` into `workspace/` and a
+   detached checkout at the SHA; the workspace `.git` is
+   hostile-by-assumption from this point on.
+4. **Sanitize** — reset `origin` to the credential-free URL and assert
+   neither git config carries `extraheader`/`askpass`/`credential` keys.
+5. **Verify (negative scan)** — no `.git-credentials` anywhere, the
+   credential value appears in no clone-metadata file, and the fresh
+   clone alone must fit the workspace quota. Any verify miss is
+   permanent `staging_verification_failed`: a workspace that fails
+   verification is never handed to an agent.
+
+Extraction never executes git *against* the workspace's `.git`: the
+agent had two hours alone with it, so its config, hooks, and fsmonitor
+settings are attacker-controlled. `gitops.Extract` runs every git call
+with `GIT_DIR` pointed at the trusted `base.git` mirror and
+`GIT_WORK_TREE` at the workspace, making the hostile `.git` inert data;
+gitlinks (embedded repos) are rejected (`embedded_repo`), and the
+container itself has no network to exfiltrate through.
+
+Enforcement is control-plane-side, typed, and pinned (config-overridable
+via the `runner` block):
+
+| mechanism | limit | on breach |
+|---|---|---|
+| workspace quota (2s poll) | 2 GiB / 200000 files | agent killed, permanent `workspace_quota_exceeded` |
+| log cap (per stream) | 16 MiB | stream truncated, `phase.log_truncated` event |
+| log flood kill | 64 MiB | agent killed, permanent `log_flood` |
+| free-space watermark | 10 GiB free on `data_root` | claims refused via `runs.Admission` before work starts |
+
+Logs persist under `data_root/logs/<ref>/` and surface as `log_ref` /
+`failure_snapshot` artifacts (broker token and provider credential
+values scrubbed); everything else under `data_root/attempts/<ref>/` is
+torn down on every exit path, with a label-scoped orphan sweep behind it.
+
+Run the suite (build tag `runnerintegration`, its own CI lane):
+
+    task image:build && task backend:test:runner
+
+It needs a real Docker daemon and both images; it skips only when the
+images are missing, never when the daemon is absent. The e2e test
+bind-mounts `t.TempDir()`, so it expects a Linux daemon (or a Docker
+Desktop whose file sharing covers the OS temp dir).
+
+The production posture stays honest: `runner.enabled` defaults false
+(`NotImplementedExecutor` + `AlwaysAdmit`, exactly Plan 05), and task
+intake is refused until Plan 08's forge adapters land, so an enabled
+runner is unreachable today — the flag exists so config, wiring, and
+validation are real now and the deploy stack flips one boolean. In prod,
+network isolation must not rest on Docker alone: the host firewall must
+deny the agent subnets everything except the gateway (baseline in the
+Plan 14 deployment runbook).
+
 ## Contracts
 
 `task contracts:gen` regenerates the OpenAPI document and the TS client

@@ -138,6 +138,61 @@ func (q *Queries) ClaimPhase(ctx context.Context, arg ClaimPhaseParams) (ClaimPh
 	return i, err
 }
 
+const claimStuckReconciling = `-- name: ClaimStuckReconciling :many
+UPDATE phase_runs SET leased_until = now() + make_interval(secs => $1::float8)
+WHERE id IN (
+    SELECT id FROM phase_runs
+    WHERE status = 'reconciling'
+      AND leased_until < now() - make_interval(secs => $2::float8)
+    ORDER BY leased_until
+    LIMIT $3 FOR UPDATE SKIP LOCKED
+)
+RETURNING id, run_id, node_id, attempt, max_attempts, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at
+`
+
+type ClaimStuckReconcilingParams struct {
+	LeaseSeconds float64
+	GraceSeconds float64
+	MaxRows      int32
+}
+
+// Rows whose owner died between marking 'reconciling' and evaluating:
+// the lease sweep can't see them (its predicate is status = 'running').
+// Extending the lease is the CAS that makes concurrent sweepers safe —
+// one winner per row per grace window.
+func (q *Queries) ClaimStuckReconciling(ctx context.Context, arg ClaimStuckReconcilingParams) ([]PhaseRun, error) {
+	rows, err := q.db.Query(ctx, claimStuckReconciling, arg.LeaseSeconds, arg.GraceSeconds, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PhaseRun
+	for rows.Next() {
+		var i PhaseRun
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.Status,
+			&i.WorkerID,
+			&i.LeasedUntil,
+			&i.ClaimedAt,
+			&i.FinishedAt,
+			&i.Outcome,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countOutbox = `-- name: CountOutbox :one
 SELECT count(*) FROM outbox
 `
@@ -304,6 +359,17 @@ func (q *Queries) GetRunForUpdate(ctx context.Context, id uuid.UUID) (Run, error
 		&i.FinishedAt,
 	)
 	return i, err
+}
+
+const getRunProjectID = `-- name: GetRunProjectID :one
+SELECT t.project_id FROM runs r JOIN tasks t ON t.id = r.task_id WHERE r.id = $1
+`
+
+func (q *Queries) GetRunProjectID(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getRunProjectID, id)
+	var project_id uuid.UUID
+	err := row.Scan(&project_id)
+	return project_id, err
 }
 
 const getTask = `-- name: GetTask :one
@@ -933,6 +999,31 @@ func (q *Queries) ListTasksByProjects(ctx context.Context, projectIds []uuid.UUI
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTerminalRunIDsAmong = `-- name: ListTerminalRunIDsAmong :many
+SELECT id FROM runs
+WHERE id = ANY($1::uuid[]) AND status IN ('succeeded', 'failed', 'superseded', 'dead')
+`
+
+func (q *Queries) ListTerminalRunIDsAmong(ctx context.Context, ids []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listTerminalRunIDsAmong, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

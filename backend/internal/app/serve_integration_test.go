@@ -3,14 +3,35 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/giiorg/caesar/backend/internal/platform/config"
 	"github.com/giiorg/caesar/backend/internal/platform/testdb"
 )
+
+// syncBuffer captures runServe's log while its goroutines are still writing.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
 
 func TestRunServe_BootsMigratesAndShutsDownOnCancel(t *testing.T) {
 	cfg := config.Config{}
@@ -26,11 +47,27 @@ func TestRunServe_BootsMigratesAndShutsDownOnCancel(t *testing.T) {
 		OutboxRetention:   config.Duration(168 * time.Hour),
 	}
 
+	logBuf := &syncBuffer{}
+	log := slog.New(slog.NewJSONHandler(logBuf, nil))
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- runServe(ctx, cfg, discard()) }()
+	go func() { done <- runServe(ctx, cfg, log) }()
 
-	time.Sleep(200 * time.Millisecond) // let it bind and migrate
+	// Cancel only after boot has finished: the listening line lands after
+	// migrations apply, where a fixed sleep raced a slow migrate on CI.
+	bootDeadline := time.Now().Add(30 * time.Second)
+	for !strings.Contains(logBuf.String(), "http server listening") {
+		select {
+		case err := <-done:
+			t.Fatalf("runServe returned before listening: %v\n%s", err, logBuf.String())
+		default:
+		}
+		if time.Now().After(bootDeadline) {
+			t.Fatalf("server never reported listening:\n%s", logBuf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	cancel()
 
 	select {
