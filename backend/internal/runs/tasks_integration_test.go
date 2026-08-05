@@ -22,10 +22,11 @@ import (
 // fixturePorts serves the fixture's own rows through the runs ports —
 // integration tests below the app layer never import peer contexts.
 type fixturePorts struct {
-	f       fixture
-	doc     runs.DefinitionDoc
-	hash    string
-	harness uuid.UUID
+	f           fixture
+	doc         runs.DefinitionDoc
+	hash        string
+	harness     uuid.UUID
+	harnessCred uuid.UUID
 }
 
 func (p fixturePorts) Definition(_ context.Context, workflowID uuid.UUID, version int32) (runs.PinnedDefinition, error) {
@@ -59,7 +60,10 @@ func (p fixturePorts) HarnessByName(_ context.Context, name string) (runs.Harnes
 	if name != "cc" {
 		return runs.HarnessRef{}, xerrors.E(xerrors.ClassNotFound, "no such harness")
 	}
-	return runs.HarnessRef{ID: p.harness, Kind: "claude-code"}, nil
+	return runs.HarnessRef{
+		ID: p.harness, Kind: "claude-code",
+		CredentialID: p.harnessCred, CredentialKind: "model_key",
+	}, nil
 }
 
 func agenticDoc() runs.DefinitionDoc {
@@ -78,7 +82,7 @@ func agenticDoc() runs.DefinitionDoc {
 
 func newService(t *testing.T, f fixture, doc runs.DefinitionDoc, snap runs.PolicySnapshot) (*runs.Service, fixturePorts) {
 	t.Helper()
-	ports := fixturePorts{f: f, doc: doc, hash: "deadbeef", harness: uuid.Max}
+	ports := fixturePorts{f: f, doc: doc, hash: "deadbeef", harness: uuid.Max, harnessCred: uuid.New()}
 	forge := fake.Forge{Heads: map[uuid.UUID]string{f.repoID: "basesha0000000000000000000000000000000000"}}
 	svc := runs.NewService(f.pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		ports, ports, ports, forge, runs.Params{Snapshot: snap})

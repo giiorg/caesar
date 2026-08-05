@@ -52,14 +52,15 @@ var (
 )
 
 // HarnessSpec is everything the runner needs to start one harness: which
-// image, which provider it talks to, and which credential unlocks it.
+// image and which provider it talks to. The credential is deliberately absent:
+// the attempt carries its own binding, pinned when the request was built, and
+// resolving one here would read the harness row as it is now instead.
 // Entrypoint and Cmd are nil in production (the image's own defaults win);
 // test resolvers script them.
 type HarnessSpec struct {
 	Kind             string
 	ImageRef         string
 	ProviderEndpoint string
-	CredentialID     uuid.UUID
 	Entrypoint       []string
 	Cmd              []string
 }

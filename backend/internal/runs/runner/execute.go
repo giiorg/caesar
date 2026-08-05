@@ -82,9 +82,11 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	if err != nil {
 		return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "resolve clone for %s: %v", req.Repo.Slug, err)
 	}
-	// Brokered credentials are infrastructure here: an unavailable secret
-	// store says nothing about this attempt's work.
-	cred, err := r.creds.OpenCredential(ctx, hs.CredentialID, "attempt:"+ref.String())
+	// The credential is the one the request pinned, never one re-resolved off
+	// today's harness row: a registry edit mid-attempt must not swap the secret
+	// under a running phase. Brokered credentials are infrastructure here: an
+	// unavailable secret store says nothing about this attempt's work.
+	cred, err := r.creds.OpenCredential(ctx, req.Credential.ID, "attempt:"+ref.String())
 	if err != nil {
 		return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "open provider credential: %v", err)
 	}

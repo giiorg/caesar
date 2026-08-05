@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -612,5 +613,61 @@ func TestBudgetBreachFailsTheRun(t *testing.T) {
 	final := waitForRun(t, svc, run.ID, runs.RunFailed)
 	if final.Outcome == nil || final.Outcome.Code != runs.CodeBudgetExhausted {
 		t.Errorf("outcome = %+v, want budget_exhausted", final.Outcome)
+	}
+}
+
+// bindingRecorder keeps every request the orchestrator built, so a test can
+// read what an attempt was actually handed.
+type bindingRecorder struct {
+	inner runs.Executor
+	mu    sync.Mutex
+	reqs  []runs.ExecutionRequest
+}
+
+func (e *bindingRecorder) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.ExecutionResult, error) {
+	e.mu.Lock()
+	e.reqs = append(e.reqs, req)
+	e.mu.Unlock()
+	return e.inner.Execute(ctx, req)
+}
+
+func (e *bindingRecorder) Inspect(ctx context.Context, ref runs.AttemptRef) (runs.InspectResult, error) {
+	return e.inner.Inspect(ctx, ref)
+}
+
+func (e *bindingRecorder) requests() []runs.ExecutionRequest {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]runs.ExecutionRequest(nil), e.reqs...)
+}
+
+// An attempt is bound to one credential the moment its request is built: the
+// registry is read once, and both halves of the identity — id and kind —
+// travel with the request (spec §3). Nothing downstream re-resolves it, so
+// this is the only place the value is chosen.
+func TestOrchestrator_RequestPinsTheHarnessCredential(t *testing.T) {
+	f := newFixture(t)
+	svc, ports := newService(t, f, agenticDoc(), runs.DefaultSnapshot())
+	rec := &bindingRecorder{inner: fake.NewExecutor()}
+	startOrchestrator(t, svc, rec, 30*time.Second)
+	ctx := context.Background()
+
+	_, run, err := svc.CreateTask(ctx, principal(f), runs.NewTask{
+		RepoID: f.repoID, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: "credential-binding",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRun(t, svc, run.ID, runs.RunSucceeded)
+
+	want := runs.CredentialBinding{ID: ports.harnessCred, Kind: "model_key"}
+	reqs := rec.requests()
+	if len(reqs) != 3 {
+		t.Fatalf("recorded %d requests, want one per node of the agentic doc", len(reqs))
+	}
+	for _, req := range reqs {
+		if req.Credential != want {
+			t.Errorf("node %s bound %+v, want %+v", req.Ref.NodeID, req.Credential, want)
+		}
 	}
 }

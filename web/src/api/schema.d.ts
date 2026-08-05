@@ -700,6 +700,8 @@ export interface components {
             class?: string;
             code?: string;
             message?: string;
+            /** Format: date-time */
+            retry_at?: null | string;
         };
         ApiPhaseResponse: {
             /** Format: int32 */

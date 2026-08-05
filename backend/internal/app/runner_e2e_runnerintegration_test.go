@@ -45,9 +45,9 @@ const (
 // image's own default command runs (Plan 07's driver contract) — a bare
 // `caesar` invocation exits 2 with usage text and never writes a patch. This
 // seam is exactly where Plan 07's drivers will script the harness; wrapping
-// (not replacing) keeps the production adapter — its Kind/ImageRef/
-// CredentialID translation and the audited credential read that the runner
-// triggers off CredentialID — under test.
+// (not replacing) keeps the production adapter — its Kind/ImageRef translation,
+// and the audited credential read the runner triggers off the binding the
+// spine pinned — under test.
 type scriptedResolver struct {
 	inner  appHarnessResolver
 	script string

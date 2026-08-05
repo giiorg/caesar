@@ -124,7 +124,6 @@ func scriptedHarness(endpoint, script string) HarnessSpec {
 		Kind:             "claude-code",
 		ImageRef:         gitImage,
 		ProviderEndpoint: endpoint,
-		CredentialID:     uuid.New(),
 		Entrypoint:       []string{"/bin/sh", "-c"},
 		Cmd:              []string{script},
 	}
@@ -333,11 +332,12 @@ func artifactsByType(arts []runs.NewArtifact) map[string]runs.NewArtifact {
 func implementRequest(t *testing.T, ref runs.AttemptRef, baseSHA string) runs.ExecutionRequest {
 	t.Helper()
 	return runs.ExecutionRequest{
-		Ref:       ref,
-		Kind:      runs.KindImplement,
-		HarnessID: uuid.New(),
-		Repo:      runs.RepoRef{Forge: "github", Slug: "giiorg/demo"},
-		BaseSHA:   baseSHA,
-		Deadline:  time.Now().Add(5 * time.Minute),
+		Ref:        ref,
+		Kind:       runs.KindImplement,
+		HarnessID:  uuid.New(),
+		Credential: runs.CredentialBinding{ID: uuid.New(), Kind: "model_key"},
+		Repo:       runs.RepoRef{Forge: "github", Slug: "giiorg/demo"},
+		BaseSHA:    baseSHA,
+		Deadline:   time.Now().Add(5 * time.Minute),
 	}
 }

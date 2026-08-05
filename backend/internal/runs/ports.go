@@ -43,8 +43,18 @@ type RepoRef struct {
 }
 
 type HarnessRef struct {
+	ID             uuid.UUID
+	Kind           string
+	CredentialID   uuid.UUID
+	CredentialKind string
+}
+
+// CredentialBinding is the phase's pinned credential identity (spec §3):
+// resolved once at request build, it travels intact to the runner, which must
+// never re-resolve the credential off the mutable harness row.
+type CredentialBinding struct {
 	ID   uuid.UUID
-	Kind string
+	Kind string // assets credential kind vocabulary, opaque here
 }
 
 // The five ports the spine consumes. Contexts never import each other:
@@ -83,9 +93,12 @@ type Executor interface {
 // ExecutionRequest is the spine's precursor of Plan 06's RunSpec:
 // explicit inputs, never ambient state (spec §3 artifact flow).
 type ExecutionRequest struct {
-	Ref          AttemptRef
-	Kind         string
-	HarnessID    uuid.UUID
+	Ref       AttemptRef
+	Kind      string
+	HarnessID uuid.UUID
+	// Credential is the binding pinned at build time; its zero value is a
+	// harnessless node, which reaches no provider and needs no secret.
+	Credential   CredentialBinding
 	Repo         RepoRef
 	Instructions string
 	Inputs       []ArtifactInput

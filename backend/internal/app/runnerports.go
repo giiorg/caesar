@@ -64,9 +64,10 @@ func buildRunner(cfg config.Runner, assetsSvc *assets.Service, runsSvc *runs.Ser
 
 // appHarnessResolver resolves a phase's harness from the assets context. The
 // runs context never imports assets, so this translation lives here in the
-// composition root. Entrypoint and Cmd are left nil: production runs the
-// image's own default command (Plan 07's driver contract), not a
-// control-plane-chosen one.
+// composition root. The harness row's credential is deliberately not carried
+// over: the attempt already pinned one. Entrypoint and Cmd are left nil:
+// production runs the image's own default command (Plan 07's driver contract),
+// not a control-plane-chosen one.
 type appHarnessResolver struct{ svc *assets.Service }
 
 func (a appHarnessResolver) HarnessSpec(ctx context.Context, id uuid.UUID) (runner.HarnessSpec, error) {
@@ -78,7 +79,6 @@ func (a appHarnessResolver) HarnessSpec(ctx context.Context, id uuid.UUID) (runn
 		Kind:             string(h.Kind),
 		ImageRef:         h.ImageRef,
 		ProviderEndpoint: h.ProviderEndpoint,
-		CredentialID:     h.CredentialID,
 	}, nil
 }
 

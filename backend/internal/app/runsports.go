@@ -68,12 +68,22 @@ func (s runsAssetSource) Repo(ctx context.Context, id uuid.UUID) (runs.RepoRef, 
 	}, nil
 }
 
+// HarnessByName resolves the harness and, with it, the kind of credential it
+// authenticates with: the spine pins both into the attempt's binding, so the
+// runner never re-reads the mutable harness row to learn either.
 func (s runsAssetSource) HarnessByName(ctx context.Context, name string) (runs.HarnessRef, error) {
 	h, err := s.svc.GetHarnessByName(ctx, name)
 	if err != nil {
 		return runs.HarnessRef{}, err
 	}
-	return runs.HarnessRef{ID: h.ID, Kind: string(h.Kind)}, nil
+	c, err := s.svc.GetCredential(ctx, h.CredentialID)
+	if err != nil {
+		return runs.HarnessRef{}, err
+	}
+	return runs.HarnessRef{
+		ID: h.ID, Kind: string(h.Kind),
+		CredentialID: h.CredentialID, CredentialKind: string(c.Kind),
+	}, nil
 }
 
 // unavailableForge refuses task intake honestly until Plan 08's forge

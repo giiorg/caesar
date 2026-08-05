@@ -510,7 +510,8 @@ func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) 
 }
 
 // buildRequest assembles explicit inputs: latest artifacts of each input
-// origin, harness resolved fresh against the registry.
+// origin, harness resolved fresh against the registry — and with it the
+// credential binding this attempt is pinned to for its whole life.
 func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node PlanNode, ref AttemptRef, deadline time.Time) (ExecutionRequest, error) {
 	req := ExecutionRequest{
 		Ref: ref, Kind: node.Kind, Repo: cp.repo, Instructions: node.Instructions,
@@ -525,6 +526,7 @@ func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node Pla
 			}}
 		}
 		req.HarnessID = h.ID
+		req.Credential = CredentialBinding{ID: h.CredentialID, Kind: h.CredentialKind}
 	}
 	q := store.New(o.svc.pool)
 	for _, in := range node.Inputs {

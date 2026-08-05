@@ -2049,6 +2049,13 @@
           },
           "message": {
             "type": "string"
+          },
+          "retry_at": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
           }
         },
         "type": "object"
