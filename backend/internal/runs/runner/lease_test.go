@@ -29,6 +29,16 @@ type leaseCall struct {
 	epoch        int64
 }
 
+// commitCall is one recorded sync-back: the fence and version it was gated on
+// and the exact bytes the runner asked the store to keep.
+type commitCall struct {
+	credentialID  uuid.UUID
+	ref           string
+	epoch         int64
+	expectVersion int64
+	secret        []byte
+}
+
 // fakeLeaser is the assets aggregate reduced to what the runner can observe:
 // a scripted acquire and a call log. Everything else answers success, so a
 // test only has to script the one thing it is about.
@@ -40,11 +50,19 @@ type fakeLeaser struct {
 	lease        Lease
 	secret       []byte
 	heartbeatErr func(n int) error
+	commitStatus SyncStatus // scripted CommitSync answer; "" = applied
+	commitErr    error
+	// currentEpoch simulates a takeover: nonzero, any heartbeat or commit at a
+	// different epoch is fenced — the aggregate has moved past this worker.
+	currentEpoch int64
+	held         bool // lease taken and not yet released
 
 	acquired    []leaseCall
 	heartbeats  []leaseCall
 	released    []leaseCall
 	authExpired []leaseCall
+	commits     []commitCall
+	quarantines []leaseCall
 }
 
 func (l *fakeLeaser) Acquire(_ context.Context, id uuid.UUID, ref string) (Lease, []byte, error) {
@@ -54,6 +72,10 @@ func (l *fakeLeaser) Acquire(_ context.Context, id uuid.UUID, ref string) (Lease
 	if l.acquireErr != nil {
 		return Lease{}, nil, l.acquireErr
 	}
+	if l.held {
+		return Lease{}, nil, ErrLeaseBusy
+	}
+	l.held = true
 	return l.lease, l.secret, nil
 }
 
@@ -62,10 +84,40 @@ func (l *fakeLeaser) Heartbeat(_ context.Context, id uuid.UUID, ref string, epoc
 	n := len(l.heartbeats) + 1
 	l.heartbeats = append(l.heartbeats, leaseCall{credentialID: id, ref: ref, epoch: epoch})
 	hb := l.heartbeatErr
+	fenced := l.currentEpoch != 0 && epoch != l.currentEpoch
 	l.mu.Unlock()
+	if fenced {
+		return xerrors.E(xerrors.ClassConflict, "credential lease fenced")
+	}
 	if hb != nil {
 		return hb(n)
 	}
+	return nil
+}
+
+func (l *fakeLeaser) CommitSync(_ context.Context, id uuid.UUID, ref string, epoch, expectVersion int64, secret []byte) (SyncStatus, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.commits = append(l.commits, commitCall{
+		credentialID: id, ref: ref, epoch: epoch,
+		expectVersion: expectVersion, secret: append([]byte(nil), secret...),
+	})
+	if l.commitErr != nil {
+		return "", l.commitErr
+	}
+	if l.currentEpoch != 0 && epoch != l.currentEpoch {
+		return SyncStatusFenced, nil
+	}
+	if l.commitStatus != "" {
+		return l.commitStatus, nil
+	}
+	return SyncStatusApplied, nil
+}
+
+func (l *fakeLeaser) RecordQuarantine(_ context.Context, id uuid.UUID, ref string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.quarantines = append(l.quarantines, leaseCall{credentialID: id, ref: ref})
 	return nil
 }
 
@@ -73,6 +125,7 @@ func (l *fakeLeaser) Release(_ context.Context, id uuid.UUID, ref string, epoch 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.released = append(l.released, leaseCall{credentialID: id, ref: ref, epoch: epoch})
+	l.held = false
 	return nil
 }
 
@@ -97,6 +150,18 @@ func (l *fakeLeaser) calls() (acquired, heartbeats, released []leaseCall) {
 	return append([]leaseCall(nil), l.acquired...),
 		append([]leaseCall(nil), l.heartbeats...),
 		append([]leaseCall(nil), l.released...)
+}
+
+func (l *fakeLeaser) commitCalls() []commitCall {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]commitCall(nil), l.commits...)
+}
+
+func (l *fakeLeaser) quarantineCalls() []leaseCall {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]leaseCall(nil), l.quarantines...)
 }
 
 // leaseEngine is a daemon that records what an attempt asked of it. Nothing

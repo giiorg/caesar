@@ -40,6 +40,13 @@ func (r *Runner) materializeAuthDir(ref runs.AttemptRef, d driver, secret []byte
 // reconciler may own the directory. Fenced → relinquish, reconciliation
 // cleans up under its own epoch.
 func (r *Runner) removeAuthDirFenced(ctx context.Context, ref runs.AttemptRef, credentialID uuid.UUID, epoch int64) bool {
+	// A runner wired without the credential aggregate cannot prove it still
+	// owns the lease, and an unproven removal is exactly what the fence
+	// exists to stop — refuse, never panic.
+	if r.leaser == nil {
+		r.log.Warn("runner.auth_cleanup_fenced", "attempt", ref.String(), "error", "no credential leaser wired")
+		return false
+	}
 	if err := r.leaser.Heartbeat(ctx, credentialID, ref.String(), epoch); err != nil {
 		r.log.Warn("runner.auth_cleanup_fenced", "attempt", ref.String())
 		return false

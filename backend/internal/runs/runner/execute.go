@@ -107,15 +107,34 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	// CLI's own refresh.
 	leased := needsLease(req.Credential)
 	var g grant
+	// The manifest variable exists before the lease does so the deferred
+	// conclusion can read it: concludeCredential is the single choke point
+	// where the credential obligation ends, and every exit path — a failure
+	// between acquire and agent start included — funnels through it once.
+	var m attemptManifest
+	concluded := false
+	conclude := func() syncConclusion {
+		concluded = true
+		return r.concludeCredential(ctx, ref, m, req.Credential.ID)
+	}
 	if leased {
 		lease, secret, err := r.acquireCredential(ctx, ref, req.Credential)
 		if err != nil {
 			return runs.ExecutionResult{}, err
 		}
 		g = grant{secret: secret, version: lease.SecretVersion, epoch: lease.Epoch}
-		// Registered before the heartbeat so it runs after it: the release is
-		// the last thing this attempt does to the credential.
-		defer r.concludeLease(ctx, req.Credential.ID, ref, g.epoch)
+		// Until manifestFor pins the full manifest, the granted epoch is all
+		// a conclusion needs: an exit in between still releases at the right
+		// fence, with nothing on disk to read back.
+		m.Epoch = lease.Epoch
+		// Registered before the heartbeat so it runs after it, and guarded so
+		// no path concludes twice: the conclusion is the last thing this
+		// attempt does to the credential, on early exits as on full runs.
+		defer func() {
+			if !concluded {
+				conclude()
+			}
+		}()
 		stopHeartbeat := r.startLeaseHeartbeat(ctx, req.Credential.ID, ref, g.epoch, cancelAttempt)
 		defer stopHeartbeat()
 	} else {
@@ -132,7 +151,7 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	// Every credential-bearing attempt gets a manifest, whatever its custody:
 	// adoption rebuilds the redaction set from it, and an attempt whose
 	// manifest is missing has to have its logs and artifacts withheld.
-	m, err := r.manifestFor(req, spec, d, g)
+	built, err := r.manifestFor(req, spec, d, g)
 	if err != nil {
 		// Bytes that cannot be identity-pinned are dead for every phase bound
 		// to this credential, not only for this attempt, so the freshness
@@ -143,6 +162,9 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 		}
 		return runs.ExecutionResult{}, err
 	}
+	// Assigned only on success: the zero manifest an error rides back with
+	// would erase the epoch the deferred conclusion releases at.
+	m = built
 	if req.Credential.ID != uuid.Nil {
 		if err := r.writeManifest(ref, m); err != nil {
 			return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "write attempt manifest: %v", err)
@@ -181,6 +203,22 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 		return runs.ExecutionResult{}, err
 	}
 	agent, err := r.runAgentToCompletion(ctx, ref, spec, d)
+	// The credential obligation settles before any result is assembled: a
+	// success may not be reported while its sync is pending (the receipt
+	// precedes the terminal result), and what the read-back found outranks
+	// whatever the agent exited with — quarantine first, then an unresolved
+	// sync, then the agent's own outcome.
+	if leased {
+		switch conc := conclude(); {
+		case conc.Outcome != nil:
+			return r.failureResult(ref, spec, agent), runs.OutcomeError{Outcome: *conc.Outcome}
+		case conc.Status == "fenced":
+			// The lease stays held; the stale-lease janitor settles it, and
+			// the retried attempt re-acquires idempotently. Nothing charged.
+			return r.failureResult(ref, spec, agent), transientf(runs.CodeCredentialBusy,
+				"credential %s: sync-back unresolved, custody belongs to reconciliation", req.Credential.ID)
+		}
+	}
 	if err != nil {
 		return r.failureResult(ref, spec, agent), err
 	}

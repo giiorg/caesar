@@ -18,12 +18,6 @@ const (
 	// judges a lease by, so an attempt that is merely slow is never mistaken
 	// for one whose worker died.
 	leaseHeartbeatInterval = 30 * time.Second
-
-	// leaseConclusionTimeout bounds the release at the end of an attempt. It
-	// runs on a context of its own: the attempt's may be exactly the one that
-	// just expired, and a lease nobody released blocks every later run of
-	// every phase bound to that credential.
-	leaseConclusionTimeout = 30 * time.Second
 )
 
 // needsLease reports whether this binding must be serialized. Only kinds a
@@ -114,19 +108,5 @@ func (r *Runner) startLeaseHeartbeat(ctx context.Context, credentialID uuid.UUID
 	return func() {
 		once.Do(func() { close(done) })
 		<-stopped
-	}
-}
-
-// concludeLease ends this attempt's custody of the credential. It is the slot
-// the guarded sync-back sequence takes: reading the possibly-refreshed
-// credential back and committing it has to happen on every exit path and has
-// to precede the release, because a released lease is another attempt's to
-// take. Until that lands, the release is the whole conclusion.
-func (r *Runner) concludeLease(ctx context.Context, credentialID uuid.UUID, ref runs.AttemptRef, epoch int64) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaseConclusionTimeout)
-	defer cancel()
-	if err := r.leaser.Release(ctx, credentialID, ref.String(), epoch); err != nil {
-		r.log.Error("runner.lease_release", "attempt", ref.String(),
-			"credential", credentialID.String(), "epoch", epoch, "error", err)
 	}
 }

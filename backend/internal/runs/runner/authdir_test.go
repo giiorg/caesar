@@ -151,7 +151,14 @@ func TestExecute_CodexAuthFileIsMaterializedBoundAndPinnedInTheManifest(t *testi
 		atAgent, readErr = os.ReadFile(filepath.Join(dataRoot, "auth", ref.String(), "auth.json"))
 		return errors.New("stop here: the agent's world is already visible")
 	}
-	leaser := &fakeLeaser{lease: Lease{Epoch: 2, SecretVersion: 9}, secret: []byte(codexAuthJSON)}
+	// The cleanup heartbeat is fenced so the conclusion leaves the evidence
+	// in place: what this test pins is that TEARDOWN never touches the auth
+	// dir or the manifest — only the lease-guarded conclusion may (spec §2.4),
+	// and a fenced worker may not either.
+	leaser := &fakeLeaser{
+		lease: Lease{Epoch: 2, SecretVersion: 9}, secret: []byte(codexAuthJSON),
+		heartbeatErr: func(int) error { return xerrors.E(xerrors.ClassConflict, "credential lease fenced") },
+	}
 
 	r := newLeaseRunner(t, eng, leaser, &recordingOpener{},
 		Options{DataRoot: dataRoot, DataHostRoot: "/srv/caesar-data"})
