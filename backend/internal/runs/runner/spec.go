@@ -145,13 +145,17 @@ func imageUnavailable(ref string, err error) error {
 // gatewayConfig picks the gateway's shape from custody (spec §3). Materialized
 // is the open-CONNECT configuration the validation gateway already runs: empty
 // token digest, zero Provider — the gateway holds nothing worth stealing, and
-// the allowlist is the sole barrier. Brokered keeps the token-authenticated
-// header injection unchanged. Both get the driver's FQDNs ∪ the operator's
-// configured list; for a brokered attempt the driver's hosts are reachable
-// over CONNECT too, which is harmless — the agent holds no provider credential
-// to spend there — and one composition point beats two shapes.
+// the allowlist is the sole barrier, so it is the one shape that opens the
+// driver's provider FQDNs. Brokered keeps the token-authenticated header
+// injection unchanged and gets the operator's list alone: a brokered CLI is
+// pointed at this gateway and has no need to reach a provider host directly,
+// and a raw CONNECT tunnel to one would be an unmetered, upload-accepting
+// route out for anything the agent finds lying in its workspace.
 func (r *Runner) gatewayConfig(spec RunSpec, d driver) egress.Config {
-	allow := append(slices.Clone(d.connectAllow), r.opts.ConnectAllow...)
+	allow := slices.Clone(r.opts.ConnectAllow)
+	if spec.Custody == custodyMaterialized {
+		allow = append(slices.Clone(d.connectAllow), r.opts.ConnectAllow...)
+	}
 	cfg := egress.Config{Attempt: spec.Ref.String(), ConnectAllow: allow}
 	if spec.Custody == custodyBrokered {
 		cfg.TokenSHA256 = spec.BrokerTokenSHA

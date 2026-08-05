@@ -179,6 +179,8 @@ func TestGatewayConfig_Shapes(t *testing.T) {
 		if diff := cmp.Diff(egress.Provider{}, cfg.Provider); diff != "" {
 			t.Errorf("a materialized gateway must hold no provider credential (-want +got):\n%s", diff)
 		}
+		// The allowlist is the only barrier here, so it is the one shape that
+		// opens the provider hosts the CLI authenticates against directly.
 		wantAllow(t, cfg.ConnectAllow,
 			[]string{"api.anthropic.com", "claude.ai", "platform.claude.com", "proxy.corp.internal"})
 	})
@@ -215,8 +217,16 @@ func TestGatewayConfig_Shapes(t *testing.T) {
 		if diff := cmp.Diff(want, cfg.Provider); diff != "" {
 			t.Errorf("provider mismatch (-want +got):\n%s", diff)
 		}
-		wantAllow(t, cfg.ConnectAllow,
-			[]string{"chatgpt.com", "auth.openai.com", "api.openai.com", "proxy.corp.internal"})
+		// A brokered CLI is pointed at this gateway, so it never needs to
+		// reach a provider host itself. Tunnelling it there anyway would be an
+		// unmetered, upload-accepting route out — the operator's list, and
+		// nothing else, is what a brokered attempt may CONNECT to.
+		wantAllow(t, cfg.ConnectAllow, []string{"proxy.corp.internal"})
+		for _, host := range d.connectAllow {
+			if slices.Contains(cfg.ConnectAllow, host) {
+				t.Errorf("brokered attempt may CONNECT to %s, want the broker to be its only route", host)
+			}
+		}
 	})
 
 	t.Run("the operator's list never leaks between attempts", func(t *testing.T) {
