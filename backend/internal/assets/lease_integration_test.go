@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +83,19 @@ func auditDetail(t *testing.T, pool *pgxpool.Pool, action, key string) string {
 		t.Fatalf("audit %s has no %q detail", action, key)
 	}
 	return *v
+}
+
+// syncReceipt reads the receipt row for an attempt. The epoch it carries is
+// load-bearing: it says whose bytes are in the store, not merely that some
+// commit happened.
+func syncReceipt(t *testing.T, pool *pgxpool.Pool, credID uuid.UUID, attemptRef string) (epoch, from, to int64) {
+	t.Helper()
+	if err := pool.QueryRow(context.Background(),
+		"SELECT epoch, from_version, to_version FROM credential_sync_receipts WHERE credential_id = $1 AND attempt_ref = $2",
+		credID, attemptRef).Scan(&epoch, &from, &to); err != nil {
+		t.Fatal(err)
+	}
+	return epoch, from, to
 }
 
 func receiptCount(t *testing.T, pool *pgxpool.Pool, credID uuid.UUID) int {
@@ -208,6 +222,68 @@ func TestAcquireCredentialLease_ReacquireRebindsToCurrentVersion(t *testing.T) {
 	}
 	if _, version, _, _ := leaseRow(t, pool, c.ID); version != 2 {
 		t.Fatalf("lease row version = %d, want the version the snapshot came from", version)
+	}
+}
+
+// A takeover moves custody to recovery, so the superseded worker cannot
+// take its own lease back — otherwise it would resume under a lease the
+// reconciler is in the middle of concluding.
+func TestAcquireCredentialLease_FencedAfterTakeover(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+	c, _ := seedAuthFile(t, svc, admin, "codex-sub", "rt-1")
+
+	if _, _, err := svc.AcquireCredentialLease(ctx, c.ID, "attempt-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.TakeoverCredentialLease(ctx, c.ID, "attempt-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := svc.AcquireCredentialLease(ctx, c.ID, "attempt-a")
+	if !errors.Is(err, assets.ErrLeaseBusy) {
+		t.Fatalf("re-acquire of a taken-over lease = %v, want ErrLeaseBusy", err)
+	}
+	if xerrors.ClassOf(err) != xerrors.ClassConflict {
+		t.Fatalf("re-acquire class = %v, want conflict", xerrors.ClassOf(err))
+	}
+	epoch, version, _, held := leaseRow(t, pool, c.ID)
+	if !held || epoch != 2 || version != 1 {
+		t.Fatalf("lease row = (epoch %d, version %d, held %v), want the reconciler's epoch 2 untouched", epoch, version, held)
+	}
+	var owner string
+	if err := pool.QueryRow(ctx,
+		"SELECT attempt_ref FROM credential_leases WHERE credential_id = $1", c.ID).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "attempt-a" {
+		t.Fatalf("lease attempt_ref = %q, want attempt-a", owner)
+	}
+}
+
+// One attempt holds at most one credential lease, enforced by the unique
+// index on attempt_ref — the recovery lookup by attempt has to be
+// unambiguous.
+func TestAcquireCredentialLease_OneLeasePerAttempt(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+	a, _ := seedAuthFile(t, svc, admin, "codex-a", "rt-a")
+	b, _ := seedAuthFile(t, svc, admin, "codex-b", "rt-b")
+
+	if _, _, err := svc.AcquireCredentialLease(ctx, a.ID, "attempt-a"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := svc.AcquireCredentialLease(ctx, b.ID, "attempt-a")
+	if xerrors.ClassOf(err) != xerrors.ClassConflict {
+		t.Fatalf("second credential for one attempt = %v, want conflict", err)
+	}
+	if !strings.Contains(err.Error(), "another credential") {
+		t.Fatalf("conflict = %q, want it to name the real cause", err)
+	}
+	if _, _, _, held := leaseRow(t, pool, b.ID); held {
+		t.Fatal("the refused acquire must leave no lease behind")
 	}
 }
 
@@ -348,6 +424,75 @@ func TestCommitCredentialSync_ReceiptMakesTheRetryIdempotent(t *testing.T) {
 	}
 	if !bytes.Equal(plain, refreshed) || bytes.Equal(plain, body) {
 		t.Fatalf("stored secret = %q, want the refreshed auth.json", plain)
+	}
+}
+
+// The receipt is keyed by (credential, attempt) but guards per EPOCH: a
+// reconciler that takes over commits under the same attempt ref, and its
+// fresher bytes must not be swallowed as a replay of the worker's commit.
+func TestCommitCredentialSync_ReceiptIsEpochScoped(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+	c, _ := seedAuthFile(t, svc, admin, "codex-sub", "rt-1")
+
+	lease, _, err := svc.AcquireCredentialLease(ctx, c.ID, "attempt-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerBytes := authJSON(t, "rt-worker", 0)
+	status, err := svc.CommitCredentialSync(ctx, c.ID, "attempt-a", lease.Epoch, lease.SecretVersion, workerBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != assets.SyncApplied {
+		t.Fatalf("worker commit = %q, want applied", status)
+	}
+	if epoch, from, to := syncReceipt(t, pool, c.ID, "attempt-a"); epoch != 1 || from != 1 || to != 2 {
+		t.Fatalf("receipt = (epoch %d, %d→%d), want epoch 1 and 1→2", epoch, from, to)
+	}
+
+	// Reconciliation takes over and reads a still-fresher auth.json off the
+	// mount — the CLI refreshed again after the worker's commit.
+	taken, err := svc.TakeoverCredentialLease(ctx, c.ID, "attempt-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcilerBytes := authJSON(t, "rt-reconciler", 0)
+	status, err = svc.CommitCredentialSync(ctx, c.ID, "attempt-a", taken.Epoch, 2, reconcilerBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != assets.SyncApplied {
+		t.Fatalf("reconciler commit under a later epoch = %q, want applied, not a swallowed replay", status)
+	}
+	if v, _, _ := credentialSecretState(t, pool, c.ID); v != 3 {
+		t.Fatalf("secret_version = %d, want 3 after two genuine commits", v)
+	}
+	if epoch, from, to := syncReceipt(t, pool, c.ID, "attempt-a"); epoch != 2 || from != 2 || to != 3 {
+		t.Fatalf("receipt = (epoch %d, %d→%d), want it moved to the reconciler's epoch 2 and 2→3", epoch, from, to)
+	}
+	plain, err := svc.UseCredential(ctx, c.ID, "verify-sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(plain, reconcilerBytes) {
+		t.Fatalf("stored secret = %q, want the reconciler's bytes", plain)
+	}
+
+	// The superseded worker's retry is still fenced, receipt or not.
+	status, err = svc.CommitCredentialSync(ctx, c.ID, "attempt-a", lease.Epoch, lease.SecretVersion, workerBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != assets.SyncFenced {
+		t.Fatalf("superseded worker's retry = %q, want fenced", status)
+	}
+	if v, _, _ := credentialSecretState(t, pool, c.ID); v != 3 {
+		t.Fatalf("secret_version = %d after the fenced retry, want the store untouched at 3", v)
+	}
+	if epoch, _, _ := syncReceipt(t, pool, c.ID, "attempt-a"); epoch != 2 {
+		t.Fatalf("receipt epoch = %d after the fenced retry, want it still the reconciler's 2", epoch)
 	}
 }
 

@@ -40,10 +40,14 @@ func leaseFromRow(r store.CredentialLease) CredentialLease {
 	}
 }
 
-// ErrLeaseBusy reports that another attempt holds the lease. It rides a
+// ErrLeaseBusy reports that the caller may not have the lease. It rides a
 // ClassConflict error; the runner turns it into the zero-charge
 // credential_busy outcome rather than a failure.
 var ErrLeaseBusy = errors.New("assets: credential lease held")
+
+// lease0Epoch is the epoch a fresh lease starts at (the schema default);
+// anything above it means a takeover happened.
+const lease0Epoch = 1
 
 // SyncStatus is the outcome of a sync-back commit. None of the four is an
 // error: three of them mean "this attempt's bytes were not stored, and that
@@ -65,11 +69,15 @@ const (
 // leased credential, so an operator rotation between acquire and delivery
 // cannot make sync-back's CAS discard a legitimate refresh.
 //
-// Acquisition is idempotent for the attempt that already holds the lease: a
-// retried attempt re-binds to the current version rather than deadlocking
-// against itself. Any other attempt gets ErrLeaseBusy — including against a
-// lease whose heartbeat expired long ago, because the old container may
-// still be alive and refreshing (spec §2.1: only conclusion releases).
+// Acquisition is idempotent for the attempt that already holds the lease at
+// its original epoch: a retried attempt re-binds to the current version
+// rather than deadlocking against itself. Everything else gets ErrLeaseBusy
+// — another attempt; a lease whose heartbeat expired long ago, because the
+// old container may still be alive and refreshing (spec §2.1: only
+// conclusion releases); and the attempt's OWN lease once a takeover has
+// advanced the epoch, because custody then belongs to recovery. Reconcilers
+// reach a taken-over lease through TakeoverCredentialLease, never here, so
+// no legitimate path needs the re-acquire past epoch 1.
 func (s *Service) AcquireCredentialLease(ctx context.Context, credentialID uuid.UUID, attemptRef string) (CredentialLease, []byte, error) {
 	var (
 		lease CredentialLease
@@ -92,6 +100,9 @@ func (s *Service) AcquireCredentialLease(ctx context.Context, credentialID uuid.
 		row, err := q.AcquireLease(ctx, store.AcquireLeaseParams{
 			CredentialID: credentialID, AttemptRef: attemptRef, SecretVersion: cred.SecretVersion,
 		})
+		if constraint, dup := uniqueViolation(err); dup && constraint == leaseAttemptIndex {
+			return xerrors.E(xerrors.ClassConflict, "attempt already holds a lease on another credential")
+		}
 		reacquired := false
 		switch {
 		case errors.Is(err, pgx.ErrNoRows): // held — by us (idempotent) or by another attempt (busy)
@@ -101,6 +112,12 @@ func (s *Service) AcquireCredentialLease(ctx context.Context, credentialID uuid.
 			}
 			if held.AttemptRef != attemptRef {
 				return xerrors.Wrap(xerrors.ClassConflict, "credential lease held by another attempt", ErrLeaseBusy)
+			}
+			if held.Epoch > lease0Epoch {
+				// Our own lease, but a takeover moved custody to recovery.
+				// Acquiring it back would let the superseded worker resume
+				// under a lease the reconciler is concluding.
+				return xerrors.Wrap(xerrors.ClassConflict, "credential lease taken over by recovery", ErrLeaseBusy)
 			}
 			// The store may have rotated since the first acquire, and the
 			// snapshot below is what materializes — so lease.secret_version
@@ -195,7 +212,9 @@ func (s *Service) TakeoverCredentialLease(ctx context.Context, credentialID uuid
 // double guard of spec §2.6: the current lease epoch (this attempt is still
 // the owner) and the version it materialized (no operator rotation since).
 // The receipt keyed by (credential, attempt) makes the commit-then-crash
-// retry recognizable as already applied.
+// retry recognizable as already applied — but only a receipt from the SAME
+// epoch does, because a reconciler that took over commits under the same
+// attempt ref and its fresher bytes must not be mistaken for a replay.
 //
 // Only a malformed secret is an error — it is permanent, so the caller
 // releases instead of retrying. Every other non-applied outcome is a status:
@@ -203,30 +222,54 @@ func (s *Service) TakeoverCredentialLease(ctx context.Context, credentialID uuid
 func (s *Service) CommitCredentialSync(
 	ctx context.Context, credentialID uuid.UUID, attemptRef string, epoch, expectVersion int64, newSecret []byte,
 ) (SyncStatus, error) {
+	// Validate, fingerprint, and seal before the transaction — the
+	// RotateCredentialSecret precedent, and crypto stays outside
+	// transactions by package convention. Kind is immutable, so reading it
+	// on the pool is race-free.
+	kind, err := s.credentialKind(ctx, credentialID)
+	if err != nil {
+		return "", err
+	}
+	if err := validateSecret(kind, newSecret); err != nil {
+		return "", err
+	}
+	fingerprint, err := credentialFingerprint(kind, newSecret)
+	if err != nil {
+		return "", err
+	}
+	env, err := s.keys.Seal(newSecret, []byte(credentialID.String()))
+	if err != nil {
+		return "", fmt.Errorf("assets: seal credential: %w", err)
+	}
+
 	status := SyncApplied
-	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+	err = pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		q := store.New(tx)
 		// The credential row lock comes first, as everywhere in this
-		// aggregate, and carries the kind the new bytes validate against.
-		cred, err := q.GetCredentialRowForUpdate(ctx, credentialID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return xerrors.E(xerrors.ClassNotFound, "no such credential")
-		}
-		if err != nil {
+		// aggregate: it pins the lock order and proves the row still exists.
+		if _, err := q.LockCredential(ctx, credentialID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return xerrors.E(xerrors.ClassNotFound, "no such credential")
+			}
 			return fmt.Errorf("assets: lock credential: %w", err)
 		}
 
 		// Reading the receipt under that lock is what makes two racing
 		// retries of one commit serialize into applied + already_applied
 		// instead of applied + cas_lost.
-		_, err = q.GetSyncReceipt(ctx, store.GetSyncReceiptParams{CredentialID: credentialID, AttemptRef: attemptRef})
-		if err == nil {
+		receipt, err := q.GetSyncReceipt(ctx, store.GetSyncReceiptParams{CredentialID: credentialID, AttemptRef: attemptRef})
+		switch {
+		case err == nil && receipt.Epoch == epoch:
+			// This attempt already committed at this epoch: the
+			// commit-then-crash retry, recognizable and harmless.
 			status = SyncAlreadyApplied
 			return nil
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
+		case err != nil && !errors.Is(err, pgx.ErrNoRows):
 			return fmt.Errorf("assets: get sync receipt: %w", err)
 		}
+		// A receipt from a different epoch belongs to the owner this caller
+		// superseded (or to the owner that superseded this caller); fall
+		// through to the fence and the CAS, which decide correctly either way.
 
 		// Locking the lease row closes the window in which a takeover could
 		// land between the fence check and the write.
@@ -245,16 +288,6 @@ func (s *Service) CommitCredentialSync(
 			return nil
 		}
 
-		kind := CredentialKind(cred.Kind)
-		if err := validateSecret(kind, newSecret); err != nil {
-			return err
-		}
-		// The new fingerprint is computed before the write because the write
-		// carries it.
-		fingerprint, err := credentialFingerprint(kind, newSecret)
-		if err != nil {
-			return err
-		}
 		if fingerprint.Valid {
 			// A refreshed token that now belongs to another registered
 			// credential is discarded here rather than by the unique index:
@@ -275,12 +308,6 @@ func (s *Service) CommitCredentialSync(
 			}
 		}
 
-		// Sealing is pure, so it is acceptable in-tx — the
-		// RotateCredentialSecret precedent.
-		env, err := s.keys.Seal(newSecret, []byte(credentialID.String()))
-		if err != nil {
-			return fmt.Errorf("assets: seal credential: %w", err)
-		}
 		n, err := q.UpdateCredentialSecretCAS(ctx, store.UpdateCredentialSecretCASParams{
 			ID: credentialID, KeyID: env.KeyID, WrappedDek: env.WrappedDEK, Ciphertext: env.Ciphertext,
 			Fingerprint: fingerprint, SecretVersion: expectVersion,
@@ -297,11 +324,11 @@ func (s *Service) CommitCredentialSync(
 			status = SyncCASLost
 			return s.recordSyncDiscarded(ctx, tx, credentialID, attemptRef, epoch, expectVersion, "cas_lost")
 		}
-		if err := q.InsertSyncReceipt(ctx, store.InsertSyncReceiptParams{
+		if err := q.UpsertSyncReceipt(ctx, store.UpsertSyncReceiptParams{
 			CredentialID: credentialID, AttemptRef: attemptRef, Epoch: epoch,
 			FromVersion: expectVersion, ToVersion: expectVersion + 1,
 		}); err != nil {
-			return fmt.Errorf("assets: insert sync receipt: %w", err)
+			return fmt.Errorf("assets: record sync receipt: %w", err)
 		}
 		return s.audit.Record(ctx, tx, audit.Entry{
 			Action: "credential.synced", SubjectKind: "credential", SubjectID: credentialID.String(),

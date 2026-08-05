@@ -292,31 +292,6 @@ func (q *Queries) GetCredential(ctx context.Context, id uuid.UUID) (GetCredentia
 	return i, err
 }
 
-const getCredentialRowForUpdate = `-- name: GetCredentialRowForUpdate :one
-SELECT id, kind, key_id, secret_version
-FROM credentials WHERE id = $1
-FOR UPDATE
-`
-
-type GetCredentialRowForUpdateRow struct {
-	ID            uuid.UUID
-	Kind          string
-	KeyID         string
-	SecretVersion int64
-}
-
-func (q *Queries) GetCredentialRowForUpdate(ctx context.Context, id uuid.UUID) (GetCredentialRowForUpdateRow, error) {
-	row := q.db.QueryRow(ctx, getCredentialRowForUpdate, id)
-	var i GetCredentialRowForUpdateRow
-	err := row.Scan(
-		&i.ID,
-		&i.Kind,
-		&i.KeyID,
-		&i.SecretVersion,
-	)
-	return i, err
-}
-
 const getHarness = `-- name: GetHarness :one
 SELECT id, name, kind, image_ref, provider_endpoint, credential_id, defaults, created_at, updated_at
 FROM harnesses WHERE id = $1
@@ -498,30 +473,6 @@ func (q *Queries) HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) 
 		return 0, err
 	}
 	return result.RowsAffected(), nil
-}
-
-const insertSyncReceipt = `-- name: InsertSyncReceipt :exec
-INSERT INTO credential_sync_receipts (credential_id, attempt_ref, epoch, from_version, to_version)
-VALUES ($1, $2, $3, $4, $5)
-`
-
-type InsertSyncReceiptParams struct {
-	CredentialID uuid.UUID
-	AttemptRef   string
-	Epoch        int64
-	FromVersion  int64
-	ToVersion    int64
-}
-
-func (q *Queries) InsertSyncReceipt(ctx context.Context, arg InsertSyncReceiptParams) error {
-	_, err := q.db.Exec(ctx, insertSyncReceipt,
-		arg.CredentialID,
-		arg.AttemptRef,
-		arg.Epoch,
-		arg.FromVersion,
-		arg.ToVersion,
-	)
-	return err
 }
 
 const listCredentialRowsForUpdate = `-- name: ListCredentialRowsForUpdate :many
@@ -782,6 +733,22 @@ func (q *Queries) ListStaleLeases(ctx context.Context, staleSeconds float64) ([]
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockCredential = `-- name: LockCredential :one
+SELECT id FROM credentials WHERE id = $1
+FOR UPDATE
+`
+
+// LockCredential takes the credential row lock that opens every write in
+// the mutable-credential aggregate, pinning its lock order. It reads
+// nothing the caller needs: kind is immutable and read on the pool, and
+// the version guard is the CAS itself.
+func (q *Queries) LockCredential(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockCredential, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
 }
 
 const markCredentialAuthExpired = `-- name: MarkCredentialAuthExpired :execrows
@@ -1145,6 +1112,36 @@ func (q *Queries) UpdateRepo(ctx context.Context, arg UpdateRepoParams) (Repo, e
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const upsertSyncReceipt = `-- name: UpsertSyncReceipt :exec
+INSERT INTO credential_sync_receipts (credential_id, attempt_ref, epoch, from_version, to_version)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (credential_id, attempt_ref) DO UPDATE
+SET epoch = EXCLUDED.epoch, from_version = EXCLUDED.from_version,
+    to_version = EXCLUDED.to_version, committed_at = now()
+`
+
+type UpsertSyncReceiptParams struct {
+	CredentialID uuid.UUID
+	AttemptRef   string
+	Epoch        int64
+	FromVersion  int64
+	ToVersion    int64
+}
+
+// UpsertSyncReceipt overwrites the previous owner's receipt when a
+// reconciler commits under a later epoch for the same attempt: the receipt
+// records which epoch's bytes are in the store, so it must move with them.
+func (q *Queries) UpsertSyncReceipt(ctx context.Context, arg UpsertSyncReceiptParams) error {
+	_, err := q.db.Exec(ctx, upsertSyncReceipt,
+		arg.CredentialID,
+		arg.AttemptRef,
+		arg.Epoch,
+		arg.FromVersion,
+		arg.ToVersion,
+	)
+	return err
 }
 
 const useCredentialRow = `-- name: UseCredentialRow :one

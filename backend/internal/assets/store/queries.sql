@@ -89,9 +89,12 @@ UPDATE credentials SET last_used_at = now()
 WHERE id = $1
 RETURNING id, kind, key_id, wrapped_dek, ciphertext, secret_version;
 
--- name: GetCredentialRowForUpdate :one
-SELECT id, kind, key_id, secret_version
-FROM credentials WHERE id = $1
+-- LockCredential takes the credential row lock that opens every write in
+-- the mutable-credential aggregate, pinning its lock order. It reads
+-- nothing the caller needs: kind is immutable and read on the pool, and
+-- the version guard is the CAS itself.
+-- name: LockCredential :one
+SELECT id FROM credentials WHERE id = $1
 FOR UPDATE;
 
 -- CredentialFingerprintHeldByOther is the sync-back pre-check. Letting the
@@ -161,9 +164,15 @@ ORDER BY credential_id;
 SELECT * FROM credential_sync_receipts
 WHERE credential_id = $1 AND attempt_ref = $2;
 
--- name: InsertSyncReceipt :exec
+-- UpsertSyncReceipt overwrites the previous owner's receipt when a
+-- reconciler commits under a later epoch for the same attempt: the receipt
+-- records which epoch's bytes are in the store, so it must move with them.
+-- name: UpsertSyncReceipt :exec
 INSERT INTO credential_sync_receipts (credential_id, attempt_ref, epoch, from_version, to_version)
-VALUES ($1, $2, $3, $4, $5);
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (credential_id, attempt_ref) DO UPDATE
+SET epoch = EXCLUDED.epoch, from_version = EXCLUDED.from_version,
+    to_version = EXCLUDED.to_version, committed_at = now();
 
 -- name: CreateRepo :one
 INSERT INTO repos (project_id, forge_kind, slug, default_branch, credential_id)

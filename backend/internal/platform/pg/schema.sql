@@ -112,8 +112,10 @@ CREATE TABLE credential_leases (
 
 -- The lease row, indexed by owning attempt, is the recovery authority:
 -- reconciliation consults it even when no manifest and no container exist
--- (spec §2.3).
-CREATE INDEX credential_leases_attempt_idx ON credential_leases (attempt_ref);
+-- (spec §2.3). UNIQUE because one attempt holds at most one credential
+-- lease by design — a second row would make the recovery lookup return an
+-- arbitrary one of them and silently leak the rest.
+CREATE UNIQUE INDEX credential_leases_attempt_ref_key ON credential_leases (attempt_ref);
 
 -- One receipt per (credential, attempt): the commit-then-crash retry is
 -- recognizable as already applied and can never clobber an operator

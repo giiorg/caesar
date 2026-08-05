@@ -33,6 +33,11 @@ func actorID(p authn.Principal) uuid.NullUUID {
 // holds the same refresh token, not a name collision.
 const fingerprintIndex = "credentials_fingerprint_key"
 
+// leaseAttemptIndex is the unique index on credential_leases (attempt_ref);
+// a violation of it means the attempt already leases a different
+// credential, not that this credential is taken.
+const leaseAttemptIndex = "credential_leases_attempt_ref_key"
+
 func isUniqueViolation(err error) bool {
 	_, dup := uniqueViolation(err)
 	return dup
