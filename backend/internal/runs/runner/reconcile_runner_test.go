@@ -82,7 +82,11 @@ EOF
 	// The crash window: the agent finished and the worker died before it
 	// could collect, so nothing has torn anything down.
 	spec := stageAttemptForInspect(t, r, ref)
-	agent, err := r.runAgentToCompletion(t.Context(), ref, spec)
+	d, err := driverFor(spec.Harness.Kind)
+	if err != nil {
+		t.Fatalf("driver for %s: %v", spec.Harness.Kind, err)
+	}
+	agent, err := r.runAgentToCompletion(t.Context(), ref, spec, d)
 	if err != nil {
 		t.Fatalf("run agent: %v", err)
 	}

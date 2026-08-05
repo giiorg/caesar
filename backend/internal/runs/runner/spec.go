@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,16 +34,21 @@ type RunSpec struct {
 	Harness     HarnessSpec
 	User        string   // "<uid>:<gid>" of this process
 	Env         []string // the pinned allowlist — never inherited from the control plane
+	// Custody is how this attempt's credential reaches the harness, derived
+	// from the (harness kind, credential kind) pair by the driver table. It
+	// decides both halves of the pipeline: what the agent's env carries, and
+	// whether the gateway holds a provider credential at all.
+	Custody custody
 	// BrokerToken goes to the agent; only BrokerTokenSHA goes to the
-	// gateway, so the gateway's config leaks nothing replayable.
-	BrokerToken                        string
-	BrokerTokenSHA                     string
-	ProviderOps                        []egress.Op
-	CredentialHeader, CredentialPrefix string
+	// gateway, so the gateway's config leaks nothing replayable. Both are
+	// empty under materialized custody: there is nobody to authenticate,
+	// because the gateway brokers nothing.
+	BrokerToken    string
+	BrokerTokenSHA string
 	// ProviderCredential is the opened provider secret. It is filled in by
-	// Execute (buildSpec never touches the credential store) and travels
-	// exactly one place: the gateway container's environment. Nothing may
-	// log a RunSpec.
+	// Execute (buildSpec never touches the credential store) for both
+	// custodies — redaction needs it either way — but it is handed to the
+	// gateway only when brokered. Nothing may log a RunSpec.
 	ProviderCredential string
 	BaseSHA            string
 	Deadline           time.Time
@@ -52,42 +58,57 @@ type RunSpec struct {
 // unknown harness kinds and unavailable images fail here, where the failure
 // is still cheap and typed.
 func (r *Runner) buildSpec(ctx context.Context, req runs.ExecutionRequest, hs HarnessSpec) (RunSpec, error) {
-	header, prefix, ops, err := providerProfile(hs.Kind)
+	d, err := driverFor(hs.Kind)
 	if err != nil {
-		return RunSpec{}, err
+		return RunSpec{}, permanentf(runs.CodeHarnessError, "%v", err)
+	}
+	cust, err := d.custodyOf(req.Credential.Kind)
+	if err != nil {
+		return RunSpec{}, permanentf(runs.CodeHarnessError, "%v", err)
 	}
 	digest, err := r.resolveImage(ctx, hs.ImageRef)
 	if err != nil {
 		return RunSpec{}, err
 	}
-	token, tokenSHA, err := newBrokerToken()
-	if err != nil {
-		return RunSpec{}, err
-	}
-	return RunSpec{
+	spec := RunSpec{
 		Ref:         req.Ref,
 		ImageDigest: digest,
 		Harness:     hs,
 		User:        r.runAs(),
+		Custody:     cust,
+		// The pinned allowlist: the agent sees exactly these, plus whatever
+		// its driver adds below. Every addition is explicit in the driver
+		// table — nothing here is inherited from the control plane.
 		Env: []string{
 			"CAESAR_ATTEMPT=" + req.Ref.String(),
 			"CAESAR_WORKSPACE=" + workspaceDir,
-			"CAESAR_BROKER_URL=" + brokerURL,
-			"CAESAR_BROKER_TOKEN=" + token,
 			"HTTPS_PROXY=" + brokerURL,
 			"HTTP_PROXY=" + brokerURL,
 			"NO_PROXY=",
 			"HOME=" + agentHome,
 			"PATH=" + agentPath,
 		},
-		BrokerToken:      token,
-		BrokerTokenSHA:   tokenSHA,
-		ProviderOps:      ops,
-		CredentialHeader: header,
-		CredentialPrefix: prefix,
-		BaseSHA:          req.BaseSHA,
-		Deadline:         req.Deadline,
-	}, nil
+		BaseSHA:  req.BaseSHA,
+		Deadline: req.Deadline,
+	}
+	// Only a brokered attempt has anything to authenticate: the agent presents
+	// this token and the gateway swaps it for the provider credential. A
+	// materialized attempt's gateway brokers nothing, so minting a token for
+	// it would be one more secret in the agent's environment for no reason.
+	if cust == custodyBrokered {
+		token, tokenSHA, err := newBrokerToken()
+		if err != nil {
+			return RunSpec{}, err
+		}
+		spec.BrokerToken, spec.BrokerTokenSHA = token, tokenSHA
+		spec.Env = append(spec.Env,
+			"CAESAR_BROKER_URL="+brokerURL,
+			"CAESAR_BROKER_TOKEN="+token)
+		spec.Env = append(spec.Env, d.env(envInput{custody: custodyBrokered, brokerToken: token})...)
+	}
+	// The materialized half of the env needs the secret, which buildSpec never
+	// touches; Execute appends it once the credential is open.
+	return spec, nil
 }
 
 // resolveImage pins the image an attempt runs. Any inspect error is treated
@@ -121,24 +142,26 @@ func imageUnavailable(ref string, err error) error {
 	}}
 }
 
-// providerProfile is the pinned per-harness allowlist: which header carries
-// the credential and which operations the broker will forward. An unlisted
-// kind has no allowlist, so it is refused rather than defaulted — a default
-// here would be an open proxy onto a provider account.
-func providerProfile(kind string) (header, prefix string, ops []egress.Op, err error) {
-	switch kind {
-	case "claude-code":
-		return "x-api-key", "", []egress.Op{
-			{Method: "POST", PathPrefix: "/v1/messages"},
-			{Method: "POST", PathPrefix: "/v1/messages/count_tokens"},
-			{Method: "GET", PathPrefix: "/v1/models"},
-		}, nil
-	case "codex":
-		return "authorization", "Bearer ", []egress.Op{
-			{Method: "POST", PathPrefix: "/v1/responses"},
-			{Method: "POST", PathPrefix: "/v1/chat/completions"},
-			{Method: "GET", PathPrefix: "/v1/models"},
-		}, nil
+// gatewayConfig picks the gateway's shape from custody (spec §3). Materialized
+// is the open-CONNECT configuration the validation gateway already runs: empty
+// token digest, zero Provider — the gateway holds nothing worth stealing, and
+// the allowlist is the sole barrier. Brokered keeps the token-authenticated
+// header injection unchanged. Both get the driver's FQDNs ∪ the operator's
+// configured list; for a brokered attempt the driver's hosts are reachable
+// over CONNECT too, which is harmless — the agent holds no provider credential
+// to spend there — and one composition point beats two shapes.
+func (r *Runner) gatewayConfig(spec RunSpec, d driver) egress.Config {
+	allow := append(slices.Clone(d.connectAllow), r.opts.ConnectAllow...)
+	cfg := egress.Config{Attempt: spec.Ref.String(), ConnectAllow: allow}
+	if spec.Custody == custodyBrokered {
+		cfg.TokenSHA256 = spec.BrokerTokenSHA
+		cfg.Provider = egress.Provider{
+			Endpoint:         spec.Harness.ProviderEndpoint,
+			Credential:       spec.ProviderCredential,
+			CredentialHeader: d.brokered.header,
+			CredentialPrefix: d.brokered.prefix,
+			Ops:              d.brokered.ops,
+		}
 	}
-	return "", "", nil, fmt.Errorf("runner: unknown harness kind %q", kind)
+	return cfg
 }

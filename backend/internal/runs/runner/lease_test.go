@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,6 +115,20 @@ func (e *leaseEngine) NetworkCreate(_ context.Context, name string, _ bool, _ ma
 
 func (e *leaseEngine) NetworkRemove(context.Context, string) error { return nil }
 
+func (e *leaseEngine) NetworkConnect(context.Context, string, string, []string) error { return nil }
+
+// A scripted container produces no output; the streams exist so an attempt
+// can run past the gateway to the agent.
+func (e *leaseEngine) ContainerLogs(context.Context, string, bool) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (e *leaseEngine) ContainerKill(context.Context, string, string) error { return nil }
+
+func (e *leaseEngine) ContainerInspect(context.Context, string) (dockerapi.ContainerInspect, error) {
+	return dockerapi.ContainerInspect{}, nil
+}
+
 func (e *leaseEngine) ContainerCreate(_ context.Context, name string, cfg dockerapi.ContainerConfig,
 	_ dockerapi.HostConfig, _ map[string]dockerapi.EndpointSettings,
 ) (string, error) {
@@ -214,9 +229,9 @@ func TestExecute_LeaseHeldElsewhereWaitsWithoutRunningAnything(t *testing.T) {
 }
 
 // Static kinds are shareable: nothing a running attempt does can change a
-// subscription token, so serializing on one would only queue work behind
-// itself. The manifest is still written — adoption needs the credential
-// identity to rebuild the redaction set whatever the custody.
+// model key, so serializing on one would only queue work behind itself. The
+// manifest is still written — adoption needs the credential identity to
+// rebuild the redaction set whatever the custody.
 func TestExecute_StaticCredentialTakesNoLeaseButStillGetsAManifest(t *testing.T) {
 	credID := uuid.New()
 	leaser := &fakeLeaser{}
@@ -228,7 +243,7 @@ func TestExecute_StaticCredentialTakesNoLeaseButStillGetsAManifest(t *testing.T)
 	dataRoot := t.TempDir()
 	r := newLeaseRunner(t, eng, leaser, &recordingOpener{}, Options{DataRoot: dataRoot})
 
-	if _, err := r.Execute(t.Context(), leaseRequest(credID, "subscription_token")); err == nil {
+	if _, err := r.Execute(t.Context(), leaseRequest(credID, "model_key")); err == nil {
 		t.Fatal("want the attempt to die at the stage container, past the manifest write")
 	}
 
@@ -239,8 +254,8 @@ func TestExecute_StaticCredentialTakesNoLeaseButStillGetsAManifest(t *testing.T)
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
 	}
-	if m.CredentialID != credID.String() || m.Kind != "subscription_token" || m.Custody != custodyBrokered {
-		t.Errorf("manifest = %+v, want the bound id, kind subscription_token, brokered custody", m)
+	if m.CredentialID != credID.String() || m.Kind != "model_key" || m.Custody != custodyBrokered {
+		t.Errorf("manifest = %+v, want the bound id, kind model_key, brokered custody", m)
 	}
 	if m.Epoch != 0 || m.SecretVersion != 0 {
 		t.Errorf("manifest carries lease fields %d/%d for an unleased kind, want 0/0", m.Epoch, m.SecretVersion)
@@ -300,8 +315,19 @@ func TestExecute_AcquiredLeaseMaterializesTheGrantedSnapshot(t *testing.T) {
 	if len(opener.opened) != 0 {
 		t.Errorf("opened %v, want nothing: the acquire snapshot is the only source", opener.opened)
 	}
-	if got := gatewayCredential(t, gatewayEnv); got != granted {
-		t.Errorf("gateway credential = %q, want the acquire snapshot %q", got, granted)
+	// Materialized custody: the gateway is the allowlisted route out and
+	// nothing more. The granted snapshot goes to the CLI's own auth
+	// directory, so a gateway holding it would be a second copy of a secret
+	// that is supposed to exist in one place.
+	cfg := gatewayConfigFromEnv(t, gatewayEnv)
+	if cfg.Provider.Credential != "" || cfg.Provider.Endpoint != "" {
+		t.Errorf("gateway provider = %+v, want none under materialized custody", cfg.Provider)
+	}
+	if cfg.TokenSHA256 != "" {
+		t.Error("a gateway that brokers nothing has nobody to authenticate, want no token digest")
+	}
+	if strings.Contains(strings.Join(gatewayEnv, " "), granted) {
+		t.Error("the granted snapshot reached the gateway's environment, want it nowhere near")
 	}
 
 	_, _, released := leaser.calls()
@@ -310,9 +336,60 @@ func TestExecute_AcquiredLeaseMaterializesTheGrantedSnapshot(t *testing.T) {
 	}
 }
 
-// gatewayCredential digs the provider secret out of the gateway container's
-// environment — the one place the runner puts it.
-func gatewayCredential(t *testing.T, env []string) string {
+// A materialized credential is delivered by the driver into the agent's own
+// world, and the gateway never sees it. Claude Code's is the env-delivered
+// case: the opened token is what the CLI authenticates with, and the broker
+// half of the environment is absent entirely.
+func TestExecute_MaterializedCredentialIsDeliveredToTheAgentNotTheGateway(t *testing.T) {
+	eng := newLeaseEngine()
+	ref := testRef()
+	dataRoot := t.TempDir()
+	eng.onCreate[stageName(ref)] = func(dockerapi.ContainerConfig) error {
+		return writeContract(filepath.Join(dataRoot, "attempts", ref.String(), gitops.StageReportFile),
+			gitops.StageReport{Verified: true, HeadSHA: "abc"})
+	}
+	var gatewayEnv, agentEnv []string
+	eng.onCreate[gatewayName(ref)] = func(cfg dockerapi.ContainerConfig) error {
+		gatewayEnv = append([]string(nil), cfg.Env...)
+		return nil
+	}
+	eng.onCreate[agentName(ref)] = func(cfg dockerapi.ContainerConfig) error {
+		agentEnv = append([]string(nil), cfg.Env...)
+		return errors.New("stop here: the delivered environment is already visible")
+	}
+
+	r, err := New(eng, &harnessRegistry{spec: HarnessSpec{Kind: "claude-code", ImageRef: "ghcr.io/x/claude@sha256:beef"}},
+		&recordingOpener{}, &fakeLeaser{}, stubGit{}, nil,
+		Options{DataRoot: dataRoot, CaesarImage: "caesar:dev", GitImage: "caesar-git:dev"}, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := r.Execute(t.Context(), leaseRequest(uuid.New(), "subscription_token")); err == nil {
+		t.Fatal("want the attempt to die at the agent, past the gateway")
+	}
+
+	env := envToMap(agentEnv)
+	if env["CLAUDE_CODE_OAUTH_TOKEN"] != "provider-key" {
+		t.Errorf("agent env token = %q, want the opened credential", env["CLAUDE_CODE_OAUTH_TOKEN"])
+	}
+	for _, k := range []string{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_AUTOUPDATER"} {
+		if env[k] != "1" {
+			t.Errorf("agent env %s = %q, want the kill-switch on", k, env[k])
+		}
+	}
+	for _, k := range []string{"CAESAR_BROKER_URL", "CAESAR_BROKER_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"} {
+		if _, ok := env[k]; ok {
+			t.Errorf("agent env carries %s, but a materialized attempt brokers nothing", k)
+		}
+	}
+	if strings.Contains(strings.Join(gatewayEnv, " "), "provider-key") {
+		t.Error("the credential reached the gateway, want it only in the agent's own environment")
+	}
+}
+
+// gatewayConfigFromEnv decodes the config document the gateway container is
+// handed — the one place an attempt's egress posture is stated.
+func gatewayConfigFromEnv(t *testing.T, env []string) egress.Config {
 	t.Helper()
 	for _, e := range env {
 		_, raw, ok := strings.Cut(e, "=")
@@ -323,10 +400,10 @@ func gatewayCredential(t *testing.T, env []string) string {
 		if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 			t.Fatalf("decode egress config: %v", err)
 		}
-		return cfg.Provider.Credential
+		return cfg
 	}
 	t.Fatalf("no egress config in the gateway environment %v", env)
-	return ""
+	return egress.Config{}
 }
 
 // The lease has to be kept alive for as long as the attempt runs, and a

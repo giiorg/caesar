@@ -22,9 +22,9 @@ const manifestLimit = 128 << 10
 // kind, and custody to rebuild the redaction set — without a manifest it must
 // withhold the attempt's logs and artifacts.
 type attemptManifest struct {
-	CredentialID string `json:"credential_id"`
-	Kind         string `json:"credential_kind"`
-	Custody      string `json:"custody"`
+	CredentialID string  `json:"credential_id"`
+	Kind         string  `json:"credential_kind"`
+	Custody      custody `json:"custody"`
 	// SecretVersion is the version actually delivered. For a leased kind it
 	// is the version the acquire transaction granted, and adoption refuses to
 	// publish unless the store still holds THIS version: a mid-attempt
@@ -38,37 +38,21 @@ type attemptManifest struct {
 	BrokerToken   string `json:"broker_token,omitempty"` // brokered custody only — see writeManifest
 }
 
-// Custody is how the attempt's provider credential reaches the harness:
-// brokered means only the egress gateway ever holds it, materialized means
-// the CLI reads it from a file caesar wrote. The distinction decides who may
-// change the credential mid-attempt, so it is recorded rather than re-derived
-// at recovery time. Plan 07's driver contract moves the choice onto the
-// driver; until then the credential kind is the whole of it.
-const (
-	custodyBrokered     = "brokered"
-	custodyMaterialized = "materialized"
-)
-
 // kindAgentAuthFile mirrors the assets credential-kind vocabulary by value:
 // the runs context never imports assets, and this is the one kind whose
 // bytes a running agent may itself replace.
 const kindAgentAuthFile = "agent_auth_file" //nolint:gosec // G101 matches the name: a kind label, not a secret
 
-func custodyFor(kind string) string {
-	if kind == kindAgentAuthFile {
-		return custodyMaterialized
-	}
-	return custodyBrokered
-}
-
 // manifestFor assembles the manifest from what is already resolved: the
-// binding the request pinned, the spec's broker token, and whatever grant the
-// lease made (the zero Lease for kinds that take none).
+// binding the request pinned, the custody and broker token the spec already
+// carries (the driver derived it from the harness/credential pair — recovery
+// reads it here rather than re-deriving it), and whatever grant the lease made
+// (the zero Lease for kinds that take none).
 func manifestFor(req runs.ExecutionRequest, spec RunSpec, lease Lease) attemptManifest {
 	m := attemptManifest{
 		CredentialID:  req.Credential.ID.String(),
 		Kind:          req.Credential.Kind,
-		Custody:       custodyFor(req.Credential.Kind),
+		Custody:       spec.Custody,
 		SecretVersion: lease.SecretVersion,
 		Epoch:         lease.Epoch,
 	}

@@ -14,7 +14,6 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/config"
 	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
 	"github.com/giiorg/caesar/backend/internal/runs"
-	"github.com/giiorg/caesar/backend/internal/runs/egress"
 	"github.com/giiorg/caesar/backend/internal/runs/runner/gitops"
 )
 
@@ -80,6 +79,12 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	if err != nil {
 		return runs.ExecutionResult{}, err
 	}
+	// The driver is re-derived rather than carried on the spec: RunSpec stays
+	// plain data, and buildSpec has already refused any kind that has no row.
+	d, err := driverFor(hs.Kind)
+	if err != nil {
+		return runs.ExecutionResult{}, permanentf(runs.CodeHarnessError, "%v", err)
+	}
 
 	// Past this point the attempt may hold a credential lease, and a fenced
 	// heartbeat has to be able to cut the whole pipeline short: the takeover
@@ -136,6 +141,15 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 		}
 		spec.ProviderCredential = string(cred)
 	}
+	// The materialized half of the agent's environment is completed here and
+	// only here: it carries the secret, which buildSpec has no business
+	// reading. A brokered attempt's env was finished before the credential
+	// was ever opened.
+	if spec.Custody == custodyMaterialized {
+		spec.Env = append(spec.Env, d.env(envInput{
+			custody: custodyMaterialized, secret: spec.ProviderCredential,
+		})...)
+	}
 
 	if err := r.ensureNetworks(ctx, ref); err != nil {
 		return runs.ExecutionResult{}, err
@@ -143,7 +157,7 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	if err := r.stageAttempt(ctx, ref, spec, clone); err != nil {
 		return runs.ExecutionResult{}, err
 	}
-	agent, err := r.runAgentToCompletion(ctx, ref, spec)
+	agent, err := r.runAgentToCompletion(ctx, ref, spec, d)
 	if err != nil {
 		return r.failureResult(ref, spec, agent), err
 	}
@@ -289,7 +303,7 @@ func (r *Runner) stageAttempt(ctx context.Context, ref runs.AttemptRef, spec Run
 // comes up first so the agent never races a missing broker, both containers
 // stream into capped log files, and the gateway is stopped gracefully at the
 // end so its usage summary flushes.
-func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, spec RunSpec) (agentOutcome, error) {
+func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, spec RunSpec, d driver) (agentOutcome, error) {
 	var out agentOutcome
 
 	// The log streams deliberately do not inherit the attempt's deadline: a
@@ -299,7 +313,7 @@ func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, 
 	var streams []*logStreamer
 	defer func() { r.drainStreams(ref, streams, stopStreams) }()
 
-	gatewayID, err := r.startGateway(ctx, ref, spec)
+	gatewayID, err := r.startGateway(ctx, ref, spec, d)
 	if err != nil {
 		return out, err
 	}
@@ -401,22 +415,12 @@ func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, 
 // startGateway brings up the attempt's egress process: dual-homed onto the
 // attempt's internal network (where it answers to the name "egress") and the
 // shared egress network (where it is the only container with a route out).
-// The provider credential exists in exactly one place — this container's
-// environment — and the agent's network cannot reach the daemon that holds it.
-func (r *Runner) startGateway(ctx context.Context, ref runs.AttemptRef, spec RunSpec) (string, error) {
-	cfg := egress.Config{
-		Attempt:     ref.String(),
-		TokenSHA256: spec.BrokerTokenSHA,
-		Provider: egress.Provider{
-			Endpoint:         spec.Harness.ProviderEndpoint,
-			Credential:       spec.ProviderCredential,
-			CredentialHeader: spec.CredentialHeader,
-			CredentialPrefix: spec.CredentialPrefix,
-			Ops:              spec.ProviderOps,
-		},
-		ConnectAllow: r.opts.ConnectAllow,
-	}
-	raw, err := json.Marshal(cfg)
+// Under brokered custody the provider credential exists in exactly one place —
+// this container's environment — and the agent's network cannot reach the
+// daemon that holds it; under materialized custody the gateway holds no
+// credential at all and is purely the allowlisted route out.
+func (r *Runner) startGateway(ctx context.Context, ref runs.AttemptRef, spec RunSpec, d driver) (string, error) {
+	raw, err := json.Marshal(r.gatewayConfig(spec, d))
 	if err != nil {
 		return "", transientf(runs.CodeInternalError, "encode egress config: %v", err)
 	}
