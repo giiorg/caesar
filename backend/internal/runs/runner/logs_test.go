@@ -73,7 +73,7 @@ func newLogRunner(t *testing.T, eng Engine, sink EventSink, capBytes, floodBytes
 	if floodBytes == 0 {
 		floodBytes = capBytes
 	}
-	r, err := New(eng, nil, nil, nil, sink, Options{
+	r, err := New(eng, nil, nil, nil, nil, sink, Options{
 		CaesarImage:   "caesar:dev",
 		GitImage:      "caesar-git:dev",
 		DataRoot:      t.TempDir(),

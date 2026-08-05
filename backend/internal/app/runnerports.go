@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -59,7 +60,7 @@ func buildRunner(cfg config.Runner, assetsSvc *assets.Service, runsSvc *runs.Ser
 		ConnectAllow:        cfg.ConnectAllow,
 	}
 	return runner.New(engine, appHarnessResolver{svc: assetsSvc}, appCredentialOpener{svc: assetsSvc},
-		appGitSource{svc: assetsSvc}, runsSvc, opts, log)
+		appCredentialLeaser{svc: assetsSvc}, appGitSource{svc: assetsSvc}, runsSvc, opts, log)
 }
 
 // appHarnessResolver resolves a phase's harness from the assets context. The
@@ -88,6 +89,98 @@ type appCredentialOpener struct{ svc *assets.Service }
 
 func (a appCredentialOpener) OpenCredential(ctx context.Context, id uuid.UUID, purpose string) ([]byte, error) {
 	return a.svc.UseCredential(ctx, id, purpose)
+}
+
+// appCredentialLeaser adapts the assets mutable-credential aggregate onto the
+// runner's port. The translation is mechanical except for the busy answer:
+// see Acquire.
+type appCredentialLeaser struct{ svc *assets.Service }
+
+var _ runner.CredentialLeaser = appCredentialLeaser{}
+
+// Acquire takes the single-flight lease and the snapshot it grants.
+//
+// Only assets.ErrLeaseBusy becomes the runner's wait. Acquire reports two
+// distinct conflicts — the lease is held elsewhere (which wraps the sentinel)
+// and this attempt already holds a lease on a different credential (which
+// does not, because it is a design error, not contention). Branching on the
+// error class instead would turn that bug into a silent zero-charge retry
+// loop that never resolves.
+func (a appCredentialLeaser) Acquire(ctx context.Context, id uuid.UUID, ref string) (runner.Lease, []byte, error) {
+	l, secret, err := a.svc.AcquireCredentialLease(ctx, id, ref)
+	if errors.Is(err, assets.ErrLeaseBusy) {
+		return runner.Lease{}, nil, runner.ErrLeaseBusy
+	}
+	if err != nil {
+		return runner.Lease{}, nil, err
+	}
+	return leaseValue(l), secret, nil
+}
+
+func (a appCredentialLeaser) Heartbeat(ctx context.Context, id uuid.UUID, ref string, epoch int64) error {
+	return a.svc.HeartbeatCredentialLease(ctx, id, ref, epoch)
+}
+
+func (a appCredentialLeaser) CommitSync(
+	ctx context.Context, id uuid.UUID, ref string, epoch, expectVersion int64, secret []byte,
+) (runner.SyncStatus, error) {
+	status, err := a.svc.CommitCredentialSync(ctx, id, ref, epoch, expectVersion, secret)
+	if err != nil {
+		return "", err
+	}
+	return syncStatus(status)
+}
+
+func (a appCredentialLeaser) Release(ctx context.Context, id uuid.UUID, ref string, epoch int64) error {
+	return a.svc.ReleaseCredentialLease(ctx, id, ref, epoch)
+}
+
+func (a appCredentialLeaser) Takeover(ctx context.Context, id uuid.UUID, ref string) (runner.Lease, error) {
+	l, err := a.svc.TakeoverCredentialLease(ctx, id, ref)
+	if err != nil {
+		return runner.Lease{}, err
+	}
+	return leaseValue(l), nil
+}
+
+// LeaseByAttempt is the recovery-authority lookup: it answers from the lease
+// row alone, so an attempt whose manifest never became durable is still
+// resolvable to the credential it holds.
+func (a appCredentialLeaser) LeaseByAttempt(ctx context.Context, ref string) (uuid.UUID, runner.Lease, bool, error) {
+	l, ok, err := a.svc.CredentialLeaseByAttempt(ctx, ref)
+	if err != nil || !ok {
+		return uuid.Nil, runner.Lease{}, false, err
+	}
+	return l.CredentialID, leaseValue(l), true, nil
+}
+
+func (a appCredentialLeaser) MarkAuthExpired(ctx context.Context, id uuid.UUID) error {
+	return a.svc.MarkCredentialAuthExpired(ctx, id)
+}
+
+func (a appCredentialLeaser) RecordQuarantine(ctx context.Context, id uuid.UUID, ref string) error {
+	return a.svc.RecordCredentialQuarantine(ctx, id, ref)
+}
+
+func leaseValue(l assets.CredentialLease) runner.Lease {
+	return runner.Lease{Epoch: l.Epoch, SecretVersion: l.SecretVersion}
+}
+
+// syncStatus maps the aggregate's vocabulary onto the runner's rather than
+// converting the string: an unmapped status is a contract drift between the
+// two halves, and the runner decides what to publish from this value.
+func syncStatus(s assets.SyncStatus) (runner.SyncStatus, error) {
+	switch s {
+	case assets.SyncApplied:
+		return runner.SyncStatusApplied, nil
+	case assets.SyncAlreadyApplied:
+		return runner.SyncStatusAlreadyApplied, nil
+	case assets.SyncCASLost:
+		return runner.SyncStatusCASLost, nil
+	case assets.SyncFenced:
+		return runner.SyncStatusFenced, nil
+	}
+	return "", fmt.Errorf("app: unknown credential sync status %q", s)
 }
 
 // appGitSource turns a repo reference into the stage container's clone. The

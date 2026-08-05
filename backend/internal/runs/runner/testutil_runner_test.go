@@ -222,7 +222,7 @@ func newDockerRunner(t *testing.T, opts Options, hs HarnessSpec, sink EventSink)
 	opts.testHostAccess = true
 
 	dir, _ := fixtureRepo(t)
-	r, err := New(engine, staticResolver{spec: hs}, staticCreds{value: []byte("real-provider-key")},
+	r, err := New(engine, staticResolver{spec: hs}, staticCreds{value: []byte("real-provider-key")}, nil,
 		fixtureGit{dir: dir}, sink, opts, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("New: %v", err)

@@ -55,6 +55,17 @@ func (r *Runner) logsDir(ref runs.AttemptRef) string {
 	return filepath.Join(r.opts.DataRoot, "logs", ref.String())
 }
 
+// manifestsDir holds one file per credential-bearing attempt. It lives beside
+// the attempt tree rather than inside it so blanket teardown never takes the
+// manifest with it: the credential obligation outlives the containers.
+func (r *Runner) manifestsDir() string {
+	return filepath.Join(r.opts.DataRoot, "manifests")
+}
+
+func (r *Runner) manifestPath(ref runs.AttemptRef) string {
+	return filepath.Join(r.manifestsDir(), ref.String()+".json")
+}
+
 // relPath renders a path the way artifacts and events carry it: relative to
 // the data root, so a stored reference survives the root being remounted
 // somewhere else. A path outside the root is carried whole — inventing a

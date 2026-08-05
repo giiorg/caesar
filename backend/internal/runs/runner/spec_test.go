@@ -37,7 +37,7 @@ func (f *fakeEngine) ImagePull(_ context.Context, ref string) error {
 
 func newSpecRunner(t *testing.T, eng Engine) *Runner {
 	t.Helper()
-	r, err := New(eng, nil, nil, nil, nil,
+	r, err := New(eng, nil, nil, nil, nil, nil,
 		Options{CaesarImage: "caesar:dev", GitImage: "caesar-git:dev"},
 		slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err != nil {

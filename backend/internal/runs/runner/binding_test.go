@@ -61,7 +61,7 @@ func TestExecute_OpensTheBoundCredentialNotTheHarnessRowsCurrentOne(t *testing.T
 	eng := &bindingEngine{fakeEngine{inspect: func(string) (dockerapi.ImageInspect, error) {
 		return dockerapi.ImageInspect{RepoDigests: []string{"ghcr.io/x/claude@sha256:beef"}}, nil
 	}}}
-	r, err := New(eng, registry, opener, stubGit{}, nil, Options{
+	r, err := New(eng, registry, opener, nil, stubGit{}, nil, Options{
 		DataRoot: t.TempDir(), CaesarImage: "caesar:dev", GitImage: "caesar-git:dev",
 	}, discardLog())
 	if err != nil {

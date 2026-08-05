@@ -77,6 +77,49 @@ type CredentialOpener interface {
 	OpenCredential(ctx context.Context, id uuid.UUID, purpose string) ([]byte, error)
 }
 
+// Lease is the runner's copy of the single-flight grant over a mutable
+// credential (spec §2.1). Epoch is the takeover fence — reconciliation
+// advances it before touching the container, so a paused worker and the
+// reconciler that superseded it can be told apart — and SecretVersion is the
+// version the grant materialized, which the sync-back CAS is compared
+// against. Plain values only: the assets vocabulary never crosses into runs.
+type Lease struct{ Epoch, SecretVersion int64 }
+
+// SyncStatus is the outcome of writing an attempt's refreshed credential
+// back. It mirrors the assets vocabulary by value. None of the four is an
+// error: three of them mean the attempt's bytes were correctly not stored,
+// and the caller releases its lease either way.
+type SyncStatus string
+
+const (
+	SyncStatusApplied        SyncStatus = "applied"
+	SyncStatusAlreadyApplied SyncStatus = "already_applied"
+	SyncStatusCASLost        SyncStatus = "cas_lost"
+	SyncStatusFenced         SyncStatus = "fenced"
+)
+
+// ErrLeaseBusy reports that another attempt holds the credential — including
+// the fenced case, where a takeover has moved custody of this attempt's own
+// lease to recovery. It is a wait, not a failure: the runner turns it into
+// the zero-charge credential_busy outcome.
+var ErrLeaseBusy = errors.New("runner: credential lease busy")
+
+// CredentialLeaser is the runner's port onto the mutable-credential
+// aggregate. The composition root adapts assets.Service onto it.
+type CredentialLeaser interface {
+	// Acquire returns the lease AND the secret snapshot it grants — one
+	// atomic assets-side read: the bytes always correspond to
+	// Lease.SecretVersion. Leased kinds never do a separate open.
+	Acquire(ctx context.Context, credentialID uuid.UUID, ref string) (Lease, []byte, error) // ErrLeaseBusy when held elsewhere
+	Heartbeat(ctx context.Context, credentialID uuid.UUID, ref string, epoch int64) error
+	CommitSync(ctx context.Context, credentialID uuid.UUID, ref string, epoch, expectVersion int64, secret []byte) (SyncStatus, error)
+	Release(ctx context.Context, credentialID uuid.UUID, ref string, epoch int64) error
+	Takeover(ctx context.Context, credentialID uuid.UUID, ref string) (Lease, error)
+	LeaseByAttempt(ctx context.Context, ref string) (uuid.UUID, Lease, bool, error)
+	MarkAuthExpired(ctx context.Context, credentialID uuid.UUID) error
+	RecordQuarantine(ctx context.Context, credentialID uuid.UUID, ref string) error
+}
+
 // CloneSpec is how the stage container reaches a repo. The credential travels
 // as a header, never inside the URL: a token in a URL lands in reflogs, remote
 // config, and process listings.
@@ -113,6 +156,12 @@ type Options struct {
 	// process; it is unexported, so no production wiring can set it, and no
 	// agent container ever receives the mapping either way.
 	testHostAccess bool
+
+	// testLeaseHeartbeatInterval shortens the credential-lease heartbeat so a
+	// test can observe several ticks without spending half a minute per tick.
+	// Unexported for the same reason as testHostAccess: production always
+	// runs at the pinned interval.
+	testLeaseHeartbeatInterval time.Duration
 }
 
 // Pinned defaults (plan Global Constraints). Config may override them; a
@@ -178,6 +227,7 @@ type Runner struct {
 	engine    Engine
 	harnesses HarnessResolver
 	creds     CredentialOpener
+	leaser    CredentialLeaser
 	git       GitSource
 	events    EventSink
 	opts      Options
@@ -191,8 +241,8 @@ type Runner struct {
 // containers run as this process's uid:gid, and uid 0 would hand the agent
 // root on every bind mount), both images are pinned by the operator, and the
 // flood threshold is not below the truncation cap.
-func New(engine Engine, harnesses HarnessResolver, creds CredentialOpener, git GitSource,
-	events EventSink, opts Options, log *slog.Logger,
+func New(engine Engine, harnesses HarnessResolver, creds CredentialOpener, leaser CredentialLeaser,
+	git GitSource, events EventSink, opts Options, log *slog.Logger,
 ) (*Runner, error) {
 	uid, gid := os.Getuid(), os.Getgid()
 	if uid == 0 {
@@ -212,6 +262,7 @@ func New(engine Engine, harnesses HarnessResolver, creds CredentialOpener, git G
 		engine:    engine,
 		harnesses: harnesses,
 		creds:     creds,
+		leaser:    leaser,
 		git:       git,
 		events:    events,
 		opts:      opts,

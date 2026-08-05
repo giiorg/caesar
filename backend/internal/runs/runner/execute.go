@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/giiorg/caesar/backend/internal/platform/config"
 	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
 	"github.com/giiorg/caesar/backend/internal/runs"
@@ -78,6 +80,40 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	if err != nil {
 		return runs.ExecutionResult{}, err
 	}
+
+	// Past this point the attempt may hold a credential lease, and a fenced
+	// heartbeat has to be able to cut the whole pipeline short: the takeover
+	// means the reconciler owns this attempt now.
+	ctx, cancelAttempt := context.WithCancel(ctx)
+	defer cancelAttempt()
+
+	// A credential a running attempt can itself replace is taken exclusively,
+	// before anything usage-bearing starts. Contention is somebody else's
+	// turn rather than this attempt's failure, so it returns as a wait and
+	// nothing has been spent when it does.
+	leased := needsLease(req.Credential)
+	var lease Lease
+	var leasedSecret []byte
+	if leased {
+		lease, leasedSecret, err = r.acquireCredential(ctx, ref, req.Credential)
+		if err != nil {
+			return runs.ExecutionResult{}, err
+		}
+		// Registered before the heartbeat so it runs after it: the release is
+		// the last thing this attempt does to the credential.
+		defer r.concludeLease(ctx, req.Credential.ID, ref, lease.Epoch)
+		stopHeartbeat := r.startLeaseHeartbeat(ctx, req.Credential.ID, ref, lease.Epoch, cancelAttempt)
+		defer stopHeartbeat()
+	}
+	// Every credential-bearing attempt gets a manifest, whatever its custody:
+	// adoption rebuilds the redaction set from it, and an attempt whose
+	// manifest is missing has to have its logs and artifacts withheld.
+	if req.Credential.ID != uuid.Nil {
+		if err := r.writeManifest(ref, manifestFor(req, spec, lease)); err != nil {
+			return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "write attempt manifest: %v", err)
+		}
+	}
+
 	clone, err := r.git.CloneSpec(ctx, req.Repo)
 	if err != nil {
 		return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "resolve clone for %s: %v", req.Repo.Slug, err)
@@ -86,11 +122,20 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	// today's harness row: a registry edit mid-attempt must not swap the secret
 	// under a running phase. Brokered credentials are infrastructure here: an
 	// unavailable secret store says nothing about this attempt's work.
-	cred, err := r.creds.OpenCredential(ctx, req.Credential.ID, "attempt:"+ref.String())
-	if err != nil {
-		return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "open provider credential: %v", err)
+	//
+	// A leased credential is never opened a second time. The acquire
+	// transaction handed back both the lease and the bytes of exactly the
+	// version it recorded, and that pairing is what lets sync-back's CAS tell
+	// an operator's rotation apart from the CLI's own refresh.
+	if leased {
+		spec.ProviderCredential = string(leasedSecret)
+	} else {
+		cred, err := r.creds.OpenCredential(ctx, req.Credential.ID, "attempt:"+ref.String())
+		if err != nil {
+			return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "open provider credential: %v", err)
+		}
+		spec.ProviderCredential = string(cred)
 	}
-	spec.ProviderCredential = string(cred)
 
 	if err := r.ensureNetworks(ctx, ref); err != nil {
 		return runs.ExecutionResult{}, err

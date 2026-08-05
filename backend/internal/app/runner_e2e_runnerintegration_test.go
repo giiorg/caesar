@@ -186,6 +186,7 @@ func TestRunnerE2E_TaskThroughRealContainerToPatch(t *testing.T) {
 	rnr, err := runner.New(engine,
 		scriptedResolver{inner: appHarnessResolver{svc: assetsSvc}, script: script},
 		appCredentialOpener{svc: assetsSvc},
+		appCredentialLeaser{svc: assetsSvc},
 		localBareGit{dir: repoDir},
 		runsSvc,
 		runner.Options{

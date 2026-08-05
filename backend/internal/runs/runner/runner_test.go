@@ -16,7 +16,7 @@ func discardLog() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard,
 
 func newRunner(t *testing.T, opts Options) (*Runner, error) {
 	t.Helper()
-	return New(&fakeEngine{}, nil, nil, nil, nil, opts, discardLog())
+	return New(&fakeEngine{}, nil, nil, nil, nil, nil, opts, discardLog())
 }
 
 // The runner is also a runs.Admission: the spine gates claiming on it.
