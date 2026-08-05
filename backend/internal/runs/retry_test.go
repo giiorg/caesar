@@ -31,6 +31,21 @@ func TestRetryDelay_ProviderResetClampedToFloorAndDeadlineless(t *testing.T) {
 	if got < 4*time.Hour {
 		t.Fatalf("provider reset must not be capped at %v, got %v", time.Hour, got)
 	}
+	// Jitter must not reach the provider branch at all. Asserting only at
+	// the neutral multiplier hides the failure that matters: at jit=0 a
+	// ±10% band shaves a stated hour down to 54 minutes and we wake inside
+	// a window the provider told us is shut. Above the floor, the returned
+	// delay must never be shorter than what the provider stated.
+	for _, jit := range []float64{0, 0.5, 1} {
+		jitter := func() float64 { return jit }
+		for _, stated := range []time.Duration{10 * time.Minute, time.Hour, 5 * time.Hour} {
+			at := now.Add(stated)
+			got := retryDelay(Outcome{Code: CodeRateLimited, RetryAt: &at}, now, 0, jitter)
+			if got < stated {
+				t.Errorf("jit=%v: provider stated %v, got %v — never wake before the provider does", jit, stated, got)
+			}
+		}
+	}
 }
 
 func TestRetryDelay_BackoffGrowsAndCapsUnderAnyJitter(t *testing.T) {
