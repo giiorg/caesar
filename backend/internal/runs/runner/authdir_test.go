@@ -294,6 +294,13 @@ func TestExecute_CredentialWithNoAccountIdentityIsRefusedBeforeAnyContainer(t *t
 	if _, _, released := leaser.calls(); len(released) != 1 {
 		t.Errorf("release calls = %+v, want exactly one: a refusal must not strand the lease", released)
 	}
+	// Unpinnable bytes are a permanent property of the credential, so the next
+	// phase bound to it must meet one already known to be dead rather than
+	// repeat this failure for as long as the operator leaves it in place.
+	marked := leaser.markedAuthExpired()
+	if len(marked) != 1 || marked[0].credentialID != credID {
+		t.Errorf("MarkAuthExpired calls = %+v, want exactly one for %s", marked, credID)
+	}
 }
 
 // seedAuthDir puts one attempt's credential material on disk: the auth

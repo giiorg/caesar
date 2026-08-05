@@ -90,10 +90,9 @@ func (r *Runner) manifestFor(req runs.ExecutionRequest, spec RunSpec, d driver, 
 	}
 	if m.Custody == custodyBrokered {
 		m.BrokerToken = spec.BrokerToken
-		return m, nil
 	}
-	if d.authMount == nil { // env-delivered: nothing on disk, nothing to read back
-		return m, nil
+	if !d.materializesAuthFile(m.Custody) {
+		return m, nil // brokered or env-delivered: nothing on disk, nothing to read back
 	}
 	if d.identity != nil {
 		identity, err := d.identity(g.secret)

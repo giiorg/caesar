@@ -412,6 +412,14 @@ func TestExecute_MaterializedCredentialIsDeliveredToTheAgentNotTheGateway(t *tes
 	if env["CLAUDE_CODE_OAUTH_TOKEN"] != "provider-key" {
 		t.Errorf("agent env token = %q, want the opened credential", env["CLAUDE_CODE_OAUTH_TOKEN"])
 	}
+	// Materialized, but env-delivered: this harness pins no auth mount, so
+	// nothing about the credential belongs on the host's disk.
+	if _, err := os.Stat(filepath.Join(dataRoot, "auth")); !os.IsNotExist(err) {
+		t.Errorf("an env-delivered credential materialized a directory, stat err = %v", err)
+	}
+	if binds := eng.hostFor(t, agentName(ref)).Binds; len(binds) != 1 {
+		t.Errorf("agent binds = %v, want the workspace alone", binds)
+	}
 	for _, k := range []string{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_AUTOUPDATER"} {
 		if env[k] != "1" {
 			t.Errorf("agent env %s = %q, want the kill-switch on", k, env[k])

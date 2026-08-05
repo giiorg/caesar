@@ -134,21 +134,30 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	// manifest is missing has to have its logs and artifacts withheld.
 	m, err := r.manifestFor(req, spec, d, g)
 	if err != nil {
+		// Bytes that cannot be identity-pinned are dead for every phase bound
+		// to this credential, not only for this attempt, so the freshness
+		// signal is stamped here exactly as it is for a provider's own
+		// rejection at exit: nothing else fails this way twice.
+		if runs.ClassifyOutcome(err).Code == runs.CodeAuthExpired {
+			r.markAuthExpired(ctx, ref, req.Credential.ID)
+		}
 		return runs.ExecutionResult{}, err
 	}
 	if req.Credential.ID != uuid.Nil {
 		if err := r.writeManifest(ref, m); err != nil {
 			return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "write attempt manifest: %v", err)
 		}
-	}
-	// A file-delivered credential lands on the host before any container
-	// exists: the bind is resolved when the agent is created, and the manifest
-	// that describes the directory is already durable.
-	if m.AuthDir != "" {
-		if err := r.materializeAuthDir(ref, d, g.secret); err != nil {
-			return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "materialize auth dir: %v", err)
+		// A file-delivered credential lands on the host before any container
+		// exists: the bind is resolved when the agent is created, and by then
+		// the manifest describing the directory is already durable. Both live
+		// under the one guard, so a secret can never reach the disk with
+		// nothing on record to say it is there.
+		if d.materializesAuthFile(spec.Custody) {
+			if err := r.materializeAuthDir(ref, d, g.secret); err != nil {
+				return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "materialize auth dir: %v", err)
+			}
+			spec.AuthBind = r.hostPath(r.authDir(ref)) + ":" + d.authMount.containerPath
 		}
-		spec.AuthBind = r.hostPath(r.authDir(ref)) + ":" + d.authMount.containerPath
 	}
 	// The materialized half of the agent's environment is completed here and
 	// only here: it carries the secret, which buildSpec has no business

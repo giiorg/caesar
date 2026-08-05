@@ -78,7 +78,7 @@ func (r *Runner) collectResult(ctx context.Context, c collection) (runs.Executio
 			// Fail fast, naming the credential the operator has to fix
 			// (spec §4, §5), and stamp the freshness signal on it.
 			out.Message = fmt.Sprintf("credential %s: %s", c.CredentialID, out.Message)
-			r.markAuthExpired(ctx, c)
+			r.markAuthExpired(ctx, c.Ref, c.CredentialID)
 		}
 		return runs.ExecutionResult{}, runs.OutcomeError{Outcome: out}
 	}
@@ -115,20 +115,23 @@ func (r *Runner) collectResult(ctx context.Context, c collection) (runs.Executio
 	return runs.ExecutionResult{Artifacts: artifacts}, nil
 }
 
-// markAuthExpired records that this credential's own provider rejected it, so
-// the next claimant meets a credential already known to be dead rather than
-// spending another attempt discovering it. Best effort by construction: the
-// outcome the caller returns is the authority, and a signal that could not be
-// written must not turn a typed auth failure into an internal error. An
-// attempt with no binding — or a runner wired without the credential
-// aggregate — has nothing to stamp.
-func (r *Runner) markAuthExpired(ctx context.Context, c collection) {
-	if r.leaser == nil || c.CredentialID == uuid.Nil {
+// markAuthExpired records that this credential is dead, so the next claimant
+// meets a credential already known to be unusable rather than spending another
+// attempt discovering it. Every auth_expired an attempt reports goes through
+// here, whether the provider said so at exit or the bytes themselves said so
+// before the attempt ever started.
+//
+// Best effort by construction: the outcome the caller returns is the
+// authority, and a signal that could not be written must not turn a typed auth
+// failure into an internal error. An attempt with no binding — or a runner
+// wired without the credential aggregate — has nothing to stamp.
+func (r *Runner) markAuthExpired(ctx context.Context, ref runs.AttemptRef, credentialID uuid.UUID) {
+	if r.leaser == nil || credentialID == uuid.Nil {
 		return
 	}
-	if err := r.leaser.MarkAuthExpired(ctx, c.CredentialID); err != nil {
-		r.log.Warn("runner.mark_auth_expired", "attempt", c.Ref.String(),
-			"credential", c.CredentialID.String(), "error", err)
+	if err := r.leaser.MarkAuthExpired(ctx, credentialID); err != nil {
+		r.log.Warn("runner.mark_auth_expired", "attempt", ref.String(),
+			"credential", credentialID.String(), "error", err)
 	}
 }
 

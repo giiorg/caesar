@@ -225,6 +225,17 @@ func mapExit(d driver, exitCode int64, tail []byte) runs.Outcome {
 	}
 }
 
+// materializesAuthFile reports whether this pairing puts the credential on the
+// host as a file the container reads: the harness has to pin a mount for one,
+// and the custody has to be materialized. Both halves matter — the same driver
+// brokering a model key materializes nothing, and a raw API key is not an
+// auth.json. Every consumer asks this one question rather than re-deriving it,
+// so the manifest's auth_dir, the identity pin and the container's bind can
+// never disagree about whether a secret is on disk.
+func (d driver) materializesAuthFile(cust custody) bool {
+	return cust == custodyMaterialized && d.authMount != nil
+}
+
 // custodyOf says how this harness may hold that credential kind. A pairing
 // outside the table produces a container that cannot authenticate at all — an
 // auth.json means nothing to Claude Code — so it is refused here, where the
