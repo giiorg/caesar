@@ -47,6 +47,24 @@ func credFingerprint(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) *string {
 	return fp
 }
 
+// credentialSecretState reads the three columns that describe which
+// secret a row holds. They move together on an operator rotation and
+// must not move at all on a rekey.
+func credentialSecretState(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) (int64, *string, time.Time) {
+	t.Helper()
+	var (
+		version   int64
+		fp        *string
+		updatedAt time.Time
+	)
+	if err := pool.QueryRow(context.Background(),
+		"SELECT secret_version, fingerprint, updated_at FROM credentials WHERE id = $1", id).
+		Scan(&version, &fp, &updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	return version, fp, updatedAt
+}
+
 func credLastUsed(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) *time.Time {
 	t.Helper()
 	var at *time.Time
