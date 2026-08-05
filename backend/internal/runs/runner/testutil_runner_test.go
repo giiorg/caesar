@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -160,11 +161,22 @@ func (c *credentialLog) snapshot() credentialLog {
 func startFakeProvider(t *testing.T) (endpoint string, seen *credentialLog) {
 	t.Helper()
 	seen = &credentialLog{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen.record(r)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":[{"id":"claude-fable-5"}]}`))
-	}))
+	// The gateway container reaches this server through host.docker.internal,
+	// which on Linux is the docker0 bridge address rather than loopback — so
+	// the listener must cover every interface, not httptest's 127.0.0.1.
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &httptest.Server{
+		Listener: ln,
+		Config: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen.record(r)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"claude-fable-5"}]}`))
+		})},
+	}
+	srv.Start()
 	t.Cleanup(srv.Close)
 
 	u, err := url.Parse(srv.URL)

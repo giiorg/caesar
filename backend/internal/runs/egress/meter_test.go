@@ -20,10 +20,20 @@ func TestMeter_CountsRequestsDenialsAndForwardedBytes(t *testing.T) {
 	brokerRequest(t, f.proxy, http.MethodPost, "/v1/messages", map[string]string{"x-api-key": tok}, body)
 	brokerRequest(t, f.proxy, http.MethodDelete, "/v1/messages", map[string]string{"x-api-key": tok}, body)
 
-	got := f.gateway.meter.snapshot()
+	// The byte counters tick when the handler's copy loop finishes, which may
+	// be after the client has read the whole response; only the final summary
+	// is ordered after the handlers, so a live reading has to wait.
 	want := meterSnapshot{Requests: 2, Denied: 1, RequestBytes: int64(len(body)), ResponseBytes: int64(len(reply))}
-	if got != want {
-		t.Fatalf("snapshot = %+v, want %+v", got, want)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := f.gateway.meter.snapshot()
+		if got == want {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("snapshot = %+v, want %+v", got, want)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
