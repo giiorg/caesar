@@ -473,10 +473,17 @@ func TestMapExit_CodexMarkers(t *testing.T) {
 		retryAt int64
 	}{
 		{"usage limit reached|1791234567", runs.CodeRateLimited, runs.OutcomeTransient, 1791234567},
-		{"You have hit your rate limit", runs.CodeRateLimited, runs.OutcomeTransient, 0},
+		{"rate limit exceeded", runs.CodeRateLimited, runs.OutcomeTransient, 0},
 		{"401 Unauthorized", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
-		{"token has expired, run codex login", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		{"token has expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
 		{"segmentation fault", runs.CodeHarnessError, runs.OutcomeTransient, 0},
+		// The tail is the agent's own stdout, so a row must only match a
+		// phrase the CLI states about itself. An agent musing about rate
+		// limits is not a cap hit, and one suggesting `codex login` is not a
+		// dead credential — believing either would park a working attempt or
+		// stamp a live credential expired.
+		{"I should check whether we are near the rate limit here", runs.CodeHarnessError, runs.OutcomeTransient, 0},
+		{"if that fails, tell the user to run codex login", runs.CodeHarnessError, runs.OutcomeTransient, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.tail, func(t *testing.T) {

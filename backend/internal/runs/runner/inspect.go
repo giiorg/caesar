@@ -151,10 +151,23 @@ func (r *Runner) adopt(ctx context.Context, ref runs.AttemptRef, insp dockerapi.
 	// finished and said why, and that answer — a cap window with its reset, a
 	// dead credential — must reach the orchestrator intact. Only an untyped
 	// error means adoption itself failed, which is what reconcile_lost is for.
+	//
+	// It carries the log pointer the worker path attaches to its own failures
+	// (execute.go failureResult), so an operator reading a run that died in
+	// reconciliation can still find the streams. The failure SNAPSHOT is
+	// deliberately not here: it embeds a log tail that has to be redacted with
+	// the attempt's secrets, and adoption holds none — it never re-opens the
+	// provider credential. Rebuilding that set from the manifest is Task 11's
+	// work, and a snapshot redacted with an empty set would look safe while
+	// carrying the credential verbatim.
 	var oe runs.OutcomeError
 	if errors.As(err, &oe) {
 		r.log.Info("runner.reconcile.adopted_outcome", "attempt", ref.String(), "code", oe.Outcome.Code)
-		return runs.InspectResult{Completed: true, Outcome: &oe.Outcome}
+		return runs.InspectResult{
+			Completed: true,
+			Result:    runs.ExecutionResult{Artifacts: []runs.NewArtifact{r.logRefArtifact(ref)}},
+			Outcome:   &oe.Outcome,
+		}
 	}
 	if err != nil {
 		r.log.Warn("runner.reconcile.collect", "attempt", ref.String(), "error", err)

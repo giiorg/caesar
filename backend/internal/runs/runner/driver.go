@@ -158,17 +158,23 @@ var drivers = map[string]driver{
 		// speaks these exact markers, and the Task 14 smoke run replaces them
 		// with recorded ones. The epoch row leads for the same reason it does
 		// under claude-code: a stated reset outranks a guessed delay.
+		//
+		// The tail these run over is the AGENT'S OWN STDOUT, so every row has
+		// to be a phrase the CLI states about itself rather than one an agent
+		// could type in passing: "rate limit" alone matches an agent
+		// discussing rate limits, and an agent that merely suggests running
+		// `codex login` would have its live credential stamped dead.
 		exitMap: []exitRule{
 			{
 				pattern: regexp.MustCompile(`(?i)usage limit reached\|(\d{9,12})`),
 				code:    runs.CodeRateLimited, class: runs.OutcomeTransient, resetEpochCapture: true,
 			},
 			{
-				pattern: regexp.MustCompile(`(?i)(?:usage|rate) limit`),
+				pattern: regexp.MustCompile(`(?i)(?:usage|rate) limit (?:reached|exceeded)`),
 				code:    runs.CodeRateLimited, class: runs.OutcomeTransient,
 			},
 			{
-				pattern: regexp.MustCompile(`(?i)401 unauthorized|token .*(?:expired|invalid)|codex login`),
+				pattern: regexp.MustCompile(`(?i)401 unauthorized|token .*(?:expired|invalid)`),
 				code:    runs.CodeAuthExpired, class: runs.OutcomePermanent,
 			},
 		},

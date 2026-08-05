@@ -186,6 +186,23 @@ func TestInspect_NonzeroExitIsAdoptedWithItsTypedOutcome(t *testing.T) {
 		if res.Outcome.RetryAt == nil || !res.Outcome.RetryAt.Equal(reset) {
 			t.Errorf("RetryAt = %v, want the marker's own %s", res.Outcome.RetryAt, reset)
 		}
+		// An adopted failure owes the same evidence the worker path attaches
+		// to its own: without the log pointer, a run that died in
+		// reconciliation leaves nothing to read.
+		byType := artifactsByType(res.Result.Artifacts)
+		logRef, ok := byType[runs.ArtifactKindLogRef]
+		if !ok {
+			t.Fatalf("adopted failure carries no log_ref: %v", res.Result.Artifacts)
+		}
+		if logRef.Payload["streams"] == nil {
+			t.Errorf("log_ref payload = %v, want the captured streams", logRef.Payload)
+		}
+		// The failure snapshot belongs to the worker path until adoption can
+		// rebuild the redaction set (Task 11): an unredacted log tail in a
+		// stored artifact is a leaked credential.
+		if _, ok := byType[runs.ArtifactKindFailureSnapshot]; ok {
+			t.Error("adoption produced a failure snapshot it cannot redact")
+		}
 	})
 
 	t.Run("without one the markers are unreadable", func(t *testing.T) {
