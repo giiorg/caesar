@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -36,6 +37,9 @@ type Orchestrator struct {
 	log       *slog.Logger
 	workerTag string
 	lastPrune time.Time
+	// jitter spreads delayed retries so a shared cap window does not wake
+	// every parked attempt at once; a seam so tests can pin the schedule.
+	jitter func() float64
 
 	planMu sync.Mutex
 	plans  map[uuid.UUID]cachedPlan // run id -> compiled plan + context
@@ -56,6 +60,7 @@ func NewOrchestrator(svc *Service, exec Executor, admission Admission, cfg Orche
 	return &Orchestrator{
 		svc: svc, exec: exec, admission: admission, cfg: cfg, log: log,
 		workerTag: uuid.NewString()[:8],
+		jitter:    rand.Float64, //nolint:gosec // G404: spreading retry wakeups, not a security decision
 		plans:     map[uuid.UUID]cachedPlan{},
 	}
 }
@@ -265,7 +270,7 @@ func (o *Orchestrator) startPendingRuns(ctx context.Context) error {
 			}
 			maxAttempts := snap.MaxAttempts
 			for _, root := range cp.plan.Roots() {
-				if _, err := o.svc.insertPhaseTx(ctx, tx, runID, root, 1, maxAttempts); err != nil {
+				if _, err := o.svc.insertPhaseTx(ctx, tx, runID, root, 1, maxAttempts, 0, nil); err != nil {
 					return err
 				}
 				evs = append(evs, Event{
@@ -437,10 +442,14 @@ func claimedFromRow(row store.PhaseRun) claimed {
 		claimedAt = *row.ClaimedAt
 	}
 	return claimed{
-		PhaseID:     row.ID,
-		Ref:         AttemptRef{RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt},
-		MaxAttempts: row.MaxAttempts,
-		ClaimedAt:   claimedAt,
+		PhaseID: row.ID,
+		Ref:     AttemptRef{RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt},
+		// The counter must travel every path that evaluates a failure, or
+		// reconcile would restart the node's failure budget each time and
+		// a lost attempt could never exhaust.
+		ChargeableFailures: row.ChargeableFailures,
+		MaxAttempts:        row.MaxAttempts,
+		ClaimedAt:          claimedAt,
 	}
 }
 
@@ -647,7 +656,7 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 		if attempted[nodeID] || !cp.plan.Ready(nodeID, succeeded) {
 			continue
 		}
-		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, nodeID, 1, c.MaxAttempts); err != nil {
+		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, nodeID, 1, c.MaxAttempts, 0, nil); err != nil {
 			return false, err
 		}
 		evs = append(evs, Event{
@@ -754,21 +763,54 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	// worker would each account the same claim->terminal interval
 	// (invariant 11: usage accumulates once).
 	q := store.New(tx)
-	retry := out.Retryable() && c.Ref.Attempt < c.MaxAttempts
+	// A wait is not a failure: only chargeable outcomes spend the node's
+	// budget, so the bound is the counter — never the attempt ordinal,
+	// which outruns max_attempts across parked retries (spec §4.3).
+	newCount := c.ChargeableFailures
+	if out.Chargeable() {
+		newCount++
+	}
+	retry := out.Retryable() && newCount < c.MaxAttempts
 	budgetBreached := false
-	if retry {
+	if retry && out.Code != CodeCredentialBusy {
 		// The fencing CAS must pick failed vs dead up front (failed ->
 		// dead is not a legal transition), and a delta that crosses the
 		// budget must not insert a successor the claim predicate
 		// (execution_used_ms < execution_budget_ms) would refuse forever.
 		// The run-row lock makes the read race-free; usage itself is
-		// still only added after the CAS wins.
+		// still only added after the CAS wins. credential_busy is exempt:
+		// it charges nothing, so demoting its requeue to budget_exhausted
+		// would kill a run for time it never spent. A rate_limited attempt
+		// did run before the window shut, so it keeps the pre-check.
 		runRow, err := q.GetRunForUpdate(ctx, c.Ref.RunID)
 		if err != nil {
 			return false, err
 		}
 		if runRow.ExecutionUsedMs+max(deltaMS, 0) >= runRow.ExecutionBudgetMs {
 			retry, budgetBreached = false, true
+		}
+	}
+
+	// A free requeue parks rather than running now — waiting is the whole
+	// point (spec §4.4). Both the delay's origin and the deadline it is
+	// checked against are database timestamps, so app-clock skew cannot
+	// move the park-vs-terminalize boundary.
+	var notBefore *time.Time
+	parkedPastDeadline := false
+	if retry && !out.Chargeable() {
+		dbNow, err := q.DBNow(ctx)
+		if err != nil {
+			return false, err
+		}
+		nb := dbNow.Add(retryDelay(out, dbNow, c.Ref.Attempt-1-c.ChargeableFailures, o.jitter))
+		// RunWallDeadline is zero on the reconcile path (claimedFromRow),
+		// where every outcome is still chargeable — so this comparison is
+		// unreachable from there until Task 7 makes reconciled waits real.
+		if !c.RunWallDeadline.IsZero() && nb.After(c.RunWallDeadline) {
+			// Never park a row that could not legally run when it woke.
+			retry, parkedPastDeadline = false, true
+		} else {
+			notBefore = &nb
 		}
 	}
 	if retry {
@@ -785,17 +827,24 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		if err != nil {
 			return false, err
 		}
-		if deltaMS > 0 {
+		// credential_busy never touched the harness — charging its
+		// contention window would bill the run for someone else's lease.
+		if deltaMS > 0 && out.Code != CodeCredentialBusy {
 			if _, err := q.AddRunUsage(ctx, store.AddRunUsageParams{ID: c.Ref.RunID, DeltaMs: deltaMS}); err != nil {
 				return false, err
 			}
 		}
-		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, c.Ref.NodeID, c.Ref.Attempt+1, c.MaxAttempts); err != nil {
+		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, c.Ref.NodeID,
+			c.Ref.Attempt+1, c.MaxAttempts, newCount, notBefore); err != nil {
 			return false, err
 		}
 		payload := map[string]any{
 			"node_id": c.Ref.NodeID, "attempt": c.Ref.Attempt,
 			"next_attempt": c.Ref.Attempt + 1, "outcome": out.Map(),
+			"chargeable_failures": newCount,
+		}
+		if notBefore != nil {
+			payload["not_before"] = notBefore.UTC().Format(time.RFC3339)
 		}
 		if len(artifactIDs) > 0 {
 			payload["artifact_ids"] = artifactIDs
@@ -818,7 +867,7 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	if err != nil {
 		return false, err
 	}
-	if deltaMS > 0 {
+	if deltaMS > 0 && out.Code != CodeCredentialBusy {
 		if _, err := q.AddRunUsage(ctx, store.AddRunUsageParams{ID: c.Ref.RunID, DeltaMs: deltaMS}); err != nil {
 			return false, err
 		}
@@ -827,10 +876,15 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	switch {
 	case budgetBreached:
 		runOut = Outcome{Class: OutcomePermanent, Code: CodeBudgetExhausted, Message: "execution budget exhausted"}
+	case parkedPastDeadline:
+		// The wait would outlast the run, so the run dies of the wait
+		// itself — nothing was exhausted, and the typed code says which
+		// door was shut.
+		runOut = out
 	case out.Retryable(): // retryable but exhausted
 		runOut = Outcome{
 			Class: OutcomePermanent, Code: CodeAttemptsExhausted,
-			Message: fmt.Sprintf("node %s exhausted %d attempts", c.Ref.NodeID, c.MaxAttempts),
+			Message: fmt.Sprintf("node %s exhausted %d chargeable failures", c.Ref.NodeID, c.MaxAttempts),
 		}
 	}
 	deadPayload := map[string]any{"node_id": c.Ref.NodeID, "attempt": c.Ref.Attempt, "outcome": out.Map()}

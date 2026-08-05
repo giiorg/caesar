@@ -198,6 +198,12 @@ CREATE TABLE phase_runs (
     node_id      text NOT NULL,
     attempt      integer NOT NULL CHECK (attempt >= 1),
     max_attempts integer NOT NULL CHECK (max_attempts >= 1),
+    -- Failures that spent the budget (spec §4.3): cap waits and lease
+    -- contention requeue without charging, so the claim predicate bounds
+    -- THIS against max_attempts, never the attempt ordinal.
+    chargeable_failures integer NOT NULL DEFAULT 0 CHECK (chargeable_failures >= 0),
+    -- Earliest moment a parked retry may be claimed (spec §4.4); NULL = now.
+    not_before   timestamptz,
     status       text NOT NULL CHECK (status IN ('pending', 'running', 'reconciling', 'succeeded', 'failed', 'dead', 'superseded')),
     worker_id    text,
     leased_until timestamptz,
@@ -212,6 +218,8 @@ CREATE UNIQUE INDEX phase_runs_live_key ON phase_runs (run_id, node_id)
     WHERE status IN ('pending', 'running', 'reconciling');
 CREATE INDEX phase_runs_claim_idx ON phase_runs (created_at) WHERE status = 'pending';
 CREATE INDEX phase_runs_lease_idx ON phase_runs (leased_until) WHERE status = 'running';
+CREATE INDEX phase_runs_not_before_idx ON phase_runs (not_before)
+    WHERE status = 'pending' AND not_before IS NOT NULL;
 
 -- Attempt-scoped durable work products with recorded lineage (spec §2).
 -- parent_ids: jsonb array of artifact uuid strings (plan decision 8).

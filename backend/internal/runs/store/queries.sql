@@ -74,18 +74,31 @@ SELECT id FROM runs
 WHERE status IN ('pending', 'running', 'waiting') AND wall_deadline <= now()
 LIMIT $1;
 
+-- name: DBNow :one
+-- The clock every deciding predicate reads. A caller that computes a
+-- not_before, or compares one against a wall deadline, reads it from here
+-- inside its own transaction so both sides of the comparison are DB
+-- timestamps and app-clock skew cannot move the boundary.
+SELECT now()::timestamptz;
+
 -- name: InsertPhase :one
-INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, status, created_at)
-VALUES ($1, $2, $3, $4, 'pending', $5)
+INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
 RETURNING *;
 
 -- name: ClaimPhase :one
+-- The attempt bound is chargeable_failures < max_attempts, not the attempt
+-- ordinal: a cap wait or a held lease requeues without charging, so the
+-- ordinal outruns max_attempts on purpose (spec §4.3). not_before parks a
+-- delayed retry until the DATABASE clock passes it — same clock as the
+-- deadline predicates, so nothing app-side can move the boundary (§4.1).
 WITH candidate AS (
     SELECT pr.id, r.wall_deadline, r.execution_budget_ms, r.execution_used_ms
     FROM phase_runs pr
     JOIN runs r ON r.id = pr.run_id
     WHERE pr.status = 'pending'
-      AND pr.attempt <= pr.max_attempts
+      AND pr.chargeable_failures < pr.max_attempts
+      AND (pr.not_before IS NULL OR pr.not_before <= now())
       AND r.status = 'running'
       AND r.wall_deadline > now()
       AND r.execution_used_ms < r.execution_budget_ms

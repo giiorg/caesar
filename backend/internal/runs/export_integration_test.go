@@ -30,15 +30,21 @@ func HeartbeatForTest(ctx context.Context, s *Service, phaseID uuid.UUID, worker
 	return s.heartbeat(ctx, phaseID, workerID, leaseSeconds)
 }
 
-func InsertPhaseForTest(ctx context.Context, s *Service, runID uuid.UUID, nodeID string, attempt, maxAttempts int32) (uuid.UUID, error) {
+func InsertPhaseForTest(ctx context.Context, s *Service, runID uuid.UUID, nodeID string,
+	attempt, maxAttempts, chargeableFailures int32, notBefore *time.Time,
+) (uuid.UUID, error) {
 	var id uuid.UUID
 	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var err error
-		id, err = s.insertPhaseTx(ctx, tx, runID, nodeID, attempt, maxAttempts)
+		id, err = s.insertPhaseTx(ctx, tx, runID, nodeID, attempt, maxAttempts, chargeableFailures, notBefore)
 		return err
 	})
 	return id, err
 }
+
+// SetJitterForTest pins the retry scheduler's jitter so a test can assert
+// an exact parked window instead of a ±10% band.
+func SetJitterForTest(o *Orchestrator, jitter func() float64) { o.jitter = jitter }
 
 // CachedPlanCountForTest reports how many runs the orchestrator's plan
 // cache holds. Eviction leaves no trace in Postgres, so this is the only
