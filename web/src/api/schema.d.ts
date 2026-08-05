@@ -659,7 +659,15 @@ export interface components {
             id?: string;
             key_id?: string;
             kind?: string;
+            /** Format: date-time */
+            last_auth_expired_at?: null | string;
+            /** Format: date-time */
+            last_used_at?: null | string;
             name?: string;
+            /** Format: date-time */
+            provided_at?: string;
+            /** Format: int64 */
+            secret_version?: number;
             /** Format: date-time */
             updated_at?: string;
         };

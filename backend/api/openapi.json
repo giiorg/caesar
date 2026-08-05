@@ -1924,8 +1924,30 @@
           "kind": {
             "type": "string"
           },
+          "last_auth_expired_at": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "last_used_at": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
           "name": {
             "type": "string"
+          },
+          "provided_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "secret_version": {
+            "format": "int64",
+            "type": "integer"
           },
           "updated_at": {
             "format": "date-time",

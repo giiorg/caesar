@@ -73,13 +73,21 @@ func repoResponse(r assets.Repo) RepoResponse {
 	}
 }
 
+// CredentialResponse is metadata only — the secret never leaves the
+// control plane. ProvidedAt is when the operator last supplied a secret
+// value; together with the two freshness stamps it is what an operator
+// reads to decide whether a subscription credential needs re-importing.
 type CredentialResponse struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Kind      string    `json:"kind"`
-	KeyID     string    `json:"key_id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID                string     `json:"id"`
+	Name              string     `json:"name"`
+	Kind              string     `json:"kind"`
+	KeyID             string     `json:"key_id"`
+	SecretVersion     int64      `json:"secret_version"`
+	ProvidedAt        time.Time  `json:"provided_at"`
+	LastUsedAt        *time.Time `json:"last_used_at,omitempty"`
+	LastAuthExpiredAt *time.Time `json:"last_auth_expired_at,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 type CredentialListResponse struct {
@@ -132,6 +140,8 @@ type UpdateHarnessRequest struct {
 func credentialResponse(c assets.Credential) CredentialResponse {
 	return CredentialResponse{
 		ID: c.ID.String(), Name: c.Name, Kind: string(c.Kind), KeyID: c.KeyID,
+		SecretVersion: c.SecretVersion, ProvidedAt: c.UpdatedAt,
+		LastUsedAt: c.LastUsedAt, LastAuthExpiredAt: c.LastAuthExpiredAt,
 		CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt,
 	}
 }

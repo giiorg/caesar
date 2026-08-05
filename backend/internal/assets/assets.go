@@ -26,11 +26,34 @@ func (f ForgeKind) Valid() bool { return f == ForgeGitHub || f == ForgeGitLab }
 type CredentialKind string
 
 const (
-	CredentialForgeToken CredentialKind = "forge_token"
-	CredentialModelKey   CredentialKind = "model_key"
+	CredentialForgeToken        CredentialKind = "forge_token"
+	CredentialModelKey          CredentialKind = "model_key"
+	CredentialSubscriptionToken CredentialKind = "subscription_token"
+	CredentialAgentAuthFile     CredentialKind = "agent_auth_file" //nolint:gosec // G101 matches the name: this is a kind label, not a secret
 )
 
-func (k CredentialKind) Valid() bool { return k == CredentialForgeToken || k == CredentialModelKey }
+func (k CredentialKind) Valid() bool {
+	switch k {
+	case CredentialForgeToken, CredentialModelKey, CredentialSubscriptionToken, CredentialAgentAuthFile:
+		return true
+	}
+	return false
+}
+
+// credentialKinds is the operator-facing list, used in validation
+// messages so a rejected kind names every accepted one.
+var credentialKinds = []CredentialKind{
+	CredentialForgeToken, CredentialModelKey, CredentialSubscriptionToken, CredentialAgentAuthFile,
+}
+
+// joinKinds renders a kind set for a validation message.
+func joinKinds(kinds []CredentialKind) string {
+	out := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		out = append(out, string(k))
+	}
+	return strings.Join(out, ", ")
+}
 
 type HarnessKind string
 
@@ -64,13 +87,21 @@ type Repo struct {
 
 // Credential is the METADATA view of an encrypted secret — plaintext
 // never rides this struct; use-time decryption goes through UseCredential.
+// SecretVersion counts operator-supplied secrets: it advances on every
+// rotation and lets a consumer prove which bytes it was handed. The two
+// stamps are the freshness view (spec §5) — a subscription credential
+// that was last used long after it last died is healthy, one that died
+// after its last use needs re-import.
 type Credential struct {
-	ID        uuid.UUID
-	Name      string
-	Kind      CredentialKind
-	KeyID     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                uuid.UUID
+	Name              string
+	Kind              CredentialKind
+	KeyID             string
+	SecretVersion     int64
+	LastUsedAt        *time.Time
+	LastAuthExpiredAt *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // Harness is one admin-registered agent harness (spec §2).
@@ -94,6 +125,7 @@ const (
 	maxBranchLen      = 200
 	maxImageRefLen    = 300
 	maxSecretLen      = 4096
+	maxAuthFileLen    = 64 << 10
 	maxDefaultsLen    = 4096
 )
 

@@ -30,31 +30,50 @@ DELETE FROM projects WHERE id = $1;
 SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1);
 
 -- name: CreateCredential :one
-INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, name, kind, key_id, created_at, updated_at;
+INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext, fingerprint)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at;
 
 -- name: ListCredentials :many
-SELECT id, name, kind, key_id, created_at, updated_at
+SELECT id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
 FROM credentials ORDER BY name;
 
 -- name: GetCredential :one
-SELECT id, name, kind, key_id, created_at, updated_at
+SELECT id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
 FROM credentials WHERE id = $1;
 
--- name: GetCredentialRow :one
-SELECT id, name, kind, key_id, wrapped_dek, ciphertext, created_at, updated_at
-FROM credentials WHERE id = $1;
+-- UseCredentialRow is the use-time read: it stamps last_used_at in the
+-- same statement that hands back the envelope, so the freshness view can
+-- never drift from what was actually opened.
+-- name: UseCredentialRow :one
+UPDATE credentials SET last_used_at = $2
+WHERE id = $1
+RETURNING id, name, kind, key_id, wrapped_dek, ciphertext, secret_version, created_at, updated_at;
 
 -- name: ListCredentialRowsForUpdate :many
 SELECT id, name, kind, key_id, wrapped_dek, ciphertext, created_at, updated_at
 FROM credentials ORDER BY id
 FOR UPDATE;
 
+-- UpdateCredentialSecret is the operator-facing rotation: new plaintext,
+-- so the version advances and the fingerprint is recomputed. Rekeying
+-- re-wraps the same plaintext and goes through RewrapCredential instead.
 -- name: UpdateCredentialSecret :one
-UPDATE credentials SET key_id = $2, wrapped_dek = $3, ciphertext = $4, updated_at = $5
+UPDATE credentials
+SET key_id = $2, wrapped_dek = $3, ciphertext = $4, fingerprint = $5,
+    secret_version = secret_version + 1, updated_at = $6
 WHERE id = $1
-RETURNING id, name, kind, key_id, created_at, updated_at;
+RETURNING id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at;
+
+-- RewrapCredential moves a row to another master key. The plaintext is
+-- unchanged, so secret_version, fingerprint, and updated_at ("when the
+-- operator last supplied the secret") all stay put.
+-- name: RewrapCredential :exec
+UPDATE credentials SET key_id = $2, wrapped_dek = $3, ciphertext = $4
+WHERE id = $1;
+
+-- name: MarkCredentialAuthExpired :execrows
+UPDATE credentials SET last_auth_expired_at = $2 WHERE id = $1;
 
 -- name: DeleteCredential :execrows
 DELETE FROM credentials WHERE id = $1;

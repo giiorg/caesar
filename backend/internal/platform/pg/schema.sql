@@ -78,15 +78,25 @@ CREATE TABLE login_rate (
 -- wrapped_dek under master key key_id, ciphertext under the DEK, AAD =
 -- the credential id. Plaintext never lands here; every use is audited.
 CREATE TABLE credentials (
-    id          uuid PRIMARY KEY,
-    name        text NOT NULL UNIQUE,
-    kind        text NOT NULL CHECK (kind IN ('forge_token', 'model_key')),
-    key_id      text NOT NULL,
-    wrapped_dek bytea NOT NULL,
-    ciphertext  bytea NOT NULL,
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
+    id                   uuid PRIMARY KEY,
+    name                 text NOT NULL UNIQUE,
+    kind                 text NOT NULL CHECK (kind IN ('forge_token', 'model_key', 'subscription_token', 'agent_auth_file')),
+    key_id               text NOT NULL,
+    wrapped_dek          bytea NOT NULL,
+    ciphertext           bytea NOT NULL,
+    secret_version       bigint NOT NULL DEFAULT 1 CHECK (secret_version >= 1),
+    fingerprint          text,
+    last_used_at         timestamptz,
+    last_auth_expired_at timestamptz,
+    created_at           timestamptz NOT NULL DEFAULT now(),
+    updated_at           timestamptz NOT NULL DEFAULT now()
 );
+
+-- Two active agent_auth_file rows sharing one refresh token would hold
+-- independent single-flight leases against the same underlying credential
+-- (spec §2 "import is exclusive custody transfer").
+CREATE UNIQUE INDEX credentials_fingerprint_key ON credentials (fingerprint)
+    WHERE fingerprint IS NOT NULL;
 
 -- Forge repos (spec §2): forge kind + slug + default branch + credential
 -- ref. RESTRICT FKs: a project with repos and a referenced credential

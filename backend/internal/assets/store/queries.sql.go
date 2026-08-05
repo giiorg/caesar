@@ -10,30 +10,35 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const createCredential = `-- name: CreateCredential :one
-INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, name, kind, key_id, created_at, updated_at
+INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext, fingerprint)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
 `
 
 type CreateCredentialParams struct {
-	ID         uuid.UUID
-	Name       string
-	Kind       string
-	KeyID      string
-	WrappedDek []byte
-	Ciphertext []byte
+	ID          uuid.UUID
+	Name        string
+	Kind        string
+	KeyID       string
+	WrappedDek  []byte
+	Ciphertext  []byte
+	Fingerprint pgtype.Text
 }
 
 type CreateCredentialRow struct {
-	ID        uuid.UUID
-	Name      string
-	Kind      string
-	KeyID     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                uuid.UUID
+	Name              string
+	Kind              string
+	KeyID             string
+	SecretVersion     int64
+	LastUsedAt        *time.Time
+	LastAuthExpiredAt *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 func (q *Queries) CreateCredential(ctx context.Context, arg CreateCredentialParams) (CreateCredentialRow, error) {
@@ -44,6 +49,7 @@ func (q *Queries) CreateCredential(ctx context.Context, arg CreateCredentialPara
 		arg.KeyID,
 		arg.WrappedDek,
 		arg.Ciphertext,
+		arg.Fingerprint,
 	)
 	var i CreateCredentialRow
 	err := row.Scan(
@@ -51,6 +57,9 @@ func (q *Queries) CreateCredential(ctx context.Context, arg CreateCredentialPara
 		&i.Name,
 		&i.Kind,
 		&i.KeyID,
+		&i.SecretVersion,
+		&i.LastUsedAt,
+		&i.LastAuthExpiredAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -169,17 +178,20 @@ func (q *Queries) DeleteRepo(ctx context.Context, id uuid.UUID) (int64, error) {
 }
 
 const getCredential = `-- name: GetCredential :one
-SELECT id, name, kind, key_id, created_at, updated_at
+SELECT id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
 FROM credentials WHERE id = $1
 `
 
 type GetCredentialRow struct {
-	ID        uuid.UUID
-	Name      string
-	Kind      string
-	KeyID     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                uuid.UUID
+	Name              string
+	Kind              string
+	KeyID             string
+	SecretVersion     int64
+	LastUsedAt        *time.Time
+	LastAuthExpiredAt *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 func (q *Queries) GetCredential(ctx context.Context, id uuid.UUID) (GetCredentialRow, error) {
@@ -190,27 +202,9 @@ func (q *Queries) GetCredential(ctx context.Context, id uuid.UUID) (GetCredentia
 		&i.Name,
 		&i.Kind,
 		&i.KeyID,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
-}
-
-const getCredentialRow = `-- name: GetCredentialRow :one
-SELECT id, name, kind, key_id, wrapped_dek, ciphertext, created_at, updated_at
-FROM credentials WHERE id = $1
-`
-
-func (q *Queries) GetCredentialRow(ctx context.Context, id uuid.UUID) (Credential, error) {
-	row := q.db.QueryRow(ctx, getCredentialRow, id)
-	var i Credential
-	err := row.Scan(
-		&i.ID,
-		&i.Name,
-		&i.Kind,
-		&i.KeyID,
-		&i.WrappedDek,
-		&i.Ciphertext,
+		&i.SecretVersion,
+		&i.LastUsedAt,
+		&i.LastAuthExpiredAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -305,15 +299,26 @@ FROM credentials ORDER BY id
 FOR UPDATE
 `
 
-func (q *Queries) ListCredentialRowsForUpdate(ctx context.Context) ([]Credential, error) {
+type ListCredentialRowsForUpdateRow struct {
+	ID         uuid.UUID
+	Name       string
+	Kind       string
+	KeyID      string
+	WrappedDek []byte
+	Ciphertext []byte
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+func (q *Queries) ListCredentialRowsForUpdate(ctx context.Context) ([]ListCredentialRowsForUpdateRow, error) {
 	rows, err := q.db.Query(ctx, listCredentialRowsForUpdate)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Credential
+	var items []ListCredentialRowsForUpdateRow
 	for rows.Next() {
-		var i Credential
+		var i ListCredentialRowsForUpdateRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Name,
@@ -335,17 +340,20 @@ func (q *Queries) ListCredentialRowsForUpdate(ctx context.Context) ([]Credential
 }
 
 const listCredentials = `-- name: ListCredentials :many
-SELECT id, name, kind, key_id, created_at, updated_at
+SELECT id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
 FROM credentials ORDER BY name
 `
 
 type ListCredentialsRow struct {
-	ID        uuid.UUID
-	Name      string
-	Kind      string
-	KeyID     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                uuid.UUID
+	Name              string
+	Kind              string
+	KeyID             string
+	SecretVersion     int64
+	LastUsedAt        *time.Time
+	LastAuthExpiredAt *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 func (q *Queries) ListCredentials(ctx context.Context) ([]ListCredentialsRow, error) {
@@ -362,6 +370,9 @@ func (q *Queries) ListCredentials(ctx context.Context) ([]ListCredentialsRow, er
 			&i.Name,
 			&i.Kind,
 			&i.KeyID,
+			&i.SecretVersion,
+			&i.LastUsedAt,
+			&i.LastAuthExpiredAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -506,6 +517,23 @@ func (q *Queries) ListReposByProject(ctx context.Context, projectID uuid.UUID) (
 	return items, nil
 }
 
+const markCredentialAuthExpired = `-- name: MarkCredentialAuthExpired :execrows
+UPDATE credentials SET last_auth_expired_at = $2 WHERE id = $1
+`
+
+type MarkCredentialAuthExpiredParams struct {
+	ID                uuid.UUID
+	LastAuthExpiredAt *time.Time
+}
+
+func (q *Queries) MarkCredentialAuthExpired(ctx context.Context, arg MarkCredentialAuthExpiredParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markCredentialAuthExpired, arg.ID, arg.LastAuthExpiredAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const projectExists = `-- name: ProjectExists :one
 SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)
 `
@@ -556,35 +584,70 @@ func (q *Queries) RegisterHarness(ctx context.Context, arg RegisterHarnessParams
 	return i, err
 }
 
-const updateCredentialSecret = `-- name: UpdateCredentialSecret :one
-UPDATE credentials SET key_id = $2, wrapped_dek = $3, ciphertext = $4, updated_at = $5
+const rewrapCredential = `-- name: RewrapCredential :exec
+UPDATE credentials SET key_id = $2, wrapped_dek = $3, ciphertext = $4
 WHERE id = $1
-RETURNING id, name, kind, key_id, created_at, updated_at
 `
 
-type UpdateCredentialSecretParams struct {
+type RewrapCredentialParams struct {
 	ID         uuid.UUID
 	KeyID      string
 	WrappedDek []byte
 	Ciphertext []byte
-	UpdatedAt  time.Time
+}
+
+// RewrapCredential moves a row to another master key. The plaintext is
+// unchanged, so secret_version, fingerprint, and updated_at ("when the
+// operator last supplied the secret") all stay put.
+func (q *Queries) RewrapCredential(ctx context.Context, arg RewrapCredentialParams) error {
+	_, err := q.db.Exec(ctx, rewrapCredential,
+		arg.ID,
+		arg.KeyID,
+		arg.WrappedDek,
+		arg.Ciphertext,
+	)
+	return err
+}
+
+const updateCredentialSecret = `-- name: UpdateCredentialSecret :one
+UPDATE credentials
+SET key_id = $2, wrapped_dek = $3, ciphertext = $4, fingerprint = $5,
+    secret_version = secret_version + 1, updated_at = $6
+WHERE id = $1
+RETURNING id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
+`
+
+type UpdateCredentialSecretParams struct {
+	ID          uuid.UUID
+	KeyID       string
+	WrappedDek  []byte
+	Ciphertext  []byte
+	Fingerprint pgtype.Text
+	UpdatedAt   time.Time
 }
 
 type UpdateCredentialSecretRow struct {
-	ID        uuid.UUID
-	Name      string
-	Kind      string
-	KeyID     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                uuid.UUID
+	Name              string
+	Kind              string
+	KeyID             string
+	SecretVersion     int64
+	LastUsedAt        *time.Time
+	LastAuthExpiredAt *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
+// UpdateCredentialSecret is the operator-facing rotation: new plaintext,
+// so the version advances and the fingerprint is recomputed. Rekeying
+// re-wraps the same plaintext and goes through RewrapCredential instead.
 func (q *Queries) UpdateCredentialSecret(ctx context.Context, arg UpdateCredentialSecretParams) (UpdateCredentialSecretRow, error) {
 	row := q.db.QueryRow(ctx, updateCredentialSecret,
 		arg.ID,
 		arg.KeyID,
 		arg.WrappedDek,
 		arg.Ciphertext,
+		arg.Fingerprint,
 		arg.UpdatedAt,
 	)
 	var i UpdateCredentialSecretRow
@@ -593,6 +656,9 @@ func (q *Queries) UpdateCredentialSecret(ctx context.Context, arg UpdateCredenti
 		&i.Name,
 		&i.Kind,
 		&i.KeyID,
+		&i.SecretVersion,
+		&i.LastUsedAt,
+		&i.LastAuthExpiredAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -701,6 +767,49 @@ func (q *Queries) UpdateRepo(ctx context.Context, arg UpdateRepoParams) (Repo, e
 		&i.Slug,
 		&i.DefaultBranch,
 		&i.CredentialID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const useCredentialRow = `-- name: UseCredentialRow :one
+UPDATE credentials SET last_used_at = $2
+WHERE id = $1
+RETURNING id, name, kind, key_id, wrapped_dek, ciphertext, secret_version, created_at, updated_at
+`
+
+type UseCredentialRowParams struct {
+	ID         uuid.UUID
+	LastUsedAt *time.Time
+}
+
+type UseCredentialRowRow struct {
+	ID            uuid.UUID
+	Name          string
+	Kind          string
+	KeyID         string
+	WrappedDek    []byte
+	Ciphertext    []byte
+	SecretVersion int64
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// UseCredentialRow is the use-time read: it stamps last_used_at in the
+// same statement that hands back the envelope, so the freshness view can
+// never drift from what was actually opened.
+func (q *Queries) UseCredentialRow(ctx context.Context, arg UseCredentialRowParams) (UseCredentialRowRow, error) {
+	row := q.db.QueryRow(ctx, useCredentialRow, arg.ID, arg.LastUsedAt)
+	var i UseCredentialRowRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Kind,
+		&i.KeyID,
+		&i.WrappedDek,
+		&i.Ciphertext,
+		&i.SecretVersion,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

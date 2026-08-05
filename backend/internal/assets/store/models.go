@@ -10,17 +10,6 @@ import (
 	"github.com/google/uuid"
 )
 
-type Credential struct {
-	ID         uuid.UUID
-	Name       string
-	Kind       string
-	KeyID      string
-	WrappedDek []byte
-	Ciphertext []byte
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-}
-
 type Harness struct {
 	ID               uuid.UUID
 	Name             string
