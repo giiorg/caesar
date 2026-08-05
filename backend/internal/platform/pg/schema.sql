@@ -98,6 +98,36 @@ CREATE TABLE credentials (
 CREATE UNIQUE INDEX credentials_fingerprint_key ON credentials (fingerprint)
     WHERE fingerprint IS NOT NULL;
 
+-- The single-flight lease: the primary key IS the mechanism (one row per
+-- credential). The epoch fences a paused owner from its own reconciler —
+-- identity alone cannot, because they are the same phase run (spec §2.1).
+CREATE TABLE credential_leases (
+    credential_id  uuid PRIMARY KEY REFERENCES credentials (id) ON DELETE RESTRICT,
+    attempt_ref    text NOT NULL,
+    epoch          bigint NOT NULL DEFAULT 1 CHECK (epoch >= 1),
+    secret_version bigint NOT NULL,
+    acquired_at    timestamptz NOT NULL DEFAULT now(),
+    heartbeat_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- The lease row, indexed by owning attempt, is the recovery authority:
+-- reconciliation consults it even when no manifest and no container exist
+-- (spec §2.3).
+CREATE INDEX credential_leases_attempt_idx ON credential_leases (attempt_ref);
+
+-- One receipt per (credential, attempt): the commit-then-crash retry is
+-- recognizable as already applied and can never clobber an operator
+-- rotation (spec §2.6).
+CREATE TABLE credential_sync_receipts (
+    credential_id uuid NOT NULL REFERENCES credentials (id) ON DELETE CASCADE,
+    attempt_ref   text NOT NULL,
+    epoch         bigint NOT NULL,
+    from_version  bigint NOT NULL,
+    to_version    bigint NOT NULL,
+    committed_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (credential_id, attempt_ref)
+);
+
 -- Forge repos (spec §2): forge kind + slug + default branch + credential
 -- ref. RESTRICT FKs: a project with repos and a referenced credential
 -- cannot be deleted.
