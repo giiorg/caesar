@@ -84,11 +84,14 @@ func (a appHarnessResolver) HarnessSpec(ctx context.Context, id uuid.UUID) (runn
 }
 
 // appCredentialOpener opens a stored secret through the AUDITED path
-// (assets.UseCredential, spec §6 "every use audited") — never GetCredential.
+// (assets.UseCredentialVersioned, spec §6 "every use audited") — never
+// GetCredential. The version rides back with the bytes because the attempt
+// manifest records it: adoption after a crash compares what it holds against
+// what the store holds now.
 type appCredentialOpener struct{ svc *assets.Service }
 
-func (a appCredentialOpener) OpenCredential(ctx context.Context, id uuid.UUID, purpose string) ([]byte, error) {
-	return a.svc.UseCredential(ctx, id, purpose)
+func (a appCredentialOpener) OpenCredential(ctx context.Context, id uuid.UUID, purpose string) ([]byte, int64, error) {
+	return a.svc.UseCredentialVersioned(ctx, id, purpose)
 }
 
 // appCredentialLeaser adapts the assets mutable-credential aggregate onto the

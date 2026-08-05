@@ -66,6 +66,15 @@ func (r *Runner) manifestPath(ref runs.AttemptRef) string {
 	return filepath.Join(r.manifestsDir(), ref.String()+".json")
 }
 
+// authDir holds the one credential the agent's own CLI may rewrite. It sits
+// beside the attempt tree for the same reason the manifest does, and one more:
+// the CLI refreshes the file mid-run, and that refreshed copy is the only one
+// there is — teardown running over it would destroy a live credential (spec
+// §2.4). Nothing removes it blanket; removeAuthDirFenced does, under the lease.
+func (r *Runner) authDir(ref runs.AttemptRef) string {
+	return filepath.Join(r.opts.DataRoot, "auth", ref.String())
+}
+
 // relPath renders a path the way artifacts and events carry it: relative to
 // the data root, so a stored reference survives the root being remounted
 // somewhere else. A path outside the root is carried whole — inventing a

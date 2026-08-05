@@ -15,7 +15,7 @@ func TestRunValidation_HardenedExitCodeAndLog(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("kept"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.RunValidation(t.Context(), ValidationSpec{
@@ -73,7 +73,7 @@ printf 'CONNECT denied.example:443 HTTP/1.1\r\nHost: denied.example:443\r\nConne
 echo tunnel-attempted
 exit 0
 `
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.RunValidation(t.Context(), ValidationSpec{

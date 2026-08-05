@@ -37,7 +37,8 @@ func TestExecute_WorkspaceFillIsQuotaKilled(t *testing.T) {
 		WorkspaceQuotaBytes: 8 << 20,
 		WorkspaceQuotaFiles: 2000,
 		QuotaPollInterval:   200 * time.Millisecond,
-	}, scriptedHarness("", script), sink)
+	}, scriptedHarness("", script), sink, nil)
+
 	ref := dockerRef()
 
 	started := time.Now()
@@ -75,7 +76,8 @@ func TestExecute_LogFloodTruncatesThenKills(t *testing.T) {
 	r := newDockerRunner(t, Options{
 		LogCapBytes:   256 << 10,
 		LogFloodBytes: 1 << 20,
-	}, scriptedHarness("", script), sink)
+	}, scriptedHarness("", script), sink, nil)
+
 	ref := dockerRef()
 
 	res, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -113,7 +115,7 @@ func TestExecute_LogFloodTruncatesThenKills(t *testing.T) {
 }
 
 func TestExecute_DeadlineKillClassifiesTimeout(t *testing.T) {
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "sleep 600"), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "sleep 600"), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	// The deadline has to clear staging — a real clone in a real container —
@@ -158,7 +160,7 @@ while [ $i -lt ` + strconv.Itoa(attempts) + ` ]; do
 done
 exit 0`
 	sink := &recordingSink{}
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), sink)
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), sink, nil)
 	ref := dockerRef()
 
 	res, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))

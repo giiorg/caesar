@@ -108,6 +108,7 @@ type leaseEngine struct {
 
 	mu       sync.Mutex
 	created  []string                                         // container names, in order
+	hosts    map[string]dockerapi.HostConfig                  // per name: the posture it was created under
 	onCreate map[string]func(dockerapi.ContainerConfig) error // per name: observe, and optionally refuse
 }
 
@@ -116,6 +117,7 @@ func newLeaseEngine() *leaseEngine {
 		fakeEngine: fakeEngine{inspect: func(string) (dockerapi.ImageInspect, error) {
 			return dockerapi.ImageInspect{RepoDigests: []string{"ghcr.io/x/codex@sha256:beef"}}, nil
 		}},
+		hosts:    map[string]dockerapi.HostConfig{},
 		onCreate: map[string]func(dockerapi.ContainerConfig) error{},
 	}
 }
@@ -146,10 +148,11 @@ func (e *leaseEngine) ContainerInspect(context.Context, string) (dockerapi.Conta
 }
 
 func (e *leaseEngine) ContainerCreate(_ context.Context, name string, cfg dockerapi.ContainerConfig,
-	_ dockerapi.HostConfig, _ map[string]dockerapi.EndpointSettings,
+	host dockerapi.HostConfig, _ map[string]dockerapi.EndpointSettings,
 ) (string, error) {
 	e.record(name)
 	e.mu.Lock()
+	e.hosts[name] = host
 	hook := e.onCreate[name]
 	e.mu.Unlock()
 	if hook != nil {
@@ -174,6 +177,19 @@ func (e *leaseEngine) seen() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]string(nil), e.created...)
+}
+
+// hostFor is the posture one container was created under — the binds above
+// all, since a bind is how anything on the host reaches into a container.
+func (e *leaseEngine) hostFor(t *testing.T, name string) dockerapi.HostConfig {
+	t.Helper()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	host, ok := e.hosts[name]
+	if !ok {
+		t.Fatalf("container %s was never created; the daemon saw %v", name, e.created)
+	}
+	return host
 }
 
 // newLeaseRunner builds a runner over the scripted daemon and leaser, with a
@@ -273,8 +289,14 @@ func TestExecute_StaticCredentialTakesNoLeaseButStillGetsAManifest(t *testing.T)
 	if m.CredentialID != credID.String() || m.Kind != "model_key" || m.Custody != custodyBrokered {
 		t.Errorf("manifest = %+v, want the bound id, kind model_key, brokered custody", m)
 	}
-	if m.Epoch != 0 || m.SecretVersion != 0 {
-		t.Errorf("manifest carries lease fields %d/%d for an unleased kind, want 0/0", m.Epoch, m.SecretVersion)
+	if m.Epoch != 0 {
+		t.Errorf("manifest carries epoch %d for a kind that takes no lease, want 0", m.Epoch)
+	}
+	// The version is not a lease field: it is what the open reported, and
+	// adoption needs one from every kind to prove the store still holds the
+	// bytes the container saw.
+	if m.SecretVersion != openedSecretVersion {
+		t.Errorf("manifest version = %d, want the %d the open reported", m.SecretVersion, openedSecretVersion)
 	}
 }
 
@@ -284,7 +306,9 @@ func TestExecute_StaticCredentialTakesNoLeaseButStillGetsAManifest(t *testing.T)
 // between the two reads would make sync-back's CAS discard a real refresh.
 func TestExecute_AcquiredLeaseMaterializesTheGrantedSnapshot(t *testing.T) {
 	credID := uuid.New()
-	const granted = "{\"tokens\":{\"refresh_token\":\"granted-by-the-lease\"}}"
+	// A real auth.json names the account it belongs to; the runner pins that
+	// identity into the manifest before it materializes anything.
+	const granted = `{"tokens":{"refresh_token":"granted-by-the-lease","account_id":"acct-1"}}`
 	leaser := &fakeLeaser{lease: Lease{Epoch: 1, SecretVersion: 7}, secret: []byte(granted)}
 	opener := &recordingOpener{}
 	eng := newLeaseEngine()

@@ -52,7 +52,7 @@ func stageAttemptForInspect(t *testing.T, r *Runner, ref runs.AttemptRef) RunSpe
 }
 
 func TestInspect_NoContainerReportsLost(t *testing.T) {
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.Inspect(t.Context(), ref)
@@ -77,7 +77,7 @@ cat > /workspace/.caesar/out/artifacts.json <<'EOF'
 [{"type":"plan","payload":{"content":"adopted plan"}}]
 EOF
 `
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	// The crash window: the agent finished and the worker died before it
@@ -146,7 +146,7 @@ func TestInspect_NonzeroExitIsAdoptedWithItsTypedOutcome(t *testing.T) {
 
 	capHitAttempt := func(t *testing.T, withManifest bool) runs.InspectResult {
 		t.Helper()
-		r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+		r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
 		ref := dockerRef()
 		spec := stageAttemptForInspect(t, r, ref)
 		if withManifest {
@@ -223,7 +223,7 @@ func TestInspect_NonzeroExitIsAdoptedWithItsTypedOutcome(t *testing.T) {
 }
 
 func TestInspect_RunningContainerIsKilledThenInspected(t *testing.T) {
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "sleep 600"), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "sleep 600"), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	spec := stageAttemptForInspect(t, r, ref)
@@ -253,7 +253,7 @@ func TestInspect_RunningContainerIsKilledThenInspected(t *testing.T) {
 }
 
 func TestSweepOrphans_RemovesOnlyOldLabeledResources(t *testing.T) {
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{}, nil)
 	ctx := t.Context()
 
 	// Created stamps cannot be faked against a real daemon, so the age

@@ -24,7 +24,7 @@ cat > /workspace/.caesar/out/artifacts.json <<'EOF'
 EOF
 `
 	sink := &recordingSink{}
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), sink)
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), sink, nil)
 	ref := dockerRef()
 
 	res, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -78,7 +78,7 @@ func TestExecute_BrokeredProviderCallNeverShowsTheAgentTheCredential(t *testing.
 	script := `set -e
 wget -qO /workspace/models.json --header "x-api-key: $CAESAR_BROKER_TOKEN" "$CAESAR_BROKER_URL/v1/models"
 `
-	r := newDockerRunner(t, Options{}, scriptedHarness(endpoint, script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness(endpoint, script), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -123,7 +123,7 @@ wget -qO /workspace/models.json --header "x-api-key: $CAESAR_BROKER_TOKEN" "$CAE
 }
 
 func TestExecute_AgentNonzeroExitClassifiesHarnessError(t *testing.T) {
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "echo failing; exit 3"), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "echo failing; exit 3"), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	_, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -143,7 +143,7 @@ func TestExecute_AgentNonzeroExitClassifiesHarnessError(t *testing.T) {
 
 func TestExecute_StageReportOutcomePropagatesAndNoAgentRuns(t *testing.T) {
 	sink := &recordingSink{}
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "echo the agent must never run"), sink)
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "echo the agent must never run"), sink, nil)
 	ref := dockerRef()
 
 	// A base SHA the fixture remote does not carry: staging refuses before
@@ -174,7 +174,7 @@ func TestExecute_StageReportOutcomePropagatesAndNoAgentRuns(t *testing.T) {
 func TestExecute_RateLimitMarkerCarriesTheProviderReset(t *testing.T) {
 	reset := time.Now().Add(90 * time.Minute).UTC().Truncate(time.Second)
 	script := fmt.Sprintf("echo 'Claude AI usage limit reached|%d'; exit 1", reset.Unix())
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	_, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -198,12 +198,11 @@ func TestExecute_RateLimitMarkerCarriesTheProviderReset(t *testing.T) {
 // attempt's outcome names it, and the aggregate is told, so the next claimant
 // does not spend another attempt rediscovering the same dead token.
 func TestExecute_AuthExpiredMarkerNamesAndMarksTheCredential(t *testing.T) {
-	r := newDockerRunner(t, Options{},
-		scriptedHarness("", "echo 'Invalid API key - Please run /login'; exit 1"), &recordingSink{})
-	// The suite's constructor wires no credential aggregate, because no other
-	// case writes back to one; this is the signal that does.
+	// A brokered attempt takes no lease, but the freshness signal still goes
+	// to the aggregate — so this case is one of the few that wires one.
 	leaser := &fakeLeaser{}
-	r.leaser = leaser
+	r := newDockerRunner(t, Options{},
+		scriptedHarness("", "echo 'Invalid API key - Please run /login'; exit 1"), &recordingSink{}, leaser)
 	ref := dockerRef()
 	req := implementRequest(t, ref, fixtureSHA(t))
 

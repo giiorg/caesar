@@ -92,54 +92,63 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	ctx, cancelAttempt := context.WithCancel(ctx)
 	defer cancelAttempt()
 
-	// A credential a running attempt can itself replace is taken exclusively,
-	// before anything usage-bearing starts. Contention is somebody else's
-	// turn rather than this attempt's failure, so it returns as a wait and
-	// nothing has been spent when it does.
+	// The credential resolves before anything else, because everything after
+	// it depends on which bytes this attempt actually holds. It is the one the
+	// request pinned, never one re-resolved off today's harness row: a registry
+	// edit mid-attempt must not swap the secret under a running phase.
+	//
+	// A credential a running attempt can itself replace is taken exclusively
+	// first, before anything usage-bearing starts. Contention is somebody
+	// else's turn rather than this attempt's failure, so it returns as a wait
+	// and nothing has been spent when it does. Such a credential is then never
+	// opened a second time: the acquire transaction handed back both the lease
+	// and the bytes of exactly the version it recorded, and that pairing is
+	// what lets sync-back's CAS tell an operator's rotation apart from the
+	// CLI's own refresh.
 	leased := needsLease(req.Credential)
-	var lease Lease
-	var leasedSecret []byte
+	var g grant
 	if leased {
-		lease, leasedSecret, err = r.acquireCredential(ctx, ref, req.Credential)
+		lease, secret, err := r.acquireCredential(ctx, ref, req.Credential)
 		if err != nil {
 			return runs.ExecutionResult{}, err
 		}
+		g = grant{secret: secret, version: lease.SecretVersion, epoch: lease.Epoch}
 		// Registered before the heartbeat so it runs after it: the release is
 		// the last thing this attempt does to the credential.
-		defer r.concludeLease(ctx, req.Credential.ID, ref, lease.Epoch)
-		stopHeartbeat := r.startLeaseHeartbeat(ctx, req.Credential.ID, ref, lease.Epoch, cancelAttempt)
+		defer r.concludeLease(ctx, req.Credential.ID, ref, g.epoch)
+		stopHeartbeat := r.startLeaseHeartbeat(ctx, req.Credential.ID, ref, g.epoch, cancelAttempt)
 		defer stopHeartbeat()
-	}
-	// Every credential-bearing attempt gets a manifest, whatever its custody:
-	// adoption rebuilds the redaction set from it, and an attempt whose
-	// manifest is missing has to have its logs and artifacts withheld.
-	if req.Credential.ID != uuid.Nil {
-		if err := r.writeManifest(ref, manifestFor(req, spec, lease)); err != nil {
-			return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "write attempt manifest: %v", err)
-		}
-	}
-
-	clone, err := r.git.CloneSpec(ctx, req.Repo)
-	if err != nil {
-		return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "resolve clone for %s: %v", req.Repo.Slug, err)
-	}
-	// The credential is the one the request pinned, never one re-resolved off
-	// today's harness row: a registry edit mid-attempt must not swap the secret
-	// under a running phase. Brokered credentials are infrastructure here: an
-	// unavailable secret store says nothing about this attempt's work.
-	//
-	// A leased credential is never opened a second time. The acquire
-	// transaction handed back both the lease and the bytes of exactly the
-	// version it recorded, and that pairing is what lets sync-back's CAS tell
-	// an operator's rotation apart from the CLI's own refresh.
-	if leased {
-		spec.ProviderCredential = string(leasedSecret)
 	} else {
-		cred, err := r.creds.OpenCredential(ctx, req.Credential.ID, "attempt:"+ref.String())
+		// Unleased credentials are infrastructure here: an unavailable secret
+		// store says nothing about this attempt's work.
+		secret, version, err := r.creds.OpenCredential(ctx, req.Credential.ID, "attempt:"+ref.String())
 		if err != nil {
 			return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "open provider credential: %v", err)
 		}
-		spec.ProviderCredential = string(cred)
+		g = grant{secret: secret, version: version}
+	}
+	spec.ProviderCredential = string(g.secret)
+
+	// Every credential-bearing attempt gets a manifest, whatever its custody:
+	// adoption rebuilds the redaction set from it, and an attempt whose
+	// manifest is missing has to have its logs and artifacts withheld.
+	m, err := r.manifestFor(req, spec, d, g)
+	if err != nil {
+		return runs.ExecutionResult{}, err
+	}
+	if req.Credential.ID != uuid.Nil {
+		if err := r.writeManifest(ref, m); err != nil {
+			return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "write attempt manifest: %v", err)
+		}
+	}
+	// A file-delivered credential lands on the host before any container
+	// exists: the bind is resolved when the agent is created, and the manifest
+	// that describes the directory is already durable.
+	if m.AuthDir != "" {
+		if err := r.materializeAuthDir(ref, d, g.secret); err != nil {
+			return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "materialize auth dir: %v", err)
+		}
+		spec.AuthBind = r.hostPath(r.authDir(ref)) + ":" + d.authMount.containerPath
 	}
 	// The materialized half of the agent's environment is completed here and
 	// only here: it carries the secret, which buildSpec has no business
@@ -149,6 +158,11 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 		spec.Env = append(spec.Env, d.env(envInput{
 			custody: custodyMaterialized, secret: spec.ProviderCredential,
 		})...)
+	}
+
+	clone, err := r.git.CloneSpec(ctx, req.Repo)
+	if err != nil {
+		return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "resolve clone for %s: %v", req.Repo.Slug, err)
 	}
 
 	if err := r.ensureNetworks(ctx, ref); err != nil {
@@ -456,8 +470,15 @@ func (r *Runner) startGateway(ctx context.Context, ref runs.AttemptRef, spec Run
 // other occupant is the gateway.
 func (r *Runner) startAgent(ctx context.Context, ref runs.AttemptRef, spec RunSpec) (string, error) {
 	ws := filepath.Join(r.attemptDir(ref), gitops.WorkspaceDir)
-	host := r.hardenedHost([]string{r.hostPath(ws) + ":" + workspaceDir},
-		networkName(ref), r.opts.MemoryBytes, r.opts.NanoCPUs, r.opts.PidsLimit)
+	// The auth directory rides the same mechanism as the workspace and is the
+	// only other path the agent shares with the host. It is writable on
+	// purpose: the CLI refreshes its own tokens, and that refreshed file is
+	// what sync-back reads back (spec §2.4).
+	binds := []string{r.hostPath(ws) + ":" + workspaceDir}
+	if spec.AuthBind != "" {
+		binds = append(binds, spec.AuthBind)
+	}
+	host := r.hardenedHost(binds, networkName(ref), r.opts.MemoryBytes, r.opts.NanoCPUs, r.opts.PidsLimit)
 
 	id, err := r.engine.ContainerCreate(ctx, agentName(ref), dockerapi.ContainerConfig{
 		Image:      spec.ImageDigest,

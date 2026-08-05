@@ -38,9 +38,14 @@ func (h *harnessRegistry) HarnessSpec(context.Context, uuid.UUID) (HarnessSpec, 
 
 type recordingOpener struct{ opened []uuid.UUID }
 
-func (o *recordingOpener) OpenCredential(_ context.Context, id uuid.UUID, _ string) ([]byte, error) {
+// openedSecretVersion is the version this opener reports for everything it
+// hands over. It is deliberately not 1: a manifest carrying it proves the
+// version came from the open rather than from a default nobody set.
+const openedSecretVersion = 3
+
+func (o *recordingOpener) OpenCredential(_ context.Context, id uuid.UUID, _ string) ([]byte, int64, error) {
 	o.opened = append(o.opened, id)
-	return []byte("provider-key"), nil
+	return []byte("provider-key"), openedSecretVersion, nil
 }
 
 type stubGit struct{}

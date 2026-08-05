@@ -50,8 +50,13 @@ type RunSpec struct {
 	// custodies — redaction needs it either way — but it is handed to the
 	// gateway only when brokered. Nothing may log a RunSpec.
 	ProviderCredential string
-	BaseSHA            string
-	Deadline           time.Time
+	// AuthBind mounts the host-backed auth directory into the agent, as
+	// "<host path>:<container path>". Empty for every attempt whose credential
+	// is not delivered as a file — env-delivered and brokered attempts
+	// materialize nothing on disk. Execute fills it once the directory exists.
+	AuthBind string
+	BaseSHA  string
+	Deadline time.Time
 }
 
 // buildSpec resolves everything an attempt needs before anything starts:

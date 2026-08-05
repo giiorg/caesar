@@ -51,6 +51,13 @@ func (r *Runner) heartbeatInterval() time.Duration {
 // only the first is somebody else's turn. Treating the second as a wait would
 // hide a design error behind an endless zero-charge retry loop.
 func (r *Runner) acquireCredential(ctx context.Context, ref runs.AttemptRef, binding runs.CredentialBinding) (Lease, []byte, error) {
+	// A runner wired without the credential aggregate cannot run a kind that
+	// needs single-flight at all. Saying so is a deployment error, permanent
+	// and loud — the alternative is a nil dereference somewhere further in.
+	if r.leaser == nil {
+		return Lease{}, nil, permanentf(runs.CodeInternalError,
+			"credential kind %s needs a credential leaser, none is wired", binding.Kind)
+	}
 	lease, secret, err := r.leaser.Acquire(ctx, binding.ID, ref.String())
 	switch {
 	case errors.Is(err, ErrLeaseBusy):

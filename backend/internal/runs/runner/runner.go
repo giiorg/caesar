@@ -71,10 +71,16 @@ type HarnessResolver interface {
 	HarnessSpec(ctx context.Context, id uuid.UUID) (HarnessSpec, error)
 }
 
-// CredentialOpener opens a stored secret for one stated purpose. The plaintext
-// never reaches the agent container — only the gateway holds it.
+// CredentialOpener opens a stored secret for one stated purpose and reports
+// the version the returned bytes belong to.
+//
+// The version is the attempt's proof obligation, not a convenience: a
+// crash-adopted attempt may only publish its evidence while the store still
+// holds the version the container actually saw, so every attempt records one
+// whether or not its kind takes a lease (spec §2.3). Leased kinds never come
+// through here — their bytes and version arrive together from the acquire.
 type CredentialOpener interface {
-	OpenCredential(ctx context.Context, id uuid.UUID, purpose string) ([]byte, error)
+	OpenCredential(ctx context.Context, id uuid.UUID, purpose string) ([]byte, int64, error)
 }
 
 // Lease is the runner's copy of the single-flight grant over a mutable

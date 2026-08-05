@@ -74,7 +74,7 @@ echo "capeff=$(awk '/^CapEff:/{print $2}' /proc/$$/status)" >> "$OUT"
 echo "nonewprivs=$(awk '/^NoNewPrivs:/{print $2}' /proc/$$/status)" >> "$OUT"
 exit 0
 `
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -149,7 +149,7 @@ probe caesar-api wget -T 3 -qO- http://host.docker.internal:8080/healthz
 probe provider-direct wget -T 3 -qO- https://api.anthropic.com/v1/models
 exit 0
 `
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -215,7 +215,7 @@ call not-allowlisted --header "x-api-key: $CAESAR_BROKER_TOKEN" "$CAESAR_BROKER_
 echo "brokered-body=$(grep -c claude-fable-5 /tmp/body.allowlisted)" >> "$OUT"
 exit 0
 `
-	r := newDockerRunner(t, Options{}, scriptedHarness(endpoint, script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness(endpoint, script), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -342,7 +342,7 @@ fi
 exit 0
 `, probeFile, shellSplit(forgeSecret), shellSplit(forgeSecretB64))
 
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
 	// The suite's constructor pins the credential-free fixture forge; this
 	// test is the one that needs the credentialed variant.
 	dir, _ := fixtureRepo(t)

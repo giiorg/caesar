@@ -29,17 +29,34 @@ type attemptManifest struct {
 	// crash-adopted nonzero exit has no marker table to read, and a cap hit
 	// would be charged to the node as a generic harness failure.
 	HarnessKind string `json:"harness_kind"`
-	// SecretVersion is the version actually delivered. For a leased kind it
-	// is the version the acquire transaction granted, and adoption refuses to
-	// publish unless the store still holds THIS version: a mid-attempt
-	// operator rotation makes the delivered bytes unrecoverable. Kinds that
-	// take no lease carry 0 — their bytes come from an open that does not yet
-	// report a version, and Plan 07's sync-back work is what gives it one.
+	// SecretVersion is the version actually delivered — the acquire
+	// transaction's grant for a leased kind, the versioned open's answer for
+	// every other. Adoption refuses to publish unless the store still holds
+	// THIS version: a mid-attempt operator rotation makes the delivered bytes
+	// unrecoverable.
 	SecretVersion int64  `json:"secret_version"`
 	Epoch         int64  `json:"epoch"`                  // leased kinds only; 0 otherwise
 	AuthDir       string `json:"auth_dir,omitempty"`     // relPath under DataRoot
 	Identity      string `json:"identity,omitempty"`     // pinned account-identity fingerprint (spec §2.5)
 	BrokerToken   string `json:"broker_token,omitempty"` // brokered custody only — see writeManifest
+
+	// secretBytes is the credential as materialized, held in memory for the
+	// length of the attempt and never serialized (unexported): sync-back
+	// compares the read-back file against it to tell a CLI refresh from a file
+	// nothing touched. The provider credential deliberately does not go into
+	// the file — a recovery path that lacks these bytes skips the comparison
+	// and settles the question through the CAS instead.
+	secretBytes []byte
+}
+
+// grant is the attempt's provider credential as actually resolved: the bytes
+// the harness will be handed, the store version they belong to, and the lease
+// epoch guarding them (0 for kinds that take no lease). The three travel
+// together because every recovery path needs all three or none.
+type grant struct {
+	secret  []byte
+	version int64
+	epoch   int64
 }
 
 // kindAgentAuthFile mirrors the assets credential-kind vocabulary by value:
@@ -50,21 +67,44 @@ const kindAgentAuthFile = "agent_auth_file" //nolint:gosec // G101 matches the n
 // manifestFor assembles the manifest from what is already resolved: the
 // binding the request pinned, the custody and broker token the spec already
 // carries (the driver derived it from the harness/credential pair — recovery
-// reads it here rather than re-deriving it), and whatever grant the lease made
-// (the zero Lease for kinds that take none).
-func manifestFor(req runs.ExecutionRequest, spec RunSpec, lease Lease) attemptManifest {
+// reads it here rather than re-deriving it), and the credential as delivered.
+//
+// The auth directory and the account identity are the materialized half, and
+// they are gated on CUSTODY rather than on the harness: the same Codex driver
+// holding a model key brokers it, and a raw API key is not an auth.json —
+// feeding one to the identity extractor would be a bug, not a fallback.
+//
+// Extracting the identity here, before anything runs, is deliberate: it is the
+// value read-back compares against (spec §2.5), so a credential caesar cannot
+// pin an identity to could never have a refresh committed. Discovering that at
+// the end of an attempt would cost the whole attempt.
+func (r *Runner) manifestFor(req runs.ExecutionRequest, spec RunSpec, d driver, g grant) (attemptManifest, error) {
 	m := attemptManifest{
 		CredentialID:  req.Credential.ID.String(),
 		Kind:          req.Credential.Kind,
 		Custody:       spec.Custody,
 		HarnessKind:   spec.Harness.Kind,
-		SecretVersion: lease.SecretVersion,
-		Epoch:         lease.Epoch,
+		SecretVersion: g.version,
+		Epoch:         g.epoch,
+		secretBytes:   g.secret,
 	}
 	if m.Custody == custodyBrokered {
 		m.BrokerToken = spec.BrokerToken
+		return m, nil
 	}
-	return m
+	if d.authMount == nil { // env-delivered: nothing on disk, nothing to read back
+		return m, nil
+	}
+	if d.identity != nil {
+		identity, err := d.identity(g.secret)
+		if err != nil {
+			return attemptManifest{}, permanentf(runs.CodeAuthExpired,
+				"credential %s cannot be identity-pinned: %v", req.Credential.ID, err)
+		}
+		m.Identity = identity
+	}
+	m.AuthDir = r.relPath(r.authDir(req.Ref))
+	return m, nil
 }
 
 // writeManifest publishes one attempt's manifest at 0600.

@@ -66,8 +66,8 @@ func (r staticResolver) HarnessSpec(context.Context, uuid.UUID) (HarnessSpec, er
 
 type staticCreds struct{ value []byte }
 
-func (c staticCreds) OpenCredential(context.Context, uuid.UUID, string) ([]byte, error) {
-	return c.value, nil
+func (c staticCreds) OpenCredential(context.Context, uuid.UUID, string) ([]byte, int64, error) {
+	return c.value, 1, nil
 }
 
 // fixtureGit stands in for the forge: the remote is a bare repo on this
@@ -188,7 +188,11 @@ func startFakeProvider(t *testing.T) (endpoint string, seen *credentialLog) {
 // newDockerRunner is the suite's constructor: a real daemon client, the
 // fixture forge, a static credential, and tight ceilings so a runaway test
 // costs seconds rather than the shipped defaults.
-func newDockerRunner(t *testing.T, opts Options, hs HarnessSpec, sink EventSink) *Runner {
+//
+// leaser is nil for every case that binds a shareable credential — most of
+// them. A case binding an agent_auth_file must supply one: that kind takes a
+// single-flight lease, and the lease grant is where its bytes come from.
+func newDockerRunner(t *testing.T, opts Options, hs HarnessSpec, sink EventSink, leaser CredentialLeaser) *Runner {
 	t.Helper()
 	if _, err := os.Stat(dockerSocket); err != nil {
 		t.Fatalf("runner suite needs a Docker daemon at %s: %v", dockerSocket, err)
@@ -222,7 +226,7 @@ func newDockerRunner(t *testing.T, opts Options, hs HarnessSpec, sink EventSink)
 	opts.testHostAccess = true
 
 	dir, _ := fixtureRepo(t)
-	r, err := New(engine, staticResolver{spec: hs}, staticCreds{value: []byte("real-provider-key")}, nil,
+	r, err := New(engine, staticResolver{spec: hs}, staticCreds{value: []byte("real-provider-key")}, leaser,
 		fixtureGit{dir: dir}, sink, opts, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("New: %v", err)
