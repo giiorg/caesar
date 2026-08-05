@@ -41,9 +41,10 @@ type fakeLeaser struct {
 	secret       []byte
 	heartbeatErr func(n int) error
 
-	acquired   []leaseCall
-	heartbeats []leaseCall
-	released   []leaseCall
+	acquired    []leaseCall
+	heartbeats  []leaseCall
+	released    []leaseCall
+	authExpired []leaseCall
 }
 
 func (l *fakeLeaser) Acquire(_ context.Context, id uuid.UUID, ref string) (Lease, []byte, error) {
@@ -73,6 +74,21 @@ func (l *fakeLeaser) Release(_ context.Context, id uuid.UUID, ref string, epoch 
 	defer l.mu.Unlock()
 	l.released = append(l.released, leaseCall{credentialID: id, ref: ref, epoch: epoch})
 	return nil
+}
+
+func (l *fakeLeaser) MarkAuthExpired(_ context.Context, id uuid.UUID) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.authExpired = append(l.authExpired, leaseCall{credentialID: id})
+	return nil
+}
+
+// markedAuthExpired is the freshness signal's call log: which credentials this
+// runner told the aggregate their provider had rejected.
+func (l *fakeLeaser) markedAuthExpired() []leaseCall {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]leaseCall(nil), l.authExpired...)
 }
 
 func (l *fakeLeaser) calls() (acquired, heartbeats, released []leaseCall) {

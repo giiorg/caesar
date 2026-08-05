@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/google/uuid"
+
 	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
 	"github.com/giiorg/caesar/backend/internal/runs"
 	"github.com/giiorg/caesar/backend/internal/runs/runner/gitops"
@@ -41,11 +43,18 @@ const (
 // credential that no container is going to be handed. Everything here is
 // either the ref itself or recoverable from the attempt directory.
 type collection struct {
-	Ref      runs.AttemptRef
-	BaseSHA  string
-	User     string
-	ExitCode int64
-	OOM      bool
+	Ref     runs.AttemptRef
+	BaseSHA string
+	User    string
+	// Kind is the harness the attempt ran, which is what makes its exit
+	// codes legible. Adoption recovers it from the attempt manifest and is
+	// left with the empty kind when there is no manifest to read.
+	Kind string
+	// CredentialID is the binding this attempt was pinned to, named in an
+	// auth failure's message and stamped on the credential itself.
+	CredentialID uuid.UUID
+	ExitCode     int64
+	OOM          bool
 }
 
 // collectResult turns a finished agent container into the attempt's result:
@@ -55,12 +64,23 @@ type collection struct {
 // this process never started.
 func (r *Runner) collectResult(ctx context.Context, c collection) (runs.ExecutionResult, error) {
 	ref := c.Ref
-	// A nonzero exit is transient here on purpose: this layer knows only
-	// that the process failed. Reading meaning into a harness's exit codes
-	// is the harness adapter's job (Plan 07).
+	// A nonzero exit means whatever the harness's own output says it means:
+	// the driver's marker table is the only translator, and an attempt whose
+	// harness cannot be identified keeps the pre-driver answer.
 	if c.ExitCode != 0 {
-		return runs.ExecutionResult{}, transientf(runs.CodeHarnessError,
-			"harness exited %d (oom_killed=%v)", c.ExitCode, c.OOM)
+		d, err := driverFor(c.Kind)
+		if err != nil {
+			return runs.ExecutionResult{}, transientf(runs.CodeHarnessError,
+				"harness exited %d (oom_killed=%v)", c.ExitCode, c.OOM)
+		}
+		out := mapExit(d, c.ExitCode, readTail(filepath.Join(r.logsDir(ref), agentLogFile), snapshotTailBytes))
+		if out.Code == runs.CodeAuthExpired {
+			// Fail fast, naming the credential the operator has to fix
+			// (spec §4, §5), and stamp the freshness signal on it.
+			out.Message = fmt.Sprintf("credential %s: %s", c.CredentialID, out.Message)
+			r.markAuthExpired(ctx, c)
+		}
+		return runs.ExecutionResult{}, runs.OutcomeError{Outcome: out}
 	}
 
 	rep, err := r.extractPatch(ctx, ref, c.BaseSHA, c.User)
@@ -93,6 +113,23 @@ func (r *Runner) collectResult(ctx context.Context, c collection) (runs.Executio
 	artifacts = append(artifacts, declared...)
 	artifacts = append(artifacts, r.logRefArtifact(ref))
 	return runs.ExecutionResult{Artifacts: artifacts}, nil
+}
+
+// markAuthExpired records that this credential's own provider rejected it, so
+// the next claimant meets a credential already known to be dead rather than
+// spending another attempt discovering it. Best effort by construction: the
+// outcome the caller returns is the authority, and a signal that could not be
+// written must not turn a typed auth failure into an internal error. An
+// attempt with no binding — or a runner wired without the credential
+// aggregate — has nothing to stamp.
+func (r *Runner) markAuthExpired(ctx context.Context, c collection) {
+	if r.leaser == nil || c.CredentialID == uuid.Nil {
+		return
+	}
+	if err := r.leaser.MarkAuthExpired(ctx, c.CredentialID); err != nil {
+		r.log.Warn("runner.mark_auth_expired", "attempt", c.Ref.String(),
+			"credential", c.CredentialID.String(), "error", err)
+	}
 }
 
 // extractPatch runs the trusted extraction container: no network, the whole

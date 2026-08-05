@@ -127,9 +127,14 @@ WHERE id = $1 AND status = sqlc.arg(from_status) AND (worker_id = sqlc.arg(worke
 SELECT id FROM phase_runs WHERE status = 'running' AND leased_until <= now() LIMIT $1;
 
 -- name: MarkPhaseReconciling :one
+-- The run's wall deadline rides along because reconciliation now adopts
+-- typed waits (a cap window with its reset): parking one past the deadline
+-- would leave a row that could never legally run when it woke, so the
+-- reconcile path needs the same boundary the claim path reads (§4.1).
 UPDATE phase_runs SET status = 'reconciling'
-WHERE id = $1 AND status = 'running' AND leased_until <= now()
-RETURNING *;
+WHERE phase_runs.id = $1 AND phase_runs.status = 'running' AND phase_runs.leased_until <= now()
+RETURNING phase_runs.*,
+          (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline;
 
 -- name: ClaimStuckReconciling :many
 -- Rows whose owner died between marking 'reconciling' and evaluating:
@@ -144,7 +149,8 @@ WHERE id IN (
     ORDER BY leased_until
     LIMIT @max_rows FOR UPDATE SKIP LOCKED
 )
-RETURNING *;
+RETURNING phase_runs.*,
+          (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline;
 
 -- name: SupersedeLivePhases :many
 UPDATE phase_runs SET status = 'superseded', outcome = $2, finished_at = $3

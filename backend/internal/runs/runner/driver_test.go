@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -418,6 +419,132 @@ func TestDriver_RowsAreWellFormed(t *testing.T) {
 	}
 	if diff := cmp.Diff([]string{"sk-ant-oat01-x"}, asStrings(got)); diff != "" {
 		t.Errorf("sensitive mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// The marker table is the only way a harness tells us WHY it stopped: the
+// exit code is 1 for every one of these. Each row was recorded against a real
+// CLI, so the table is evidence, not guesswork — and the Task 14 smoke run
+// re-verifies it against the shipped version.
+func TestMapExit_ClaudeMarkers(t *testing.T) {
+	d, err := driverFor("claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		tail    string
+		code    string
+		class   runs.OutcomeClass
+		retryAt int64 // 0 = must be nil
+	}{
+		// recorded 2026-08-05, v2.1.222; re-verified by the Task 14 smoke run
+		{"Claude AI usage limit reached|1754398800", runs.CodeRateLimited, runs.OutcomeTransient, 1754398800},
+		{"5-hour limit reached ∙ resets 6pm", runs.CodeRateLimited, runs.OutcomeTransient, 0},
+		{"Invalid API key · Please run /login", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		{"OAuth token revoked", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		{"panic: something else entirely", runs.CodeHarnessError, runs.OutcomeTransient, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.tail, func(t *testing.T) {
+			out := mapExit(d, 1, []byte(c.tail))
+			if out.Code != c.code {
+				t.Errorf("code = %q, want %q", out.Code, c.code)
+			}
+			if out.Class != c.class {
+				t.Errorf("class = %q, want %q", out.Class, c.class)
+			}
+			assertRetryAt(t, out, c.retryAt)
+		})
+	}
+}
+
+// The codex rows are PROVISIONAL — no recorded corpus yet — but the epoch row
+// is already load-bearing: Task 13's fakecli speaks exactly this marker and
+// the cap-resume e2e reads the reset time back out of the outcome.
+func TestMapExit_CodexMarkers(t *testing.T) {
+	d, err := driverFor("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		tail    string
+		code    string
+		class   runs.OutcomeClass
+		retryAt int64
+	}{
+		{"usage limit reached|1791234567", runs.CodeRateLimited, runs.OutcomeTransient, 1791234567},
+		{"You have hit your rate limit", runs.CodeRateLimited, runs.OutcomeTransient, 0},
+		{"401 Unauthorized", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		{"token has expired, run codex login", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		{"segmentation fault", runs.CodeHarnessError, runs.OutcomeTransient, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.tail, func(t *testing.T) {
+			out := mapExit(d, 1, []byte(c.tail))
+			if out.Code != c.code {
+				t.Errorf("code = %q, want %q", out.Code, c.code)
+			}
+			if out.Class != c.class {
+				t.Errorf("class = %q, want %q", out.Class, c.class)
+			}
+			assertRetryAt(t, out, c.retryAt)
+		})
+	}
+}
+
+// The table is ordered, and the order is the whole disambiguation: a tail that
+// matches both the epoch row and the plain cap row must keep the epoch, or a
+// provider that told us when it will let us back in would be retried on a
+// guess instead.
+func TestMapExit_OrderingAndFallback(t *testing.T) {
+	d, err := driverFor("claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	both := mapExit(d, 1, []byte("Claude AI usage limit reached|1754398800 (5-hour limit reached)"))
+	if both.Code != runs.CodeRateLimited {
+		t.Fatalf("code = %q, want rate_limited", both.Code)
+	}
+	assertRetryAt(t, both, 1754398800)
+
+	// Nothing recognized: the pre-driver answer, unchanged — transient, and
+	// the exit code is the only fact there is to report.
+	fallback := mapExit(d, 137, []byte("Killed"))
+	if fallback.Code != runs.CodeHarnessError || fallback.Class != runs.OutcomeTransient {
+		t.Errorf("fallback = %+v, want a transient harness_error", fallback)
+	}
+	if !strings.Contains(fallback.Message, "137") {
+		t.Errorf("fallback message = %q, want it to name the exit code", fallback.Message)
+	}
+	if fallback.RetryAt != nil {
+		t.Errorf("fallback RetryAt = %v, want nil — only a stated reset sets it", fallback.RetryAt)
+	}
+
+	// A number too short to be a unix timestamp is not a reset time: the row
+	// falls through to the plain cap rule, and the delay is our own guess
+	// rather than a moment in 1970.
+	short := mapExit(d, 1, []byte("usage limit reached|123"))
+	if short.Code != runs.CodeRateLimited {
+		t.Errorf("code = %q, want rate_limited", short.Code)
+	}
+	if short.RetryAt != nil {
+		t.Errorf("RetryAt = %v, want nil when the marker carries no epoch", short.RetryAt)
+	}
+}
+
+func assertRetryAt(t *testing.T, out runs.Outcome, epoch int64) {
+	t.Helper()
+	if epoch == 0 {
+		if out.RetryAt != nil {
+			t.Errorf("RetryAt = %v, want nil", out.RetryAt)
+		}
+		return
+	}
+	if out.RetryAt == nil {
+		t.Fatalf("RetryAt = nil, want %s", time.Unix(epoch, 0).UTC())
+	}
+	if !out.RetryAt.Equal(time.Unix(epoch, 0)) {
+		t.Errorf("RetryAt = %s, want %s", out.RetryAt, time.Unix(epoch, 0).UTC())
 	}
 }
 

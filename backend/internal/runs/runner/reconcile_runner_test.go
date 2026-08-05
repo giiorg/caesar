@@ -3,6 +3,7 @@
 package runner
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -131,6 +132,77 @@ EOF
 	if log := readLogFile(t, r, ref, agentLogFile); !strings.Contains(log, "hello-from-adopted-agent") {
 		t.Errorf("the adopted attempt's log did not survive: %q", log)
 	}
+}
+
+// A worker that died after its agent had already hit the cap must not lose
+// that answer. The attempt is adopted as the typed failure the harness
+// reported — reset and all — because reporting it lost would charge a cap
+// wait to the node's failure budget. Reading the exit takes the manifest: it
+// is what says which harness's markers apply, and without one adoption has to
+// fall back to the pre-driver answer.
+func TestInspect_NonzeroExitIsAdoptedWithItsTypedOutcome(t *testing.T) {
+	reset := time.Now().Add(45 * time.Minute).UTC().Truncate(time.Second)
+	script := fmt.Sprintf("echo 'Claude AI usage limit reached|%d'; exit 1", reset.Unix())
+
+	capHitAttempt := func(t *testing.T, withManifest bool) runs.InspectResult {
+		t.Helper()
+		r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+		ref := dockerRef()
+		spec := stageAttemptForInspect(t, r, ref)
+		if withManifest {
+			if err := r.writeManifest(ref, attemptManifest{
+				CredentialID: uuid.NewString(), Kind: "model_key",
+				Custody: spec.Custody, HarnessKind: spec.Harness.Kind,
+			}); err != nil {
+				t.Fatalf("write manifest: %v", err)
+			}
+		}
+		d, err := driverFor(spec.Harness.Kind)
+		if err != nil {
+			t.Fatalf("driver for %s: %v", spec.Harness.Kind, err)
+		}
+		agent, err := r.runAgentToCompletion(t.Context(), ref, spec, d)
+		if err != nil {
+			t.Fatalf("run agent: %v", err)
+		}
+		if agent.exitCode != 1 {
+			t.Fatalf("agent exited %d, want the scripted 1", agent.exitCode)
+		}
+		res, err := r.Inspect(t.Context(), ref)
+		if err != nil {
+			t.Fatalf("inspect: %v", err)
+		}
+		return res
+	}
+
+	t.Run("with a manifest the marker table applies", func(t *testing.T) {
+		res := capHitAttempt(t, true)
+		if !res.Completed || res.Outcome == nil {
+			t.Fatalf("result = %+v, want an adopted typed outcome", res)
+		}
+		if res.Outcome.Code != runs.CodeRateLimited {
+			t.Errorf("code = %q, want rate_limited", res.Outcome.Code)
+		}
+		if res.Outcome.RetryAt == nil || !res.Outcome.RetryAt.Equal(reset) {
+			t.Errorf("RetryAt = %v, want the marker's own %s", res.Outcome.RetryAt, reset)
+		}
+	})
+
+	t.Run("without one the markers are unreadable", func(t *testing.T) {
+		// The manifest is the route back to the driver, so its absence costs
+		// the meaning of the exit — not the attempt. The failure is adopted,
+		// it just reads as the generic exit it looks like from outside.
+		res := capHitAttempt(t, false)
+		if !res.Completed || res.Outcome == nil {
+			t.Fatalf("result = %+v, want the failure adopted anyway", res)
+		}
+		if res.Outcome.Code != runs.CodeHarnessError {
+			t.Errorf("code = %q, want the pre-driver harness_error", res.Outcome.Code)
+		}
+		if res.Outcome.RetryAt != nil {
+			t.Errorf("RetryAt = %v, want nil: nothing read the cap marker", res.Outcome.RetryAt)
+		}
+	})
 }
 
 func TestInspect_RunningContainerIsKilledThenInspected(t *testing.T) {

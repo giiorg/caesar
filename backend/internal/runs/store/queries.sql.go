@@ -157,7 +157,8 @@ WHERE id IN (
     ORDER BY leased_until
     LIMIT $3 FOR UPDATE SKIP LOCKED
 )
-RETURNING id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
+          (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline
 `
 
 type ClaimStuckReconcilingParams struct {
@@ -166,19 +167,37 @@ type ClaimStuckReconcilingParams struct {
 	MaxRows      int32
 }
 
+type ClaimStuckReconcilingRow struct {
+	ID                 uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	MaxAttempts        int32
+	ChargeableFailures int32
+	NotBefore          *time.Time
+	Status             string
+	WorkerID           pgtype.Text
+	LeasedUntil        *time.Time
+	ClaimedAt          *time.Time
+	FinishedAt         *time.Time
+	Outcome            []byte
+	CreatedAt          time.Time
+	RunWallDeadline    time.Time
+}
+
 // Rows whose owner died between marking 'reconciling' and evaluating:
 // the lease sweep can't see them (its predicate is status = 'running').
 // Extending the lease is the CAS that makes concurrent sweepers safe —
 // one winner per row per grace window.
-func (q *Queries) ClaimStuckReconciling(ctx context.Context, arg ClaimStuckReconcilingParams) ([]PhaseRun, error) {
+func (q *Queries) ClaimStuckReconciling(ctx context.Context, arg ClaimStuckReconcilingParams) ([]ClaimStuckReconcilingRow, error) {
 	rows, err := q.db.Query(ctx, claimStuckReconciling, arg.LeaseSeconds, arg.GraceSeconds, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []PhaseRun
+	var items []ClaimStuckReconcilingRow
 	for rows.Next() {
-		var i PhaseRun
+		var i ClaimStuckReconcilingRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.RunID,
@@ -194,6 +213,7 @@ func (q *Queries) ClaimStuckReconciling(ctx context.Context, arg ClaimStuckRecon
 			&i.FinishedAt,
 			&i.Outcome,
 			&i.CreatedAt,
+			&i.RunWallDeadline,
 		); err != nil {
 			return nil, err
 		}
@@ -1081,13 +1101,36 @@ func (q *Queries) LockEventCounter(ctx context.Context) (int64, error) {
 
 const markPhaseReconciling = `-- name: MarkPhaseReconciling :one
 UPDATE phase_runs SET status = 'reconciling'
-WHERE id = $1 AND status = 'running' AND leased_until <= now()
-RETURNING id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at
+WHERE phase_runs.id = $1 AND phase_runs.status = 'running' AND phase_runs.leased_until <= now()
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
+          (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline
 `
 
-func (q *Queries) MarkPhaseReconciling(ctx context.Context, id uuid.UUID) (PhaseRun, error) {
+type MarkPhaseReconcilingRow struct {
+	ID                 uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	MaxAttempts        int32
+	ChargeableFailures int32
+	NotBefore          *time.Time
+	Status             string
+	WorkerID           pgtype.Text
+	LeasedUntil        *time.Time
+	ClaimedAt          *time.Time
+	FinishedAt         *time.Time
+	Outcome            []byte
+	CreatedAt          time.Time
+	RunWallDeadline    time.Time
+}
+
+// The run's wall deadline rides along because reconciliation now adopts
+// typed waits (a cap window with its reset): parking one past the deadline
+// would leave a row that could never legally run when it woke, so the
+// reconcile path needs the same boundary the claim path reads (§4.1).
+func (q *Queries) MarkPhaseReconciling(ctx context.Context, id uuid.UUID) (MarkPhaseReconcilingRow, error) {
 	row := q.db.QueryRow(ctx, markPhaseReconciling, id)
-	var i PhaseRun
+	var i MarkPhaseReconcilingRow
 	err := row.Scan(
 		&i.ID,
 		&i.RunID,
@@ -1103,6 +1146,7 @@ func (q *Queries) MarkPhaseReconciling(ctx context.Context, id uuid.UUID) (Phase
 		&i.FinishedAt,
 		&i.Outcome,
 		&i.CreatedAt,
+		&i.RunWallDeadline,
 	)
 	return i, err
 }

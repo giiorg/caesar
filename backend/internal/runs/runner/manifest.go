@@ -25,6 +25,10 @@ type attemptManifest struct {
 	CredentialID string  `json:"credential_id"`
 	Kind         string  `json:"credential_kind"`
 	Custody      custody `json:"custody"`
+	// HarnessKind is adoption's route back to the driver: without it a
+	// crash-adopted nonzero exit has no marker table to read, and a cap hit
+	// would be charged to the node as a generic harness failure.
+	HarnessKind string `json:"harness_kind"`
 	// SecretVersion is the version actually delivered. For a leased kind it
 	// is the version the acquire transaction granted, and adoption refuses to
 	// publish unless the store still holds THIS version: a mid-attempt
@@ -53,6 +57,7 @@ func manifestFor(req runs.ExecutionRequest, spec RunSpec, lease Lease) attemptMa
 		CredentialID:  req.Credential.ID.String(),
 		Kind:          req.Credential.Kind,
 		Custody:       spec.Custody,
+		HarnessKind:   spec.Harness.Kind,
 		SecretVersion: lease.SecretVersion,
 		Epoch:         lease.Epoch,
 	}

@@ -375,7 +375,11 @@ func (o *Orchestrator) sweepExpiredLeases(ctx context.Context) error {
 			o.log.Error("orchestrator: mark reconciling", "phase", phaseID, "error", err)
 			continue
 		}
-		o.reconcileAttempt(ctx, row, true)
+		o.reconcileAttempt(ctx, reconcileRow{
+			PhaseID: row.ID, RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt,
+			ChargeableFailures: row.ChargeableFailures, MaxAttempts: row.MaxAttempts,
+			ClaimedAt: row.ClaimedAt, RunWallDeadline: row.RunWallDeadline,
+		}, true)
 	}
 	return nil
 }
@@ -396,21 +400,41 @@ func (o *Orchestrator) sweepStuckReconciling(ctx context.Context) error {
 		return err
 	}
 	for _, row := range rows {
-		o.reconcileAttempt(ctx, row, false)
+		o.reconcileAttempt(ctx, reconcileRow{
+			PhaseID: row.ID, RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt,
+			ChargeableFailures: row.ChargeableFailures, MaxAttempts: row.MaxAttempts,
+			ClaimedAt: row.ClaimedAt, RunWallDeadline: row.RunWallDeadline,
+		}, false)
 	}
 	return nil
 }
 
+// reconcileRow is one attempt the reconcile path owns, in the shape both
+// entry points share: the lease sweep and the stuck sweep read the same
+// columns through different statements, and neither generated row type is
+// the other's.
+type reconcileRow struct {
+	PhaseID            uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	ChargeableFailures int32
+	MaxAttempts        int32
+	ClaimedAt          *time.Time
+	RunWallDeadline    time.Time
+}
+
 // reconcileAttempt runs reconcile-before-retry for one row already in
-// 'reconciling' (spec §3): adopt a completed execution idempotently,
-// anything else concludes transient reconcile_lost. announce writes the
-// phase.reconciling event — true for the lease sweep, which is what put
+// 'reconciling' (spec §3): adopt a completed execution idempotently, adopt a
+// completed FAILURE as the typed outcome the harness reported, and conclude
+// anything genuinely unadoptable as transient reconcile_lost. announce writes
+// the phase.reconciling event — true for the lease sweep, which is what put
 // the row in the state, false for the stuck sweep, where the process
 // that died already announced it.
-func (o *Orchestrator) reconcileAttempt(ctx context.Context, row store.PhaseRun, announce bool) {
+func (o *Orchestrator) reconcileAttempt(ctx context.Context, row reconcileRow, announce bool) {
 	cp, err := o.loadPlan(ctx, row.RunID)
 	if err != nil {
-		o.log.Error("orchestrator: reconcile plan load", "phase", row.ID, "error", err)
+		o.log.Error("orchestrator: reconcile plan load", "phase", row.PhaseID, "error", err)
 		return
 	}
 	ref := AttemptRef{RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt}
@@ -422,7 +446,7 @@ func (o *Orchestrator) reconcileAttempt(ctx context.Context, row store.PhaseRun,
 				CorrelationID: ref.String(), Payload: map[string]any{"node_id": row.NodeID, "attempt": row.Attempt},
 			}})
 		}); err != nil {
-			o.log.Error("orchestrator: reconciling event", "phase", row.ID, "error", err)
+			o.log.Error("orchestrator: reconciling event", "phase", row.PhaseID, "error", err)
 		}
 	}
 
@@ -432,24 +456,36 @@ func (o *Orchestrator) reconcileAttempt(ctx context.Context, row store.PhaseRun,
 		o.evaluate(ctx, "", cp, claimedFromRow(row), PhaseReconciling, ExecutionResult{}, OutcomeError{Outcome: out})
 		return
 	}
+	if ins.Outcome != nil {
+		// The attempt finished and said why it failed. That answer is the
+		// evaluation: a cap wait parks with its own reset, a dead credential
+		// terminalizes naming itself — neither is a lost attempt, and
+		// reconcile_lost would charge the node for both.
+		o.evaluate(ctx, "", cp, claimedFromRow(row), PhaseReconciling, ins.Result, OutcomeError{Outcome: *ins.Outcome})
+		return
+	}
 	// Completed with intact outputs: adopt idempotently.
 	o.evaluate(ctx, "", cp, claimedFromRow(row), PhaseReconciling, ins.Result, nil)
 }
 
-func claimedFromRow(row store.PhaseRun) claimed {
+func claimedFromRow(row reconcileRow) claimed {
 	claimedAt := time.Time{}
 	if row.ClaimedAt != nil {
 		claimedAt = *row.ClaimedAt
 	}
 	return claimed{
-		PhaseID: row.ID,
+		PhaseID: row.PhaseID,
 		Ref:     AttemptRef{RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt},
 		// The counter must travel every path that evaluates a failure, or
 		// reconcile would restart the node's failure budget each time and
 		// a lost attempt could never exhaust.
 		ChargeableFailures: row.ChargeableFailures,
 		MaxAttempts:        row.MaxAttempts,
-		ClaimedAt:          claimedAt,
+		// The deadline travels for the adopted waits: a reconciled
+		// rate_limited is a real uncharged retry, and it must park or
+		// terminalize on exactly the boundary the worker path uses.
+		RunWallDeadline: row.RunWallDeadline,
+		ClaimedAt:       claimedAt,
 	}
 }
 
@@ -803,9 +839,10 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 			return false, err
 		}
 		nb := dbNow.Add(retryDelay(out, dbNow, c.Ref.Attempt-1-c.ChargeableFailures, o.jitter))
-		// RunWallDeadline is zero on the reconcile path (claimedFromRow),
-		// where every outcome is still chargeable — so this comparison is
-		// unreachable from there until Task 7 makes reconciled waits real.
+		// Both paths carry the deadline: an adopted cap wait is as real a
+		// wait as the worker's own, and it parks or terminalizes on the same
+		// boundary. A zero deadline means nobody read one, which is not a
+		// licence to park past it — it only skips a comparison with nothing.
 		if !c.RunWallDeadline.IsZero() && nb.After(c.RunWallDeadline) {
 			// Never park a row that could not legally run when it woke.
 			retry, parkedPastDeadline = false, true

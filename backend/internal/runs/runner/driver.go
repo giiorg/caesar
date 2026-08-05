@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/giiorg/caesar/backend/internal/runs"
 	"github.com/giiorg/caesar/backend/internal/runs/egress"
@@ -28,8 +30,8 @@ const (
 )
 
 // exitRule maps one recognizable ending of a harness process onto a typed
-// outcome. Rows land in Task 7; the shape is here because the driver is the
-// one place per-harness knowledge lives.
+// outcome. The rows are ordered and the driver is the one place per-harness
+// knowledge lives.
 type exitRule struct {
 	pattern           *regexp.Regexp
 	code              string
@@ -74,7 +76,7 @@ type driver struct {
 	custodyFor   map[string]custody // credential kind → custody mode
 	brokered     brokeredProfile
 	env          func(envInput) []string
-	exitMap      []exitRule // rows land in Task 7
+	exitMap      []exitRule // ordered: mapExit takes the first match
 	sensitive    func(secret []byte) ([][]byte, error)
 	identity     func(secret []byte) (string, error) // nil = no identity pin (static kinds)
 	authMount    *authMount                          // nil = env-delivered credential
@@ -108,6 +110,24 @@ var drivers = map[string]driver{
 				"DISABLE_AUTOUPDATER=1",
 			}
 		},
+		// Recorded 2026-08-05 against Claude Code v2.1.222 (the Task 14 smoke
+		// run re-verifies against whatever ships). The epoch-bearing cap
+		// marker comes first: when the CLI names the moment the window
+		// reopens, the retry must wait for THAT time, not for our own guess.
+		exitMap: []exitRule{
+			{
+				pattern: regexp.MustCompile(`(?i)usage limit reached\|(\d{9,12})`),
+				code:    runs.CodeRateLimited, class: runs.OutcomeTransient, resetEpochCapture: true,
+			},
+			{
+				pattern: regexp.MustCompile(`(?i)(?:5-hour|usage) limit reached`),
+				code:    runs.CodeRateLimited, class: runs.OutcomeTransient,
+			},
+			{
+				pattern: regexp.MustCompile(`Invalid API key|OAuth token (?:revoked|expired)|Please run /login`),
+				code:    runs.CodeAuthExpired, class: runs.OutcomePermanent,
+			},
+		},
 		sensitive: func(secret []byte) ([][]byte, error) { return [][]byte{secret}, nil },
 		// identity nil: a static token has no read-back and no identity pin.
 	},
@@ -134,6 +154,24 @@ var drivers = map[string]driver{
 			}
 			return []string{"CODEX_HOME=/caesar-auth"}
 		},
+		// PROVISIONAL: no recorded corpus for this CLI yet. Task 13's fakecli
+		// speaks these exact markers, and the Task 14 smoke run replaces them
+		// with recorded ones. The epoch row leads for the same reason it does
+		// under claude-code: a stated reset outranks a guessed delay.
+		exitMap: []exitRule{
+			{
+				pattern: regexp.MustCompile(`(?i)usage limit reached\|(\d{9,12})`),
+				code:    runs.CodeRateLimited, class: runs.OutcomeTransient, resetEpochCapture: true,
+			},
+			{
+				pattern: regexp.MustCompile(`(?i)(?:usage|rate) limit`),
+				code:    runs.CodeRateLimited, class: runs.OutcomeTransient,
+			},
+			{
+				pattern: regexp.MustCompile(`(?i)401 unauthorized|token .*(?:expired|invalid)|codex login`),
+				code:    runs.CodeAuthExpired, class: runs.OutcomePermanent,
+			},
+		},
 		sensitive: codexSensitive,
 		identity:  codexIdentity,
 		authMount: &authMount{containerPath: "/caesar-auth", envVar: "CODEX_HOME", file: "auth.json"},
@@ -150,6 +188,35 @@ func driverFor(kind string) (driver, error) {
 		return driver{}, fmt.Errorf("runner: unknown harness kind %q", kind)
 	}
 	return d, nil
+}
+
+// mapExit reads meaning into a nonzero exit the only way a harness offers it:
+// recorded output markers over the log tail (spec §4). Rules are ordered —
+// first match wins — and anything unmatched stays a transient harness_error,
+// exactly what collect did before drivers existed. Exit 0 never arrives here:
+// the caller gates on it.
+func mapExit(d driver, exitCode int64, tail []byte) runs.Outcome {
+	for _, rule := range d.exitMap {
+		m := rule.pattern.FindSubmatch(tail)
+		if m == nil {
+			continue
+		}
+		out := runs.Outcome{
+			Class: rule.class, Code: rule.code,
+			Message: fmt.Sprintf("harness exited %d: %s", exitCode, rule.pattern.String()),
+		}
+		if rule.resetEpochCapture && len(m) > 1 {
+			if sec, err := strconv.ParseInt(string(m[1]), 10, 64); err == nil {
+				at := time.Unix(sec, 0).UTC()
+				out.RetryAt = &at // sanity clamping is retryDelay's job (spec §4.1)
+			}
+		}
+		return out
+	}
+	return runs.Outcome{
+		Class: runs.OutcomeTransient, Code: runs.CodeHarnessError,
+		Message: fmt.Sprintf("harness exited %d", exitCode),
+	}
 }
 
 // custodyOf says how this harness may hold that credential kind. A pairing

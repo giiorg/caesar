@@ -163,6 +163,7 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	}
 	res, err := r.collectResult(ctx, collection{
 		Ref: ref, BaseSHA: spec.BaseSHA, User: spec.User,
+		Kind: spec.Harness.Kind, CredentialID: req.Credential.ID,
 		ExitCode: agent.exitCode, OOM: agent.oom,
 	})
 	if err != nil {

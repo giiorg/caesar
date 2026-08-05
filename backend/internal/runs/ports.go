@@ -130,6 +130,11 @@ type ExecutionResult struct {
 type InspectResult struct {
 	Completed bool
 	Result    ExecutionResult
+	// Outcome is the adopted attempt's typed FAILURE, when it has one: a
+	// harness that finished and said why (a cap window with its reset, a dead
+	// credential) is adopted as that answer rather than degraded to
+	// reconcile_lost. nil means the completion succeeded; Result carries it.
+	Outcome *Outcome
 }
 
 // NotImplementedExecutor is wired in production serve until Plan 06: a
