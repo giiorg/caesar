@@ -8,11 +8,14 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 	"github.com/giiorg/caesar/backend/internal/runs"
+	"github.com/giiorg/caesar/backend/internal/runs/runner/gitops"
 )
 
 // The read-back fixtures. Every well-formed one carries the refresh token the
@@ -336,12 +339,9 @@ func TestConcludeCredential_CrashMatrix(t *testing.T) {
 			// an eternal credential_busy. The release is what frees the next
 			// claimant.
 			name: "well-formed file without a refresh token is refused before commit",
-			prepare: func(t *testing.T, r *Runner, ref runs.AttemptRef, l *fakeLeaser, credID uuid.UUID) attemptManifest {
+			prepare: func(t *testing.T, r *Runner, ref runs.AttemptRef, _ *fakeLeaser, credID uuid.UUID) attemptManifest {
 				m := seedSyncFixture(t, r, ref, credID)
 				rewriteAuthFile(t, r, ref, noRefreshCodexJSON)
-				if _, _, err := l.Acquire(context.Background(), credID, ref.String()); err != nil {
-					t.Fatalf("seeding the held lease: %v", err)
-				}
 				return m
 			},
 			wantStatus: "unscannable", wantReleases: 1,
@@ -394,7 +394,9 @@ func TestConcludeCredential_CrashMatrix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			credID, ref := uuid.New(), testRef()
-			leaser := &fakeLeaser{}
+			// A conclusion always runs over a lease this attempt holds; the
+			// fake answers conflict to any heartbeat on a not-held one.
+			leaser := &fakeLeaser{held: true}
 			if tc.script != nil {
 				tc.script(leaser)
 			}
@@ -443,6 +445,46 @@ func TestConcludeCredential_CrashMatrix(t *testing.T) {
 				tc.check(t, r, ref, leaser, conc)
 			}
 		})
+	}
+}
+
+// The release is not the end of the attempt: collectResult runs the extraction
+// container after it, and that is real work many heartbeat intervals wide. A
+// heartbeat that outlived the release would land on a lease nobody holds, come
+// back as a conflict, and be read as a takeover — cancelling the attempt out
+// from under its own result collection and failing a run that had already
+// synced and released cleanly. So the heartbeat stops before the conclusion
+// starts, and nothing here may tick after the release.
+func TestExecute_TheHeartbeatStopsBeforeTheConclusionReleases(t *testing.T) {
+	credID, ref := uuid.New(), testRef()
+	dataRoot := t.TempDir()
+	eng := newLeaseEngine()
+	eng.onCreate[stageName(ref)] = func(dockerapi.ContainerConfig) error {
+		return writeContract(filepath.Join(dataRoot, "attempts", ref.String(), gitops.StageReportFile),
+			gitops.StageReport{Verified: true, HeadSHA: "abc"})
+	}
+	// Extraction is deliberately slow against a 5ms heartbeat: the post-release
+	// window is what the ordering has to keep empty, and a window shorter than
+	// one tick would prove nothing.
+	eng.onCreate[extractName(ref)] = func(dockerapi.ContainerConfig) error {
+		time.Sleep(100 * time.Millisecond)
+		return writeContract(filepath.Join(dataRoot, "attempts", ref.String(), gitops.ExtractReportFile),
+			gitops.ExtractReport{BaseSHA: "abc", TreeHash: "tree-1"})
+	}
+	leaser := &fakeLeaser{lease: Lease{Epoch: 1, SecretVersion: 9}, secret: []byte(codexAuthJSON)}
+	r := newLeaseRunner(t, eng, leaser, &recordingOpener{},
+		Options{DataRoot: dataRoot, testLeaseHeartbeatInterval: 5 * time.Millisecond})
+
+	if _, err := r.Execute(t.Context(), leaseRequest(credID, kindAgentAuthFile)); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if _, _, released := leaser.calls(); len(released) != 1 {
+		t.Fatalf("Release calls = %+v, want exactly one: the CLI never wrote, so the conclusion is clean", released)
+	}
+	if after := leaser.heartbeatsAfterRelease(); after != 0 {
+		t.Errorf("%d heartbeats arrived after the lease was released, want none: "+
+			"the aggregate answers those with a conflict, and this worker reads a conflict as a fence", after)
 	}
 }
 

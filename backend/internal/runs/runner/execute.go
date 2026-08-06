@@ -117,6 +117,7 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 		concluded = true
 		return r.concludeCredential(ctx, ref, m, req.Credential.ID)
 	}
+	stopHeartbeat := func() {}
 	if leased {
 		lease, secret, err := r.acquireCredential(ctx, ref, req.Credential)
 		if err != nil {
@@ -135,7 +136,7 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 				conclude()
 			}
 		}()
-		stopHeartbeat := r.startLeaseHeartbeat(ctx, req.Credential.ID, ref, g.epoch, cancelAttempt)
+		stopHeartbeat = r.startLeaseHeartbeat(ctx, req.Credential.ID, ref, g.epoch, cancelAttempt)
 		defer stopHeartbeat()
 	} else {
 		// Unleased credentials are infrastructure here: an unavailable secret
@@ -209,6 +210,11 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	// whatever the agent exited with — quarantine first, then an unresolved
 	// sync, then the agent's own outcome.
 	if leased {
+		// The heartbeat stops (and its goroutine joins) before the conclusion
+		// releases: a tick landing after the release reads as a fence at the
+		// aggregate, and the resulting cancel would fail the result collection
+		// of an attempt that had already synced and released cleanly.
+		stopHeartbeat()
 		switch conc := conclude(); {
 		case conc.Outcome != nil:
 			return r.failureResult(ref, spec, agent), runs.OutcomeError{Outcome: *conc.Outcome}

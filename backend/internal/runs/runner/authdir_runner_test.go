@@ -37,7 +37,12 @@ cat > "$CODEX_HOME/auth.json" <<'EOF'
 EOF
 `
 	leaser := &fakeLeaser{lease: Lease{Epoch: 2, SecretVersion: 9}, secret: []byte(codexAuthJSON)}
-	r := newDockerRunner(t, Options{}, scriptedCodexHarness(script), &recordingSink{}, leaser)
+	// The fast heartbeat pins the stop-before-release ordering: the fake
+	// answers conflict to any heartbeat on a not-held lease, so a heartbeat
+	// goroutine still alive through the post-release extraction work would
+	// fence, cancel the attempt, and fail this run.
+	r := newDockerRunner(t, Options{testLeaseHeartbeatInterval: 50 * time.Millisecond},
+		scriptedCodexHarness(script), &recordingSink{}, leaser)
 	ref := dockerRef()
 	req := codexAuthRequest(t, ref, fixtureSHA(t))
 

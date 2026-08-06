@@ -56,6 +56,9 @@ type fakeLeaser struct {
 	// different epoch is fenced — the aggregate has moved past this worker.
 	currentEpoch int64
 	held         bool // lease taken and not yet released
+	// atRelease is how many heartbeats had been answered when the lease was
+	// handed back. Everything past it arrived on a lease nobody holds.
+	atRelease int
 
 	acquired    []leaseCall
 	heartbeats  []leaseCall
@@ -84,7 +87,11 @@ func (l *fakeLeaser) Heartbeat(_ context.Context, id uuid.UUID, ref string, epoc
 	n := len(l.heartbeats) + 1
 	l.heartbeats = append(l.heartbeats, leaseCall{credentialID: id, ref: ref, epoch: epoch})
 	hb := l.heartbeatErr
-	fenced := l.currentEpoch != 0 && epoch != l.currentEpoch
+	// A heartbeat on a lease nobody holds is a conflict, exactly as the real
+	// aggregate answers it: the row is gone. This is what pins the ordering
+	// of stopHeartbeat before the conclusion's release — a tick landing after
+	// the release reads as a fence and cancels the attempt.
+	fenced := (l.currentEpoch != 0 && epoch != l.currentEpoch) || !l.held
 	l.mu.Unlock()
 	if fenced {
 		return xerrors.E(xerrors.ClassConflict, "credential lease fenced")
@@ -125,8 +132,17 @@ func (l *fakeLeaser) Release(_ context.Context, id uuid.UUID, ref string, epoch 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.released = append(l.released, leaseCall{credentialID: id, ref: ref, epoch: epoch})
+	l.atRelease = len(l.heartbeats)
 	l.held = false
 	return nil
+}
+
+// heartbeatsAfterRelease is how many heartbeats arrived once the lease was
+// already handed back — the count a correct attempt keeps at zero.
+func (l *fakeLeaser) heartbeatsAfterRelease() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.heartbeats) - l.atRelease
 }
 
 func (l *fakeLeaser) MarkAuthExpired(_ context.Context, id uuid.UUID) error {
@@ -527,7 +543,7 @@ func TestLeaseHeartbeat_TicksUntilStoppedAndCancelsOnAFence(t *testing.T) {
 	credID, ref := uuid.New(), testRef()
 
 	t.Run("ticks at the configured interval and stops cleanly", func(t *testing.T) {
-		leaser := &fakeLeaser{}
+		leaser := &fakeLeaser{held: true}
 		r := newLeaseRunner(t, newLeaseEngine(), leaser, nil,
 			Options{testLeaseHeartbeatInterval: 5 * time.Millisecond})
 
@@ -551,7 +567,7 @@ func TestLeaseHeartbeat_TicksUntilStoppedAndCancelsOnAFence(t *testing.T) {
 	})
 
 	t.Run("a fenced heartbeat cancels the attempt", func(t *testing.T) {
-		leaser := &fakeLeaser{heartbeatErr: func(int) error {
+		leaser := &fakeLeaser{held: true, heartbeatErr: func(int) error {
 			return xerrors.E(xerrors.ClassConflict, "credential lease fenced")
 		}}
 		r := newLeaseRunner(t, newLeaseEngine(), leaser, nil,
@@ -570,7 +586,7 @@ func TestLeaseHeartbeat_TicksUntilStoppedAndCancelsOnAFence(t *testing.T) {
 	})
 
 	t.Run("a transient store error is not a fence", func(t *testing.T) {
-		leaser := &fakeLeaser{heartbeatErr: func(int) error { return errors.New("connection reset") }}
+		leaser := &fakeLeaser{held: true, heartbeatErr: func(int) error { return errors.New("connection reset") }}
 		r := newLeaseRunner(t, newLeaseEngine(), leaser, nil,
 			Options{testLeaseHeartbeatInterval: 5 * time.Millisecond})
 

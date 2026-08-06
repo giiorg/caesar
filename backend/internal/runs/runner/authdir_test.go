@@ -80,7 +80,7 @@ func TestMaterializeAuthDir_Permissions(t *testing.T) {
 // means relinquish, not delete.
 func TestRemoveAuthDirFenced_FencedWorkerRelinquishes(t *testing.T) {
 	credID, ref := uuid.New(), testRef()
-	leaser := &fakeLeaser{heartbeatErr: func(int) error {
+	leaser := &fakeLeaser{held: true, heartbeatErr: func(int) error {
 		return xerrors.E(xerrors.ClassConflict, "credential lease fenced")
 	}}
 	r := newLeaseRunner(t, newLeaseEngine(), leaser, nil, Options{})
@@ -106,7 +106,7 @@ func TestRemoveAuthDirFenced_FencedWorkerRelinquishes(t *testing.T) {
 // leaves the host with the manifest that described it.
 func TestRemoveAuthDirFenced_OwnerRemovesTheDirectoryAndTheManifest(t *testing.T) {
 	credID, ref := uuid.New(), testRef()
-	leaser := &fakeLeaser{}
+	leaser := &fakeLeaser{held: true}
 	r := newLeaseRunner(t, newLeaseEngine(), leaser, nil, Options{})
 	seedAuthDir(t, r, ref)
 
