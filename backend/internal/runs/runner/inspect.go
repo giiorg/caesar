@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -142,10 +143,21 @@ func (r *Runner) stopAttemptRuntime(ctx context.Context, ref runs.AttemptRef) er
 type credentialReconciliation struct {
 	Manifest    attemptManifest // in-memory copy; zero-valued when absent
 	HasManifest bool
-	Stored      []byte // stored credential bytes, opened pre-commit; nil if open failed
-	StoredOK    bool   // open succeeded AND at the version the manifest recorded
-	Concluded   bool   // a lease existed and concludeCredential ran
-	Conc        syncConclusion
+	// Bound is whether this attempt is known to have carried a credential at
+	// all: a readable manifest, a manifest file too corrupt for this build to
+	// act on, or a lease row naming it. It is the question adoption asks before
+	// it may publish against an empty set — "no credential" is the one case
+	// where empty IS the complete set, and every other reading of a missing
+	// manifest has to withhold.
+	Bound bool
+	// CredentialID is the binding the LEASE named, which is the recovery
+	// authority when the manifest is missing or unreadable. uuid.Nil when no
+	// lease was taken over.
+	CredentialID uuid.UUID
+	Stored       []byte // stored credential bytes, opened pre-commit; nil if open failed
+	StoredOK     bool   // open succeeded AND at the version the manifest recorded
+	Concluded    bool   // a lease existed and concludeCredential ran
+	Conc         syncConclusion
 }
 
 // takeoverCredential is stage 1: fence the paused owner (spec §2.1, §2.3 —
@@ -203,7 +215,9 @@ func (r *Runner) settleCredential(ctx context.Context, ref runs.AttemptRef,
 	// The manifest read is NOT gated on the lease: static kinds
 	// (subscription_token) write one with no lease behind it, and adoption
 	// needs it either way.
-	rec.Manifest, rec.HasManifest = r.readManifestForRecovery(ref)
+	var present bool
+	rec.Manifest, rec.HasManifest, present = r.readManifestForRecovery(ref)
+	rec.Bound, rec.CredentialID = present || held, credentialID
 	if rec.HasManifest {
 		// Open the stored credential BEFORE any CommitSync bumps the version:
 		// these are the only recoverable copy of the initially-materialized
@@ -237,17 +251,23 @@ func (r *Runner) settleCredential(ctx context.Context, ref runs.AttemptRef,
 
 // readManifestForRecovery reads the attempt manifest the way every recovery
 // path wants it: absent is the documented gap (a crash before the write), and
-// anything else is worth a line in the log but still reads as absent — a
+// anything else is worth a line in the log but still reads as unusable — a
 // manifest this build cannot parse is not one it may act on.
-func (r *Runner) readManifestForRecovery(ref runs.AttemptRef) (attemptManifest, bool) {
+//
+// present is the weaker fact that a manifest FILE was there at all. An
+// unparseable one says nothing about what the attempt held, but it does prove
+// the attempt held something — and adoption may not publish an attempt's bytes
+// against an empty set on the strength of a file it merely failed to read.
+func (r *Runner) readManifestForRecovery(ref runs.AttemptRef) (m attemptManifest, usable, present bool) {
 	m, err := r.readManifest(ref)
 	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			r.log.Warn("runner.reconcile.manifest", "attempt", ref.String(), "error", err)
+		if errors.Is(err, fs.ErrNotExist) {
+			return attemptManifest{}, false, false
 		}
-		return attemptManifest{}, false
+		r.log.Warn("runner.reconcile.manifest", "attempt", ref.String(), "error", err)
+		return attemptManifest{}, false, true
 	}
-	return m, true
+	return m, true, true
 }
 
 // attemptDirExists reports whether the attempt still has a working directory
@@ -318,6 +338,40 @@ func (r *Runner) adopt(ctx context.Context, ref runs.AttemptRef, insp dockerapi.
 		r.log.Warn("runner.reconcile.stage_contract", "attempt", ref.String(), "error", err)
 		return runs.InspectResult{}
 	}
+	// The dead worker's redaction set died with it, so it is rebuilt from the
+	// state the settlement captured — or this attempt publishes nothing at all.
+	// A read-back nobody could parse withholds for the same reason (spec §2.7):
+	// the refreshed value is unknowable, so no complete scan exists.
+	set, rebuilt := adoptionSensitive(rec)
+	withheld := !rebuilt || rec.Conc.Status == concUnscannable
+	if withheld {
+		r.log.Warn("runner.reconcile.withheld", "attempt", ref.String(),
+			"rebuilt", rebuilt, "conclusion", rec.Conc.Status)
+	}
+	if set == nil {
+		// A refused rebuild hands back nothing; the snapshot still redacts, with
+		// the empty set it is entitled to.
+		set = newSensitiveSet()
+	}
+	r.publishOrWithhold(ref, set, withheld)
+
+	// What the read-back found outranks what the agent exited with, exactly as
+	// it does on the live path: a quarantined credential is a permanent fact an
+	// operator has to act on, and reporting the exit's transient harness_error
+	// instead would schedule a retry doomed to meet the same broken credential.
+	switch {
+	case rec.Conc.Outcome != nil:
+		return r.adoptedFailure(ref, insp, set, withheld, *rec.Conc.Outcome)
+	case rec.Conc.Status == concFenced:
+		// A second reconciler took over in between; custody is its problem now,
+		// and this attempt requeues without charge.
+		return r.adoptedFailure(ref, insp, set, withheld, runs.Outcome{
+			Class: runs.OutcomeTransient, Code: runs.CodeCredentialBusy,
+			Message: fmt.Sprintf("credential %s: sync-back unresolved, custody belongs to reconciliation",
+				rec.CredentialID),
+		})
+	}
+
 	credentialID, _ := uuid.Parse(rec.Manifest.CredentialID) // no manifest, no binding: uuid.Nil
 	res, err := r.collectResult(ctx, collection{
 		Ref:          ref,
@@ -327,27 +381,16 @@ func (r *Runner) adopt(ctx context.Context, ref runs.AttemptRef, insp dockerapi.
 		CredentialID: credentialID,
 		ExitCode:     insp.State.ExitCode,
 		OOM:          insp.State.OOMKilled,
+		Sensitive:    set,
+		Unscannable:  withheld,
 	})
 	// A typed failure is an ADOPTED result, not a lost attempt: the harness
 	// finished and said why, and that answer — a cap window with its reset, a
 	// dead credential — must reach the orchestrator intact. Only an untyped
 	// error means adoption itself failed, which is what reconcile_lost is for.
-	//
-	// It carries the log pointer the worker path attaches to its own failures
-	// (execute.go failureResult), so an operator reading a run that died in
-	// reconciliation can still find the streams. The failure SNAPSHOT is
-	// deliberately not here: it embeds a log tail that has to be redacted with
-	// the attempt's secrets, and rebuilding that set from rec.Stored and the
-	// conclusion's recovered tokens is Task 11's work — a snapshot redacted
-	// with an empty set would look safe while carrying the credential verbatim.
 	var oe runs.OutcomeError
 	if errors.As(err, &oe) {
-		r.log.Info("runner.reconcile.adopted_outcome", "attempt", ref.String(), "code", oe.Outcome.Code)
-		return runs.InspectResult{
-			Completed: true,
-			Result:    runs.ExecutionResult{Artifacts: []runs.NewArtifact{r.logRefArtifact(ref)}},
-			Outcome:   &oe.Outcome,
-		}
+		return r.adoptedFailure(ref, insp, set, withheld, oe.Outcome)
 	}
 	if err != nil {
 		r.log.Warn("runner.reconcile.collect", "attempt", ref.String(), "error", err)
@@ -355,4 +398,20 @@ func (r *Runner) adopt(ctx context.Context, ref runs.AttemptRef, insp dockerapi.
 	}
 	r.log.Info("runner.reconcile.adopted", "attempt", ref.String(), "artifacts", len(res.Artifacts))
 	return runs.InspectResult{Completed: true, Result: res}
+}
+
+// adoptedFailure is one adopted attempt that ended badly, with the evidence the
+// worker path attaches to its own failures: the log pointer, so an operator
+// reading a run that died in reconciliation can still find the streams, and the
+// snapshot — which is only safe here because the set above was rebuilt from
+// trusted state. Under withholding both shrink exactly as they do live.
+func (r *Runner) adoptedFailure(ref runs.AttemptRef, insp dockerapi.ContainerInspect,
+	set *sensitiveSet, withheld bool, out runs.Outcome,
+) runs.InspectResult {
+	r.log.Info("runner.reconcile.adopted_outcome", "attempt", ref.String(), "code", out.Code)
+	return runs.InspectResult{
+		Completed: true,
+		Result:    r.failureResult(ref, agentOutcome{started: true, inspect: insp}, set, withheld),
+		Outcome:   &out,
+	}
 }

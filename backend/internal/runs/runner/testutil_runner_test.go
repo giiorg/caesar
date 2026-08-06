@@ -325,14 +325,6 @@ func decodedDiff(t *testing.T, payload map[string]any) string {
 	return string(raw)
 }
 
-func artifactsByType(arts []runs.NewArtifact) map[string]runs.NewArtifact {
-	out := make(map[string]runs.NewArtifact, len(arts))
-	for _, a := range arts {
-		out[a.Type] = a
-	}
-	return out
-}
-
 func implementRequest(t *testing.T, ref runs.AttemptRef, baseSHA string) runs.ExecutionRequest {
 	t.Helper()
 	return runs.ExecutionRequest{

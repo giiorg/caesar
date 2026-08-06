@@ -32,7 +32,7 @@ EOF
 		t.Fatal(err)
 	}
 
-	byType := artifactsByType(res.Artifacts)
+	byType := artifactTypes(res.Artifacts)
 	patch, ok := byType[runs.ArtifactKindPatch]
 	if !ok {
 		t.Fatalf("no patch artifact in %v", res.Artifacts)
@@ -104,7 +104,7 @@ wget -qO /workspace/models.json --header "x-api-key: $CAESAR_BROKER_TOKEN" "$CAE
 		}
 	}
 
-	patch := artifactsByType(res.Artifacts)[runs.ArtifactKindPatch].Payload
+	patch := artifactTypes(res.Artifacts)[runs.ArtifactKindPatch].Payload
 	diff := decodedDiff(t, patch)
 	if !strings.Contains(diff, "models.json") || !strings.Contains(diff, "claude-fable-5") {
 		t.Errorf("brokered response never reached the workspace: %q", diff)

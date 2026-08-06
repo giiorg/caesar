@@ -27,11 +27,20 @@ const (
 	credentialConcludeTimeout = 30 * time.Second
 )
 
+// The pinned syncConclusion.Status vocabulary. They are named rather than
+// spelled out at each site because two of them are read as decisions — a
+// mistyped comparison against concUnscannable would publish an attempt whose
+// bytes nothing scanned.
+const (
+	concClean       = "clean"       // nothing to sync
+	concSynced      = "synced"      // the refreshed credential was committed
+	concDiscarded   = "discarded"   // CAS lost to an operator rotation
+	concUnscannable = "unscannable" // read-back unusable: logs and artifacts withheld (§2.7)
+	concQuarantined = "quarantined" // read-back identity mismatch (§2.5)
+	concFenced      = "fenced"      // a reconciler owns the lease now
+)
+
 // syncConclusion is what concluding the credential obligation left behind.
-// Status vocabulary (pinned): "clean" (nothing to sync), "synced" (committed),
-// "discarded" (CAS lost to an operator rotation), "unscannable" (read-back
-// unusable — Task 11 withholds this attempt's logs and artifacts),
-// "quarantined" (identity mismatch), "fenced" (a reconciler owns the lease now).
 type syncConclusion struct {
 	Status             string
 	RefreshedSensitive [][]byte      // token fields recovered from the read-back file
@@ -58,12 +67,12 @@ func (r *Runner) concludeCredential(ctx context.Context, ref runs.AttemptRef, m 
 	}
 	if m.AuthDir == "" { // env-delivered credential: nothing mutable to guard
 		release()
-		return syncConclusion{Status: "clean"}
+		return syncConclusion{Status: concClean}
 	}
 	raw, ok := r.readAuthFile(ref)
 	if !ok {
 		release() // store preserved; the credential may be dead (§2.7 accepted loss window)
-		return syncConclusion{Status: "unscannable"}
+		return syncConclusion{Status: concUnscannable}
 	}
 	sens, _ := codexSensitive(raw) // best-effort even before identity: these bytes must never publish
 	if bytes.Equal(raw, m.secretBytes) {
@@ -71,17 +80,17 @@ func (r *Runner) concludeCredential(ctx context.Context, ref runs.AttemptRef, m 
 		// bytes (the manifest never serializes them) skip this shortcut and
 		// let the CAS settle it — already_applied and cas_lost cover them.
 		if !r.removeAuthDirFenced(ctx, ref, credentialID, m.Epoch) {
-			return syncConclusion{Status: "fenced", RefreshedSensitive: sens}
+			return syncConclusion{Status: concFenced, RefreshedSensitive: sens}
 		}
 		release()
-		return syncConclusion{Status: "clean", RefreshedSensitive: sens}
+		return syncConclusion{Status: concClean, RefreshedSensitive: sens}
 	}
 	id, err := codexIdentity(raw)
 	if err != nil {
 		// Identity unreadable = no complete scan: same terminal shape as any
 		// other unscannable read-back, and the store stays as it was.
 		release()
-		return syncConclusion{Status: "unscannable", RefreshedSensitive: sens}
+		return syncConclusion{Status: concUnscannable, RefreshedSensitive: sens}
 	}
 	if id != m.Identity {
 		// Agent-authored substitution (spec §2.5): preserve the store, type
@@ -91,7 +100,7 @@ func (r *Runner) concludeCredential(ctx context.Context, ref runs.AttemptRef, m 
 				"credential", credentialID.String(), "error", err)
 		}
 		release()
-		return syncConclusion{Status: "quarantined", RefreshedSensitive: sens, Outcome: &runs.Outcome{
+		return syncConclusion{Status: concQuarantined, RefreshedSensitive: sens, Outcome: &runs.Outcome{
 			Class: runs.OutcomePermanent, Code: runs.CodeCredentialQuarantined,
 			Message: fmt.Sprintf("credential %s: read-back identity mismatch; stored credential preserved", credentialID),
 		}}
@@ -103,7 +112,7 @@ func (r *Runner) concludeCredential(ctx context.Context, ref runs.AttemptRef, m 
 		// is handed back — the no-release path is ONLY for fencing and infra
 		// uncertainty. Store preserved, evidence retained.
 		release()
-		return syncConclusion{Status: "unscannable", RefreshedSensitive: sens}
+		return syncConclusion{Status: concUnscannable, RefreshedSensitive: sens}
 	case err != nil:
 		// Infra uncertainty: the commit may or may not have landed, so this
 		// worker keeps its hands off — the lease stays held and the stale-
@@ -111,18 +120,18 @@ func (r *Runner) concludeCredential(ctx context.Context, ref runs.AttemptRef, m 
 		// that retry idempotent).
 		r.log.Warn("runner.credential_sync", "attempt", ref.String(),
 			"credential", credentialID.String(), "error", err)
-		return syncConclusion{Status: "fenced", RefreshedSensitive: sens}
+		return syncConclusion{Status: concFenced, RefreshedSensitive: sens}
 	case status == SyncStatusFenced:
-		return syncConclusion{Status: "fenced", RefreshedSensitive: sens}
+		return syncConclusion{Status: concFenced, RefreshedSensitive: sens}
 	}
 	r.removeAuthDirFenced(ctx, ref, credentialID, m.Epoch)
 	release()
 	if status == SyncStatusCASLost {
 		// An operator rotated mid-attempt: the stale snapshot dies quietly
 		// (the discard is audited assets-side).
-		return syncConclusion{Status: "discarded", RefreshedSensitive: sens}
+		return syncConclusion{Status: concDiscarded, RefreshedSensitive: sens}
 	}
-	return syncConclusion{Status: "synced", RefreshedSensitive: sens}
+	return syncConclusion{Status: concSynced, RefreshedSensitive: sens}
 }
 
 // readAuthFile is the read gate over the one agent-writable file on the host:

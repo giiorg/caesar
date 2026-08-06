@@ -19,7 +19,7 @@ import (
 // containers and the workspace.
 func assertFailureArtifacts(t *testing.T, res runs.ExecutionResult) map[string]any {
 	t.Helper()
-	byType := artifactsByType(res.Artifacts)
+	byType := artifactTypes(res.Artifacts)
 	if _, ok := byType[runs.ArtifactKindLogRef]; !ok {
 		t.Fatalf("no log_ref artifact in %v", res.Artifacts)
 	}
@@ -186,7 +186,7 @@ exit 0`
 	}
 
 	// The meter, by contrast, counted every one of them.
-	egress, ok := artifactsByType(res.Artifacts)[runs.ArtifactKindLogRef].Payload["egress"].(map[string]any)
+	egress, ok := artifactTypes(res.Artifacts)[runs.ArtifactKindLogRef].Payload["egress"].(map[string]any)
 	if !ok {
 		t.Fatalf("log_ref has no egress map: %v", res.Artifacts)
 	}

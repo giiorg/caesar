@@ -52,7 +52,7 @@ EOF
 	}
 
 	// Delivery: what the container hashed is what the lease granted.
-	diff := decodedDiff(t, artifactsByType(res.Artifacts)[runs.ArtifactKindPatch].Payload)
+	diff := decodedDiff(t, artifactTypes(res.Artifacts)[runs.ArtifactKindPatch].Payload)
 	granted := sha256.Sum256([]byte(codexAuthJSON))
 	if !strings.Contains(diff, hex.EncodeToString(granted[:])) {
 		t.Errorf("the agent hashed something other than the granted credential:\n%s", diff)

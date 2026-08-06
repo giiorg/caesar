@@ -97,21 +97,26 @@ func (r *Runner) SweepOrphans(ctx context.Context, olderThan time.Duration) erro
 	// Containers first: a network still holding an endpoint cannot be
 	// removed, and the endpoints worth removing are the ones just swept.
 	r.removeByName(ctx, staleContainers, staleNetworks)
-	dirs, dirErr := r.sweepAttemptDirs(cutoff)
+	dirs, dirErr := r.sweepStaleDirs(filepath.Join(r.opts.DataRoot, "attempts"), cutoff)
+	// A quarantine outlives publication only when the attempt was withheld, and
+	// a withheld attempt can never be published later: its refreshed credential
+	// is unknowable forever (spec §2.7). So the evidence ages out with the
+	// attempt directory rather than accumulating without a reaper.
+	quar, quarErr := r.sweepStaleDirs(filepath.Join(r.opts.DataRoot, "quarantine"), cutoff)
 	creds, credErr := r.sweepCredentialLeftovers(ctx, cutoff)
-	if len(staleContainers) > 0 || len(staleNetworks) > 0 || dirs > 0 || creds > 0 {
+	if len(staleContainers) > 0 || len(staleNetworks) > 0 || dirs > 0 || quar > 0 || creds > 0 {
 		r.log.Info("runner.sweep", "containers", len(staleContainers), "networks", len(staleNetworks),
-			"attempt_dirs", dirs, "credential_leftovers", creds, "older_than", olderThan.String())
+			"attempt_dirs", dirs, "quarantine_dirs", quar, "credential_leftovers", creds,
+			"older_than", olderThan.String())
 	}
-	return errors.Join(listErr, netErr, dirErr, credErr)
+	return errors.Join(listErr, netErr, dirErr, quarErr, credErr)
 }
 
-// sweepAttemptDirs removes the attempt directories left behind by processes
-// that died before their own teardown, and reports how many went. The logs
-// directory is deliberately not swept: logs are evidence, and their retention
-// is a separate decision (Plan 13).
-func (r *Runner) sweepAttemptDirs(cutoff time.Time) (int, error) {
-	root := filepath.Join(r.opts.DataRoot, "attempts")
+// sweepStaleDirs removes the per-attempt directories under one root that were
+// left behind by processes that died before their own teardown, and reports
+// how many went. The published logs directory is deliberately never swept this
+// way: logs are evidence, and their retention is a separate decision (Plan 13).
+func (r *Runner) sweepStaleDirs(root string, cutoff time.Time) (int, error) {
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
@@ -127,7 +132,7 @@ func (r *Runner) sweepAttemptDirs(cutoff time.Time) (int, error) {
 		}
 		path := filepath.Join(root, e.Name())
 		if err := os.RemoveAll(path); err != nil {
-			r.log.Warn("runner.sweep.attempt_dir", "path", path, "error", err)
+			r.log.Warn("runner.sweep.dir", "path", path, "error", err)
 			continue
 		}
 		removed++

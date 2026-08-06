@@ -27,7 +27,7 @@ const probeFile = "probe.out"
 // report fails loudly with the agent's own output attached.
 func probeReport(t *testing.T, r *Runner, ref runs.AttemptRef, res runs.ExecutionResult) map[string]string {
 	t.Helper()
-	patch, ok := artifactsByType(res.Artifacts)[runs.ArtifactKindPatch]
+	patch, ok := artifactTypes(res.Artifacts)[runs.ArtifactKindPatch]
 	if !ok {
 		t.Fatalf("no patch artifact in %v\nagent log:\n%s", res.Artifacts, readLogFile(t, r, ref, agentLogFile))
 	}
@@ -241,7 +241,7 @@ exit 0
 
 	// The gateway's own meter agrees, and the counters ride out on the
 	// attempt's log_ref where the orchestrator reads them.
-	egress, ok := artifactsByType(res.Artifacts)[runs.ArtifactKindLogRef].Payload["egress"].(map[string]any)
+	egress, ok := artifactTypes(res.Artifacts)[runs.ArtifactKindLogRef].Payload["egress"].(map[string]any)
 	if !ok {
 		t.Fatalf("log_ref has no egress map: %v", res.Artifacts)
 	}
@@ -379,7 +379,7 @@ exit 0
 
 	// Nothing that outlives the attempt carries the secret either: not the
 	// patch the probe rode out on, not the captured streams.
-	patch := artifactsByType(res.Artifacts)[runs.ArtifactKindPatch].Payload
+	patch := artifactTypes(res.Artifacts)[runs.ArtifactKindPatch].Payload
 	for _, needle := range []string{forgeSecret, forgeSecretB64} {
 		if strings.Contains(decodedDiff(t, patch), needle) {
 			t.Errorf("the patch carries %q", needle)

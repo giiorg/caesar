@@ -26,7 +26,9 @@ func stageAttemptForInspect(t *testing.T, r *Runner, ref runs.AttemptRef) RunSpe
 	if err := os.MkdirAll(r.attemptDir(ref), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(r.logsDir(ref), 0o700); err != nil {
+	// The streams land in quarantine; publication is what moves them into the
+	// logs directory, and on this path adoption is what publishes.
+	if err := os.MkdirAll(r.quarantineDir(ref), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	req := implementRequest(t, ref, fixtureSHA(t))
@@ -103,7 +105,7 @@ EOF
 		t.Fatalf("a finished attempt with an intact workspace was not adopted: %+v", res)
 	}
 
-	byType := artifactsByType(res.Result.Artifacts)
+	byType := artifactTypes(res.Result.Artifacts)
 	patch, ok := byType[runs.ArtifactKindPatch]
 	if !ok {
 		t.Fatalf("adoption produced no patch: %v", res.Result.Artifacts)
@@ -153,6 +155,10 @@ func TestInspect_NonzeroExitIsAdoptedWithItsTypedOutcome(t *testing.T) {
 			if err := r.writeManifest(ref, attemptManifest{
 				CredentialID: uuid.NewString(), Kind: "model_key",
 				Custody: spec.Custody, HarnessKind: spec.Harness.Kind,
+				// The version the suite's credential store still holds: without
+				// it adoption cannot recover the bytes the container saw, and it
+				// would withhold this attempt's evidence (spec §3).
+				SecretVersion: 1,
 			}); err != nil {
 				t.Fatalf("write manifest: %v", err)
 			}
@@ -189,7 +195,7 @@ func TestInspect_NonzeroExitIsAdoptedWithItsTypedOutcome(t *testing.T) {
 		// An adopted failure owes the same evidence the worker path attaches
 		// to its own: without the log pointer, a run that died in
 		// reconciliation leaves nothing to read.
-		byType := artifactsByType(res.Result.Artifacts)
+		byType := artifactTypes(res.Result.Artifacts)
 		logRef, ok := byType[runs.ArtifactKindLogRef]
 		if !ok {
 			t.Fatalf("adopted failure carries no log_ref: %v", res.Result.Artifacts)
@@ -197,11 +203,14 @@ func TestInspect_NonzeroExitIsAdoptedWithItsTypedOutcome(t *testing.T) {
 		if logRef.Payload["streams"] == nil {
 			t.Errorf("log_ref payload = %v, want the captured streams", logRef.Payload)
 		}
-		// The failure snapshot belongs to the worker path until adoption can
-		// rebuild the redaction set (Task 11): an unredacted log tail in a
-		// stored artifact is a leaked credential.
-		if _, ok := byType[runs.ArtifactKindFailureSnapshot]; ok {
-			t.Error("adoption produced a failure snapshot it cannot redact")
+		// The snapshot rides along too, now that adoption rebuilds the
+		// redaction set its log tail is scrubbed with (Task 11).
+		snap, ok := byType[runs.ArtifactKindFailureSnapshot]
+		if !ok {
+			t.Fatalf("adopted failure carries no snapshot: %v", res.Result.Artifacts)
+		}
+		if snap.Payload["exit_code"] != int64(1) {
+			t.Errorf("snapshot exit_code = %v, want the harness's own 1", snap.Payload["exit_code"])
 		}
 	})
 
@@ -284,17 +293,22 @@ func TestSweepOrphans_RemovesOnlyOldLabeledResources(t *testing.T) {
 
 	create()
 	// The dirs half of the sweep answers to mtime, and must answer in both
-	// directions too.
-	attempts := filepath.Join(r.opts.DataRoot, "attempts")
-	stale, fresh := filepath.Join(attempts, "stale"), filepath.Join(attempts, "fresh")
-	for _, dir := range []string{stale, fresh} {
+	// directions too — over the attempt tree and over the quarantine, whose
+	// withheld evidence has no other reaper (spec §2.7).
+	var stale, fresh []string
+	for _, root := range []string{filepath.Join(r.opts.DataRoot, "attempts"), filepath.Join(r.opts.DataRoot, "quarantine")} {
+		stale, fresh = append(stale, filepath.Join(root, "stale")), append(fresh, filepath.Join(root, "fresh"))
+	}
+	for _, dir := range append(append([]string{}, stale...), fresh...) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	old := time.Now().Add(-48 * time.Hour)
-	if err := os.Chtimes(stale, old, old); err != nil {
-		t.Fatal(err)
+	for _, dir := range stale {
+		if err := os.Chtimes(dir, old, old); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if err := r.SweepOrphans(ctx, 24*time.Hour); err != nil {
@@ -307,11 +321,15 @@ func TestSweepOrphans_RemovesOnlyOldLabeledResources(t *testing.T) {
 		}
 	}
 	assertContainer(t, r, bystander)
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Errorf("a 48h-old attempt dir survived the sweep, stat err = %v", err)
+	for _, dir := range stale {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("a 48h-old %s survived the sweep, stat err = %v", dir, err)
+		}
 	}
-	if _, err := os.Stat(fresh); err != nil {
-		t.Errorf("a fresh attempt dir was swept: %v", err)
+	for _, dir := range fresh {
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("a fresh %s was swept: %v", dir, err)
+		}
 	}
 }
 
