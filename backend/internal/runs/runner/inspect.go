@@ -81,10 +81,14 @@ func (r *Runner) Inspect(ctx context.Context, ref runs.AttemptRef) (runs.Inspect
 	// finished at all.
 	if insp.State.Status != "exited" || !r.attemptDirExists(ref) ||
 		(ourKill && insp.State.ExitCode != 0) {
-		// Teardown force-removes the containers, and a force-remove kills:
-		// that is what makes the settlement's precondition hold on this path
-		// for a container the kill above could not stop. Nothing is adopted
-		// here, so losing the corpse costs nothing.
+		// The kill above may not have landed — that is one of the reasons this
+		// branch is reached — so the runtime is force-removed and the removal
+		// is checked. Nothing is adopted here, so losing the corpse costs
+		// nothing; settling over a container the daemon would not remove would
+		// cost the credential, because that container may still be writing it.
+		if err := r.stopAttemptRuntime(ctx, ref); err != nil {
+			return runs.InspectResult{}, err
+		}
 		r.teardown(ctx, ref)
 		r.settleCredential(ctx, ref, credID, lease, held)
 		return runs.InspectResult{}, nil

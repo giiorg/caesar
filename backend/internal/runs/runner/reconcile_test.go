@@ -44,13 +44,13 @@ func (j *journal) events() []string {
 func (j *journal) before(t *testing.T, first, second string) {
 	t.Helper()
 	ev := j.events()
-	i, j2 := slices.Index(ev, first), slices.Index(ev, second)
+	at, then := slices.Index(ev, first), slices.Index(ev, second)
 	switch {
-	case i < 0:
+	case at < 0:
 		t.Errorf("%q never happened; the sequence was %v", first, ev)
-	case j2 < 0:
+	case then < 0:
 		t.Errorf("%q never happened; the sequence was %v", second, ev)
-	case i > j2:
+	case at > then:
 		t.Errorf("%q happened after %q; the sequence was %v", first, second, ev)
 	}
 }
@@ -367,26 +367,41 @@ func TestReconcileCredential_SettlesWithoutAdopting(t *testing.T) {
 	assertAuthEvidence(t, f.r, f.ref, false)
 }
 
-// The settlement's precondition, enforced rather than assumed: a runtime the
-// daemon will not stop may still be writing auth.json, so nothing is read back
-// and nothing is released. The caller retries, and the lease stays held under
-// this reconciler's own epoch in the meantime.
-func TestReconcileCredential_WillNotSettleOverARuntimeItCannotStop(t *testing.T) {
-	f := newReconFixture(t, "running", 0)
-	f.seedCrashedAttempt(t, "still going")
-	rewriteAuthFile(t, f.r, f.ref, refreshedCodexJSON)
-	f.eng.removeErr = errors.New("daemon is wedged")
+// The settlement's precondition, enforced rather than assumed on BOTH entry
+// points: a runtime the daemon will not stop may still be writing auth.json, so
+// nothing is read back and nothing is released. The caller retries, and the
+// lease stays held under this reconciler's own epoch in the meantime.
+func TestReconciliation_WillNotSettleOverARuntimeItCannotStop(t *testing.T) {
+	settle := map[string]func(*Runner, context.Context, runs.AttemptRef) error{
+		"the janitor entry": func(r *Runner, ctx context.Context, ref runs.AttemptRef) error {
+			return r.ReconcileCredential(ctx, ref)
+		},
+		"the reconciling inspect": func(r *Runner, ctx context.Context, ref runs.AttemptRef) error {
+			_, err := r.Inspect(ctx, ref)
+			return err
+		},
+	}
+	for name, run := range settle {
+		t.Run(name, func(t *testing.T) {
+			f := newReconFixture(t, "running", 0)
+			f.seedCrashedAttempt(t, "still going")
+			rewriteAuthFile(t, f.r, f.ref, refreshedCodexJSON)
+			// The kill is accepted but the corpse cannot be removed, so this
+			// reconciliation cannot promise the container is gone.
+			f.eng.removeErr = errors.New("daemon is wedged")
 
-	if err := f.r.ReconcileCredential(t.Context(), f.ref); err == nil {
-		t.Fatal("want an error: the caller must not terminalize over an unsettled obligation")
+			if err := run(f.r, t.Context(), f.ref); err == nil {
+				t.Fatal("want an error: the caller must not terminalize over an unsettled obligation")
+			}
+			if commits := f.leaser.commitCalls(); len(commits) != 0 {
+				t.Errorf("commits = %+v, want none: a live agent may still be writing that file", commits)
+			}
+			if _, _, released := f.leaser.calls(); len(released) != 0 {
+				t.Errorf("releases = %+v, want none: releasing would let a second attempt start beside the first", released)
+			}
+			assertAuthEvidence(t, f.r, f.ref, true)
+		})
 	}
-	if commits := f.leaser.commitCalls(); len(commits) != 0 {
-		t.Errorf("commits = %+v, want none: a live agent may still be writing that file", commits)
-	}
-	if _, _, released := f.leaser.calls(); len(released) != 0 {
-		t.Errorf("releases = %+v, want none: releasing would let a second attempt start beside the first", released)
-	}
-	assertAuthEvidence(t, f.r, f.ref, true)
 }
 
 // An attempt with no lease behind it still hands adoption what it needs: the
