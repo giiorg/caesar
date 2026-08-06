@@ -104,8 +104,11 @@ func TestExecute_AnUnscannableReadBackStillTypesTheExit(t *testing.T) {
 		wantReset bool
 	}{
 		{
-			name:   "an auth-death marker",
-			marker: "401 Unauthorized",
+			name: "an auth-death marker",
+			// The CLI's own shape: the uppercase ERROR level marker is what the
+			// codex auth row requires, because a bare 401 line is something an
+			// agent pastes.
+			marker: "ERROR: 401 Unauthorized",
 			// The credential the operator has to replace, named — not a
 			// transient the scheduler will retry against the same dead token.
 			wantClass: runs.OutcomePermanent, wantCode: runs.CodeAuthExpired,

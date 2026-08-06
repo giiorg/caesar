@@ -643,7 +643,7 @@ Build the images first: `task image:harness`.
 
 Item 4 is the one with teeth, because the tables are not equally trustworthy:
 
-- **The `codex` rows are INVENTED** (`driver.go:205-235`). No recorded corpus
+- **The `codex` rows are INVENTED** (`driver.go:205-239`). No recorded corpus
   for that CLI exists; Task 13's fakecli fixture speaks these exact markers,
   which proves the mapping engine and says nothing about the CLI. If the real
   CLI speaks differently, cap hits charge as `harness_error` instead of parking,

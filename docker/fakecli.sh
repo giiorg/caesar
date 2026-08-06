@@ -133,7 +133,11 @@ while IFS= read -r line || [ -n "$line" ]; do
         fi
         ;;
     fakecli:auth-death)
-        echo "401 Unauthorized: token expired"
+        # The codex driver's auth-expired marker, in the shape the row now
+        # requires: the CLI's own uppercase ERROR level marker, then the
+        # message. A bare `401 Unauthorized` no longer classifies, because an
+        # agent pasting a log excerpt puts exactly that at column 0.
+        echo "ERROR: 401 Unauthorized: token expired"
         exit 1
         ;;
     fakecli:exit)

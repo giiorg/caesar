@@ -482,19 +482,22 @@ func TestMapExit_CodexMarkers(t *testing.T) {
 	}{
 		{"usage limit reached|1791234567", runs.CodeRateLimited, runs.OutcomeTransient, 1791234567},
 		{"rate limit exceeded", runs.CodeRateLimited, runs.OutcomeTransient, 0},
-		{"401 Unauthorized", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		// Both of codex's own error shapes, observed against v0.146.1 on
+		// 2026-08-06. The uppercase ERROR level marker is mandatory: it is the
+		// only part of these lines the CLI owns and an agent does not write.
+		{"ERROR: 401 Unauthorized", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
 		// The line docker/fakecli.sh speaks for `fakecli:auth-death`, so the
 		// e2e and the table cannot drift apart silently.
-		{"401 Unauthorized: token expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
-		{"refresh token has expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
-		{"access token expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
-		// Codex's own error shape, observed against v0.146.1 on 2026-08-06:
-		// the message trails a tracing preamble rather than opening the line.
+		{"ERROR: 401 Unauthorized: token expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
 		{
 			"2026-08-06T12:32:24.735772Z ERROR codex_api::endpoint::responses: 401 Unauthorized",
 			runs.CodeAuthExpired, runs.OutcomePermanent, 0,
 		},
 		{"ERROR: refresh token has expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		{
+			"2026-08-06T12:32:24.735772Z ERROR codex_core::auth: access token expired",
+			runs.CodeAuthExpired, runs.OutcomePermanent, 0,
+		},
 		{"segmentation fault", runs.CodeHarnessError, runs.OutcomeTransient, 0},
 		// The tail is the agent's own stdout, so a row must only match a
 		// phrase the CLI states about itself. An agent musing about rate
@@ -534,6 +537,17 @@ func TestMapExit_AuthRowsRejectAgentProse(t *testing.T) {
 		{"codex", "We got a 401 Unauthorized back from the API, so the access token expired."},
 		{"codex", "A 401 Unauthorized response means the credential was rejected."},
 		{"codex", "if that fails, tell the user to run codex login"},
+		// Opening a line is NOT enough on its own, and this project's own
+		// dogfooding is the trigger profile: an agent editing this very file,
+		// or pasting a log excerpt into its output, puts these at column 0.
+		// Only the CLI's uppercase ERROR level marker separates them from the
+		// real thing — `Error handling:` is prose and must stay prose.
+		{"codex", "401 Unauthorized responses are retried once by the client."},
+		{"codex", "401 Unauthorized: this happens when the key is stale, so I'll add a guard."},
+		{"codex", "Error handling: 401 Unauthorized should be surfaced to the operator."},
+		{"codex", "access token expired is the phrase the driver matches on."},
+		{"codex", "refresh token has expired -> auth_expired (see the table)"},
+		{"codex", "The log said:\n401 Unauthorized\nso I added a retry."},
 		// Bare fragments an agent types when it explains an auth failure it did
 		// not itself suffer. Every one of these matched before this row was
 		// narrowed.

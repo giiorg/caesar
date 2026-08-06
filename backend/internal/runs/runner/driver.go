@@ -219,16 +219,21 @@ var drivers = map[string]driver{
 				// writing "the token .* invalid case is handled below", and
 				// that match is permanent and stamps the credential.
 				//
-				// Each alternative now has to OPEN a line, which is where a CLI
-				// states an error about itself and where prose almost never
-				// puts one; `invalid` is gone outright, because no phrasing of
-				// it is a phrase the CLI owns. The optional preamble is codex's
-				// own observed error shape — running v0.146.1 with no route out
-				// (2026-08-06) yields both `ERROR: <msg>` and
-				// `<ts> ERROR <module>: <msg>` — and it is gated on the literal
-				// `error` so it cannot degrade into a free-floating prefix.
+				// `invalid` is gone outright — no phrasing of it is a phrase the
+				// CLI owns — and what remains is not allowed to stand on its own
+				// line either. Opening a line is a weak signal against THIS
+				// project's own agents: one editing this very file, or pasting a
+				// log excerpt, puts `401 Unauthorized` at column 0 as a matter
+				// of course. So the preamble is MANDATORY, and it is codex's own
+				// recorded error shape rather than the word "error": running
+				// v0.146.1 with no route out (2026-08-06) yields exactly
+				// `ERROR: <msg>` and `<ts> ERROR <module::path>: <msg>`. The
+				// `ERROR` is matched case-SENSITIVELY inside the row's (?i),
+				// which is what separates the CLI's own level marker from an
+				// agent's prose "Error handling: …" — the whole discriminator
+				// is that the CLI shouts and prose does not.
 				pattern: regexp.MustCompile(
-					`(?im)^(?:(?:\S+ +)?error\b[^\n]{0,60}?: +)?(?:401 unauthorized|(?:access|refresh|id) token (?:has )?expired)\b`),
+					`(?im)^(?:\S+ +)?(?-i:ERROR)(?: +\S+)?: +(?:401 unauthorized|(?:access|refresh|id) token (?:has )?expired)\b`),
 				code: runs.CodeAuthExpired, class: runs.OutcomePermanent,
 			},
 		},
