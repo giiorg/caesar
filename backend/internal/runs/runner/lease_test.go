@@ -400,6 +400,69 @@ func TestExecute_LeaseHeldElsewhereWaitsWithoutRunningAnything(t *testing.T) {
 	}
 }
 
+// Materializing a credential and leasing it are ONE decision, and this is the
+// property that stops them from drifting into two. Every driver/kind pair that
+// puts the operator's real credential on the host as a file must also take the
+// lease, because the lease is the entire custody protocol around that file:
+// single-flight, the heartbeat, the sync-back of whatever the CLI refreshed,
+// and the fence removeAuthDirFenced needs before it will delete the directory
+// at all. A pair that materialized without leasing would bind a live
+// credential into an agent, never conclude it, and leave it under
+// <DataRoot>/auth/ until the 25h orphan sweep — every step of that silent.
+//
+// The two shipped rows satisfy this through the credential-kind rule alone, so
+// they cannot fail it however needsLease is written. The registered fixture is
+// the case with teeth: THE NEXT DRIVER ROW — a harness that materializes an
+// auth file under some other kind — which only passes because needsLease asks
+// the driver instead of restating a kind list.
+func TestDriver_MaterializingAnAuthFileAlwaysTakesALease(t *testing.T) {
+	withTestDriver(t, "future-harness", driver{
+		kind:         "future-harness",
+		connectAllow: []string{"api.example.invalid"},
+		// Deliberately NOT agent_auth_file: this is the pairing a kind list
+		// would miss while the container still gets the operator's credential
+		// as a file.
+		custodyFor: map[string]custody{"subscription_token": custodyMaterialized},
+		env:        func(in envInput) []string { return []string{"TEST_AUTH=" + in.secret} },
+		sensitive:  func(secret []byte) ([][]byte, error) { return [][]byte{secret}, nil },
+		authMount:  &authMount{containerPath: "/caesar-auth", envVar: "TEST_HOME", file: "auth.json"},
+	})
+
+	kinds := map[string]bool{}
+	for _, d := range drivers {
+		for credKind := range d.custodyFor {
+			kinds[credKind] = true
+		}
+	}
+	for harness, d := range drivers {
+		for credKind := range kinds {
+			t.Run(harness+"/"+credKind, func(t *testing.T) {
+				cust, err := d.custodyOf(credKind)
+				if err != nil {
+					t.Skipf("%s cannot be handed a %s at all; buildSpec refuses the pair", harness, credKind)
+				}
+				if !d.materializesAuthFile(cust) {
+					return
+				}
+				if !d.needsLease(runs.CredentialBinding{ID: uuid.New(), Kind: credKind}) {
+					t.Errorf("%s materializes a %s onto the host and takes no lease: the credential "+
+						"would reach the agent with no single-flight, no sync-back, and no fence to "+
+						"clean it up", harness, credKind)
+				}
+			})
+		}
+	}
+	// An unbound attempt leases nothing whatever the table says — there is no
+	// credential to serialize on.
+	d, err := driverFor("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.needsLease(runs.CredentialBinding{Kind: kindAgentAuthFile}) {
+		t.Error("a nil credential id is not a binding, so there is nothing to lease")
+	}
+}
+
 // Static kinds are shareable: nothing a running attempt does can change a
 // model key, so serializing on one would only queue work behind itself. The
 // manifest is still written — adoption needs the credential identity to

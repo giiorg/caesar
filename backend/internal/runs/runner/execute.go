@@ -108,7 +108,7 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	// and the bytes of exactly the version it recorded, and that pairing is
 	// what lets sync-back's CAS tell an operator's rotation apart from the
 	// CLI's own refresh.
-	leased := needsLease(req.Credential)
+	leased := d.needsLease(req.Credential)
 	var g grant
 	// The manifest variable exists before the lease does so the deferred
 	// conclusion can read it: concludeCredential is the single choke point
