@@ -39,6 +39,17 @@ type exitRule struct {
 	resetEpochCapture bool // capture group 1 is a unix epoch → Outcome.RetryAt
 }
 
+// epochGuard closes the right-hand side of an epoch capture. Without it
+// `(\d{9,12})` is happy to take the first twelve digits of a THIRTEEN-digit
+// millisecond timestamp and call the result a second — a reset in the year
+// 7620. Nothing downstream would catch it: retryDelay takes a provider-stated
+// reset verbatim (retry.go — the cap and the jitter deliberately cannot
+// shorten it), and evaluateFailure then sees a not-before past the run's wall
+// deadline and TERMINALIZES the run instead of parking it. Failing the row
+// outright is the right answer: the tail still matches the plain cap rule
+// underneath, which waits on our own bounded guess.
+const epochGuard = `(?:\D|$)`
+
 // authMount is where a materialized credential lands inside the container and
 // the environment variable that points the CLI at it.
 type authMount struct{ containerPath, envVar, file string } // "/caesar-auth", "CODEX_HOME", "auth.json"
@@ -110,13 +121,14 @@ var drivers = map[string]driver{
 				"DISABLE_AUTOUPDATER=1",
 			}
 		},
-		// Recorded 2026-08-05 against Claude Code v2.1.222 (the Task 14 smoke
-		// run re-verifies against whatever ships). The epoch-bearing cap
-		// marker comes first: when the CLI names the moment the window
-		// reopens, the retry must wait for THAT time, not for our own guess.
+		// Recorded 2026-08-05 against Claude Code v2.1.222, except where a row
+		// says otherwise (the Task 14 smoke run re-verifies against whatever
+		// ships). The epoch-bearing cap marker comes first: when the CLI names
+		// the moment the window reopens, the retry must wait for THAT time,
+		// not for our own guess.
 		exitMap: []exitRule{
 			{
-				pattern: regexp.MustCompile(`(?i)usage limit reached\|(\d{9,12})`),
+				pattern: regexp.MustCompile(`(?i)usage limit reached\|(\d{9,12})` + epochGuard),
 				code:    runs.CodeRateLimited, class: runs.OutcomeTransient, resetEpochCapture: true,
 			},
 			{
@@ -124,8 +136,34 @@ var drivers = map[string]driver{
 				code:    runs.CodeRateLimited, class: runs.OutcomeTransient,
 			},
 			{
-				pattern: regexp.MustCompile(`Invalid API key|OAuth token (?:revoked|expired)|Please run /login`),
-				code:    runs.CodeAuthExpired, class: runs.OutcomePermanent,
+				// Every alternative is a completing phrase the CLI owns: a
+				// reason it states about itself, followed by the slash command
+				// only it can offer. The tail these run over is the AGENT'S OWN
+				// STDOUT, and this is the one row whose match is PERMANENT and
+				// writes to the operator's credential row (markAuthExpired,
+				// collect.go), so a bare `Invalid API key` or a bare `Please
+				// run /login` — phrases a model types in passing about a CLI it
+				// knows well — cannot stand alone here. The asymmetry is what
+				// decides it: missing a real auth death costs a retry (baked
+				// decision 13's transient harness_error, and the next attempt
+				// meets the same dead token), while a false match kills a live
+				// run permanently and flags a working credential.
+				//
+				// RECORDED VERBATIM (2026-08-06, the pinned v2.1.223 in
+				// caesar-harness-claude:dev): started uncredentialed the CLI
+				// prints `Not logged in · Please run /login` — one line, `·` as
+				// U+00B7, no escape sequences, exit 1. The separator is matched
+				// as bounded non-word runes rather than as those bytes: the log
+				// tail carries the CLI's output unmodified, so the U+00B7 does
+				// arrive intact, but a version that swaps it for `-` or `:`
+				// must not silently stop classifying.
+				//
+				// NARROWED ON REASONING (not recorded in this shape): the
+				// `invalid api key` and `oauth token …` reasons are v2.1.222
+				// corpus phrases refitted onto the renderer shape above.
+				pattern: regexp.MustCompile(
+					`(?im)^(?:not logged in|invalid api key|oauth token (?:revoked|expired))\W{1,8}please run /login`),
+				code: runs.CodeAuthExpired, class: runs.OutcomePermanent,
 			},
 		},
 		sensitive: func(secret []byte) ([][]byte, error) { return [][]byte{secret}, nil },
@@ -166,7 +204,7 @@ var drivers = map[string]driver{
 		// `codex login` would have its live credential stamped dead.
 		exitMap: []exitRule{
 			{
-				pattern: regexp.MustCompile(`(?i)usage limit reached\|(\d{9,12})`),
+				pattern: regexp.MustCompile(`(?i)usage limit reached\|(\d{9,12})` + epochGuard),
 				code:    runs.CodeRateLimited, class: runs.OutcomeTransient, resetEpochCapture: true,
 			},
 			{
@@ -174,8 +212,24 @@ var drivers = map[string]driver{
 				code:    runs.CodeRateLimited, class: runs.OutcomeTransient,
 			},
 			{
-				pattern: regexp.MustCompile(`(?i)401 unauthorized|token .*(?:expired|invalid)`),
-				code:    runs.CodeAuthExpired, class: runs.OutcomePermanent,
+				// PROVISIONAL like its siblings, and narrowed ON REASONING —
+				// there is nothing recorded to narrow onto. The rule three
+				// paragraphs up is the specification, and the row this replaces
+				// broke it: `(?i)token .*(?:expired|invalid)` matched an agent
+				// writing "the token .* invalid case is handled below", and
+				// that match is permanent and stamps the credential.
+				//
+				// Each alternative now has to OPEN a line, which is where a CLI
+				// states an error about itself and where prose almost never
+				// puts one; `invalid` is gone outright, because no phrasing of
+				// it is a phrase the CLI owns. The optional preamble is codex's
+				// own observed error shape — running v0.146.1 with no route out
+				// (2026-08-06) yields both `ERROR: <msg>` and
+				// `<ts> ERROR <module>: <msg>` — and it is gated on the literal
+				// `error` so it cannot degrade into a free-floating prefix.
+				pattern: regexp.MustCompile(
+					`(?im)^(?:(?:\S+ +)?error\b[^\n]{0,60}?: +)?(?:401 unauthorized|(?:access|refresh|id) token (?:has )?expired)\b`),
+				code: runs.CodeAuthExpired, class: runs.OutcomePermanent,
 			},
 		},
 		sensitive: codexSensitive,

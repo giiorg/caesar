@@ -440,8 +440,16 @@ func TestMapExit_ClaudeMarkers(t *testing.T) {
 		// recorded 2026-08-05, v2.1.222; re-verified by the Task 14 smoke run
 		{"Claude AI usage limit reached|1754398800", runs.CodeRateLimited, runs.OutcomeTransient, 1754398800},
 		{"5-hour limit reached ∙ resets 6pm", runs.CodeRateLimited, runs.OutcomeTransient, 0},
+		// Recorded VERBATIM against the pinned v2.1.223 image, uncredentialed:
+		// this exact line, `·` as U+00B7, is what the CLI prints before exit 1.
+		{"Not logged in · Please run /login", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
 		{"Invalid API key · Please run /login", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
-		{"OAuth token revoked", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		{"OAuth token revoked · Please run /login", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		// The separator is matched as bounded non-word runes, never as the
+		// U+00B7 bytes: a version that renders the same line with a hyphen
+		// still has to classify as a dead credential.
+		{"Invalid API key - Please run /login", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		{"OAuth token expired: Please run /login", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
 		{"panic: something else entirely", runs.CodeHarnessError, runs.OutcomeTransient, 0},
 	}
 	for _, c := range cases {
@@ -475,7 +483,18 @@ func TestMapExit_CodexMarkers(t *testing.T) {
 		{"usage limit reached|1791234567", runs.CodeRateLimited, runs.OutcomeTransient, 1791234567},
 		{"rate limit exceeded", runs.CodeRateLimited, runs.OutcomeTransient, 0},
 		{"401 Unauthorized", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
-		{"token has expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		// The line docker/fakecli.sh speaks for `fakecli:auth-death`, so the
+		// e2e and the table cannot drift apart silently.
+		{"401 Unauthorized: token expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		{"refresh token has expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		{"access token expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		// Codex's own error shape, observed against v0.146.1 on 2026-08-06:
+		// the message trails a tracing preamble rather than opening the line.
+		{
+			"2026-08-06T12:32:24.735772Z ERROR codex_api::endpoint::responses: 401 Unauthorized",
+			runs.CodeAuthExpired, runs.OutcomePermanent, 0,
+		},
+		{"ERROR: refresh token has expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
 		{"segmentation fault", runs.CodeHarnessError, runs.OutcomeTransient, 0},
 		// The tail is the agent's own stdout, so a row must only match a
 		// phrase the CLI states about itself. An agent musing about rate
@@ -495,6 +514,82 @@ func TestMapExit_CodexMarkers(t *testing.T) {
 				t.Errorf("class = %q, want %q", out.Class, c.class)
 			}
 			assertRetryAt(t, out, c.retryAt)
+		})
+	}
+}
+
+// The auth rows are the ones that must be wrong in only one direction. A miss
+// costs a retry against a token that will fail again; a FALSE match is
+// permanent, kills a live run, and stamps last_auth_expired_at on a working
+// credential (collect.go's markAuthExpired). The tail is the agent's own
+// stdout, so precision here is a property of what a MODEL writes — which no
+// smoke run against a CLI can ever measure. These are the lines an agent
+// plausibly emits while doing its job.
+func TestMapExit_AuthRowsRejectAgentProse(t *testing.T) {
+	cases := []struct{ harness, tail string }{
+		// The exact false-match class the review named: an agent narrating its
+		// own code, with `token .*invalid` spanning the sentence.
+		{"codex", "the token .* invalid case is handled below"},
+		{"codex", "// TODO: the refresh token may be invalid here — retry once"},
+		{"codex", "We got a 401 Unauthorized back from the API, so the access token expired."},
+		{"codex", "A 401 Unauthorized response means the credential was rejected."},
+		{"codex", "if that fails, tell the user to run codex login"},
+		// Bare fragments an agent types when it explains an auth failure it did
+		// not itself suffer. Every one of these matched before this row was
+		// narrowed.
+		{"claude-code", "Please run /login"},
+		{"claude-code", "Invalid API key"},
+		{"claude-code", "// Invalid API key: the operator has to re-issue the token"},
+		{"claude-code", "Invalid API key errors are handled by the retry loop."},
+		{"claude-code", "If Claude Code reports an invalid API key, please run /login again."},
+		{"claude-code", "The OAuth token expired at some point during the migration."},
+	}
+	for _, c := range cases {
+		t.Run(c.harness+"/"+c.tail, func(t *testing.T) {
+			d, err := driverFor(c.harness)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := mapExit(d, 1, []byte(c.tail))
+			if out.Code != runs.CodeHarnessError || out.Class != runs.OutcomeTransient {
+				t.Errorf("agent prose classified %s/%s, want a transient harness_error:\n\t%q",
+					out.Class, out.Code, c.tail)
+			}
+		})
+	}
+}
+
+// A millisecond timestamp is the failure mode the epoch capture's right-hand
+// guard exists for. Unguarded, `\d{9,12}` takes the first twelve digits of a
+// 13-digit epoch and calls them seconds — a reset in the year 7620, which
+// retryDelay honours verbatim (a provider's word bypasses cap and jitter) and
+// evaluateFailure then terminalizes as past the run's wall deadline. The row
+// must fail outright instead, so the plain cap rule underneath supplies a
+// bounded guess and the attempt PARKS.
+func TestMapExit_MillisecondEpochFallsThroughToTheCapRule(t *testing.T) {
+	for _, kind := range []string{"claude-code", "codex"} {
+		t.Run(kind, func(t *testing.T) {
+			d, err := driverFor(kind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The seconds form still parks on the provider's own moment —
+			// otherwise this test would pass with the whole row deleted.
+			secs := mapExit(d, 1, []byte("usage limit reached|1754398800\n"))
+			if secs.Code != runs.CodeRateLimited {
+				t.Fatalf("code = %q, want rate_limited", secs.Code)
+			}
+			assertRetryAt(t, secs, 1754398800)
+
+			ms := mapExit(d, 1, []byte("usage limit reached|1783123456789\n"))
+			if ms.Code != runs.CodeRateLimited || ms.Class != runs.OutcomeTransient {
+				t.Errorf("outcome = %s/%s, want the plain cap rule's transient rate_limited",
+					ms.Class, ms.Code)
+			}
+			if ms.RetryAt != nil {
+				t.Errorf("RetryAt = %s from a millisecond epoch, want nil: a reset we cannot read "+
+					"is not a reset, and this one parks past every wall deadline", ms.RetryAt)
+			}
 		})
 	}
 }
