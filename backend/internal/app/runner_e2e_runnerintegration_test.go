@@ -212,7 +212,7 @@ func TestRunnerE2E_TaskThroughRealContainerToPatch(t *testing.T) {
 	started := time.Now().Unix()
 	t.Cleanup(func() { e2eSweep(t, engine, egressNet, started) })
 
-	orch := runs.NewOrchestrator(runsSvc, rnr, rnr, runs.OrchestratorConfig{
+	orch := runs.NewOrchestrator(runsSvc, rnr, rnr, runsAssetSource{svc: assetsSvc}, runs.OrchestratorConfig{
 		Workers: 1, PollInterval: 50 * time.Millisecond, LeaseTTL: 60 * time.Second,
 		HeartbeatInterval: 10 * time.Second, OutboxRetention: 168 * time.Hour,
 	}, log)

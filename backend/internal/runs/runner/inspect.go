@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
+	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 	"github.com/giiorg/caesar/backend/internal/runs"
 	"github.com/giiorg/caesar/backend/internal/runs/runner/gitops"
 )
@@ -23,17 +24,37 @@ import (
 // its whole result can be collected here, and every other path tears the
 // remnants down and reports nothing, which the orchestrator concludes as a
 // transient reconcile_lost and retries honestly.
+//
+// The credential obligation is settled on EVERY path, adopted or not, and in
+// the pinned order: take custody first, stop the runtime, then settle (spec
+// §2.8). A path that returned early without settling would strand the lease
+// until the stale-lease janitor noticed, and every attempt behind it would meet
+// a credential_busy in the meantime.
 func (r *Runner) Inspect(ctx context.Context, ref runs.AttemptRef) (runs.InspectResult, error) {
+	credID, lease, held, err := r.takeoverCredential(ctx, ref)
+	if err != nil {
+		// Custody could not be taken, so nothing here may touch the container
+		// or the credential: a still-paused worker is not fenced yet, and
+		// reading auth.json beside it could commit bytes it is still writing.
+		// The orchestrator reads this as reconcile_lost and comes back.
+		return runs.InspectResult{}, err
+	}
+
 	insp, err := r.engine.ContainerInspect(ctx, agentName(ref))
 	if dockerapi.IsNotFound(err) {
 		// Nothing to adopt and nothing to remove: either the attempt never
-		// got as far as an agent, or a teardown already ran.
+		// got as far as an agent, or a teardown already ran — including the
+		// teardown of a worker this takeover has just fenced. The obligation
+		// outlives all of that, so it still settles.
+		r.settleCredential(ctx, ref, credID, lease, held)
 		return runs.InspectResult{}, nil
 	}
 	if err != nil {
 		// The daemon could not be asked, so nothing is known — and tearing
 		// down what might still be a live attempt on the strength of a failed
-		// inspect is the one move that could destroy work.
+		// inspect is the one move that could destroy work. The lease stays
+		// held (this takeover already fenced the old owner); the next
+		// reconciliation settles it.
 		return runs.InspectResult{}, transientf(runs.CodeInternalError,
 			"inspect %s: %v", agentName(ref), err)
 	}
@@ -60,18 +81,169 @@ func (r *Runner) Inspect(ctx context.Context, ref runs.AttemptRef) (runs.Inspect
 	// finished at all.
 	if insp.State.Status != "exited" || !r.attemptDirExists(ref) ||
 		(ourKill && insp.State.ExitCode != 0) {
+		// Teardown force-removes the containers, and a force-remove kills:
+		// that is what makes the settlement's precondition hold on this path
+		// for a container the kill above could not stop. Nothing is adopted
+		// here, so losing the corpse costs nothing.
 		r.teardown(ctx, ref)
+		r.settleCredential(ctx, ref, credID, lease, held)
 		return runs.InspectResult{}, nil
 	}
-	// The manifest is read here, before adoption concludes the attempt's
-	// credential obligation and deletes the file. It is convenience, not
-	// authority: an attempt whose manifest is gone is still adopted, it just
-	// has no harness to read its exit code with.
-	m, err := r.readManifest(ref)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		r.log.Warn("runner.reconcile.manifest", "attempt", ref.String(), "error", err)
+	// The container is exited, so nothing can write auth.json between the
+	// read-back and the commit — the settlement's precondition, proved.
+	rec := r.settleCredential(ctx, ref, credID, lease, held)
+	return r.adopt(ctx, ref, insp, rec), nil
+}
+
+// ReconcileCredential settles an attempt's credential obligation and nothing
+// else (runs.CredentialReconciler): the entry point for the janitor paths whose
+// attempt already has an outcome — a run past its wall deadline, a lease whose
+// owner stopped heartbeating. Deliberately no adoption: a completed attempt
+// evaluated here could be persisted as a success the run is no longer entitled
+// to (FinishRun carries no deadline predicate).
+func (r *Runner) ReconcileCredential(ctx context.Context, ref runs.AttemptRef) error {
+	credID, lease, held, err := r.takeoverCredential(ctx, ref)
+	if err != nil {
+		return err
 	}
-	return r.adopt(ctx, ref, insp, m), nil
+	// The force-remove IS the kill, and it does not return until the daemon
+	// has done it. There is nothing to adopt here, so the exit code the corpse
+	// carries is worth nothing and losing it is free.
+	if err := r.stopAttemptRuntime(ctx, ref); err != nil {
+		// Refusing to settle over a runtime that may still be running is the
+		// whole point: the caller retries, and until then the lease stays held
+		// under this reconciler's own epoch.
+		return err
+	}
+	r.settleCredential(ctx, ref, credID, lease, held)
+	return nil
+}
+
+// stopAttemptRuntime removes the two containers that can still be executing an
+// attempt's code, and reports whether it can promise they are gone. Already-
+// gone is success; anything else is not, because the settlement that follows
+// reads a file the agent may still be writing.
+func (r *Runner) stopAttemptRuntime(ctx context.Context, ref runs.AttemptRef) error {
+	for _, name := range []string{agentName(ref), gatewayName(ref)} {
+		if err := r.engine.ContainerRemove(ctx, name, true); err != nil && !dockerapi.IsNotFound(err) {
+			return transientf(runs.CodeInternalError, "remove %s: %v", name, err)
+		}
+	}
+	return nil
+}
+
+// credentialReconciliation is everything settling the obligation learned —
+// adoption (Task 11) rebuilds its redaction set from this, so it is captured
+// BEFORE conclusion deletes the on-disk manifest or bumps the store version.
+type credentialReconciliation struct {
+	Manifest    attemptManifest // in-memory copy; zero-valued when absent
+	HasManifest bool
+	Stored      []byte // stored credential bytes, opened pre-commit; nil if open failed
+	StoredOK    bool   // open succeeded AND at the version the manifest recorded
+	Concluded   bool   // a lease existed and concludeCredential ran
+	Conc        syncConclusion
+}
+
+// takeoverCredential is stage 1: fence the paused owner (spec §2.1, §2.3 —
+// takeover FIRST, before that owner can race its own commit or cleanup).
+// Fencing the WORKER is all it does: the epoch stops the old process's
+// database writes, not the container's file writes — the runtime must be
+// provably stopped by the caller before settleCredential may read auth.json.
+//
+// The lease row is the authority, not the manifest: an attempt that crashed
+// between the acquire and the manifest write still resolves to its credential
+// here, which is what keeps that lease from becoming an eternal credential_busy.
+func (r *Runner) takeoverCredential(ctx context.Context, ref runs.AttemptRef) (uuid.UUID, Lease, bool, error) {
+	if r.leaser == nil {
+		return uuid.Nil, Lease{}, false, nil // no aggregate wired: no leased kinds run at all
+	}
+	credID, _, ok, err := r.leaser.LeaseByAttempt(ctx, ref.String())
+	if err != nil {
+		return uuid.Nil, Lease{}, false, transientf(runs.CodeInternalError,
+			"look up credential lease for %s: %v", ref.String(), err)
+	}
+	if !ok {
+		return uuid.Nil, Lease{}, false, nil
+	}
+	lease, err := r.leaser.Takeover(ctx, credID, ref.String())
+	if leaseAlreadyConcluded(err) {
+		return uuid.Nil, Lease{}, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, Lease{}, false, transientf(runs.CodeInternalError,
+			"take over credential %s for %s: %v", credID, ref.String(), err)
+	}
+	r.log.Info("runner.credential_takeover", "attempt", ref.String(),
+		"credential", credID.String(), "epoch", lease.Epoch)
+	return credID, lease, true, nil
+}
+
+// leaseAlreadyConcluded reports the one takeover refusal that is not a
+// failure: the lease row is gone, because the owner got its own conclusion in
+// between the lookup and the takeover. There is nothing left to take custody
+// of, and calling that an error would leave the deadline sweep retrying
+// forever against an obligation that is already settled.
+func leaseAlreadyConcluded(err error) bool {
+	return err != nil && xerrors.ClassOf(err) == xerrors.ClassNotFound
+}
+
+// settleCredential is stage 3: capture the redaction inputs, then conclude.
+// PRECONDITION (each caller's to prove, tested): the attempt's containers are
+// gone or exited — a still-running agent could write auth.json between the
+// read-back and the commit, and a released lease would let a second attempt
+// acquire while the first still runs.
+func (r *Runner) settleCredential(ctx context.Context, ref runs.AttemptRef,
+	credentialID uuid.UUID, lease Lease, held bool,
+) credentialReconciliation {
+	var rec credentialReconciliation
+	// The manifest read is NOT gated on the lease: static kinds
+	// (subscription_token) write one with no lease behind it, and adoption
+	// needs it either way.
+	rec.Manifest, rec.HasManifest = r.readManifestForRecovery(ref)
+	if rec.HasManifest {
+		// Open the stored credential BEFORE any CommitSync bumps the version:
+		// these are the only recoverable copy of the initially-materialized
+		// bytes, and adoption may not publish logs it cannot scan for them.
+		if id, err := uuid.Parse(rec.Manifest.CredentialID); err == nil && r.creds != nil {
+			// The manifest's version is what was DELIVERED (every kind records
+			// it); the store must still hold it, or the delivered bytes are
+			// unrecoverable and adoption must withhold. `!held` is no
+			// exemption: a rotated subscription_token's old value entered the
+			// crashed attempt's env just the same.
+			if b, v, oerr := r.creds.OpenCredential(ctx, id, "reconcile:"+ref.String()); oerr == nil {
+				rec.Stored, rec.StoredOK = b, v == rec.Manifest.SecretVersion
+			} else {
+				r.log.Warn("runner.reconcile.open_credential", "attempt", ref.String(), "error", oerr)
+			}
+		}
+	}
+	if !held {
+		return rec // no lease: nothing to conclude (auth-dir leftovers age into the orphan sweep)
+	}
+	m := rec.Manifest // conclusion works on a copy; a missing manifest concludes as "clean"
+	// (crash between lease commit and manifest write, spec §2.3 — the lease
+	// row is the recovery authority; release, never loop on credential_busy)
+	m.Epoch = lease.Epoch                 // conclude under the taken-over epoch
+	m.SecretVersion = lease.SecretVersion // the version the lease actually granted
+	rec.Conc = r.concludeCredential(ctx, ref, m, credentialID)
+	rec.Concluded = true
+	r.log.Info("runner.credential_reconciled", "attempt", ref.String(), "status", rec.Conc.Status)
+	return rec
+}
+
+// readManifestForRecovery reads the attempt manifest the way every recovery
+// path wants it: absent is the documented gap (a crash before the write), and
+// anything else is worth a line in the log but still reads as absent — a
+// manifest this build cannot parse is not one it may act on.
+func (r *Runner) readManifestForRecovery(ref runs.AttemptRef) (attemptManifest, bool) {
+	m, err := r.readManifest(ref)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			r.log.Warn("runner.reconcile.manifest", "attempt", ref.String(), "error", err)
+		}
+		return attemptManifest{}, false
+	}
+	return m, true
 }
 
 // attemptDirExists reports whether the attempt still has a working directory
@@ -121,13 +293,18 @@ func (r *Runner) killThenInspect(ctx context.Context, ref runs.AttemptRef,
 // attempt is reported lost, because a partial result would be persisted as if
 // it were the phase's real output.
 //
+// It runs on the reconciliation the settlement produced, never on a fresh read
+// of the disk: by now the conclusion may have deleted the manifest and bumped
+// the store's version, and the in-memory copy is the only record of what the
+// container was actually handed.
+//
 // The base SHA comes back off disk rather than out of a rebuilt RunSpec. The
 // stage contract is written by the runner before staging and lives outside
 // the workspace, so the agent could not have touched it, and reading it here
 // keeps adoption from resolving a harness or opening a provider credential
 // that no container is going to be handed.
 func (r *Runner) adopt(ctx context.Context, ref runs.AttemptRef, insp dockerapi.ContainerInspect,
-	m attemptManifest,
+	rec credentialReconciliation,
 ) runs.InspectResult {
 	defer r.teardown(ctx, ref)
 
@@ -137,12 +314,12 @@ func (r *Runner) adopt(ctx context.Context, ref runs.AttemptRef, insp dockerapi.
 		r.log.Warn("runner.reconcile.stage_contract", "attempt", ref.String(), "error", err)
 		return runs.InspectResult{}
 	}
-	credentialID, _ := uuid.Parse(m.CredentialID) // no manifest, no binding: uuid.Nil
+	credentialID, _ := uuid.Parse(rec.Manifest.CredentialID) // no manifest, no binding: uuid.Nil
 	res, err := r.collectResult(ctx, collection{
 		Ref:          ref,
 		BaseSHA:      stage.BaseSHA,
 		User:         r.runAs(),
-		Kind:         m.HarnessKind,
+		Kind:         rec.Manifest.HarnessKind,
 		CredentialID: credentialID,
 		ExitCode:     insp.State.ExitCode,
 		OOM:          insp.State.OOMKilled,
@@ -156,10 +333,9 @@ func (r *Runner) adopt(ctx context.Context, ref runs.AttemptRef, insp dockerapi.
 	// (execute.go failureResult), so an operator reading a run that died in
 	// reconciliation can still find the streams. The failure SNAPSHOT is
 	// deliberately not here: it embeds a log tail that has to be redacted with
-	// the attempt's secrets, and adoption holds none — it never re-opens the
-	// provider credential. Rebuilding that set from the manifest is Task 11's
-	// work, and a snapshot redacted with an empty set would look safe while
-	// carrying the credential verbatim.
+	// the attempt's secrets, and rebuilding that set from rec.Stored and the
+	// conclusion's recovered tokens is Task 11's work — a snapshot redacted
+	// with an empty set would look safe while carrying the credential verbatim.
 	var oe runs.OutcomeError
 	if errors.As(err, &oe) {
 		r.log.Info("runner.reconcile.adopted_outcome", "attempt", ref.String(), "code", oe.Outcome.Code)

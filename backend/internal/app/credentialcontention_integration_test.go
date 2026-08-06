@@ -205,7 +205,7 @@ func TestCredentialContention_RunsWaitFreeThenRunSerially(t *testing.T) {
 		inner: fake.NewExecutor(), leaser: appCredentialLeaser{svc: assetsSvc},
 		hold: 150 * time.Millisecond,
 	}
-	orch := runs.NewOrchestrator(runsSvc, exec, runs.AlwaysAdmit{}, runs.OrchestratorConfig{
+	orch := runs.NewOrchestrator(runsSvc, exec, runs.AlwaysAdmit{}, nil, runs.OrchestratorConfig{
 		Workers: 2, PollInterval: 20 * time.Millisecond, LeaseTTL: 30 * time.Second,
 		HeartbeatInterval: 10 * time.Second, OutboxRetention: 168 * time.Hour,
 	}, discard())

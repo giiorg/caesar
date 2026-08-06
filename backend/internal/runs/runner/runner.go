@@ -47,8 +47,9 @@ type Engine interface {
 // halves of the contract are pinned here rather than discovered at wiring
 // time in the composition root.
 var (
-	_ Engine        = (*dockerapi.Client)(nil)
-	_ runs.Executor = (*Runner)(nil)
+	_ Engine                    = (*dockerapi.Client)(nil)
+	_ runs.Executor             = (*Runner)(nil)
+	_ runs.CredentialReconciler = (*Runner)(nil)
 )
 
 // HarnessSpec is everything the runner needs to start one harness: which

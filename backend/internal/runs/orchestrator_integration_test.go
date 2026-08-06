@@ -19,7 +19,7 @@ import (
 // newOrchestrator builds the loop against a fake executor without
 // starting it — for tests that drive one sweep by hand.
 func newOrchestrator(svc *runs.Service, ex runs.Executor, lease time.Duration) *runs.Orchestrator {
-	return runs.NewOrchestrator(svc, ex, runs.AlwaysAdmit{}, runs.OrchestratorConfig{
+	return runs.NewOrchestrator(svc, ex, runs.AlwaysAdmit{}, nil, runs.OrchestratorConfig{
 		Workers: 2, PollInterval: 20 * time.Millisecond, LeaseTTL: lease,
 		HeartbeatInterval: lease / 3, OutboxRetention: 7 * 24 * time.Hour,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))

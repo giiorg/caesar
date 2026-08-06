@@ -360,6 +360,41 @@ func (q *Queries) GetPhase(ctx context.Context, id uuid.UUID) (PhaseRun, error) 
 	return i, err
 }
 
+const getPhaseByRef = `-- name: GetPhaseByRef :one
+SELECT id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE run_id = $1 AND node_id = $2 AND attempt = $3
+`
+
+type GetPhaseByRefParams struct {
+	RunID   uuid.UUID
+	NodeID  string
+	Attempt int32
+}
+
+// The reverse lookup recovery needs: a credential lease records only the
+// attempt ref, and the janitor must know whether the phase behind it is still
+// live before it takes custody of that credential.
+func (q *Queries) GetPhaseByRef(ctx context.Context, arg GetPhaseByRefParams) (PhaseRun, error) {
+	row := q.db.QueryRow(ctx, getPhaseByRef, arg.RunID, arg.NodeID, arg.Attempt)
+	var i PhaseRun
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ChargeableFailures,
+		&i.NotBefore,
+		&i.Status,
+		&i.WorkerID,
+		&i.LeasedUntil,
+		&i.ClaimedAt,
+		&i.FinishedAt,
+		&i.Outcome,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getRun = `-- name: GetRun :one
 SELECT id, task_id, status, definition_hash, base_sha, policy_snapshot, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at FROM runs WHERE id = $1
 `
@@ -1131,6 +1166,60 @@ type MarkPhaseReconcilingRow struct {
 func (q *Queries) MarkPhaseReconciling(ctx context.Context, id uuid.UUID) (MarkPhaseReconcilingRow, error) {
 	row := q.db.QueryRow(ctx, markPhaseReconciling, id)
 	var i MarkPhaseReconcilingRow
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ChargeableFailures,
+		&i.NotBefore,
+		&i.Status,
+		&i.WorkerID,
+		&i.LeasedUntil,
+		&i.ClaimedAt,
+		&i.FinishedAt,
+		&i.Outcome,
+		&i.CreatedAt,
+		&i.RunWallDeadline,
+	)
+	return i, err
+}
+
+const markPhaseReconcilingPastDeadline = `-- name: MarkPhaseReconcilingPastDeadline :one
+UPDATE phase_runs SET status = 'reconciling'
+WHERE phase_runs.id = $1 AND phase_runs.status = 'running'
+  AND EXISTS (SELECT 1 FROM runs r WHERE r.id = phase_runs.run_id AND r.wall_deadline <= now())
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
+          (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline
+`
+
+type MarkPhaseReconcilingPastDeadlineRow struct {
+	ID                 uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	MaxAttempts        int32
+	ChargeableFailures int32
+	NotBefore          *time.Time
+	Status             string
+	WorkerID           pgtype.Text
+	LeasedUntil        *time.Time
+	ClaimedAt          *time.Time
+	FinishedAt         *time.Time
+	Outcome            []byte
+	CreatedAt          time.Time
+	RunWallDeadline    time.Time
+}
+
+// The deadline sweep's variant of MarkPhaseReconciling: fenced by the RUN's
+// expired wall deadline (db clock) instead of the phase lease — a live lease
+// must not shield a phase whose run is already past its deadline (spec §2.8).
+// The worker's own evaluate loses its FinishPhase CAS against this, which is
+// what stops it committing a result the run is no longer entitled to.
+func (q *Queries) MarkPhaseReconcilingPastDeadline(ctx context.Context, id uuid.UUID) (MarkPhaseReconcilingPastDeadlineRow, error) {
+	row := q.db.QueryRow(ctx, markPhaseReconcilingPastDeadline, id)
+	var i MarkPhaseReconcilingPastDeadlineRow
 	err := row.Scan(
 		&i.ID,
 		&i.RunID,

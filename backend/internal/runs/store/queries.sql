@@ -136,6 +136,18 @@ WHERE phase_runs.id = $1 AND phase_runs.status = 'running' AND phase_runs.leased
 RETURNING phase_runs.*,
           (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline;
 
+-- name: MarkPhaseReconcilingPastDeadline :one
+-- The deadline sweep's variant of MarkPhaseReconciling: fenced by the RUN's
+-- expired wall deadline (db clock) instead of the phase lease — a live lease
+-- must not shield a phase whose run is already past its deadline (spec §2.8).
+-- The worker's own evaluate loses its FinishPhase CAS against this, which is
+-- what stops it committing a result the run is no longer entitled to.
+UPDATE phase_runs SET status = 'reconciling'
+WHERE phase_runs.id = $1 AND phase_runs.status = 'running'
+  AND EXISTS (SELECT 1 FROM runs r WHERE r.id = phase_runs.run_id AND r.wall_deadline <= now())
+RETURNING phase_runs.*,
+          (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline;
+
 -- name: ClaimStuckReconciling :many
 -- Rows whose owner died between marking 'reconciling' and evaluating:
 -- the lease sweep can't see them (its predicate is status = 'running').
@@ -159,6 +171,12 @@ RETURNING id, node_id, attempt;
 
 -- name: GetPhase :one
 SELECT * FROM phase_runs WHERE id = $1;
+
+-- name: GetPhaseByRef :one
+-- The reverse lookup recovery needs: a credential lease records only the
+-- attempt ref, and the janitor must know whether the phase behind it is still
+-- live before it takes custody of that credential.
+SELECT * FROM phase_runs WHERE run_id = $1 AND node_id = $2 AND attempt = $3;
 
 -- name: ListPhasesForRun :many
 SELECT * FROM phase_runs WHERE run_id = $1 ORDER BY created_at, node_id, attempt;

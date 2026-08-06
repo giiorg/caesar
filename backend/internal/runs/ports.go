@@ -3,6 +3,8 @@ package runs
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +22,43 @@ type AttemptRef struct {
 
 func (r AttemptRef) String() string {
 	return fmt.Sprintf("caesar-%s-%s-%d", r.RunID, r.NodeID, r.Attempt)
+}
+
+// attemptRefPrefix and uuidLen are what make the format reversible: the run id
+// is fixed-width, so the node id — which routinely carries dashes — starts at a
+// known offset, and only the LAST dash separates it from the attempt ordinal.
+const (
+	attemptRefPrefix = "caesar-"
+	uuidLen          = 36
+)
+
+// ParseAttemptRef is the inverse of AttemptRef.String(). Recovery needs it:
+// a credential lease records its owner as the string alone, and the stale-lease
+// janitor has to resolve that back to a phase before it may act on it.
+//
+// Anything that is not a ref this build wrote is refused rather than guessed
+// at — a lease held by something else entirely (an operator's manual hold, a
+// future subsystem) must be left alone, not reconciled against a phase that
+// does not exist.
+func ParseAttemptRef(s string) (AttemptRef, error) {
+	rest, ok := strings.CutPrefix(s, attemptRefPrefix)
+	if !ok || len(rest) < uuidLen+1 || rest[uuidLen] != '-' {
+		return AttemptRef{}, fmt.Errorf("runs: %q is not an attempt ref", s)
+	}
+	runID, err := uuid.Parse(rest[:uuidLen])
+	if err != nil {
+		return AttemptRef{}, fmt.Errorf("runs: attempt ref %q: %w", s, err)
+	}
+	tail := rest[uuidLen+1:]
+	cut := strings.LastIndexByte(tail, '-')
+	if cut <= 0 { // no ordinal, or an empty node id
+		return AttemptRef{}, fmt.Errorf("runs: attempt ref %q has no node id and attempt", s)
+	}
+	attempt, err := strconv.ParseInt(tail[cut+1:], 10, 32)
+	if err != nil || attempt < 1 {
+		return AttemptRef{}, fmt.Errorf("runs: attempt ref %q has no valid attempt ordinal", s)
+	}
+	return AttemptRef{RunID: runID, NodeID: tail[:cut], Attempt: int32(attempt)}, nil
 }
 
 // PinnedDefinition is what a run pins at intake: the version identity
@@ -88,6 +127,36 @@ type Forge interface {
 type Executor interface {
 	Execute(ctx context.Context, req ExecutionRequest) (ExecutionResult, error)
 	Inspect(ctx context.Context, ref AttemptRef) (InspectResult, error)
+}
+
+// CredentialReconciler settles an attempt's credential obligation and nothing
+// else: take custody, stop whatever is still running, sync the credential back
+// with its receipt, release the lease (spec §2.8). It is deliberately NOT
+// Inspect — the janitor paths that call it have already decided the attempt's
+// outcome, and an adoption here could evaluate a finished attempt as a success
+// the run is no longer entitled to.
+//
+// The Docker runner implements it; executors that hold no credentials (the
+// fake, the not-implemented stub) implement it as a no-op.
+type CredentialReconciler interface {
+	ReconcileCredential(ctx context.Context, ref AttemptRef) error
+}
+
+// StaleLease is one credential lease whose owner stopped heartbeating. The
+// credential id travels with it because the janitor logs against it; the
+// attempt ref is the string the lease row holds, parsed back with
+// ParseAttemptRef.
+type StaleLease struct {
+	CredentialID uuid.UUID
+	AttemptRef   string
+}
+
+// StaleLeaseSource surfaces leases nobody is keeping alive. Expiry alone never
+// releases one (spec §2.1: only a concluded reconciliation does), so these are
+// handed to reconciliation and never to a new acquirer. app adapts it over
+// assets — the runs context never imports that vocabulary.
+type StaleLeaseSource interface {
+	StaleCredentialLeases(ctx context.Context, olderThan time.Duration) ([]StaleLease, error)
 }
 
 // ExecutionRequest is the spine's precursor of Plan 06's RunSpec:

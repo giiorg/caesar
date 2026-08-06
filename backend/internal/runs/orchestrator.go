@@ -26,17 +26,29 @@ type OrchestratorConfig struct {
 	OutboxRetention   time.Duration
 }
 
+// staleLeaseAfter is when a credential lease counts as abandoned: ten times
+// the runner's heartbeat interval, so an attempt that is merely slow is never
+// mistaken for one whose worker died. Staleness alone releases nothing — it
+// only hands the lease to reconciliation (spec §2.1, §2.8).
+const staleLeaseAfter = 5 * time.Minute
+
 // Orchestrator drives the queue: one janitor goroutine (run startup,
-// deadline sweep, lease sweep + reconcile, outbox retention) and N claim
-// workers. It owns no state Postgres doesn't own first (spec §1).
+// deadline sweep, lease sweep + reconcile, stale-credential-lease sweep,
+// outbox retention) and N claim workers. It owns no state Postgres doesn't own
+// first (spec §1).
 type Orchestrator struct {
 	svc       *Service
 	exec      Executor
 	admission Admission
-	cfg       OrchestratorConfig
-	log       *slog.Logger
-	workerTag string
-	lastPrune time.Time
+	// credentials is exec's credential-settling half, resolved once here
+	// rather than asserted per tick. nil means this deployment's executor
+	// holds no credentials, and every path that would settle one is skipped.
+	credentials CredentialReconciler
+	leases      StaleLeaseSource
+	cfg         OrchestratorConfig
+	log         *slog.Logger
+	workerTag   string
+	lastPrune   time.Time
 	// jitter spreads delayed retries so a shared cap window does not wake
 	// every parked attempt at once; a seam so tests can pin the schedule.
 	jitter func() float64
@@ -53,12 +65,19 @@ type cachedPlan struct {
 	repo       RepoRef
 }
 
-func NewOrchestrator(svc *Service, exec Executor, admission Admission, cfg OrchestratorConfig, log *slog.Logger) *Orchestrator {
+// NewOrchestrator wires the queue driver. leases may be nil: a deployment
+// whose executor holds no provider credentials has no stale-lease sweep to
+// run, and the janitor skips it rather than pretending it swept.
+func NewOrchestrator(svc *Service, exec Executor, admission Admission, leases StaleLeaseSource,
+	cfg OrchestratorConfig, log *slog.Logger,
+) *Orchestrator {
 	if admission == nil {
 		admission = AlwaysAdmit{}
 	}
+	credentials, _ := exec.(CredentialReconciler)
 	return &Orchestrator{
-		svc: svc, exec: exec, admission: admission, cfg: cfg, log: log,
+		svc: svc, exec: exec, admission: admission, credentials: credentials, leases: leases,
+		cfg: cfg, log: log,
 		workerTag: uuid.NewString()[:8],
 		jitter:    rand.Float64, //nolint:gosec // G404: spreading retry wakeups, not a security decision
 		plans:     map[uuid.UUID]cachedPlan{},
@@ -106,6 +125,9 @@ func (o *Orchestrator) janitorLoop(ctx context.Context) {
 		}
 		if err := o.sweepStuckReconciling(ctx); err != nil {
 			o.log.Error("orchestrator: stuck-reconciling sweep", "error", err)
+		}
+		if err := o.sweepStaleCredentialLeases(ctx); err != nil {
+			o.log.Error("orchestrator: stale credential lease sweep", "error", err)
 		}
 		if o.svc.clock.Now().Sub(o.lastPrune) > time.Hour {
 			o.lastPrune = o.svc.clock.Now()
@@ -291,18 +313,138 @@ func (o *Orchestrator) startPendingRuns(ctx context.Context) error {
 // sweepExpiredRuns terminalizes wall-deadline breaches (spec §3: the
 // predicate in every deciding statement is the mechanism; this sweep
 // just makes the death visible).
+//
+// Every live phase's credential obligation is settled BEFORE the run dies
+// (spec §2.8: sync receipt and lease release precede the terminal event). A
+// run whose obligation could not be settled this tick is left alone: it stays
+// matched by the expired-run predicate and is retried next tick. Terminalizing
+// anyway would make the ordering violation durable — terminalizeRun supersedes
+// every live phase at once and FinishRun has no deadline predicate to catch it
+// later — where a run stuck here is visible in the log and self-healing.
 func (o *Orchestrator) sweepExpiredRuns(ctx context.Context) error {
 	ids, err := store.New(o.svc.pool).ListExpiredRunIDs(ctx, 16)
 	if err != nil {
 		return err
 	}
 	for _, runID := range ids {
+		if !o.settleRunCredentials(ctx, runID) {
+			continue
+		}
 		out := Outcome{Class: OutcomePermanent, Code: CodeWallDeadlineExceeded, Message: "wall clock expired"}
 		if err := o.terminalizeRun(ctx, runID, RunDead, out, EventRunDead); err != nil {
 			o.log.Error("orchestrator: expire run", "run", runID, "error", err)
 		}
 	}
 	return nil
+}
+
+// settleRunCredentials fences and settles the credential obligation of every
+// phase of an expired run that could still be holding one, and reports whether
+// the run may now be terminalized.
+//
+// The cleanup-only entry is deliberate. Full reconciliation ADOPTS a completed
+// attempt and can evaluate it as a success — and FinishRun carries no deadline
+// predicate, so an exit-0 attempt reconciled after the wall deadline would mark
+// the run succeeded and this sweep's terminalization would silently lose its
+// CAS. Past the deadline the run's outcome is already decided; only the
+// credential obligation is still owed.
+//
+// Rows this sweep already moved to 'reconciling' on an earlier tick are picked
+// up again: without that, a reconciliation that failed once would leave a phase
+// whose credential is never settled and a run that terminalizes over it.
+func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID) bool {
+	if o.credentials == nil {
+		return true // no executor-held credentials in this deployment
+	}
+	q := store.New(o.svc.pool)
+	phases, err := q.ListPhasesForRun(ctx, runID)
+	if err != nil {
+		o.log.Error("orchestrator: expired-run phases", "run", runID, "error", err)
+		return false
+	}
+	settled := true
+	for _, p := range phases {
+		switch PhaseStatus(p.Status) {
+		case PhaseRunning:
+			// Fence first: the phase lease may still be future-dated (the
+			// worker's own deadline exit races this sweep), so the plain
+			// MarkPhaseReconciling cannot serve here.
+			if _, err := q.MarkPhaseReconcilingPastDeadline(ctx, p.ID); err != nil {
+				if errorsIsNoRows(err) {
+					continue // moved on under us: terminal, or another sweeper's
+				}
+				o.log.Error("orchestrator: fence past-deadline phase", "phase", p.ID, "error", err)
+				settled = false
+				continue
+			}
+		case PhaseReconciling:
+			// Already fenced — by this sweep on an earlier tick, or by the
+			// lease sweep. Either way the obligation may still be owed.
+		default:
+			continue
+		}
+		ref := AttemptRef{RunID: runID, NodeID: p.NodeID, Attempt: p.Attempt}
+		if err := o.credentials.ReconcileCredential(ctx, ref); err != nil {
+			o.log.Error("orchestrator: settle credential past deadline", "ref", ref.String(), "error", err)
+			settled = false
+		}
+	}
+	return settled
+}
+
+// sweepStaleCredentialLeases hands abandoned credential leases to
+// reconciliation (spec §2.8). Expiry never releases a lease by itself: the old
+// container may still be alive and refreshing, so only a concluded
+// reconciliation ends custody.
+//
+// A lease whose phase is still live is left alone — its own heartbeat and the
+// lease/stuck sweeps own it, and taking custody underneath a running attempt
+// would fence a worker that is doing exactly what it should.
+func (o *Orchestrator) sweepStaleCredentialLeases(ctx context.Context) error {
+	if o.leases == nil || o.credentials == nil {
+		return nil
+	}
+	stale, err := o.leases.StaleCredentialLeases(ctx, staleLeaseAfter)
+	if err != nil {
+		return err
+	}
+	q := store.New(o.svc.pool)
+	for _, l := range stale {
+		ref, err := ParseAttemptRef(l.AttemptRef)
+		if err != nil {
+			// Not a ref this build wrote — an operator hold, a future
+			// subsystem. Reconciling it would act on a phase that does not
+			// exist, so it is left where it is.
+			o.log.Warn("orchestrator: stale lease holder is not an attempt",
+				"credential", l.CredentialID, "holder", l.AttemptRef)
+			continue
+		}
+		phase, err := q.GetPhaseByRef(ctx, store.GetPhaseByRefParams{
+			RunID: ref.RunID, NodeID: ref.NodeID, Attempt: ref.Attempt,
+		})
+		switch {
+		case errorsIsNoRows(err):
+			// No phase behind the lease at all: nothing will ever conclude it
+			// except this sweep.
+		case err != nil:
+			o.log.Error("orchestrator: stale lease phase", "ref", ref.String(), "error", err)
+			continue
+		case phaseIsLive(PhaseStatus(phase.Status)):
+			continue
+		}
+		if err := o.credentials.ReconcileCredential(ctx, ref); err != nil {
+			o.log.Error("orchestrator: reconcile stale credential lease",
+				"credential", l.CredentialID, "ref", ref.String(), "error", err)
+		}
+	}
+	return nil
+}
+
+// phaseIsLive reports whether the attempt's own machinery still owns it: a
+// running phase heartbeats, a reconciling one is mid-recovery. Everything else
+// — terminal, or never claimed — has nobody left to conclude its credential.
+func phaseIsLive(s PhaseStatus) bool {
+	return s == PhaseRunning || s == PhaseReconciling
 }
 
 // terminalizeRun is the shared one-tx run death: CAS the run, supersede

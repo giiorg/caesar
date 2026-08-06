@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -84,6 +85,21 @@ func (s runsAssetSource) HarnessByName(ctx context.Context, name string) (runs.H
 		ID: h.ID, Kind: string(h.Kind),
 		CredentialID: h.CredentialID, CredentialKind: string(c.Kind),
 	}, nil
+}
+
+// StaleCredentialLeases adapts the assets aggregate onto the orchestrator's
+// janitor port. Only the two fields the janitor acts on cross the boundary:
+// everything else about a lease is the aggregate's business.
+func (s runsAssetSource) StaleCredentialLeases(ctx context.Context, olderThan time.Duration) ([]runs.StaleLease, error) {
+	leases, err := s.svc.ListStaleCredentialLeases(ctx, olderThan)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]runs.StaleLease, 0, len(leases))
+	for _, l := range leases {
+		out = append(out, runs.StaleLease{CredentialID: l.CredentialID, AttemptRef: l.AttemptRef})
+	}
+	return out, nil
 }
 
 // unavailableForge refuses task intake honestly until Plan 08's forge

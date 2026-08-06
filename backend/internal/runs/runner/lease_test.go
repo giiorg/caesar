@@ -56,9 +56,22 @@ type fakeLeaser struct {
 	// different epoch is fenced — the aggregate has moved past this worker.
 	currentEpoch int64
 	held         bool // lease taken and not yet released
+	// leaseCredential is who the held lease belongs to, as LeaseByAttempt
+	// answers it. Nil means no recoverable lease under this ref at all.
+	leaseCredential uuid.UUID
+	// lookupRefs narrows LeaseByAttempt to named refs, for the sweep tests
+	// that need one attempt lease-held and its neighbours orphaned. nil means
+	// every ref answers from `held`.
+	lookupRefs  map[string]bool
+	lookupErr   error // LeaseByAttempt refuses: the store is unreachable
+	takeoverErr error
 	// atRelease is how many heartbeats had been answered when the lease was
 	// handed back. Everything past it arrived on a lease nobody holds.
 	atRelease int
+
+	// j records ownership changes on the shared ordering journal, so a test
+	// can see them interleaved with what the daemon was asked to do.
+	j *journal
 
 	acquired    []leaseCall
 	heartbeats  []leaseCall
@@ -66,6 +79,7 @@ type fakeLeaser struct {
 	authExpired []leaseCall
 	commits     []commitCall
 	quarantines []leaseCall
+	takeovers   []leaseCall
 }
 
 func (l *fakeLeaser) Acquire(_ context.Context, id uuid.UUID, ref string) (Lease, []byte, error) {
@@ -102,9 +116,53 @@ func (l *fakeLeaser) Heartbeat(_ context.Context, id uuid.UUID, ref string, epoc
 	return nil
 }
 
+// LeaseByAttempt is the recovery-authority lookup: it answers from the lease
+// alone, with no manifest and no container involved.
+func (l *fakeLeaser) LeaseByAttempt(_ context.Context, ref string) (uuid.UUID, Lease, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lookupErr != nil {
+		return uuid.Nil, Lease{}, false, l.lookupErr
+	}
+	if !l.held || l.leaseCredential == uuid.Nil || (l.lookupRefs != nil && !l.lookupRefs[ref]) {
+		return uuid.Nil, Lease{}, false, nil
+	}
+	return l.leaseCredential, l.lease, true, nil
+}
+
+// Takeover advances the epoch exactly as the aggregate does, so everything the
+// reconciler does afterwards runs at the new fence and everything the
+// superseded worker tries runs at the old one.
+func (l *fakeLeaser) Takeover(_ context.Context, id uuid.UUID, ref string) (Lease, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.record("takeover")
+	l.takeovers = append(l.takeovers, leaseCall{credentialID: id, ref: ref})
+	if l.takeoverErr != nil {
+		return Lease{}, l.takeoverErr
+	}
+	l.currentEpoch = l.lease.Epoch + 1
+	return Lease{Epoch: l.currentEpoch, SecretVersion: l.lease.SecretVersion}, nil
+}
+
+func (l *fakeLeaser) takeoverCalls() []leaseCall {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]leaseCall(nil), l.takeovers...)
+}
+
+// record appends to the shared journal, if the test wired one. Called with
+// l.mu held, so the journal must never call back into the leaser.
+func (l *fakeLeaser) record(what string) {
+	if l.j != nil {
+		l.j.add(what)
+	}
+}
+
 func (l *fakeLeaser) CommitSync(_ context.Context, id uuid.UUID, ref string, epoch, expectVersion int64, secret []byte) (SyncStatus, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.record("commit")
 	l.commits = append(l.commits, commitCall{
 		credentialID: id, ref: ref, epoch: epoch,
 		expectVersion: expectVersion, secret: append([]byte(nil), secret...),
@@ -131,6 +189,7 @@ func (l *fakeLeaser) RecordQuarantine(_ context.Context, id uuid.UUID, ref strin
 func (l *fakeLeaser) Release(_ context.Context, id uuid.UUID, ref string, epoch int64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.record("release")
 	l.released = append(l.released, leaseCall{credentialID: id, ref: ref, epoch: epoch})
 	l.atRelease = len(l.heartbeats)
 	l.held = false

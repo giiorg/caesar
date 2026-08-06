@@ -59,6 +59,19 @@ func IsConflict(err error) bool {
 	return errors.As(err, &ae) && ae.Status == http.StatusConflict
 }
 
+// NotFound and Conflict build the two answers every caller of this port
+// branches on. They are exported for the packages that speak the port through
+// a fake daemon: the branches those packages take on an already-gone container
+// are the ones recovery depends on, and without a way to produce the answer
+// they would be reachable only against a real daemon.
+func NotFound(message string) error {
+	return &apiError{Status: http.StatusNotFound, Message: message}
+}
+
+func Conflict(message string) error {
+	return &apiError{Status: http.StatusConflict, Message: message}
+}
+
 // do issues one request; 2xx decodes into out (when non-nil), anything
 // else becomes a typed apiError carrying the daemon's message.
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, in, out any) error {

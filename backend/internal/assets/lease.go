@@ -398,6 +398,21 @@ func (s *Service) CredentialLeaseByAttempt(ctx context.Context, attemptRef strin
 	return leaseFromRow(row), true, nil
 }
 
+// ListStaleCredentialLeases surfaces leases whose owner stopped heartbeating
+// (spec §2.8): expiry alone never breaks single-flight — these are handed to
+// reconciliation, never to a new acquirer.
+func (s *Service) ListStaleCredentialLeases(ctx context.Context, olderThan time.Duration) ([]CredentialLease, error) {
+	rows, err := store.New(s.pool).ListStaleLeases(ctx, olderThan.Seconds())
+	if err != nil {
+		return nil, fmt.Errorf("assets: list stale credential leases: %w", err)
+	}
+	out := make([]CredentialLease, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, leaseFromRow(row))
+	}
+	return out, nil
+}
+
 // RecordCredentialQuarantine audits a read-back whose account identity no
 // longer matches the credential caesar materialized (spec §2.5) — agent-
 // authored content, not a CLI refresh. Audit-only by design: the stored
