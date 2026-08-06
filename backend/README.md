@@ -280,8 +280,18 @@ sufficient alone:
    therefore `changed`) and the patch bytes stay honest even if the
    exclude ever failed.
 
-A repository that commits its own `.caesar/` directory is not supported:
-staging shadows it and extraction hides it.
+A repository that commits its own `.caesar/` directory is not supported,
+and it degrades quietly rather than loudly. Exclude files do not apply to
+already-tracked paths, so the base tree's `.caesar` entries survive
+`read-tree` and are refreshed by `add -A`; the index drop then removes
+them, leaving a written tree that differs from the base tree by exactly
+those deletions, while the `diff-tree` pathspec suppresses them from the
+patch. Every real change still reaches the patch, so the only phase this
+misreports is one that changed nothing else: it reports `changed` with an
+empty diff and publishes an empty patch artifact. The visible symptom
+lands one phase later — its successor is refused by `lineageInto` for a
+patch input carrying no diff, naming the wrong phase. Keep `.caesar/` out
+of the repository.
 
 Lineage is bounded at stage time; a breach is a permanent
 `staging_failed` naming the bound (the same oversize input would breach

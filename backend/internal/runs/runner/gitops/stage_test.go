@@ -105,6 +105,12 @@ func TestStage_CumulativePatchSubsumesItsAncestor(t *testing.T) {
 			t.Fatalf("phase 2's patch is missing %q — it is not cumulative:\n%s", want, second.Diff)
 		}
 	}
+	// The bytes that produced the tree are not part of the tree. This
+	// workspace was staged FROM a patch, so if input.patch were written inside
+	// the workspace rather than beside it, extraction would find it here.
+	if bytes.Contains(second.Diff, []byte(inputPatchFile)) {
+		t.Fatalf("%s was staged inside the workspace and reached the patch:\n%s", inputPatchFile, second.Diff)
+	}
 
 	// And the newest patch ALONE reproduces the composition.
 	d3 := stageInto(t, remote, sha, func(in *StageInput) {

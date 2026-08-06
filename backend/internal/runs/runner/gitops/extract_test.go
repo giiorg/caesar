@@ -436,8 +436,16 @@ func TestExtract_CaesarInputsNeverReachThePatch(t *testing.T) {
 }
 
 // The second of the two mechanisms, proved on its own: with the mirror's
-// exclude line gone, Extract's explicit pathspec still keeps the contract
-// directory out of both the index and the diff.
+// exclude line gone, Extract's own exclusions still keep the contract
+// directory out of the index, the tree hash and the diff.
+//
+// The first assertion is the one that pins the index half. A staged workspace
+// whose agent did nothing still has .caesar in it, so with the exclude gone
+// the `git rm --cached` is the only thing left that can bring the written tree
+// back to the base tree — the diff-tree pathspec cannot, because Changed is
+// decided by comparing trees before any diff runs. Nothing else in the suite
+// covers that line: every other case either keeps the exclude or writes a real
+// change first, which makes Changed true whatever the index holds.
 func TestExtract_PathspecHidesCaesarWithoutTheMirrorExclude(t *testing.T) {
 	remote, sha := stageFixture(t)
 	dir := stageInto(t, remote, sha, func(in *StageInput) { in.Instructions = "implement the thing\n" })
@@ -455,8 +463,22 @@ func TestExtract_PathspecHidesCaesarWithoutTheMirrorExclude(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	writeFile(t, filepath.Join(dir, workspaceName, "real.txt"), "the agent's work\n")
+	// Nothing but the staged contract is in this workspace, and the mirror's
+	// exclude is gone: dropping .caesar from the index is what has to make the
+	// written tree equal the base tree again. A phase that did nothing must
+	// report exactly that — a spurious Changed here would publish an empty
+	// patch artifact, and the phase after it would then die on a patch input
+	// carrying no diff, pointing at the wrong phase entirely.
 	rep, err := Extract(t.Context(), dir, defaultCaps(sha))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Changed {
+		t.Fatalf("changed = true for a workspace holding only the staged contract; %s reached the index and the tree hash", caesarDir)
+	}
+
+	writeFile(t, filepath.Join(dir, workspaceName, "real.txt"), "the agent's work\n")
+	rep, err = Extract(t.Context(), dir, defaultCaps(sha))
 	if err != nil {
 		t.Fatal(err)
 	}
