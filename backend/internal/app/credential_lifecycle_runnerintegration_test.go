@@ -389,16 +389,11 @@ func TestCredentialLifecycle_ObligationOutlivesTheWorker(t *testing.T) {
 		// out, which is what a cancellation-immune conclusion is for.
 		assertCredentialConcluded(t, e, ref, 1)
 		assertNoAttemptContainers(t, e, ref)
-
-		synced := lifeScalar[time.Time](t, e.pool,
-			`SELECT occurred_at FROM audit_entries WHERE action = 'credential.synced' AND subject_id = $1`,
-			e.credID.String())
-		terminal := lifeScalar[time.Time](t, e.pool,
-			`SELECT occurred_at FROM run_events WHERE run_id = $1 AND kind = $2`, run.ID, runs.EventRunDead)
-		if !terminal.After(synced) {
-			t.Errorf("the run died at %s, before its credential synced at %s: the terminal event must come last",
-				terminal, synced)
-		}
+		// No receipt-before-terminal assertion here: the worker concluded
+		// during stopFirst, before this test expired the deadline or started
+		// the second orchestrator, so any such comparison would hold on the
+		// test's own sequencing whatever the sweep does. Case 4 is where the
+		// sweep is provably the committer, and it carries that assertion.
 	})
 
 	// 2. The crash between the lease commit and the manifest write (spec §2.3):
@@ -505,6 +500,22 @@ func TestCredentialLifecycle_ObligationOutlivesTheWorker(t *testing.T) {
 		// alive, and it — not that worker — committed the refresh.
 		assertCredentialConcluded(t, e, ref, 2)
 		assertNoAttemptContainers(t, e, ref)
+
+		// The ordering guarantee, where the sweep is the one that owes it
+		// (spec §2.8). Because the committer here is settleRunCredentials and
+		// not the worker, these two timestamps are written by the same
+		// goroutine on the same tick, and only the order of the calls decides
+		// which comes first: the terminal event may not precede the receipt
+		// that the run's own credential obligation was discharged.
+		synced := lifeScalar[time.Time](t, e.pool,
+			`SELECT occurred_at FROM audit_entries WHERE action = 'credential.synced' AND subject_id = $1`,
+			e.credID.String())
+		terminal := lifeScalar[time.Time](t, e.pool,
+			`SELECT occurred_at FROM run_events WHERE run_id = $1 AND kind = $2`, run.ID, runs.EventRunDead)
+		if !terminal.After(synced) {
+			t.Errorf("the run died at %s, before its credential synced at %s: the terminal event must come last",
+				terminal, synced)
+		}
 	})
 
 	// 5. The sweep's cleanup-only path never adopts. A finished, adoptable

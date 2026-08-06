@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/giiorg/caesar/backend/internal/runs"
 	"github.com/giiorg/caesar/backend/internal/runs/fake"
@@ -301,6 +302,120 @@ func TestWallDeadlineTerminatesTheRun(t *testing.T) {
 	final := waitForRun(t, svc, run.ID, runs.RunDead)
 	if final.Outcome == nil || final.Outcome.Code != runs.CodeWallDeadlineExceeded {
 		t.Errorf("outcome = %+v, want wall_deadline_exceeded", final.Outcome)
+	}
+}
+
+// sweeperRace is an executor whose reconciliation of one phase moves another
+// phase of the same run out from under the sweep — standing in for a second
+// orchestrator process winning the running -> reconciling CAS in exactly the
+// window between this sweep's phase listing and its own fencing update.
+type sweeperRace struct {
+	*fake.Executor
+	pool        *pgxpool.Pool
+	movePhaseID uuid.UUID
+	moveTo      string
+	moveWhen    string // node id whose reconciliation triggers the move
+
+	mu   sync.Mutex
+	seen []string
+}
+
+func (s *sweeperRace) ReconcileCredential(ctx context.Context, ref runs.AttemptRef) error {
+	s.mu.Lock()
+	s.seen = append(s.seen, ref.NodeID)
+	s.mu.Unlock()
+	if ref.NodeID != s.moveWhen {
+		return nil
+	}
+	var finishedAt *time.Time
+	if runs.PhaseStatus(s.moveTo).Terminal() {
+		now := time.Now().UTC()
+		finishedAt = &now
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE phase_runs SET status = $2, finished_at = $3 WHERE id = $1`,
+		s.movePhaseID, s.moveTo, finishedAt)
+	return err
+}
+
+func (s *sweeperRace) reconciled() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.seen...)
+}
+
+// Losing the fencing CAS means one of two very different things, and the sweep
+// may only terminalize on one of them. A phase that moved because it is over
+// owes nothing; a phase another sweeper moved to reconciling is mid-settlement
+// right now — its sync receipt and lease release have not landed, and
+// terminalizeRun would supersede it and make the ordering violation durable
+// (FinishRun has no deadline predicate to catch it afterwards).
+func TestOrchestrator_ExpiredRunWaitsOutASweeperThatWonTheFence(t *testing.T) {
+	tests := []struct {
+		name    string
+		moveTo  string
+		wantRun runs.RunStatus
+	}{
+		{
+			name:    "another sweeper owns an obligation that has not concluded",
+			moveTo:  "reconciling",
+			wantRun: runs.RunRunning,
+		},
+		{
+			name:    "the phase is already over and owes nothing",
+			moveTo:  "dead",
+			wantRun: runs.RunDead,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			svc, _ := newService(t, f, agenticDoc(), runs.DefaultSnapshot())
+			ctx := context.Background()
+			_, runID := f.newRunRow(t, "running")
+			if _, err := f.pool.Exec(ctx,
+				`UPDATE runs SET wall_deadline = now() - interval '1 second' WHERE id = $1`, runID); err != nil {
+				t.Fatal(err)
+			}
+
+			// Two live phases, listed in this order: settling the first is what
+			// gives the imaginary second process its window at the second.
+			ids := make(map[string]uuid.UUID, 2)
+			for i, node := range []string{"plan", "impl"} {
+				var id uuid.UUID
+				if err := f.pool.QueryRow(ctx,
+					`INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, status,
+					                         worker_id, claimed_at, leased_until, created_at)
+					 VALUES ($1, $2, 1, 3, 'running', 'w-live', now(), now() + interval '10 minutes',
+					         now() + make_interval(secs => $3)) RETURNING id`, runID, node, i,
+				).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				ids[node] = id
+			}
+
+			ex := &sweeperRace{
+				Executor: fake.NewExecutor(), pool: f.pool,
+				movePhaseID: ids["impl"], moveTo: tc.moveTo, moveWhen: "plan",
+			}
+			o := newOrchestrator(svc, ex, 30*time.Second)
+			if err := runs.SweepExpiredRunsForTest(ctx, o); err != nil {
+				t.Fatal(err)
+			}
+
+			run, _, _, err := svc.GetRun(ctx, runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if run.Status != tc.wantRun {
+				t.Errorf("run status = %s, want %s", run.Status, tc.wantRun)
+			}
+			// Either way the moved phase belongs to whoever moved it: this
+			// sweep took custody of the one it fenced and nothing else.
+			if got := ex.reconciled(); len(got) != 1 || got[0] != "plan" {
+				t.Errorf("reconciled %v, want only the phase this sweep fenced ([plan])", got)
+			}
+		})
 	}
 }
 

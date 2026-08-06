@@ -371,7 +371,11 @@ func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID
 			// MarkPhaseReconciling cannot serve here.
 			if _, err := q.MarkPhaseReconcilingPastDeadline(ctx, p.ID); err != nil {
 				if errorsIsNoRows(err) {
-					continue // moved on under us: terminal, or another sweeper's
+					if o.phaseSettledElsewhere(ctx, q, p.ID) {
+						continue
+					}
+					settled = false
+					continue
 				}
 				o.log.Error("orchestrator: fence past-deadline phase", "phase", p.ID, "error", err)
 				settled = false
@@ -438,6 +442,24 @@ func (o *Orchestrator) sweepStaleCredentialLeases(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// phaseSettledElsewhere answers the only question the lost fencing CAS leaves
+// open: did the phase move because it is over, or because another sweeper
+// claimed it? Losing that CAS to a concurrent process' MarkPhaseReconciling
+// means that process is mid-reconciliation right now — its receipt and release
+// have not landed yet, and terminalizing on top of it makes exactly the
+// ordering violation this sweep exists to prevent durable. Only a terminal row
+// is proof that nobody is still holding an obligation.
+//
+// A read error is treated as "not proven", which costs a retry next tick.
+func (o *Orchestrator) phaseSettledElsewhere(ctx context.Context, q *store.Queries, phaseID uuid.UUID) bool {
+	row, err := q.GetPhase(ctx, phaseID)
+	if err != nil {
+		o.log.Error("orchestrator: re-read fenced phase", "phase", phaseID, "error", err)
+		return false
+	}
+	return PhaseStatus(row.Status).Terminal()
 }
 
 // phaseIsLive reports whether the attempt's own machinery still owns it: a

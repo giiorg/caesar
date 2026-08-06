@@ -61,6 +61,14 @@ func LoadPlanForTest(ctx context.Context, o *Orchestrator, runID uuid.UUID) erro
 // janitor's own schedule is far too slow for a test to wait on.
 func PrunePlanCacheForTest(ctx context.Context, o *Orchestrator) { o.prunePlanCache(ctx) }
 
+// SweepExpiredRunsForTest drives one wall-deadline sweep by hand. The
+// credential-settlement branches it guards turn on losing a CAS to a
+// concurrent sweeper, which a test can only stage between two calls — not
+// against a loop ticking on its own schedule.
+func SweepExpiredRunsForTest(ctx context.Context, o *Orchestrator) error {
+	return o.sweepExpiredRuns(ctx)
+}
+
 func FinishPhaseForTest(ctx context.Context, s *Service, phaseID uuid.UUID, from, to, workerID string) (int64, error) {
 	var n int64
 	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
