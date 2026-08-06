@@ -35,6 +35,8 @@ Sequence is dependency-ordered but not rigid: 10 (SSE) can start any time after 
 
 **Two notes on row 07.** *Generations / revision rematerialization moved to Plan 08*: it needs gate decisions to exist before it can be built, and every other 07 deliverable landed without it. And 07 does **not** flip to done on green CI. Per its own gate, the plan's acceptance evidence is the manual smoke checklist in `backend/README.md` — run once by the operator against real subscriptions, because no CI lane may ever place a live subscription call. Until that runs and its evidence is committed, the codex exit-marker rows in `internal/runs/runner/driver.go` remain **invented** rather than recorded: the CI fixture speaks them, which proves the mapping engine and nothing about the CLI. If the real CLI speaks differently, cap hits charge as `harness_error` instead of parking and auth death stops failing fast. The row closes on that single item; it never closes silently.
 
+Those are the *miss* failures, and they are the mild ones. The two the smoke run structurally **cannot** close are the false-match failures, because it observes what a CLI prints and never what a model prints into the same stdout: an auth row that matches the agent's own prose is **permanent** and writes `last_auth_expired_at` onto a live, working credential, and an epoch the capture mis-reads (a millisecond timestamp read as seconds) yields a provider-stated reset that bypasses the retry cap by design and therefore **terminalizes a run that was owed a park**. Both rows were narrowed for precision *before* the run rather than after it.
+
 ## Where the spec's "left to the implementation plan" items land
 
 | Item | Plan |

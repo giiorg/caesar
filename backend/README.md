@@ -643,22 +643,32 @@ Build the images first: `task image:harness`.
 
 Item 4 is the one with teeth, because the tables are not equally trustworthy:
 
-- **The `codex` rows are INVENTED** (`driver.go:167-180`). No recorded corpus
+- **The `codex` rows are INVENTED** (`driver.go:205-235`). No recorded corpus
   for that CLI exists; Task 13's fakecli fixture speaks these exact markers,
   which proves the mapping engine and says nothing about the CLI. If the real
   CLI speaks differently, cap hits charge as `harness_error` instead of parking,
   and auth death stops failing fast.
-- **The `claude-code` rows are recorded** against v2.1.222. One of them wants a
-  decision: the auth-expired row carries a bare `Please run /login` alternative,
-  which is the same false-match class a narrowing already fixed on the codex side
-  — the tail these patterns run over is the agent's own stdout, so a phrase an
-  agent could type in passing would stamp a live credential dead via
-  `MarkAuthExpired`. The evidence for keeping it is that real Claude Code
-  2.1.223, started uncredentialed, prints `Not logged in · Please run /login`
-  verbatim. The smoke run settles whether the bare alternative stays or gets
-  narrowed to that fuller phrase.
+- **The `claude-code` rows are recorded** — the cap rows against v2.1.222, and
+  the auth row's first alternative verbatim against the pinned v2.1.223: started
+  uncredentialed the CLI prints `Not logged in · Please run /login` (one line,
+  `·` as U+00B7, no escape sequences, exit 1). The bare `Please run /login` and
+  bare `Invalid API key` alternatives that row used to carry are **gone**: the
+  tail these patterns run over is the agent's own stdout, so a phrase an agent
+  types in passing would stamp a live credential dead via `MarkAuthExpired`.
+  Every alternative now has to open a line AND complete with the slash command
+  only the CLI can offer.
 
-One consequence of that row worth knowing before anyone reads a smoke
+That narrowing is deliberately not the smoke run's to settle. A smoke run
+measures **recall** — does the CLI print this? — and the auth rows' danger is
+**precision**: a false match is permanent, kills a live run, and writes to the
+operator's credential row, and no observation of a CLI can tell you what a model
+will print into the same stdout. Item 4 may therefore *widen* these rows onto
+recorded lines; it should not loosen them onto bare fragments. The same applies
+to the epoch capture, which is guarded on the right (`epochGuard`) so a
+millisecond timestamp fails the row and falls through to the plain cap rule
+rather than parking a run past its wall deadline.
+
+One consequence of the auth row worth knowing before anyone reads a smoke
 transcript: because the CLI prints the marker whenever it has no usable token,
 **a claude attempt whose token is absent, empty or rejected classifies as
 `auth_expired`, not `harness_error`.** Defensible — there is genuinely no
