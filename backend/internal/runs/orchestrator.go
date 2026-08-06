@@ -15,6 +15,7 @@ import (
 
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/pg"
+	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 	"github.com/giiorg/caesar/backend/internal/runs/store"
 )
 
@@ -728,10 +729,23 @@ func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node Pla
 	}
 	if node.Harness != "" {
 		h, err := o.svc.harnesses.HarnessByName(ctx, node.Harness)
-		if err != nil {
+		// Only a harness that is genuinely GONE is permanent: retrying finds
+		// the same nothing, so the node dies naming what an operator has to
+		// re-register. Everything else here is the database being briefly
+		// unreachable, and this resolution is two round trips wide — the row
+		// and the credential kind it pins (app/runsports.go) — so a pool
+		// timeout on either would otherwise kill the node permanently and tell
+		// the operator something that is not true.
+		switch {
+		case err != nil && xerrors.ClassOf(err) == xerrors.ClassNotFound:
 			return ExecutionRequest{}, OutcomeError{Outcome: Outcome{
 				Class: OutcomePermanent, Code: CodeHarnessError,
 				Message: fmt.Sprintf("harness %q no longer registered", node.Harness),
+			}}
+		case err != nil:
+			return ExecutionRequest{}, OutcomeError{Outcome: Outcome{
+				Class: OutcomeTransient, Code: CodeInternalError,
+				Message: fmt.Sprintf("resolve harness %q: %v", node.Harness, err),
 			}}
 		}
 		req.HarnessID = h.ID
