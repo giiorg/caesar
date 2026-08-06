@@ -501,8 +501,13 @@ the §2.7 malformed-write window, or a missing manifest — the refreshed values
 are unknowable and no complete scan exists. That attempt's quarantined logs and
 workspace-derived artifacts are then **permanently withheld** rather than
 published unscanned. Withholding suppresses an attempt's logs and artifacts,
-never its typed outcome: the run still fails legibly, it just publishes nothing
-that might carry a token caesar cannot name.
+never its typed outcome, and the workspace decides which outcome that is: an
+attempt that produced a diff fails permanently as `invalid_output`, because the
+alternative is a "success" whose patch and logs silently never appear; an
+attempt that changed nothing concludes normally with no artifacts. **So a
+withheld attempt does not always look like a failure** — a run that finished
+cleanly but has no logs is this case, not a missing-logs bug. Either way it
+publishes nothing that might carry a token caesar cannot name.
 
 ### The images
 
