@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/google/uuid"
 
@@ -22,6 +23,13 @@ import (
 // config knob because the control plane and daemon are co-located by design.
 const dockerSocketPath = "/var/run/docker.sock"
 
+// runnerDataDirs is the runner's on-disk tree under DataRoot, mirroring
+// naming.go: per-attempt scratch, published logs, the one agent-writable
+// credential directory, attempt manifests, and the unscanned streams that
+// have not earned publication yet. Creating any of them creates DataRoot too,
+// which is what AdmitClaim's free-space statfs needs.
+var runnerDataDirs = []string{"attempts", "logs", "auth", "manifests", "quarantine"}
+
 // runsSvc already writes the run's event stream, so it satisfies the runner's
 // EventSink port directly — no adapter, only this compile-time assertion that
 // the port and the method stay in lockstep.
@@ -35,10 +43,21 @@ func buildRunner(cfg config.Runner, assetsSvc *assets.Service, runsSvc *runs.Ser
 	// Nothing else creates DataRoot, and AdmitClaim statfs's it on every
 	// claim to check the free-space watermark — so a fresh install refuses
 	// every claim until the directory exists. Create the local tree here
-	// (0700: attempt workspaces and logs live under it). DataHostRoot is the
-	// daemon-side bind mapping, not a path on this host, so it is never made.
-	if err := os.MkdirAll(cfg.DataRoot, 0o700); err != nil {
-		return nil, fmt.Errorf("runner: create data root %s: %w", cfg.DataRoot, err)
+	// (0700: attempt workspaces, logs and credentials live under it).
+	// DataHostRoot is the daemon-side bind mapping, not a path on this host,
+	// so it is never made.
+	//
+	// The five subdirectories are made up front rather than on demand because
+	// they are the runner's on-disk contract, and an operator sizing or
+	// mounting them separately should meet them on a fresh install instead of
+	// after the first attempt of each kind happens to create one. The runner
+	// still MkdirAlls its own as it writes them; this is the shape of the
+	// tree, not a precondition it relies on.
+	for _, dir := range runnerDataDirs {
+		path := filepath.Join(cfg.DataRoot, dir)
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return nil, fmt.Errorf("runner: create data root %s: %w", path, err)
+		}
 	}
 
 	engine := dockerapi.New(dockerSocketPath)

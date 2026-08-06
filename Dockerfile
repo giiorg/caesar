@@ -22,6 +22,17 @@ COPY --from=build /out/caesar /usr/local/bin/caesar
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/caesar"]
 
+# The fakecli stage is CI's agent: a scripted stand-in for a real harness CLI,
+# speaking the same filesystem contract the operator-built images do
+# (docker/harness/). It lives in this Dockerfile rather than beside them so the
+# existing runner CI lane builds it with `task image:build` and no workflow
+# change — and, like the git stage, it is deliberately not the last stage.
+FROM alpine:3.22 AS fakecli
+RUN apk add --no-cache jq
+COPY docker/fakecli.sh /usr/local/bin/fakecli
+RUN chmod 0755 /usr/local/bin/fakecli
+ENTRYPOINT ["/usr/local/bin/fakecli"]
+
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/caesar /usr/local/bin/caesar
 ENTRYPOINT ["/usr/local/bin/caesar"]

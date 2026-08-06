@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -48,9 +49,23 @@ func lifecycleAgentScript(tail string) string {
 		tail + "\n"
 }
 
-// lifecycleEnv is one isolated world: its own database, its own credential,
-// and a runner over the real daemon whose agent runs the given script.
-type lifecycleEnv struct {
+// envSpec is what distinguishes one full-stack world from another: which
+// agent image runs, whether the resolver scripts it or the image's own
+// entrypoint wins (production's contract), what the phase's instructions say,
+// and which auth.json the credential starts at.
+type envSpec struct {
+	name         string // names the project, the workflow and the credential
+	repoDir      string // the bare fixture remote, bound read-only into staging
+	headSHA      string
+	storedAuth   string // the agent_auth_file credential's v1 bytes
+	imageRef     string // the harness image the agent runs
+	script       string // non-empty: injected as the agent's command instead of the image default
+	instructions string // the phase's instructions, staged to .caesar/in/instructions.md
+}
+
+// runnerEnv is one isolated world: its own database, its own credential, and a
+// runner over the real daemon.
+type runnerEnv struct {
 	pool      *pgxpool.Pool
 	assets    *assets.Service
 	runs      *runs.Service
@@ -66,7 +81,19 @@ type lifecycleEnv struct {
 	log       *slog.Logger
 }
 
-func newLifecycleEnv(t *testing.T, engine *dockerapi.Client, repoDir, headSHA, script string) *lifecycleEnv {
+// newLifecycleEnv is this suite's world: the git image driven by a scripted
+// agent. The materialized-pipeline suite builds its own spec over the same
+// constructor.
+func newLifecycleEnv(t *testing.T, engine *dockerapi.Client, repoDir, headSHA, script string) *runnerEnv {
+	t.Helper()
+	return newRunnerEnv(t, engine, envSpec{
+		name: "credential-lifecycle", repoDir: repoDir, headSHA: headSHA,
+		storedAuth: lifecycleStoredAuth, imageRef: e2eGitImage,
+		script: script, instructions: "Implement.",
+	})
+}
+
+func newRunnerEnv(t *testing.T, engine *dockerapi.Client, spec envSpec) *runnerEnv {
 	t.Helper()
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, testdb.NewURL(t))
@@ -97,12 +124,12 @@ func newLifecycleEnv(t *testing.T, engine *dockerapi.Client, repoDir, headSHA, s
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
 		fake.Forge{Heads: heads}, runs.Params{Snapshot: runs.DefaultSnapshot()})
 
-	project, err := assetsSvc.CreateProject(ctx, admin, "credential-lifecycle", "")
+	project, err := assetsSvc.CreateProject(ctx, admin, spec.name, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	authCred, err := assetsSvc.CreateCredential(ctx, admin, "codex-subscription",
-		assets.CredentialAgentAuthFile, []byte(lifecycleStoredAuth))
+		assets.CredentialAgentAuthFile, []byte(spec.storedAuth))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,28 +138,32 @@ func newLifecycleEnv(t *testing.T, engine *dockerapi.Client, repoDir, headSHA, s
 		t.Fatal(err)
 	}
 	if _, err := assetsSvc.RegisterHarness(ctx, admin, assets.NewHarness{
-		Name: "cx", Kind: assets.HarnessCodex, ImageRef: e2eGitImage,
+		Name: "cx", Kind: assets.HarnessCodex, ImageRef: spec.imageRef,
 		ProviderEndpoint: "https://chatgpt.com/backend-api", CredentialID: authCred.ID,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	repo, err := assetsSvc.CreateRepo(ctx, admin, project.ID, assets.NewRepo{
-		Forge: assets.ForgeGitHub, Slug: "lifecycle/demo", DefaultBranch: "main", CredentialID: forgeCred.ID,
+		Forge: assets.ForgeGitHub, Slug: spec.name + "/demo", DefaultBranch: "main", CredentialID: forgeCred.ID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	heads[repo.ID] = headSHA
+	heads[repo.ID] = spec.headSHA
 
-	wf, err := workflowsSvc.CreateWorkflow(ctx, admin, "credential-lifecycle", "")
+	wf, err := workflowsSvc.CreateWorkflow(ctx, admin, spec.name, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	version, _, err := workflowsSvc.CreateVersion(ctx, admin, wf.ID, []byte(`{
+	instructions, err := json.Marshal(spec.instructions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, _, err := workflowsSvc.CreateVersion(ctx, admin, wf.ID, fmt.Appendf(nil, `{
 	  "schema": 1,
-	  "nodes": [{"id": "impl", "type": "implement", "harness": "cx", "instructions": "Implement."}],
+	  "nodes": [{"id": "impl", "type": "implement", "harness": "cx", "instructions": %s}],
 	  "edges": []
-	}`))
+	}`, instructions))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,12 +173,18 @@ func newLifecycleEnv(t *testing.T, engine *dockerapi.Client, repoDir, headSHA, s
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	egressNet := "caesar-egress-life-" + uuid.NewString()[:8]
+	egressNet := "caesar-egress-" + uuid.NewString()[:8]
+	// An empty script means the image's OWN entrypoint runs, which is
+	// production's contract (appHarnessResolver leaves Entrypoint/Cmd nil).
+	var resolver runner.HarnessResolver = appHarnessResolver{svc: assetsSvc}
+	if spec.script != "" {
+		resolver = scriptedResolver{inner: appHarnessResolver{svc: assetsSvc}, script: spec.script}
+	}
 	rnr, err := runner.New(engine,
-		scriptedResolver{inner: appHarnessResolver{svc: assetsSvc}, script: script},
+		resolver,
 		appCredentialOpener{svc: assetsSvc},
 		appCredentialLeaser{svc: assetsSvc},
-		localBareGit{dir: repoDir},
+		localBareGit{dir: spec.repoDir},
 		runsSvc,
 		runner.Options{
 			DataRoot: dataRoot, CaesarImage: e2eCaesarImage, GitImage: e2eGitImage,
@@ -162,7 +199,7 @@ func newLifecycleEnv(t *testing.T, engine *dockerapi.Client, repoDir, headSHA, s
 	started := time.Now().Unix()
 	t.Cleanup(func() { e2eSweep(t, engine, egressNet, started) })
 
-	return &lifecycleEnv{
+	return &runnerEnv{
 		pool: pool, assets: assetsSvc, runs: runsSvc, admin: admin,
 		credID: authCred.ID, repoID: repo.ID, wfID: wf.ID, version: version.Version,
 		dataRoot: dataRoot, rnr: rnr, engine: engine, egressNet: egressNet, log: log,
@@ -173,7 +210,7 @@ func newLifecycleEnv(t *testing.T, engine *dockerapi.Client, repoDir, headSHA, s
 // The phase lease is deliberately long-lived and heartbeated often: every case
 // here is about the DEADLINE path, and a phase lease that expired underneath it
 // would hand the attempt to the lease sweep instead.
-func (e *lifecycleEnv) startOrchestrator(t *testing.T, exec runs.Executor, workers int) func() {
+func (e *runnerEnv) startOrchestrator(t *testing.T, exec runs.Executor, workers int) func() {
 	t.Helper()
 	orch := runs.NewOrchestrator(e.runs, exec, runs.AlwaysAdmit{}, runsAssetSource{svc: e.assets},
 		runs.OrchestratorConfig{
@@ -196,7 +233,7 @@ func (e *lifecycleEnv) startOrchestrator(t *testing.T, exec runs.Executor, worke
 	return stop
 }
 
-func (e *lifecycleEnv) newRun(t *testing.T, title string) runs.Run {
+func (e *runnerEnv) newRun(t *testing.T, title string) runs.Run {
 	t.Helper()
 	_, run, err := e.runs.CreateTask(context.Background(), e.admin, runs.NewTask{
 		RepoID: e.repoID, WorkflowID: e.wfID, WorkflowVersion: e.version, Title: title,
@@ -211,7 +248,7 @@ func (e *lifecycleEnv) newRun(t *testing.T, title string) runs.Run {
 // DATABASE clock, which is the clock every deciding predicate reads. A worker
 // already running keeps the deadline it was handed at claim time, so this is
 // exactly the race the deadline sweep exists for.
-func (e *lifecycleEnv) expireWallDeadline(t *testing.T, runID uuid.UUID) {
+func (e *runnerEnv) expireWallDeadline(t *testing.T, runID uuid.UUID) {
 	t.Helper()
 	if _, err := e.pool.Exec(context.Background(),
 		`UPDATE runs SET wall_deadline = now() - interval '1 second' WHERE id = $1`, runID); err != nil {
@@ -219,7 +256,7 @@ func (e *lifecycleEnv) expireWallDeadline(t *testing.T, runID uuid.UUID) {
 	}
 }
 
-func (e *lifecycleEnv) authFilePath(ref runs.AttemptRef) string {
+func (e *runnerEnv) authFilePath(ref runs.AttemptRef) string {
 	return filepath.Join(e.dataRoot, "auth", ref.String(), "auth.json")
 }
 
@@ -263,7 +300,7 @@ func lifeWaitForRunStatus(t *testing.T, svc *runs.Service, runID uuid.UUID, want
 // assertCredentialConcluded pins the shape every one of these cases ends in:
 // the refreshed bytes are in the store at the next version, the receipt says
 // which attempt put them there, and nobody holds the lease any more.
-func assertCredentialConcluded(t *testing.T, e *lifecycleEnv, ref runs.AttemptRef, wantEpoch int64) {
+func assertCredentialConcluded(t *testing.T, e *runnerEnv, ref runs.AttemptRef, wantEpoch int64) {
 	t.Helper()
 	if v := lifeScalar[int64](t, e.pool, `SELECT secret_version FROM credentials WHERE id = $1`, e.credID); v != 2 {
 		t.Errorf("credential secret_version = %d, want 2 — the CLI's refresh landed exactly once", v)
@@ -283,7 +320,7 @@ func assertCredentialConcluded(t *testing.T, e *lifecycleEnv, ref runs.AttemptRe
 // assertNoAttemptContainers pins that nothing of the attempt's runtime is left:
 // the agent above all, which is the container that could still be writing the
 // credential this reconciliation just committed.
-func assertNoAttemptContainers(t *testing.T, e *lifecycleEnv, ref runs.AttemptRef) {
+func assertNoAttemptContainers(t *testing.T, e *runnerEnv, ref runs.AttemptRef) {
 	t.Helper()
 	for _, name := range []string{ref.String(), ref.String() + "-egress"} {
 		if _, err := e.engine.ContainerInspect(context.Background(), name); !dockerapi.IsNotFound(err) {
