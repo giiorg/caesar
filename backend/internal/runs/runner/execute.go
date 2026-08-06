@@ -160,13 +160,26 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	// the driver's fields join it under materialized custody. What the CLI may
 	// refresh mid-run is unknown until the conclusion reads it back, so the set
 	// is completed there and nothing publishes before then (spec §3).
-	set := newSensitiveSet([]byte(spec.BrokerToken), g.secret)
+	set := newSensitiveSet()
+	if short := set.addRaw(g.secret, []byte(spec.BrokerToken)); short > 0 {
+		// Below the floor the credential still redacts — it is secret by
+		// definition — but it now blanks every incidental occurrence of itself.
+		// Operator-caused, and loud rather than silent.
+		r.log.Warn("runner.short_credential", "attempt", ref.String(),
+			"values", short, "floor", minSecretLen)
+	}
+	// withheld starts here because an unreadable field list is already a reason
+	// to withhold: the set holds the WHOLE auth file, so a log line printing
+	// only the access token is not a substring of anything in it. That is an
+	// incomplete scan, not a less precise one, and adoption refuses to publish
+	// on exactly this condition (adoptionSensitive) — the two paths may not
+	// disagree about what counts as a complete scan.
+	withheld := false
 	if spec.Custody == custodyMaterialized && d.sensitive != nil {
 		sens, err := d.sensitive(g.secret)
 		if err != nil {
-			// The raw bytes are already in the set, so this costs precision on
-			// the individual fields, not the credential itself.
 			r.log.Warn("runner.sensitive_fields", "attempt", ref.String(), "error", err)
+			withheld = true
 		}
 		set.add(sens...)
 	}
@@ -235,7 +248,6 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	// The conclusion is also what completes the redaction set, so the order is
 	// pinned: conclude, extend the set, publish or withhold, and only then
 	// assemble anything an artifact could carry (spec §3).
-	withheld := false
 	if leased {
 		// The heartbeat stops (and its goroutine joins) before the conclusion
 		// releases: a tick landing after the release reads as a fence at the
@@ -248,7 +260,7 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 		// unknowable, so no complete scan exists and nothing this attempt
 		// produced may publish (spec §2.7). The streams stay in quarantine as
 		// evidence; only the typed outcome still gets out.
-		withheld = conc.Status == concUnscannable
+		withheld = withheld || conc.Status == concUnscannable
 		r.publishOrWithhold(ref, set, withheld)
 		switch {
 		case conc.Outcome != nil:
@@ -261,8 +273,9 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 		}
 	} else {
 		// Nothing about an unleased credential can change while the attempt
-		// runs, so its set was already complete when the agent started.
-		r.publishOrWithhold(ref, set, false)
+		// runs: the set was as complete when the agent started as it will ever
+		// be, and whether that is complete enough was already decided above.
+		r.publishOrWithhold(ref, set, withheld)
 	}
 	if err != nil {
 		return r.failureResult(ref, agent, set, withheld), err
@@ -318,6 +331,12 @@ type agentOutcome struct {
 func (r *Runner) failureResult(ref runs.AttemptRef, agent agentOutcome, set *sensitiveSet, withheld bool) runs.ExecutionResult {
 	if !agent.started {
 		return runs.ExecutionResult{}
+	}
+	if set == nil {
+		// Unreachable by construction, and fails closed the way publishLogs
+		// does: no set means nothing scanned anything, which is what withheld
+		// means. The empty stand-in keeps the metadata redaction total.
+		set, withheld = newSensitiveSet(), true
 	}
 	if withheld {
 		return runs.ExecutionResult{Artifacts: []runs.NewArtifact{{

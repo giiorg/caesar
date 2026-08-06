@@ -1,11 +1,13 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,10 +39,18 @@ const (
 
 // Case 1 (spec §6): the precision the whole per-kind field list exists for. A
 // patch that legitimately mentions the literal `chatgpt` — the auth_mode value
-// every Codex auth.json carries — and a timestamp must persist untouched. The
-// field list plus the length floor is the entire mechanism.
+// every Codex auth.json carries — a timestamp, and the account slug that sits
+// in the very file the set was built from, must persist untouched. The field
+// list plus the length floor is the entire mechanism: the slug is real content
+// of the credential, so this case fails if the driver's list ever widens to
+// reach it without the floor still holding it back.
 func TestSensitiveSet_ALegitimatePatchMentioningChatgptIsNotASecret(t *testing.T) {
-	set := newSensitiveSet([]byte(claudeOAuthToken), []byte(codexStoredAuth))
+	const accountSlug = "acct-redaction" // 14 bytes, and inside codexStoredAuth
+	if len(accountSlug) >= minSecretLen || !strings.Contains(codexStoredAuth, accountSlug) {
+		t.Fatalf("fixture %q must be a sub-floor value the credential really carries", accountSlug)
+	}
+	set := newSensitiveSet()
+	set.addRaw([]byte(claudeOAuthToken), []byte(codexStoredAuth))
 	sens, err := codexSensitive([]byte(codexStoredAuth))
 	if err != nil {
 		t.Fatal(err)
@@ -48,8 +58,9 @@ func TestSensitiveSet_ALegitimatePatchMentioningChatgptIsNotASecret(t *testing.T
 	set.add(sens...)
 
 	patch := []byte(`diff --git a/docs/auth.md b/docs/auth.md
-+The CLI records auth_mode: "chatgpt" beside last_refresh: 1754380800.
-+Both are benign, and neither is a credential.
++The CLI records auth_mode: "chatgpt" beside last_refresh: 1754380800,
++and files the run under account ` + accountSlug + `.
++All three are benign, and none of them is a credential.
 `)
 	if set.scan(patch) {
 		t.Errorf("a patch mentioning chatgpt and a timestamp read as a secret: %s", patch)
@@ -59,18 +70,20 @@ func TestSensitiveSet_ALegitimatePatchMentioningChatgptIsNotASecret(t *testing.T
 	}
 }
 
-// Case 2: the floor. auth.json carries short benign values, and an exact match
-// on one of them would blank or fail every patch that happened to contain it.
-func TestSensitiveSet_ValuesBelowTheFloorAreNeverAdded(t *testing.T) {
+// Case 2: the floor over the driver's extracted fields. auth.json carries short
+// benign values, and an exact match on one of them would blank or fail every
+// patch that happened to contain it.
+func TestSensitiveSet_ExtractedValuesBelowTheFloorAreNeverAdded(t *testing.T) {
 	const short = "chatgpt1" // 8 bytes: benign, and never a credential
 	if len(short) >= minSecretLen {
 		t.Fatalf("fixture %q is %d bytes, want one below the %d-byte floor", short, len(short), minSecretLen)
 	}
-	set := newSensitiveSet([]byte(short))
+	set := newSensitiveSet()
+	set.add([]byte(short))
 
 	body := []byte("the auth_mode is chatgpt1 today")
 	if set.scan(body) {
-		t.Error("an 8-byte value entered the set; the floor did not hold")
+		t.Error("an 8-byte extracted value entered the set; the floor did not hold")
 	}
 	if got := set.redact(body); string(got) != string(body) {
 		t.Errorf("redact = %q, want the body untouched", got)
@@ -79,6 +92,37 @@ func TestSensitiveSet_ValuesBelowTheFloorAreNeverAdded(t *testing.T) {
 	set.add([]byte(strings.Repeat("z", minSecretLen)))
 	if !set.scan([]byte("prefix" + strings.Repeat("z", minSecretLen) + "suffix")) {
 		t.Error("a value exactly at the floor was dropped")
+	}
+}
+
+// The other half of the floor rule: it governs what is parsed OUT of an auth
+// file, never the credential itself. A short provider credential or broker
+// token is still a credential — dropping it would take away every protection
+// at once, silently — so it enters whole and the caller is told, because
+// redacting a 4-byte value everywhere is its own kind of damage.
+func TestSensitiveSet_TheCredentialItselfIsNeverBelowTheFloor(t *testing.T) {
+	const tinyKey = "sk-4f2a" // an operator's idea of a credential
+	if len(tinyKey) >= minSecretLen {
+		t.Fatalf("fixture %q must sit below the %d-byte floor", tinyKey, minSecretLen)
+	}
+	set := newSensitiveSet()
+	short := set.addRaw([]byte(tinyKey), []byte(testBrokerToken), nil)
+
+	if short != 1 {
+		t.Errorf("addRaw reported %d short values, want the one an operator must hear about", short)
+	}
+	if !set.scan([]byte("export OPENAI_API_KEY=" + tinyKey)) {
+		t.Error("a short credential was dropped: the exact leak redaction exists to stop")
+	}
+	if !set.scan([]byte("authorization: Bearer " + testBrokerToken)) {
+		t.Error("the broker token did not enter the set")
+	}
+	// The empty broker token every materialized attempt carries must never
+	// enter: bytes.Contains finds an empty value in everything, which would
+	// read every artifact as a leak and rewrite every published byte.
+	body := []byte("nothing sensitive here")
+	if got := newSensitiveSet(); got.addRaw(nil, []byte("")) != 0 || got.scan(body) {
+		t.Errorf("an empty value entered the set and matched %q", body)
 	}
 }
 
@@ -97,7 +141,8 @@ func TestPublishLogs_RedactsAMidRunRefreshedTokenAndIsIdempotent(t *testing.T) {
 
 	// The set as it stood while the agent ran knows nothing of the new token;
 	// the conclusion's read-back is what completes it.
-	set := newSensitiveSet([]byte(claudeOAuthToken))
+	set := newSensitiveSet()
+	set.addRaw([]byte(claudeOAuthToken))
 	if set.scan([]byte(quarantined)) {
 		t.Fatal("the fixture's refreshed token was already in the set; the case proves nothing")
 	}
@@ -143,7 +188,8 @@ func TestPublishLogs_RedactsAMidRunRefreshedTokenAndIsIdempotent(t *testing.T) {
 // token. The scan must run on the canonical decoded bytes — exactly where
 // collect.go encodes them.
 func TestSensitiveSet_ScansTheCanonicalPatchBytesNotTheEncodedPayload(t *testing.T) {
-	set := newSensitiveSet([]byte(claudeOAuthToken))
+	set := newSensitiveSet()
+	set.addRaw([]byte(claudeOAuthToken))
 	rep := gitops.ExtractReport{
 		Changed:  true,
 		TreeHash: "tree-1",
@@ -226,6 +272,73 @@ func TestExecute_AnUnscannableReadBackWithholdsEverythingWorkspaceDerived(t *tes
 	}
 	if _, sErr := os.Stat(filepath.Join(r.quarantineDir(ref), agentLogFile)); sErr != nil {
 		t.Errorf("the quarantined log was not retained as evidence: %v", sErr)
+	}
+}
+
+// The live path's twin of the rule adoption already enforces: a field list the
+// driver could not extract is an INCOMPLETE scan, not a coarser one. The set
+// holds the WHOLE auth file, so a log line printing only the access token —
+// exactly what a CLI does — matches nothing in it. Execute must withhold on
+// that, as adoptionSensitive does, or the two paths disagree about what counts
+// as a complete scan and the more forgiving one publishes the token.
+func TestExecute_AFieldListTheDriverCannotExtractWithholdsEverything(t *testing.T) {
+	const kind = "redaction-test-harness"
+	withTestDriver(t, kind, driver{
+		kind:         kind,
+		connectAllow: []string{"api.example.invalid"},
+		custodyFor:   map[string]custody{kindAgentAuthFile: custodyMaterialized},
+		env:          func(in envInput) []string { return []string{"TEST_AUTH=" + in.secret} },
+		// The shape that makes the branch reachable: an extractor that fails over
+		// a credential nothing else rejects. No authMount either, so the
+		// conclusion is clean and the extraction is the only thing to withhold
+		// over.
+		sensitive: func([]byte) ([][]byte, error) { return nil, errors.New("unreadable auth file") },
+	})
+
+	credID, ref := uuid.New(), testRef()
+	dataRoot := t.TempDir()
+	eng := newLeaseEngine()
+	fakePipeline(t, eng, dataRoot, ref, gitops.ExtractReport{
+		Changed: true, BaseSHA: "abc", TreeHash: "tree-1",
+		Diff: []byte("diff --git a/NEW.md b/NEW.md\n+work\n"),
+	})
+	daemon := &scriptedLogs{leaseEngine: eng, streams: map[string][]byte{
+		"id-" + agentName(ref): logFrame(1, "authenticating with "+codexAccessToken+"\n"),
+	}}
+	leaser := &fakeLeaser{lease: Lease{Epoch: 1, SecretVersion: 9}, secret: []byte(codexStoredAuth)}
+	r := newLeaseRunner(t, daemon, leaser, &recordingOpener{}, Options{DataRoot: dataRoot})
+	r.harnesses = &harnessRegistry{spec: HarnessSpec{Kind: kind, ImageRef: "ghcr.io/x/codex@sha256:beef"}}
+
+	res, err := r.Execute(t.Context(), leaseRequest(credID, kindAgentAuthFile))
+
+	// The disk first: it is where the leak would be, and it says what happened
+	// whether or not the attempt was typed the way it should have been.
+	if entries, rErr := os.ReadDir(r.logsDir(ref)); rErr == nil && len(entries) > 0 {
+		t.Errorf("the streams were published against a set that never saw the driver's fields: %v\n%s",
+			entries, readPublished(t, r, ref, agentLogFile))
+	} else if rErr != nil && !os.IsNotExist(rErr) {
+		t.Fatal(rErr)
+	}
+	// The evidence survives where only an operator can reach it, and the fixture
+	// really did carry the value the set could not know.
+	quarantined, qErr := os.ReadFile(filepath.Join(r.quarantineDir(ref), agentLogFile))
+	if qErr != nil {
+		t.Fatalf("the quarantined log was not retained as evidence: %v", qErr)
+	}
+	if !strings.Contains(string(quarantined), codexAccessToken) {
+		t.Fatalf("the agent's line never reached the log, so this case proves nothing:\n%s", quarantined)
+	}
+
+	byType := artifactTypes(res.Artifacts)
+	for _, kind := range []string{runs.ArtifactKindPatch, runs.ArtifactKindLogRef} {
+		if _, ok := byType[kind]; ok {
+			t.Errorf("a withheld attempt produced a %s artifact: %v", kind, res.Artifacts)
+		}
+	}
+	out := outcomeOf(t, err)
+	if out.Class != runs.OutcomePermanent || out.Code != runs.CodeInvalidOutput {
+		t.Errorf("outcome = %s/%s, want permanent/%s — a run whose bytes can never publish is not a success",
+			out.Class, out.Code, runs.CodeInvalidOutput)
 	}
 }
 
@@ -542,6 +655,32 @@ func TestExecute_ASecretInAWorkspaceArtifactFailsClosed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// withTestDriver registers a harness row for the duration of one test. No
+// shipped driver can fail its own field extractor today — codex's identity pin
+// rejects the same bytes a step later, and claude-code's extractor cannot fail
+// at all — but the redaction rule is a property of the driver contract, not of
+// the two rows that happen to implement it now.
+func withTestDriver(t *testing.T, kind string, d driver) {
+	t.Helper()
+	if _, taken := drivers[kind]; taken {
+		t.Fatalf("driver %q is a real harness; pick a kind nothing ships", kind)
+	}
+	drivers[kind] = d
+	t.Cleanup(func() { delete(drivers, kind) })
+}
+
+// scriptedLogs is the daemon handing a container the output a test wants
+// streamed; leaseEngine's own streams are empty for every container. The key is
+// the container ID the daemon handed back, which is how the runner asks.
+type scriptedLogs struct {
+	*leaseEngine
+	streams map[string][]byte
+}
+
+func (e *scriptedLogs) ContainerLogs(_ context.Context, id string, _ bool) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(e.streams[id])), nil
 }
 
 // fixedOpener is the credential store answering with exactly what an attempt

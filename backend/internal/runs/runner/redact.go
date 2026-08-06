@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	// minSecretLen is the exact-match floor (spec §3): an auth.json also holds
-	// benign short values — `auth_mode: "chatgpt"`, timestamps — and matching
-	// those exactly would blank or fail legitimate patches. Nothing shorter
-	// than this is treated as a secret; the per-kind sensitive-field list is
-	// what makes the floor safe to have.
+	// minSecretLen is the exact-match floor (spec §3) for values parsed OUT of
+	// an auth file: it also holds benign short ones — `auth_mode: "chatgpt"`,
+	// an account slug, timestamps — and matching those exactly would blank or
+	// fail legitimate patches. The floor governs the driver's extracted fields
+	// and nothing else: the credential itself and the broker token are secret
+	// by definition and enter at any length (addRaw).
 	minSecretLen = 16
 
 	// redactedMarker replaces every matched value. It names caesar so an
@@ -32,28 +33,55 @@ const (
 // completed at the conclusion; nothing scans or publishes before then.
 type sensitiveSet struct{ values [][]byte }
 
-// newSensitiveSet builds the set from the values already in hand. Anything
-// below the floor is dropped, so a caller may hand over whatever it has
-// without first deciding what counts as a secret.
-func newSensitiveSet(values ...[]byte) *sensitiveSet {
-	s := &sensitiveSet{}
-	s.add(values...)
-	return s
+// newSensitiveSet returns an empty set. Values enter through one of the two
+// doors below, and which one a caller uses is the whole floor question: the
+// constructor takes none so that choice is always written down.
+func newSensitiveSet() *sensitiveSet {
+	return &sensitiveSet{}
 }
 
-// add extends the set. Duplicates are dropped: the same credential arrives
-// from several directions (the raw bytes, the driver's field list, the
-// read-back), and scanning for it twice only costs time.
+// addRaw adds credential bytes that are secret by definition — the provider
+// credential itself and the per-attempt broker token — bypassing the floor.
+// Empty values are skipped (a materialized attempt has no broker token).
+//
+// It reports how many of them are short enough that the floor would have
+// dropped them. A credential that short redacts every incidental occurrence of
+// itself, including legitimate patch bytes; that is operator-caused, and the
+// caller makes it visible rather than letting either the leak or the damage be
+// silent.
+func (s *sensitiveSet) addRaw(values ...[]byte) (short int) {
+	for _, v := range values {
+		if len(v) == 0 {
+			continue
+		}
+		if len(v) < minSecretLen {
+			short++
+		}
+		s.insert(v)
+	}
+	return short
+}
+
+// add extends the set with the driver's extracted fields — the values the
+// floor exists for — and with the read-back's refreshed ones, which are the
+// same fields a run later.
 func (s *sensitiveSet) add(values ...[]byte) {
 	for _, v := range values {
 		if len(v) < minSecretLen {
 			continue
 		}
-		if slices.ContainsFunc(s.values, func(have []byte) bool { return bytes.Equal(have, v) }) {
-			continue
-		}
-		s.values = append(s.values, bytes.Clone(v))
+		s.insert(v)
 	}
+}
+
+// insert appends one value, dropping duplicates: the same credential arrives
+// from several directions (the raw bytes, the driver's field list, the
+// read-back), and scanning for it twice only costs time.
+func (s *sensitiveSet) insert(v []byte) {
+	if slices.ContainsFunc(s.values, func(have []byte) bool { return bytes.Equal(have, v) }) {
+		return
+	}
+	s.values = append(s.values, bytes.Clone(v))
 }
 
 // scan reports whether any value in the set appears in b. The bytes handed
@@ -172,7 +200,12 @@ func adoptionSensitive(rec credentialReconciliation) (*sensitiveSet, bool) {
 	if err != nil {
 		return nil, false // no per-kind field list, no complete scan
 	}
-	set := newSensitiveSet([]byte(rec.Manifest.BrokerToken), rec.Stored)
+	set := newSensitiveSet()
+	// The short-credential warning belongs to the live path, which emits it
+	// before any container exists — so an attempt reachable by adoption has
+	// already logged it once, and repeating it here would only date-stamp the
+	// crash.
+	set.addRaw(rec.Stored, []byte(rec.Manifest.BrokerToken))
 	if rec.Manifest.Custody == custodyMaterialized && d.sensitive != nil {
 		// Materialized only: a brokered binding's credential is a raw key, and
 		// the driver's extractor describes an auth file (Task 6's per-kind rule).
