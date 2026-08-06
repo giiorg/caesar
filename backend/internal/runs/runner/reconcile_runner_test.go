@@ -47,7 +47,7 @@ func stageAttemptForInspect(t *testing.T, r *Runner, ref runs.AttemptRef) RunSpe
 	if err := r.ensureNetworks(ctx, ref); err != nil {
 		t.Fatalf("ensure networks: %v", err)
 	}
-	if err := r.stageAttempt(ctx, ref, spec, clone); err != nil {
+	if err := r.stageAttempt(ctx, ref, req, spec, clone); err != nil {
 		t.Fatalf("stage: %v", err)
 	}
 	return spec

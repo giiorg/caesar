@@ -395,6 +395,80 @@ func TestParseObjectID_AcceptsOnlyAnObjectID(t *testing.T) {
 	}
 }
 
+// The filesystem contract is the control plane's, not the agent's work: it is
+// staged into the workspace and must not show up as a change the phase made.
+func TestExtract_CaesarInputsNeverReachThePatch(t *testing.T) {
+	remote, sha := stageFixture(t)
+	dir := stageInto(t, remote, sha, func(in *StageInput) {
+		in.Instructions = "implement the thing\n"
+		in.TaskInputs = map[string]any{"ticket": "CAESAR-12"}
+		in.Contexts = []StageContext{{Name: "0-plan.json", JSON: json.RawMessage(`{"content":"the plan"}`)}}
+	})
+	ws := filepath.Join(dir, workspaceName)
+
+	// A staged contract plus whatever the agent wrote under it is still no
+	// change at all.
+	writeFile(t, filepath.Join(ws, caesarDir, "in", "agent-scratch.txt"), "scratch\n")
+	writeFile(t, filepath.Join(ws, caesarDir, "out", "artifacts.json"), `[{"type":"plan","payload":{}}]`)
+	rep, err := Extract(t.Context(), dir, defaultCaps(sha))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Changed || len(rep.Diff) != 0 {
+		t.Fatalf("changed = %v, want an unchanged tree — %s is not the phase's work:\n%s",
+			rep.Changed, caesarDir, rep.Diff)
+	}
+
+	// Alongside a real change, the patch carries the real change and nothing
+	// else.
+	writeFile(t, filepath.Join(ws, "real.txt"), "the agent's work\n")
+	rep, err = Extract(t.Context(), dir, defaultCaps(sha))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Changed || !bytes.Contains(rep.Diff, []byte("real.txt")) {
+		t.Fatalf("the real change is missing from the patch:\n%s", rep.Diff)
+	}
+	if bytes.Contains(rep.Diff, []byte(caesarDir)) {
+		t.Fatalf("%s leaked into the patch:\n%s", caesarDir, rep.Diff)
+	}
+	assertPatchApplies(t, dir, sha, rep)
+}
+
+// The second of the two mechanisms, proved on its own: with the mirror's
+// exclude line gone, Extract's explicit pathspec still keeps the contract
+// directory out of both the index and the diff.
+func TestExtract_PathspecHidesCaesarWithoutTheMirrorExclude(t *testing.T) {
+	remote, sha := stageFixture(t)
+	dir := stageInto(t, remote, sha, func(in *StageInput) { in.Instructions = "implement the thing\n" })
+
+	exclude := filepath.Join(dir, baseRepoDir, "info", "exclude")
+	raw, err := os.ReadFile(exclude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripped := strings.ReplaceAll(string(raw), "/"+caesarDir+"/", "")
+	if stripped == string(raw) {
+		t.Fatalf("the mirror exclude never carried the %s line: %q", caesarDir, raw)
+	}
+	if err := os.WriteFile(exclude, []byte(stripped), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, filepath.Join(dir, workspaceName, "real.txt"), "the agent's work\n")
+	rep, err := Extract(t.Context(), dir, defaultCaps(sha))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Changed || !bytes.Contains(rep.Diff, []byte("real.txt")) {
+		t.Fatalf("the real change is missing from the patch:\n%s", rep.Diff)
+	}
+	if bytes.Contains(rep.Diff, []byte(caesarDir)) {
+		t.Fatalf("%s leaked into the patch with only the pathspec guarding it:\n%s", caesarDir, rep.Diff)
+	}
+	assertPatchApplies(t, dir, sha, rep)
+}
+
 func TestExtract_MissingBaseSHAIsExtractionFailed(t *testing.T) {
 	dir, _ := stagedDir(t)
 	_, err := Extract(t.Context(), dir, defaultCaps(strings.Repeat("a", 40)))

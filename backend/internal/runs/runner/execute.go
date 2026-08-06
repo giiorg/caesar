@@ -235,7 +235,7 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	if err := r.ensureNetworks(ctx, ref); err != nil {
 		return runs.ExecutionResult{}, err
 	}
-	if err := r.stageAttempt(ctx, ref, spec, clone); err != nil {
+	if err := r.stageAttempt(ctx, ref, req, spec, clone); err != nil {
 		return runs.ExecutionResult{}, err
 	}
 	agent, err := r.runAgentToCompletion(ctx, ref, spec, d)
@@ -387,17 +387,66 @@ func (r *Runner) ensureEgressNetwork(ctx context.Context) error {
 	return nil
 }
 
+// lineageInto maps what the node was compiled with onto the staging contract:
+// the phase's own instructions and task inputs, the one patch its workspace
+// opens from, and a context file per remaining artifact. It is what turns a
+// graph edge into something the agent can read off its filesystem.
+//
+// Exactly one patch, by contract. Extraction diffs from the run's base, so
+// every patch already carries its ancestors' changes and the newest one
+// subsumes the whole linear chain; applying two would apply everything they
+// share a second time. A node with two patch inputs is therefore not a merge
+// this plan can perform, and pretending otherwise would silently corrupt the
+// tree — it is refused instead.
+func lineageInto(in *gitops.StageInput, req runs.ExecutionRequest) error {
+	in.Instructions = req.Instructions
+	in.TaskInputs = req.TaskInputs
+	for i, a := range req.Inputs {
+		if a.Type == runs.ArtifactKindPatch {
+			if in.Patch != "" {
+				return permanentf(runs.CodeStagingFailed,
+					"node declares more than one patch input; multi-patch staging lands with generations (Plan 08)")
+			}
+			// Already the base64 wire form collect wrote, and it travels
+			// unchanged: a patch is arbitrary bytes, so decoding it here only
+			// to re-encode it would be the corruption the wire form avoids.
+			diff, _ := a.Payload["diff"].(string)
+			if diff == "" {
+				// Staging nothing would be worse than failing: the phase would
+				// open at the run base, and its own patch would then read as a
+				// revert of everything its predecessor did.
+				return permanentf(runs.CodeInvalidOutput,
+					"patch input %s carries no diff in the base64 wire form", a.ID)
+			}
+			in.Patch = diff
+			in.InputRefs = append(in.InputRefs, gitops.InputRef{ID: a.ID.String(), Type: a.Type})
+			continue
+		}
+		name := fmt.Sprintf("%d-%s.json", i, a.Type)
+		raw, err := json.Marshal(a.Payload)
+		if err != nil {
+			return permanentf(runs.CodeInvalidOutput, "encode %s input %s: %v", a.Type, a.ID, err)
+		}
+		in.Contexts = append(in.Contexts, gitops.StageContext{Name: name, JSON: raw})
+		in.InputRefs = append(in.InputRefs, gitops.InputRef{ID: a.ID.String(), Type: a.Type, Name: name})
+	}
+	return nil
+}
+
 // stageAttempt runs the trusted stage container: it clones at the pinned SHA,
 // sanitizes and verifies, and reports through a contract file. The report is
 // the signal, never the exit code — a container that died before writing one
 // staged nothing.
-func (r *Runner) stageAttempt(ctx context.Context, ref runs.AttemptRef, spec RunSpec, clone CloneSpec) error {
+func (r *Runner) stageAttempt(ctx context.Context, ref runs.AttemptRef, req runs.ExecutionRequest, spec RunSpec, clone CloneSpec) error {
 	dir := r.attemptDir(ref)
 	in := gitops.StageInput{
 		CloneURL:   clone.URL,
 		BaseSHA:    spec.BaseSHA,
 		QuotaBytes: r.opts.WorkspaceQuotaBytes,
 		QuotaFiles: r.opts.WorkspaceQuotaFiles,
+	}
+	if err := lineageInto(&in, req); err != nil {
+		return err
 	}
 	if err := writeContract(filepath.Join(dir, gitops.StageInputFile), in); err != nil {
 		return transientf(runs.CodeStagingFailed, "write stage contract: %v", err)

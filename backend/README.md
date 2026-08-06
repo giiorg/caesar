@@ -236,6 +236,75 @@ network isolation must not rest on Docker alone: the host firewall must
 deny the agent subnets everything except the gateway (baseline in the
 Plan 14 deployment runbook).
 
+## Harness filesystem contract (Plan 07)
+
+`/workspace` is the agent's only mount and its whole world. Everything a
+phase was handed, and everything it hands back, moves through one
+reserved directory inside it — `.caesar/`, laid out by the stage
+container before the agent starts:
+
+    /workspace/                     the repo, checked out detached at base_sha
+      .caesar/in/instructions.md    the node's instructions, verbatim (may be empty)
+      .caesar/in/inputs.json        {"task_inputs": {...}, "inputs": [{"id","type","name"}]}
+      .caesar/in/<idx>-<type>.json  one file per non-patch input artifact, payload verbatim
+      .caesar/out/                  created empty; the harness's side of the contract
+      .caesar/out/artifacts.json    optional: [{"type","payload"}, ...]
+
+`in/` is always complete: `instructions.md` and `inputs.json` exist even
+for a phase with no lineage at all (`task_inputs` an object, `inputs` an
+array — never `null`), so a harness entry script can read them
+unconditionally. `<idx>` is the input's position in the node's declared
+input list, so the filenames are stable and collision-free; `name` in the
+manifest points at the file, and is absent for a patch input, which
+arrives as tree content rather than as a file.
+
+`out/artifacts.json` is the declarable allowlist from Plan 06: `plan`,
+`review_verdict` and other work products. A harness may not declare a
+`patch` (that is extracted from the workspace), nor `log_ref` /
+`failure_snapshot` (those are the runtime's own observations).
+
+**`.caesar/` is reserved, and invisible to the extracted patch.** It is
+the control plane's work, not the phase's, so it must never read as a
+change the agent made. Two independent mechanisms enforce that, either
+sufficient alone:
+
+1. A `/.caesar/` line written into `base.git/info/exclude` at stage time.
+   Extraction indexes the workspace with `GIT_DIR` pointed at that
+   trusted mirror, which lives *outside* the agent's bind mount — so this
+   is the authoritative one: the agent cannot re-include itself. (The
+   same line goes into `workspace/.git/info/exclude` for agent-side
+   `git status` hygiene. That copy is the agent's own file and carries no
+   security weight.)
+2. Extraction drops `.caesar` from its throwaway index and passes
+   `-- . :(exclude).caesar` to `diff-tree`, so both the tree hash (and
+   therefore `changed`) and the patch bytes stay honest even if the
+   exclude ever failed.
+
+A repository that commits its own `.caesar/` directory is not supported:
+staging shadows it and extraction hides it.
+
+Lineage is bounded at stage time; a breach is a permanent
+`staging_failed` naming the bound (the same oversize input would breach
+it again on every retry):
+
+| input | cap |
+|---|---|
+| input patch (decoded bytes) | 4 MiB |
+| `instructions.md` | 256 KiB |
+| each context file | 1 MiB |
+
+**The cumulative-patch contract.** Extraction always diffs from the
+run's base SHA, never from where the phase started, so every patch
+artifact already contains its ancestors' changes and the newest one
+subsumes the whole linear chain. Staging therefore applies **exactly one**
+patch: applying an ancestor chain would apply everything they share a
+second time. A node declaring two patch inputs is refused before any
+container runs (permanent `staging_failed`); multi-patch composition is a
+generations/merge shape that lands with Plan 08. The patch travels as
+base64 (`payload["diff"]`) end to end — a patch is arbitrary bytes, and
+round-tripping it through a JSON string would silently replace invalid
+UTF-8 while leaving a diff that still applies.
+
 ## Contracts
 
 `task contracts:gen` regenerates the OpenAPI document and the TS client
