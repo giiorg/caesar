@@ -205,8 +205,10 @@ func TestMaterializedPipeline_TheWholeStackAgainstAScriptedCLI(t *testing.T) {
 		ref := runs.AttemptRef{RunID: run.ID, NodeID: "impl", Attempt: 1}
 		matRequireStatus(t, matWaitTerminal(t, e, run.ID), runs.RunSucceeded)
 
-		// Delivery, both halves at once: CODEX_HOME pointed at the bind, and
-		// the bytes behind it were the stored credential to the last byte.
+		// Delivery, both halves at once. The fixture has no fallback path — it
+		// dies on an unset CODEX_HOME (docker/fakecli.sh) — so a logged sha at
+		// all proves the driver emitted the variable, and this sha proves the
+		// bytes behind it were the stored credential to the last byte.
 		wantSHA := sha256.Sum256([]byte(stored))
 		agentLog := matPublishedLog(t, e, ref, "agent.log")
 		if want := "fakecli:auth-sha " + hex.EncodeToString(wantSHA[:]); !strings.Contains(agentLog, want) {

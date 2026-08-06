@@ -13,10 +13,12 @@
 set -eu
 
 instructions=/workspace/.caesar/in/instructions.md
-# CODEX_HOME is what the codex driver's authMount sets; the default matches
-# its containerPath so a mis-wired env fails visibly on a missing file rather
-# than by silently reading somewhere else.
-auth="${CODEX_HOME:-/caesar-auth}/auth.json"
+# CODEX_HOME is what the codex driver's authMount sets, and there is
+# deliberately no default: the mount's containerPath is a value this fixture
+# must never know. A default equal to it would read the same bytes with the env
+# half of the delivery unwired, so print-auth-sha would keep passing while the
+# variable the real CLI needs was never emitted. Unset dies here, loudly.
+auth="${CODEX_HOME:?the codex driver's authMount did not deliver CODEX_HOME}/auth.json"
 
 # The values mutate-auth writes. Both clear the runner's 16-byte exact-match
 # redaction floor, and the refresh token carries the "rt-refreshed" marker that
