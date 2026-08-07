@@ -217,6 +217,11 @@ CREATE TABLE runs (
     definition_hash     text NOT NULL,
     base_sha            text NOT NULL,
     policy_snapshot     jsonb NOT NULL,
+    -- Generations (spec §3): a gate's request_changes rewinds a slice and
+    -- opens the next one. Dispatch never reads this — readiness is the
+    -- node's NEWEST attempt row — but markers, approval invalidation and
+    -- round accounting all do.
+    generation          integer NOT NULL DEFAULT 1 CHECK (generation >= 1),
     execution_budget_ms bigint NOT NULL CHECK (execution_budget_ms > 0),
     execution_used_ms   bigint NOT NULL DEFAULT 0 CHECK (execution_used_ms >= 0),
     wall_deadline       timestamptz NOT NULL,
@@ -246,7 +251,8 @@ CREATE TABLE phase_runs (
     chargeable_failures integer NOT NULL DEFAULT 0 CHECK (chargeable_failures >= 0),
     -- Earliest moment a parked retry may be claimed (spec §4.4); NULL = now.
     not_before   timestamptz,
-    status       text NOT NULL CHECK (status IN ('pending', 'running', 'reconciling', 'succeeded', 'failed', 'dead', 'superseded')),
+    status       text NOT NULL CHECK (status IN ('pending', 'running', 'waiting_decision', 'reconciling', 'succeeded', 'failed', 'dead', 'superseded')),
+    generation   integer NOT NULL DEFAULT 1 CHECK (generation >= 1),
     worker_id    text,
     leased_until timestamptz,
     claimed_at   timestamptz,
@@ -256,8 +262,10 @@ CREATE TABLE phase_runs (
     UNIQUE (run_id, node_id, attempt)
 );
 
+-- A gate awaiting a decision is as live as a running attempt: it must block
+-- a second row for its node.
 CREATE UNIQUE INDEX phase_runs_live_key ON phase_runs (run_id, node_id)
-    WHERE status IN ('pending', 'running', 'reconciling');
+    WHERE status IN ('pending', 'running', 'waiting_decision', 'reconciling');
 CREATE INDEX phase_runs_claim_idx ON phase_runs (created_at) WHERE status = 'pending';
 CREATE INDEX phase_runs_lease_idx ON phase_runs (leased_until) WHERE status = 'running';
 CREATE INDEX phase_runs_not_before_idx ON phase_runs (not_before)
@@ -270,13 +278,26 @@ CREATE TABLE artifacts (
     run_id     uuid NOT NULL REFERENCES runs (id) ON DELETE RESTRICT,
     node_id    text NOT NULL,
     attempt    integer NOT NULL,
-    type       text NOT NULL CHECK (type IN ('plan', 'patch', 'review_verdict', 'log_ref', 'failure_snapshot')),
+    generation integer NOT NULL DEFAULT 1 CHECK (generation >= 1),
+    -- publication and gate_note join log_ref and failure_snapshot as RUNTIME
+    -- outputs: they are never edge bindings (the definitions validator only
+    -- knows plan/patch/review_verdict), they are produced by the control
+    -- plane rather than by a harness, and they are read by the API and by the
+    -- revision seed respectively.
+    type       text NOT NULL CHECK (type IN ('plan', 'patch', 'review_verdict', 'log_ref', 'failure_snapshot', 'publication', 'gate_note')),
     payload    jsonb NOT NULL,
     parent_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
     created_at timestamptz NOT NULL
 );
 
 CREATE INDEX artifacts_run_id_idx ON artifacts (run_id);
+-- buildRequest and the lineage reader both want "the newest artifact of this
+-- type for this node", which is this index read backwards. The column order
+-- mirrors GetNodeArtifact's ORDER BY exactly: selection is by PROVENANCE
+-- first — generation, then attempt — and only then by time, because seeds and
+-- produced artifacts are stamped from two independent clocks. An index ordered
+-- on created_at would no longer serve that query.
+CREATE INDEX artifacts_node_lookup_idx ON artifacts (run_id, node_id, type, generation DESC, attempt DESC, created_at DESC, id DESC);
 
 -- Commit-ordered event ids (spec §2): allocated from this single row,
 -- locked FOR UPDATE inside the mutation tx. Sequences allocate in
@@ -311,3 +332,117 @@ CREATE TABLE outbox (
 );
 
 CREATE INDEX outbox_created_at_idx ON outbox (created_at);
+
+-- A gate's decision (spec §2 Gate). One row per gate ATTEMPT: a revision
+-- rematerializes the gate as a new attempt row, which is decidable again,
+-- while the unique key makes deciding the SAME row twice impossible — that
+-- uniqueness IS the API's concurrency answer, not a convention.
+CREATE TABLE gate_decisions (
+    id                   uuid PRIMARY KEY DEFAULT uuidv7(),
+    phase_run_id         uuid NOT NULL UNIQUE REFERENCES phase_runs (id) ON DELETE RESTRICT,
+    run_id               uuid NOT NULL REFERENCES runs (id) ON DELETE RESTRICT,
+    node_id              text NOT NULL,
+    generation           integer NOT NULL CHECK (generation >= 1),
+    decision             text NOT NULL CHECK (decision IN ('approve', 'request_changes', 'reject')),
+    -- The immutable artifact the human examined. Approval authorizes exactly
+    -- this id and nothing newer (spec §3 artifact flow).
+    examined_artifact_id uuid NOT NULL REFERENCES artifacts (id) ON DELETE RESTRICT,
+    note                 text NOT NULL DEFAULT '',
+    acted_by             uuid NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
+    -- Marked distinctly because the policy permits it, not because it is
+    -- ordinary (spec §6).
+    self_approval        boolean NOT NULL DEFAULT false,
+    acted_at             timestamptz NOT NULL
+);
+
+CREATE INDEX gate_decisions_run_node_idx ON gate_decisions (run_id, node_id);
+
+-- The single-use ApprovedPatch authorization (spec §2): the only token
+-- git-publish can consume, scoped to the one publish node its gate
+-- dominates. Every field here is re-validated at consumption; a mismatch
+-- aborts before any forge call.
+CREATE TABLE approved_patches (
+    id               uuid PRIMARY KEY DEFAULT uuidv7(),
+    run_id           uuid NOT NULL REFERENCES runs (id) ON DELETE RESTRICT,
+    gate_node_id     text NOT NULL,
+    publish_node_id  text NOT NULL,
+    gate_decision_id uuid NOT NULL UNIQUE REFERENCES gate_decisions (id) ON DELETE RESTRICT,
+    artifact_id      uuid NOT NULL REFERENCES artifacts (id) ON DELETE RESTRICT,
+    base_sha         text NOT NULL,
+    tree_hash        text NOT NULL,
+    repo_id          uuid NOT NULL REFERENCES repos (id) ON DELETE RESTRICT,
+    -- The repo's coordinates AS APPROVED. repo_id alone is not an identity:
+    -- UpdateRepo can change a repo's slug, default branch and credential
+    -- mid-run (assets/repos.go), so the row the id points at is not
+    -- necessarily the repository the human approved publishing to. Pinning
+    -- them here means the publish path can prove the destination has not
+    -- moved, and a rename becomes a refusal instead of a patch delivered to
+    -- the wrong repository.
+    forge_kind       text NOT NULL,
+    repo_slug        text NOT NULL,
+    target_branch    text NOT NULL,
+    generation       integer NOT NULL CHECK (generation >= 1),
+    status           text NOT NULL CHECK (status IN ('valid', 'consumed', 'invalidated')),
+    created_at       timestamptz NOT NULL,
+    settled_at       timestamptz
+);
+
+-- At most one LIVE authorization per publish node per run. A newer patch
+-- generation invalidates the prior one (spec §2), and this index is what
+-- makes "invalidate then mint" impossible to get half-done.
+CREATE UNIQUE INDEX approved_patches_live_key ON approved_patches (run_id, publish_node_id)
+    WHERE status = 'valid';
+
+-- The git-publish effect state machine (spec §3 Publishing). The row commits
+-- BEFORE the first forge call; every effect records its receipt as it lands,
+-- so a retry always distinguishes "never happened" from "succeeded, receipt
+-- lost". One intent per (run, publish node) — resumed across attempts, never
+-- re-minted, because a second intent would mean a second branch.
+CREATE TABLE publish_intents (
+    id               uuid PRIMARY KEY DEFAULT uuidv7(),
+    run_id           uuid NOT NULL REFERENCES runs (id) ON DELETE RESTRICT,
+    node_id          text NOT NULL,
+    -- The attempt that created the intent: provenance, not identity.
+    attempt          integer NOT NULL CHECK (attempt >= 1),
+    -- UNIQUE is the single-use guarantee in its strongest form: a second
+    -- consumption of the same authorization is a constraint violation, not a
+    -- lost CAS (invariant 2, Postgres is the authority).
+    authorization_id uuid NOT NULL UNIQUE REFERENCES approved_patches (id) ON DELETE RESTRICT,
+    repo_id          uuid NOT NULL REFERENCES repos (id) ON DELETE RESTRICT,
+    -- Copied from the authorization at creation, so every later attempt and
+    -- every recovery probe addresses the repository the approval named — not
+    -- whatever the repos table says today. The credential rides along for the
+    -- same reason: UpdateRepo can repoint a repo at a different one, and a
+    -- resumed publication must present the credential its approval implied.
+    forge_kind       text NOT NULL,
+    repo_slug        text NOT NULL,
+    credential_id    uuid NOT NULL REFERENCES credentials (id) ON DELETE RESTRICT,
+    -- The deterministic markers recovery reconstructs from the authorization.
+    branch           text NOT NULL,
+    target_branch    text NOT NULL,
+    base_sha         text NOT NULL,
+    tree_hash        text NOT NULL,
+    title            text NOT NULL,
+    body             text NOT NULL,
+    status           text NOT NULL CHECK (status IN ('pending', 'pushed', 'published', 'halted')),
+    -- Receipts, each written in the transaction after its effect landed.
+    head_sha         text,
+    pr_number        bigint,
+    pr_url           text,
+    halt_reason      text,
+    -- When settlement first found the marker missing. A single absent probe
+    -- cannot settle an intent — a request issued just before the deadline may
+    -- still be in flight — so absence must persist across ticks before it
+    -- means "nothing landed". Cleared the moment a probe finds the marker.
+    absent_since     timestamptz,
+    created_at       timestamptz NOT NULL,
+    updated_at       timestamptz NOT NULL,
+    UNIQUE (run_id, node_id)
+);
+
+-- Two publications can never target the same branch on the same repo: the
+-- marker is derived from the approved artifact id, so a collision would mean
+-- two authorizations over one artifact, which approved_patches_live_key
+-- already forbids. Belt and braces, because the consequence is a silent
+-- overwrite of somebody else's ref.
+CREATE UNIQUE INDEX publish_intents_marker_key ON publish_intents (repo_id, branch);

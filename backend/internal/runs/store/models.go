@@ -11,15 +11,49 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type ApprovedPatch struct {
+	ID             uuid.UUID
+	RunID          uuid.UUID
+	GateNodeID     string
+	PublishNodeID  string
+	GateDecisionID uuid.UUID
+	ArtifactID     uuid.UUID
+	BaseSha        string
+	TreeHash       string
+	RepoID         uuid.UUID
+	ForgeKind      string
+	RepoSlug       string
+	TargetBranch   string
+	Generation     int32
+	Status         string
+	CreatedAt      time.Time
+	SettledAt      *time.Time
+}
+
 type Artifact struct {
-	ID        uuid.UUID
-	RunID     uuid.UUID
-	NodeID    string
-	Attempt   int32
-	Type      string
-	Payload   []byte
-	ParentIds []byte
-	CreatedAt time.Time
+	ID         uuid.UUID
+	RunID      uuid.UUID
+	NodeID     string
+	Attempt    int32
+	Generation int32
+	Type       string
+	Payload    []byte
+	ParentIds  []byte
+	CreatedAt  time.Time
+}
+
+type GateDecision struct {
+	ID                 uuid.UUID
+	PhaseRunID         uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Generation         int32
+	Decision           string
+	ExaminedArtifactID uuid.UUID
+	Note               string
+	ActedBy            uuid.UUID
+	SelfApproval       bool
+	ActedAt            time.Time
 }
 
 type PhaseRun struct {
@@ -31,12 +65,39 @@ type PhaseRun struct {
 	ChargeableFailures int32
 	NotBefore          *time.Time
 	Status             string
+	Generation         int32
 	WorkerID           pgtype.Text
 	LeasedUntil        *time.Time
 	ClaimedAt          *time.Time
 	FinishedAt         *time.Time
 	Outcome            []byte
 	CreatedAt          time.Time
+}
+
+type PublishIntent struct {
+	ID              uuid.UUID
+	RunID           uuid.UUID
+	NodeID          string
+	Attempt         int32
+	AuthorizationID uuid.UUID
+	RepoID          uuid.UUID
+	ForgeKind       string
+	RepoSlug        string
+	CredentialID    uuid.UUID
+	Branch          string
+	TargetBranch    string
+	BaseSha         string
+	TreeHash        string
+	Title           string
+	Body            string
+	Status          string
+	HeadSha         pgtype.Text
+	PrNumber        pgtype.Int8
+	PrUrl           pgtype.Text
+	HaltReason      pgtype.Text
+	AbsentSince     *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type Run struct {
@@ -46,6 +107,7 @@ type Run struct {
 	DefinitionHash    string
 	BaseSha           string
 	PolicySnapshot    []byte
+	Generation        int32
 	ExecutionBudgetMs int64
 	ExecutionUsedMs   int64
 	WallDeadline      time.Time

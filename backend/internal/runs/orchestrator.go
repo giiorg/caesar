@@ -293,7 +293,8 @@ func (o *Orchestrator) startPendingRuns(ctx context.Context) error {
 			}
 			maxAttempts := snap.MaxAttempts
 			for _, root := range cp.plan.Roots() {
-				if _, err := o.svc.insertPhaseTx(ctx, tx, runID, root, 1, maxAttempts, 0, nil); err != nil {
+				// Task 4 threads the run's real generation here.
+				if _, err := o.svc.insertPhaseTx(ctx, tx, runID, root, 1, maxAttempts, 0, 1, nil); err != nil {
 					return err
 				}
 				evs = append(evs, Event{
@@ -830,7 +831,8 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 	if err != nil {
 		return false, err
 	}
-	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, res.Artifacts, rawParents, now)
+	// Task 4 threads the run's real generation here.
+	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, 1, res.Artifacts, rawParents, now)
 	if err != nil {
 		return false, err
 	}
@@ -873,7 +875,8 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 		if attempted[nodeID] || !cp.plan.Ready(nodeID, succeeded) {
 			continue
 		}
-		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, nodeID, 1, c.MaxAttempts, 0, nil); err != nil {
+		// Task 4 threads the run's real generation here.
+		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, nodeID, 1, c.MaxAttempts, 0, 1, nil); err != nil {
 			return false, err
 		}
 		evs = append(evs, Event{
@@ -894,7 +897,7 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 // caller's tx and returns their ids for the event payload. Lineage is
 // the caller's call: successes descend from their inputs, failures from
 // nothing.
-func insertArtifacts(ctx context.Context, q *store.Queries, ref AttemptRef,
+func insertArtifacts(ctx context.Context, q *store.Queries, ref AttemptRef, generation int32,
 	artifacts []NewArtifact, rawParents []byte, now time.Time,
 ) ([]string, error) {
 	var ids []string
@@ -909,7 +912,8 @@ func insertArtifacts(ctx context.Context, q *store.Queries, ref AttemptRef,
 		}
 		if _, err := q.InsertArtifact(ctx, store.InsertArtifactParams{
 			ID: id, RunID: ref.RunID, NodeID: ref.NodeID, Attempt: ref.Attempt,
-			Type: a.Type, Payload: rawPayload, ParentIds: rawParents, CreatedAt: now,
+			Generation: generation,
+			Type:       a.Type, Payload: rawPayload, ParentIds: rawParents, CreatedAt: now,
 		}); err != nil {
 			return nil, fmt.Errorf("runs: insert artifact: %w", err)
 		}
@@ -1041,7 +1045,8 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		if n == 0 {
 			return false, nil // fenced
 		}
-		artifactIDs, err := insertArtifacts(ctx, q, c.Ref, res.Artifacts, noParents, now)
+		// Task 4 threads the run's real generation here.
+		artifactIDs, err := insertArtifacts(ctx, q, c.Ref, 1, res.Artifacts, noParents, now)
 		if err != nil {
 			return false, err
 		}
@@ -1052,8 +1057,9 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 				return false, err
 			}
 		}
+		// Task 4 threads the run's real generation here.
 		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, c.Ref.NodeID,
-			c.Ref.Attempt+1, c.MaxAttempts, newCount, notBefore); err != nil {
+			c.Ref.Attempt+1, c.MaxAttempts, newCount, 1, notBefore); err != nil {
 			return false, err
 		}
 		payload := map[string]any{
@@ -1081,7 +1087,8 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	if n == 0 {
 		return false, nil // fenced
 	}
-	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, res.Artifacts, noParents, now)
+	// Task 4 threads the run's real generation here.
+	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, 1, res.Artifacts, noParents, now)
 	if err != nil {
 		return false, err
 	}

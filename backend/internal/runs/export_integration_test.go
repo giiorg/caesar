@@ -36,7 +36,8 @@ func InsertPhaseForTest(ctx context.Context, s *Service, runID uuid.UUID, nodeID
 	var id uuid.UUID
 	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var err error
-		id, err = s.insertPhaseTx(ctx, tx, runID, nodeID, attempt, maxAttempts, chargeableFailures, notBefore)
+		// Task 4 threads the run's real generation here.
+		id, err = s.insertPhaseTx(ctx, tx, runID, nodeID, attempt, maxAttempts, chargeableFailures, 1, notBefore)
 		return err
 	})
 	return id, err

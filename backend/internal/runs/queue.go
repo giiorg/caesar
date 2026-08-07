@@ -84,11 +84,12 @@ func (s *Service) heartbeat(ctx context.Context, phaseID uuid.UUID, workerID str
 // chargeableFailures carries the node's spent failure budget forward;
 // notBefore parks the row until the database clock passes it (nil = now).
 func (s *Service) insertPhaseTx(ctx context.Context, tx pgx.Tx, runID uuid.UUID, nodeID string,
-	attempt, maxAttempts, chargeableFailures int32, notBefore *time.Time,
+	attempt, maxAttempts, chargeableFailures, generation int32, notBefore *time.Time,
 ) (uuid.UUID, error) {
 	row, err := store.New(tx).InsertPhase(ctx, store.InsertPhaseParams{
 		RunID: runID, NodeID: nodeID, Attempt: attempt, MaxAttempts: maxAttempts,
-		ChargeableFailures: chargeableFailures, NotBefore: notBefore, CreatedAt: s.clock.Now(),
+		ChargeableFailures: chargeableFailures, NotBefore: notBefore,
+		Generation: generation, CreatedAt: s.clock.Now(),
 	})
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("runs: insert phase %s/%s#%d: %w", runID, nodeID, attempt, err)
