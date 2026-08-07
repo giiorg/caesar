@@ -915,6 +915,7 @@ export interface components {
             type?: string;
         };
         RunsPolicySnapshot: {
+            allow_self_approval?: boolean;
             /** Format: int64 */
             execution_budget_ms?: number;
             /** Format: int32 */

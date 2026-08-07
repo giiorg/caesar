@@ -2715,6 +2715,9 @@
       },
       "RunsPolicySnapshot": {
         "properties": {
+          "allow_self_approval": {
+            "type": "boolean"
+          },
           "execution_budget_ms": {
             "format": "int64",
             "type": "integer"
