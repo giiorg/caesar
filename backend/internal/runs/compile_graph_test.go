@@ -43,8 +43,10 @@ func twinConveyor() DefinitionDoc {
 func twinDiamond() DefinitionDoc {
 	return DefinitionDoc{
 		Nodes: []DefNode{
-			{ID: "a", Kind: KindPlan}, {ID: "b", Kind: KindImplement},
-			{ID: "c", Kind: KindImplement}, {ID: "d", Kind: KindGate},
+			{ID: "a", Kind: KindPlan},
+			{ID: "b", Kind: KindImplement},
+			{ID: "c", Kind: KindImplement},
+			{ID: "d", Kind: KindGate},
 		},
 		Edges: []DefEdge{
 			{From: "a", To: "b", Artifact: ArtifactKindPlan},
