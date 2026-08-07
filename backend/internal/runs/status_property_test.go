@@ -20,18 +20,27 @@ var allPhaseStatuses = []runs.PhaseStatus{
 	runs.PhaseSucceeded, runs.PhaseFailed, runs.PhaseDead, runs.PhaseSuperseded,
 }
 
-// revisionRetiresASuccess is the ONE declared exception to the sink rule
-// (Plan 08): readiness reads a node's newest attempt row, so a revision that
-// rewinds a slice must retire even a row that succeeded in the prior
-// generation — otherwise that row stays newest and readable as done forever.
+// revisionRetiresASuccess names the ONE declared exception to the sink rule
+// (Plan 08 decision 2) as an exact (from, to) pair — not "succeeded is
+// exempt", which would wave through any future edge out of succeeded.
+// Readiness reads a node's newest attempt row, so a revision that rewinds a
+// slice must retire even a row that succeeded in the prior generation —
+// otherwise that row stays newest and readable as done forever.
 func revisionRetiresASuccess(from, to runs.PhaseStatus) bool {
 	return from == runs.PhaseSucceeded && to == runs.PhaseSuperseded
 }
 
 // Terminal states admit no transition at all, for both entities — save for
-// the single revision edge named above, which the property still pins as the
-// only one by rejecting every other pair.
+// the single revision edge named above. The property pins that edge from both
+// sides: the assertion below fails if it ever disappears, and the sampled
+// check fails if any OTHER terminal edge appears.
 func TestPropertyTerminalStatesAreSinks(t *testing.T) {
+	// Asserted, not merely tolerated. A predicate that only permits the pair
+	// would keep passing if someone deleted the edge, and a revision would
+	// silently stop retiring succeeded rows.
+	if !runs.PhaseSucceeded.CanTransition(runs.PhaseSuperseded) {
+		t.Fatal("succeeded -> superseded must be legal: it is the declared exception this property exempts")
+	}
 	rapid.Check(t, func(t *rapid.T) {
 		from := rapid.SampledFrom(allRunStatuses).Draw(t, "from")
 		to := rapid.SampledFrom(allRunStatuses).Draw(t, "to")
