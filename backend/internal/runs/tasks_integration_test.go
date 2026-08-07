@@ -80,6 +80,22 @@ func agenticDoc() runs.DefinitionDoc {
 	}
 }
 
+// gatedConveyorDoc is agenticDoc closed with the gate and the publish it
+// authorizes — the shape Plan 05 refused at intake and Plan 08 executes.
+func gatedConveyorDoc() runs.DefinitionDoc {
+	doc := agenticDoc()
+	doc.Nodes = append(doc.Nodes,
+		runs.DefNode{ID: "gate", Kind: runs.KindGate, Revision: &runs.DefRevision{Target: "impl", MaxRounds: 2}},
+		runs.DefNode{ID: "publish", Kind: runs.KindGitPublish},
+	)
+	doc.Edges = append(doc.Edges,
+		runs.DefEdge{From: "impl", To: "gate", Artifact: runs.ArtifactKindPatch},
+		runs.DefEdge{From: "review", To: "gate", Artifact: runs.ArtifactKindReviewVerdict},
+		runs.DefEdge{From: "gate", To: "publish", Artifact: runs.ArtifactKindPatch},
+	)
+	return doc
+}
+
 func newService(t *testing.T, f fixture, doc runs.DefinitionDoc, snap runs.PolicySnapshot) (*runs.Service, fixturePorts) {
 	t.Helper()
 	ports := fixturePorts{f: f, doc: doc, hash: "deadbeef", harness: uuid.Max, harnessCred: uuid.New()}
@@ -138,10 +154,6 @@ func TestCreateTaskPinsEverything(t *testing.T) {
 
 func TestCreateTaskValidation(t *testing.T) {
 	f := newFixture(t)
-	gated := agenticDoc()
-	gated.Nodes = append(gated.Nodes, runs.DefNode{ID: "gate", Kind: runs.KindGate})
-	gated.Edges = append(gated.Edges, runs.DefEdge{From: "impl", To: "gate", Artifact: runs.ArtifactKindPatch})
-
 	cases := []struct {
 		name  string
 		doc   runs.DefinitionDoc
@@ -151,7 +163,6 @@ func TestCreateTaskValidation(t *testing.T) {
 		{"empty title", agenticDoc(), runs.NewTask{RepoID: uuid.Max, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: ""}, "title"},
 		{"title too long", agenticDoc(), runs.NewTask{RepoID: uuid.Max, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: strings.Repeat("x", 201)}, "title"},
 		{"unknown harness", func() runs.DefinitionDoc { d := agenticDoc(); d.Nodes[0].Harness = "ghost"; return d }(), runs.NewTask{WorkflowVersion: 1, Title: "t"}, "harness"},
-		{"gate rejected in plan 05", gated, runs.NewTask{WorkflowVersion: 1, Title: "t"}, "definition"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -183,6 +194,37 @@ func TestCreateTaskValidation(t *testing.T) {
 				t.Errorf("fields = %+v, want one blaming %q", xe.Fields, tc.field)
 			}
 		})
+	}
+}
+
+// Plan 05 refused a definition containing a gate or a git-publish node at
+// intake. Plan 08's compiler assigns the gate that authorizes the publish
+// instead, so the refusal is gone and the whole conveyor must now pin a run
+// like any other definition. Without this the removal is untested: the
+// deleted "gate rejected" case asserted the old behaviour and nothing
+// asserted the new one.
+func TestCreateTaskAcceptsAGatedDefinition(t *testing.T) {
+	f := newFixture(t)
+	svc, _ := newService(t, f, gatedConveyorDoc(), runs.DefaultSnapshot())
+	ctx := context.Background()
+
+	task, run, err := svc.CreateTask(ctx, principal(f), runs.NewTask{
+		RepoID: f.repoID, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: "ship it",
+	})
+	if err != nil {
+		t.Fatalf("a gated definition must be accepted at intake: %v", err)
+	}
+	if run.Status != runs.RunPending || task.LatestRunID != run.ID {
+		t.Errorf("gated run not pinned pending: run %+v, task %+v", run, task)
+	}
+	// Intake still materializes nothing; the gate node is the orchestrator's
+	// business, and the run is a pending row like any other.
+	_, phases, _, err := svc.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(phases) != 0 {
+		t.Errorf("intake must not materialize phases, got %d", len(phases))
 	}
 }
 
