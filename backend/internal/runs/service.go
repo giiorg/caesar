@@ -87,10 +87,21 @@ func unmarshalMap(raw []byte) (map[string]any, error) {
 }
 
 // snapshotFromRow re-parses the pinned snapshot; corruption is internal.
+// A stored schema-1 document (Plan 05..07) is upgraded in place: it predates
+// AllowSelfApproval, and the shipped baseline value is what those runs were
+// created under, so defaulting to true changes nothing for them.
 func snapshotFromRow(raw []byte) (PolicySnapshot, error) {
 	var s PolicySnapshot
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return PolicySnapshot{}, fmt.Errorf("runs: pinned snapshot corrupt: %w", err)
+	}
+	switch s.SchemaVersion {
+	case 1:
+		s.SchemaVersion = snapshotSchemaVersion
+		s.AllowSelfApproval = true
+	case snapshotSchemaVersion:
+	default:
+		return PolicySnapshot{}, fmt.Errorf("runs: pinned snapshot schema %d is not readable by this binary", s.SchemaVersion)
 	}
 	return s, nil
 }

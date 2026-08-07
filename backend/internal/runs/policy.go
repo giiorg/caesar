@@ -6,9 +6,10 @@ import (
 	"math"
 )
 
-// snapshotSchemaVersion is the only snapshot shape this binary writes or
-// understands. Plan 09's policy engine bumps it.
-const snapshotSchemaVersion = 1
+// snapshotSchemaVersion is the only snapshot shape this binary WRITES.
+// Readers additionally accept version 1 (see snapshotFromRow), which is
+// the Plan 05 shape without AllowSelfApproval.
+const snapshotSchemaVersion = 2
 
 // maxAttemptsCap bounds retry storms regardless of future baselines.
 const maxAttemptsCap = 10
@@ -21,6 +22,10 @@ type PolicySnapshot struct {
 	MaxAttempts       int32 `json:"max_attempts"`
 	ExecutionBudgetMS int64 `json:"execution_budget_ms"`
 	WallClockMS       int64 `json:"wall_clock_ms"`
+	// AllowSelfApproval lets the requester decide their own gate (spec §6).
+	// True in the shipped baseline — teams flip it in the versioned baseline
+	// Plan 09 introduces. Self-approvals are still marked distinctly in audit.
+	AllowSelfApproval bool `json:"allow_self_approval"`
 }
 
 // DefaultSnapshot is the V1 shipped baseline (plan header pins).
@@ -30,9 +35,13 @@ func DefaultSnapshot() PolicySnapshot {
 		MaxAttempts:       3,
 		ExecutionBudgetMS: 2 * 60 * 60 * 1000,
 		WallClockMS:       24 * 60 * 60 * 1000,
+		AllowSelfApproval: true,
 	}
 }
 
+// Validate keeps checking for the CURRENT schema: what a caller hands
+// insertRun must be the shape this binary writes. The tolerance for an older
+// stored document lives on the read path only (snapshotFromRow).
 func (s PolicySnapshot) Validate() error {
 	var problems []error
 	if s.SchemaVersion != snapshotSchemaVersion {

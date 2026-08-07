@@ -465,7 +465,10 @@ func (o *Orchestrator) phaseSettledElsewhere(ctx context.Context, q *store.Queri
 
 // phaseIsLive reports whether the attempt's own machinery still owns it: a
 // running phase heartbeats, a reconciling one is mid-recovery. Everything else
-// — terminal, or never claimed — has nobody left to conclude its credential.
+// — terminal, never claimed, or waiting on a human — has nobody left to
+// conclude its credential. A gate is deliberately NOT live here: it never ran
+// a container, so it never took a credential lease, and treating it as live
+// would strand any lease whose ref collided with a gate node's.
 func phaseIsLive(s PhaseStatus) bool {
 	return s == PhaseRunning || s == PhaseReconciling
 }

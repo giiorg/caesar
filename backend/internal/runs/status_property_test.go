@@ -16,11 +16,21 @@ var allRunStatuses = []runs.RunStatus{
 }
 
 var allPhaseStatuses = []runs.PhaseStatus{
-	runs.PhasePending, runs.PhaseRunning, runs.PhaseReconciling,
+	runs.PhasePending, runs.PhaseRunning, runs.PhaseWaitingDecision, runs.PhaseReconciling,
 	runs.PhaseSucceeded, runs.PhaseFailed, runs.PhaseDead, runs.PhaseSuperseded,
 }
 
-// Terminal states admit no transition at all, for both entities.
+// revisionRetiresASuccess is the ONE declared exception to the sink rule
+// (Plan 08): readiness reads a node's newest attempt row, so a revision that
+// rewinds a slice must retire even a row that succeeded in the prior
+// generation — otherwise that row stays newest and readable as done forever.
+func revisionRetiresASuccess(from, to runs.PhaseStatus) bool {
+	return from == runs.PhaseSucceeded && to == runs.PhaseSuperseded
+}
+
+// Terminal states admit no transition at all, for both entities — save for
+// the single revision edge named above, which the property still pins as the
+// only one by rejecting every other pair.
 func TestPropertyTerminalStatesAreSinks(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		from := rapid.SampledFrom(allRunStatuses).Draw(t, "from")
@@ -30,7 +40,7 @@ func TestPropertyTerminalStatesAreSinks(t *testing.T) {
 		}
 		pf := rapid.SampledFrom(allPhaseStatuses).Draw(t, "pf")
 		pt := rapid.SampledFrom(allPhaseStatuses).Draw(t, "pt")
-		if pf.Terminal() && pf.CanTransition(pt) {
+		if pf.Terminal() && pf.CanTransition(pt) && !revisionRetiresASuccess(pf, pt) {
 			t.Fatalf("terminal phase status %s transitions to %s", pf, pt)
 		}
 	})

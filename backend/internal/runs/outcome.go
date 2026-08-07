@@ -49,6 +49,16 @@ const (
 	CodeCredentialBusy        = "credential_busy"        //nolint:gosec // G101 matches the name: this is a state, not a secret — single-flight lease held elsewhere; charges nothing
 	CodeCredentialQuarantined = "credential_quarantined" //nolint:gosec // G101 matches the name: this is a state, not a secret — read-back identity mismatch (§2.5)
 	CodeSecretInArtifact      = "secret_in_artifact"     // redaction scan hit; artifact withheld (§3)
+
+	// Plan 08: gate and publish outcomes (spec §2 Gate, §3 Publishing).
+	CodeGateRejected            = "gate_rejected"             // a human ended the run at a gate
+	CodeRevisionRoundsExhausted = "revision_rounds_exhausted" // max_rounds spent; only approve/reject remain
+	CodeAuthorizationStale      = "authorization_stale"       // the ApprovedPatch no longer matches what it authorized
+	CodePublishConflict         = "publish_conflict"          // a marker exists in a state we cannot prove is ours
+	CodePushRejected            = "push_rejected"             // the expected-remote-SHA precondition failed
+	CodeForgeUnavailable        = "forge_unavailable"         // the forge API could not be reached or refused transiently
+	CodePublishNotStarted       = "publish_not_started"       // transient, UNCHARGED: the worker died before authorizing
+	CodePublishResumable        = "publish_resumable"         // transient, UNCHARGED: an unfinished publication resumes from its intent
 )
 
 // Outcome is a typed terminal result for an attempt or a run. RetryAt is
@@ -64,10 +74,20 @@ type Outcome struct {
 func (o Outcome) Retryable() bool { return o.Class == OutcomeTransient }
 
 // Chargeable reports whether this failure spends the phase's failure budget.
-// Cap waits and lease contention are facts of subscription life, not errors:
-// they requeue without charging (spec §2.2, §4.3).
+// Cap waits, lease contention, a publication that never began and one that is
+// merely unfinished are facts of life rather than errors: they requeue without
+// charging (spec §2.2, §4.3). The two publish codes matter most — charging
+// them would let a lease hiccup or a forge outage exhaust a node whose branch
+// is already on the forge, terminalizing the run over work that succeeded.
 func (o Outcome) Chargeable() bool {
-	return o.Class == OutcomeTransient && o.Code != CodeRateLimited && o.Code != CodeCredentialBusy
+	if o.Class != OutcomeTransient {
+		return false
+	}
+	switch o.Code {
+	case CodeRateLimited, CodeCredentialBusy, CodePublishNotStarted, CodePublishResumable:
+		return false
+	}
+	return true
 }
 
 // Map renders the outcome for event payloads and jsonb columns.
