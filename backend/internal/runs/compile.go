@@ -41,11 +41,21 @@ type DefinitionDoc struct {
 	Edges []DefEdge
 }
 
+// DefRevision is the runs-owned mirror of a gate's bounded
+// on_request_changes loop (spec §2). It is not a graph edge — the dataflow
+// DAG stays acyclic; the loop is replayed by rematerializing a slice.
+type DefRevision struct {
+	Target    string
+	MaxRounds int
+}
+
 type DefNode struct {
 	ID           string
 	Kind         string
 	Harness      string
 	Instructions string
+	// Revision is set on gates that declare on_request_changes, nil otherwise.
+	Revision *DefRevision
 }
 
 type DefEdge struct {
@@ -69,6 +79,7 @@ type PlanNode struct {
 	Harness      string
 	Instructions string
 	Inputs       []PlanInput
+	Revision     *DefRevision
 }
 
 // ExecPlan is a compiled definition: topological order plus per-node
@@ -76,6 +87,47 @@ type PlanNode struct {
 type ExecPlan struct {
 	Order []string
 	Nodes map[string]PlanNode
+	// gateFor maps a git-publish node to the gate whose approval authorizes
+	// it, and publishFor is its inverse. The document validator already
+	// proved the assignment exists and is one-to-one (workflows §2
+	// invariants 6 and 7); this re-derives it with the same nearest-eligible
+	// rule so the runtime can name the gate a publish must wait for.
+	gateFor    map[string]string
+	publishFor map[string]string
+	// revisionSlice maps a gate declaring on_request_changes to the node ids
+	// its loop rewinds, sorted.
+	revisionSlice map[string][]string
+}
+
+func (p ExecPlan) GateFor(publishNodeID string) (string, bool) {
+	g, ok := p.gateFor[publishNodeID]
+	return g, ok
+}
+
+func (p ExecPlan) PublishFor(gateNodeID string) (string, bool) {
+	pub, ok := p.publishFor[gateNodeID]
+	return pub, ok
+}
+
+func (p ExecPlan) RevisionSlice(gateNodeID string) ([]string, bool) {
+	s, ok := p.revisionSlice[gateNodeID]
+	return s, ok
+}
+
+// ExaminedInput is the single plan-or-patch a gate decides on (spec §2:
+// "a gate examines exactly one plan or patch"). Approval binds this
+// artifact id and nothing newer.
+func (p ExecPlan) ExaminedInput(gateNodeID string) (PlanInput, bool) {
+	n, ok := p.Nodes[gateNodeID]
+	if !ok || n.Kind != KindGate {
+		return PlanInput{}, false
+	}
+	for _, in := range n.Inputs {
+		if in.Artifact == ArtifactKindPlan || in.Artifact == ArtifactKindPatch {
+			return in, true
+		}
+	}
+	return PlanInput{}, false
 }
 
 // Compile validates the mirror just enough to execute it and resolves
@@ -118,7 +170,7 @@ func Compile(doc DefinitionDoc) (ExecPlan, error) {
 
 	nodes := make(map[string]PlanNode, len(doc.Nodes))
 	for _, n := range doc.Nodes {
-		pn := PlanNode{ID: n.ID, Kind: n.Kind, Harness: n.Harness, Instructions: n.Instructions}
+		pn := PlanNode{ID: n.ID, Kind: n.Kind, Harness: n.Harness, Instructions: n.Instructions, Revision: n.Revision}
 		for _, e := range in[n.ID] {
 			origin, err := resolveOrigin(byID, in, e)
 			if err != nil {
@@ -131,11 +183,22 @@ func Compile(doc DefinitionDoc) (ExecPlan, error) {
 			if a.Origin != b.Origin {
 				return a.Origin < b.Origin
 			}
-			return a.Artifact < b.Artifact
+			if a.Artifact != b.Artifact {
+				return a.Artifact < b.Artifact
+			}
+			// Two edges may share an origin AND a type and still differ in
+			// their direct source — one patch reaching a node through two
+			// gates. From is the last discriminator, so this comparison is
+			// a total order and compilation is deterministic.
+			return a.From < b.From
 		})
 		nodes[n.ID] = pn
 	}
-	return ExecPlan{Order: order, Nodes: nodes}, nil
+	plan := ExecPlan{Order: order, Nodes: nodes}
+	if err := plan.assignGates(in); err != nil {
+		return ExecPlan{}, err
+	}
+	return plan, nil
 }
 
 // topoOrder is Kahn's algorithm with lexicographic tie-breaking — the
@@ -188,18 +251,42 @@ func resolveOrigin(byID map[string]DefNode, in map[string][]DefEdge, e DefEdge) 
 // the same artifact type where the gate examines one, else the single
 // examined work product. Matching on type first keeps a gate that sees
 // both a plan and a patch from binding the wrong producer.
+//
+// Candidates are compared in a fixed order rather than taken as they come:
+// `in` is built by ranging over doc.Edges, so its order is the document's,
+// and a caller that reorders two equivalent edges must still get the same
+// origin. Ties break on (From, To, Artifact) — the whole edge.
 func passThrough(inputs []DefEdge, artifact string) (DefEdge, bool) {
+	best, found := DefEdge{}, false
+	consider := func(e DefEdge) {
+		if !found || edgeLess(e, best) {
+			best, found = e, true
+		}
+	}
 	for _, ge := range inputs {
 		if ge.Artifact == artifact {
-			return ge, true
+			consider(ge)
 		}
+	}
+	if found {
+		return best, true
 	}
 	for _, ge := range inputs {
 		if ge.Artifact == ArtifactKindPlan || ge.Artifact == ArtifactKindPatch {
-			return ge, true
+			consider(ge)
 		}
 	}
-	return DefEdge{}, false
+	return best, found
+}
+
+func edgeLess(a, b DefEdge) bool {
+	if a.From != b.From {
+		return a.From < b.From
+	}
+	if a.To != b.To {
+		return a.To < b.To
+	}
+	return a.Artifact < b.Artifact
 }
 
 // Roots are the nodes materialized when a run starts.
@@ -232,16 +319,163 @@ func (p ExecPlan) Ready(nodeID string, succeeded map[string]bool) bool {
 	return true
 }
 
-// HasUnsupportedNodes lists gate/git-publish node ids — Plan 05 intake
-// rejects documents containing them (plan decision 2; Plan 08 deletes
-// the call site).
-func (p ExecPlan) HasUnsupportedNodes() []string {
-	var ids []string
-	for id, n := range p.Nodes {
-		if n.Kind == KindGate || n.Kind == KindGitPublish {
+// assignGates re-derives the two graph facts the runtime needs from an
+// already-validated document. It is deliberately a re-derivation and not a
+// second validation: reaching a state the validator rejects is corruption of
+// a stored version, so it returns an error the caller surfaces as
+// internal_error rather than a user-facing violation.
+func (p *ExecPlan) assignGates(in map[string][]DefEdge) error {
+	anc := map[string]map[string]bool{}
+	for id := range p.Nodes {
+		anc[id] = p.ancestors(id, in)
+	}
+	dom := p.dominators(in)
+
+	p.gateFor = map[string]string{}
+	p.publishFor = map[string]string{}
+	for _, pubID := range p.Order {
+		if p.Nodes[pubID].Kind != KindGitPublish {
+			continue
+		}
+		var patch PlanInput
+		for _, pin := range p.Nodes[pubID].Inputs {
+			if pin.Artifact == ArtifactKindPatch {
+				patch = pin
+				break
+			}
+		}
+		nearest, nearestDepth := "", -1
+		for _, gateID := range p.Order {
+			if p.Nodes[gateID].Kind != KindGate || !dom[pubID][gateID] {
+				continue
+			}
+			ex, ok := p.ExaminedInput(gateID)
+			if !ok || ex.Artifact != ArtifactKindPatch || ex.Origin != patch.Origin {
+				continue
+			}
+			// No patch producer may sit between the gate and the publish, or
+			// the approved artifact and the published artifact could diverge.
+			divergent := false
+			for id := range p.descendants(gateID) {
+				if anc[pubID][id] && p.Nodes[id].Kind == KindImplement {
+					divergent = true
+					break
+				}
+			}
+			if divergent {
+				continue
+			}
+			// dom(publish) is a chain, so |dom(gate)| orders the candidates
+			// and the deepest eligible gate is the nearest one.
+			if d := len(dom[gateID]); d > nearestDepth {
+				nearest, nearestDepth = gateID, d
+			}
+		}
+		if nearest == "" {
+			return fmt.Errorf("runs: compile: publish %q has no dominating gate examining its patch", pubID)
+		}
+		if other, taken := p.publishFor[nearest]; taken {
+			return fmt.Errorf("runs: compile: gate %q authorizes both %q and %q", nearest, other, pubID)
+		}
+		p.gateFor[pubID] = nearest
+		p.publishFor[nearest] = pubID
+	}
+
+	p.revisionSlice = map[string][]string{}
+	for _, gateID := range p.Order {
+		n := p.Nodes[gateID]
+		if n.Kind != KindGate || n.Revision == nil {
+			continue
+		}
+		target := n.Revision.Target
+		if _, ok := p.Nodes[target]; !ok {
+			return fmt.Errorf("runs: compile: gate %q rewinds to unknown node %q", gateID, target)
+		}
+		if !dom[gateID][target] {
+			return fmt.Errorf("runs: compile: revision target %q does not dominate gate %q", target, gateID)
+		}
+		slice := map[string]bool{target: true, gateID: true}
+		desc := p.descendants(target)
+		for a := range anc[gateID] {
+			if desc[a] {
+				slice[a] = true
+			}
+		}
+		ids := make([]string, 0, len(slice))
+		for id := range slice {
 			ids = append(ids, id)
 		}
+		sort.Strings(ids)
+		p.revisionSlice[gateID] = ids
 	}
-	sort.Strings(ids)
-	return ids
+	return nil
+}
+
+// ancestors is the strict ancestor set of id.
+func (p ExecPlan) ancestors(id string, in map[string][]DefEdge) map[string]bool {
+	seen := map[string]bool{}
+	var walk func(string)
+	walk = func(cur string) {
+		for _, e := range in[cur] {
+			if !seen[e.From] {
+				seen[e.From] = true
+				walk(e.From)
+			}
+		}
+	}
+	walk(id)
+	return seen
+}
+
+// descendants is the strict descendant set of id, walked over the plan's
+// resolved inputs so it needs no edge index of its own.
+func (p ExecPlan) descendants(id string) map[string]bool {
+	children := map[string][]string{}
+	for _, n := range p.Nodes {
+		for _, pin := range n.Inputs {
+			children[pin.From] = append(children[pin.From], n.ID)
+		}
+	}
+	seen := map[string]bool{}
+	var walk func(string)
+	walk = func(cur string) {
+		for _, c := range children[cur] {
+			if !seen[c] {
+				seen[c] = true
+				walk(c)
+			}
+		}
+	}
+	walk(id)
+	return seen
+}
+
+// dominators is the classic iterative fixed point over the topological
+// order: dom(n) = {n} ∪ ⋂ dom(pred). Order is already topological, so one
+// forward pass suffices. It is reflexive, matching the definitions
+// validator: dom[pubID][gateID] reads "gateID dominates pubID", and a
+// publish is trivially its own dominator.
+func (p ExecPlan) dominators(in map[string][]DefEdge) map[string]map[string]bool {
+	dom := make(map[string]map[string]bool, len(p.Order))
+	for _, id := range p.Order {
+		cur := map[string]bool{id: true}
+		first := true
+		for _, e := range in[id] {
+			pd := dom[e.From]
+			if first {
+				for k := range pd {
+					cur[k] = true
+				}
+				first = false
+				continue
+			}
+			for k := range cur {
+				if k != id && !pd[k] {
+					delete(cur, k)
+				}
+			}
+		}
+		dom[id] = cur
+	}
+	return dom
 }

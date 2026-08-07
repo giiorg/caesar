@@ -42,9 +42,19 @@ func pinnedFromVersion(v workflows.Version) (runs.PinnedDefinition, error) {
 	}
 	mirror := runs.DefinitionDoc{}
 	for _, n := range doc.Nodes {
-		mirror.Nodes = append(mirror.Nodes, runs.DefNode{
+		mn := runs.DefNode{
 			ID: n.ID, Kind: string(n.Type), Harness: n.Harness, Instructions: n.Instructions,
-		})
+		}
+		if n.OnRequestChanges != nil {
+			// Only app sees both vocabularies (composition root): the mapping
+			// is mechanical, and the runs mirror owns its own type so the
+			// contexts stay peers.
+			mn.Revision = &runs.DefRevision{
+				Target:    n.OnRequestChanges.Target,
+				MaxRounds: n.OnRequestChanges.MaxRounds,
+			}
+		}
+		mirror.Nodes = append(mirror.Nodes, mn)
 	}
 	for _, e := range doc.Edges {
 		mirror.Edges = append(mirror.Edges, runs.DefEdge{From: e.From, To: e.To, Artifact: string(e.Artifact)})

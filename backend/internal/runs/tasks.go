@@ -121,9 +121,9 @@ func (s *Service) RepoProject(ctx context.Context, repoID uuid.UUID) (uuid.UUID,
 	return repo.ProjectID, nil
 }
 
-// resolveIntake pins everything a run needs before any row exists:
-// repo, definition (compiled, gates refused until Plan 08), per-node
-// harness refs, snapshot, base SHA.
+// resolveIntake pins everything a run needs before any row exists: repo,
+// definition (compiled — gates and publishes are executable from Plan 08
+// on), per-node harness refs, snapshot, base SHA.
 func (s *Service) resolveIntake(ctx context.Context, in NewTask) (RepoRef, PinnedDefinition, string, error) {
 	repo, err := s.repos.Repo(ctx, in.RepoID)
 	if err != nil {
@@ -136,10 +136,6 @@ func (s *Service) resolveIntake(ctx context.Context, in NewTask) (RepoRef, Pinne
 	plan, err := compilePinned(def)
 	if err != nil {
 		return RepoRef{}, PinnedDefinition{}, "", err
-	}
-	if unsupported := plan.HasUnsupportedNodes(); len(unsupported) > 0 {
-		return RepoRef{}, PinnedDefinition{}, "", xerrors.E(xerrors.ClassInvalid, "validation failed").
-			WithFields(xerrors.FieldError{Field: "definition", Message: fmt.Sprintf("gates and publishing arrive in Plan 08 (nodes: %v)", unsupported)})
 	}
 	for _, id := range plan.Order {
 		n := plan.Nodes[id]
