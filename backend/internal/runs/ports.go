@@ -3,6 +3,8 @@ package runs
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +22,43 @@ type AttemptRef struct {
 
 func (r AttemptRef) String() string {
 	return fmt.Sprintf("caesar-%s-%s-%d", r.RunID, r.NodeID, r.Attempt)
+}
+
+// attemptRefPrefix and uuidLen are what make the format reversible: the run id
+// is fixed-width, so the node id — which routinely carries dashes — starts at a
+// known offset, and only the LAST dash separates it from the attempt ordinal.
+const (
+	attemptRefPrefix = "caesar-"
+	uuidLen          = 36
+)
+
+// ParseAttemptRef is the inverse of AttemptRef.String(). Recovery needs it:
+// a credential lease records its owner as the string alone, and the stale-lease
+// janitor has to resolve that back to a phase before it may act on it.
+//
+// Anything that is not a ref this build wrote is refused rather than guessed
+// at — a lease held by something else entirely (an operator's manual hold, a
+// future subsystem) must be left alone, not reconciled against a phase that
+// does not exist.
+func ParseAttemptRef(s string) (AttemptRef, error) {
+	rest, ok := strings.CutPrefix(s, attemptRefPrefix)
+	if !ok || len(rest) < uuidLen+1 || rest[uuidLen] != '-' {
+		return AttemptRef{}, fmt.Errorf("runs: %q is not an attempt ref", s)
+	}
+	runID, err := uuid.Parse(rest[:uuidLen])
+	if err != nil {
+		return AttemptRef{}, fmt.Errorf("runs: attempt ref %q: %w", s, err)
+	}
+	tail := rest[uuidLen+1:]
+	cut := strings.LastIndexByte(tail, '-')
+	if cut <= 0 { // no ordinal, or an empty node id
+		return AttemptRef{}, fmt.Errorf("runs: attempt ref %q has no node id and attempt", s)
+	}
+	attempt, err := strconv.ParseInt(tail[cut+1:], 10, 32)
+	if err != nil || attempt < 1 {
+		return AttemptRef{}, fmt.Errorf("runs: attempt ref %q has no valid attempt ordinal", s)
+	}
+	return AttemptRef{RunID: runID, NodeID: tail[:cut], Attempt: int32(attempt)}, nil
 }
 
 // PinnedDefinition is what a run pins at intake: the version identity
@@ -43,8 +82,18 @@ type RepoRef struct {
 }
 
 type HarnessRef struct {
+	ID             uuid.UUID
+	Kind           string
+	CredentialID   uuid.UUID
+	CredentialKind string
+}
+
+// CredentialBinding is the phase's pinned credential identity (spec §3):
+// resolved once at request build, it travels intact to the runner, which must
+// never re-resolve the credential off the mutable harness row.
+type CredentialBinding struct {
 	ID   uuid.UUID
-	Kind string
+	Kind string // assets credential kind vocabulary, opaque here
 }
 
 // The five ports the spine consumes. Contexts never import each other:
@@ -80,12 +129,45 @@ type Executor interface {
 	Inspect(ctx context.Context, ref AttemptRef) (InspectResult, error)
 }
 
+// CredentialReconciler settles an attempt's credential obligation and nothing
+// else: take custody, stop whatever is still running, sync the credential back
+// with its receipt, release the lease (spec §2.8). It is deliberately NOT
+// Inspect — the janitor paths that call it have already decided the attempt's
+// outcome, and an adoption here could evaluate a finished attempt as a success
+// the run is no longer entitled to.
+//
+// The Docker runner implements it; executors that hold no credentials (the
+// fake, the not-implemented stub) implement it as a no-op.
+type CredentialReconciler interface {
+	ReconcileCredential(ctx context.Context, ref AttemptRef) error
+}
+
+// StaleLease is one credential lease whose owner stopped heartbeating. The
+// credential id travels with it because the janitor logs against it; the
+// attempt ref is the string the lease row holds, parsed back with
+// ParseAttemptRef.
+type StaleLease struct {
+	CredentialID uuid.UUID
+	AttemptRef   string
+}
+
+// StaleLeaseSource surfaces leases nobody is keeping alive. Expiry alone never
+// releases one (spec §2.1: only a concluded reconciliation does), so these are
+// handed to reconciliation and never to a new acquirer. app adapts it over
+// assets — the runs context never imports that vocabulary.
+type StaleLeaseSource interface {
+	StaleCredentialLeases(ctx context.Context, olderThan time.Duration) ([]StaleLease, error)
+}
+
 // ExecutionRequest is the spine's precursor of Plan 06's RunSpec:
 // explicit inputs, never ambient state (spec §3 artifact flow).
 type ExecutionRequest struct {
-	Ref          AttemptRef
-	Kind         string
-	HarnessID    uuid.UUID
+	Ref       AttemptRef
+	Kind      string
+	HarnessID uuid.UUID
+	// Credential is the binding pinned at build time; its zero value is a
+	// harnessless node, which reaches no provider and needs no secret.
+	Credential   CredentialBinding
 	Repo         RepoRef
 	Instructions string
 	Inputs       []ArtifactInput
@@ -117,6 +199,11 @@ type ExecutionResult struct {
 type InspectResult struct {
 	Completed bool
 	Result    ExecutionResult
+	// Outcome is the adopted attempt's typed FAILURE, when it has one: a
+	// harness that finished and said why (a cap window with its reset, a dead
+	// credential) is adopted as that answer rather than degraded to
+	// reconcile_lost. nil means the completion succeeded; Result carries it.
+	Outcome *Outcome
 }
 
 // NotImplementedExecutor is wired in production serve until Plan 06: a

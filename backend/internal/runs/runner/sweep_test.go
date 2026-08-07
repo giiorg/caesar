@@ -61,7 +61,7 @@ func TestSweepOrphans_RemovesOnlyWhatNoLiveRunCanReach(t *testing.T) {
 			{ID: "undated", Name: "c-net", Created: "whenever"},
 		},
 	}
-	r, err := New(eng, nil, nil, nil, nil,
+	r, err := New(eng, nil, nil, nil, nil, nil,
 		Options{CaesarImage: "caesar:dev", GitImage: "caesar-git:dev", DataRoot: t.TempDir()}, discardLog())
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestSweepOrphans_RemovesOnlyWhatNoLiveRunCanReach(t *testing.T) {
 }
 
 func TestRun_TheMaintenanceLoopEndsWithItsContext(t *testing.T) {
-	r, err := New(&sweepEngine{}, nil, nil, nil, nil,
+	r, err := New(&sweepEngine{}, nil, nil, nil, nil, nil,
 		Options{CaesarImage: "caesar:dev", GitImage: "caesar-git:dev", DataRoot: t.TempDir()}, discardLog())
 	if err != nil {
 		t.Fatal(err)

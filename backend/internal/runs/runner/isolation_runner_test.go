@@ -27,7 +27,7 @@ const probeFile = "probe.out"
 // report fails loudly with the agent's own output attached.
 func probeReport(t *testing.T, r *Runner, ref runs.AttemptRef, res runs.ExecutionResult) map[string]string {
 	t.Helper()
-	patch, ok := artifactsByType(res.Artifacts)[runs.ArtifactKindPatch]
+	patch, ok := artifactTypes(res.Artifacts)[runs.ArtifactKindPatch]
 	if !ok {
 		t.Fatalf("no patch artifact in %v\nagent log:\n%s", res.Artifacts, readLogFile(t, r, ref, agentLogFile))
 	}
@@ -74,7 +74,7 @@ echo "capeff=$(awk '/^CapEff:/{print $2}' /proc/$$/status)" >> "$OUT"
 echo "nonewprivs=$(awk '/^NoNewPrivs:/{print $2}' /proc/$$/status)" >> "$OUT"
 exit 0
 `
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -149,7 +149,7 @@ probe caesar-api wget -T 3 -qO- http://host.docker.internal:8080/healthz
 probe provider-direct wget -T 3 -qO- https://api.anthropic.com/v1/models
 exit 0
 `
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -215,7 +215,7 @@ call not-allowlisted --header "x-api-key: $CAESAR_BROKER_TOKEN" "$CAESAR_BROKER_
 echo "brokered-body=$(grep -c claude-fable-5 /tmp/body.allowlisted)" >> "$OUT"
 exit 0
 `
-	r := newDockerRunner(t, Options{}, scriptedHarness(endpoint, script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness(endpoint, script), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.Execute(t.Context(), implementRequest(t, ref, fixtureSHA(t)))
@@ -241,7 +241,7 @@ exit 0
 
 	// The gateway's own meter agrees, and the counters ride out on the
 	// attempt's log_ref where the orchestrator reads them.
-	egress, ok := artifactsByType(res.Artifacts)[runs.ArtifactKindLogRef].Payload["egress"].(map[string]any)
+	egress, ok := artifactTypes(res.Artifacts)[runs.ArtifactKindLogRef].Payload["egress"].(map[string]any)
 	if !ok {
 		t.Fatalf("log_ref has no egress map: %v", res.Artifacts)
 	}
@@ -342,7 +342,7 @@ fi
 exit 0
 `, probeFile, shellSplit(forgeSecret), shellSplit(forgeSecretB64))
 
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
 	// The suite's constructor pins the credential-free fixture forge; this
 	// test is the one that needs the credentialed variant.
 	dir, _ := fixtureRepo(t)
@@ -379,7 +379,7 @@ exit 0
 
 	// Nothing that outlives the attempt carries the secret either: not the
 	// patch the probe rode out on, not the captured streams.
-	patch := artifactsByType(res.Artifacts)[runs.ArtifactKindPatch].Payload
+	patch := artifactTypes(res.Artifacts)[runs.ArtifactKindPatch].Payload
 	for _, needle := range []string{forgeSecret, forgeSecretB64} {
 		if strings.Contains(decodedDiff(t, patch), needle) {
 			t.Errorf("the patch carries %q", needle)

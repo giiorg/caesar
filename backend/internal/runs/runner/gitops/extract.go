@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/giiorg/caesar/backend/internal/runs"
@@ -18,6 +19,11 @@ const extractIndexName = "extract.index"
 // gitlinkMode is the index mode git records for a nested repository. Spec §3
 // rejects gitlinks: a commit pointer we cannot resolve is not a patch.
 const gitlinkMode = "160000"
+
+// caesarPathspec keeps the harness filesystem contract out of the diff. It
+// resolves against the work tree root, which is what `.` means here: every git
+// call below runs with GIT_WORK_TREE set and a cwd outside it.
+var caesarPathspec = []string{"--", ".", ":(exclude)" + caesarDir}
 
 // ExtractInput is the extraction contract's input file: the pinned base and
 // the caps the traversal and the patch must fit inside.
@@ -90,6 +96,26 @@ func Extract(ctx context.Context, dir string, in ExtractInput) (ExtractReport, e
 	}
 	if _, err := runGit(ctx, dir, env, "add", "-A"); err != nil {
 		return ExtractReport{}, typed(runs.OutcomePermanent, runs.CodeExtractionFailed, "index workspace: %v", err)
+	}
+	// The harness filesystem contract is the control plane's work, not the
+	// phase's, so it leaves the index again whatever put it there. This is the
+	// second of the two independent mechanisms that keep .caesar out of the
+	// patch — the first is the exclude line staging writes into this very
+	// mirror — and it is the one that also keeps the tree hash, and so
+	// Changed, honest if the first ever failed.
+	//
+	// It is its own command rather than an `add` pathspec because git's add
+	// reports every ignored path its pathspec matched and exits nonzero for
+	// it, exclusion pathspecs included: with both mechanisms live,
+	// `add -A -- . :(exclude).caesar` fails on the very directory it was told
+	// to skip. --force skips the local-modification check (there is no working
+	// tree change here — only the index is touched), and --ignore-unmatch is
+	// what makes the common case, where the exclude already did the job, a
+	// no-op rather than an error.
+	if _, err := runGit(ctx, dir, env,
+		"rm", "-r", "-q", "--force", "--cached", "--ignore-unmatch", "--", caesarDir); err != nil {
+		return ExtractReport{}, typed(runs.OutcomePermanent, runs.CodeExtractionFailed,
+			"drop %s from the index: %v", caesarDir, err)
 	}
 	entries, err := runGit(ctx, dir, env, "ls-files", "-s")
 	if err != nil {
@@ -181,8 +207,8 @@ func gitDiffCapped(ctx context.Context, dir string, env []string, limit int64, b
 	if err != nil {
 		return nil, false, fmt.Errorf("gitops: git binary: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, gitBin,
-		"diff-tree", "-p", "--binary", "--full-index", "-M50", baseSHA, tree)
+	cmd := exec.CommandContext(ctx, gitBin, slices.Concat(
+		[]string{"diff-tree", "-p", "--binary", "--full-index", "-M50", baseSHA, tree}, caesarPathspec)...)
 	cmd.Dir = dir
 	cmd.Env = env
 	out := &cappedBuffer{limit: limit}

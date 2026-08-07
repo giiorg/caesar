@@ -28,9 +28,30 @@ func actorID(p authn.Principal) uuid.NullUUID {
 	return uuid.NullUUID{UUID: p.UserID, Valid: true}
 }
 
+// fingerprintIndex is the partial unique index on credentials
+// (fingerprint); a violation of it means a different credential already
+// holds the same refresh token, not a name collision.
+const fingerprintIndex = "credentials_fingerprint_key"
+
+// leaseAttemptIndex is the unique index on credential_leases (attempt_ref);
+// a violation of it means the attempt already leases a different
+// credential, not that this credential is taken.
+const leaseAttemptIndex = "credential_leases_attempt_ref_key"
+
 func isUniqueViolation(err error) bool {
+	_, dup := uniqueViolation(err)
+	return dup
+}
+
+// uniqueViolation returns the violated constraint name for unique
+// violations, so callers on a table with more than one unique constraint
+// can tell which one fired.
+func uniqueViolation(err error) (string, bool) {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return pgErr.ConstraintName, true
+	}
+	return "", false
 }
 
 // fkViolation returns the violated constraint name for foreign-key errors,

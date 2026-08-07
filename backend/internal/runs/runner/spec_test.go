@@ -13,7 +13,6 @@ import (
 
 	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
 	"github.com/giiorg/caesar/backend/internal/runs"
-	"github.com/giiorg/caesar/backend/internal/runs/egress"
 )
 
 type fakeEngine struct {
@@ -37,7 +36,7 @@ func (f *fakeEngine) ImagePull(_ context.Context, ref string) error {
 
 func newSpecRunner(t *testing.T, eng Engine) *Runner {
 	t.Helper()
-	r, err := New(eng, nil, nil, nil, nil,
+	r, err := New(eng, nil, nil, nil, nil, nil,
 		Options{CaesarImage: "caesar:dev", GitImage: "caesar-git:dev"},
 		slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err != nil {
@@ -55,13 +54,21 @@ func envToMap(env []string) map[string]string {
 	return m
 }
 
+// testRequest binds a model key: the brokered pairing every harness kind
+// accepts, so a test that is about images or env can stay silent about
+// credentials.
 func testRequest() runs.ExecutionRequest {
+	return requestWithCredential("model_key")
+}
+
+func requestWithCredential(kind string) runs.ExecutionRequest {
 	return runs.ExecutionRequest{
-		Ref:       testRef(),
-		Kind:      runs.KindImplement,
-		HarnessID: uuid.New(),
-		Repo:      runs.RepoRef{Forge: "github", Slug: "giiorg/demo"},
-		BaseSHA:   "abc",
+		Ref:        testRef(),
+		Kind:       runs.KindImplement,
+		HarnessID:  uuid.New(),
+		Credential: runs.CredentialBinding{ID: uuid.New(), Kind: kind},
+		Repo:       runs.RepoRef{Forge: "github", Slug: "giiorg/demo"},
+		BaseSHA:    "abc",
 	}
 }
 
@@ -87,16 +94,20 @@ func TestBuildSpec_PinsDigestAndConstructsEnv(t *testing.T) {
 		t.Fatal("image should have been pulled once")
 	}
 	envMap := envToMap(spec.Env)
-	for _, k := range []string{"CAESAR_ATTEMPT", "CAESAR_WORKSPACE", "CAESAR_BROKER_URL", "CAESAR_BROKER_TOKEN", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "HOME", "PATH"} {
+	for _, k := range []string{
+		"CAESAR_ATTEMPT", "CAESAR_WORKSPACE", "CAESAR_BROKER_URL", "CAESAR_BROKER_TOKEN",
+		"HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "HOME", "PATH",
+		"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY",
+	} {
 		if _, ok := envMap[k]; !ok {
 			t.Errorf("env missing %s", k)
 		}
 	}
-	if len(spec.Env) != 9 {
-		t.Fatalf("env allowlist must be EXACTLY the pinned nine, got %v", spec.Env)
+	if len(spec.Env) != 11 {
+		t.Fatalf("env must be EXACTLY the pinned seven plus this custody's four, got %v", spec.Env)
 	}
-	if spec.CredentialHeader != "x-api-key" || spec.CredentialPrefix != "" {
-		t.Fatal("claude-code credential profile wrong")
+	if spec.Custody != custodyBrokered {
+		t.Fatalf("custody = %q, want brokered for a model key", spec.Custody)
 	}
 }
 
@@ -120,6 +131,10 @@ func TestBuildSpec_EnvCarriesTheAttemptIdentityAndBrokerReachability(t *testing.
 		"NO_PROXY":            "",
 		"HOME":                "/tmp",
 		"PATH":                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		// The driver's brokered half: the CLI talks to the gateway and
+		// authenticates as this attempt, never with a provider credential.
+		"ANTHROPIC_BASE_URL": "http://egress:8080",
+		"ANTHROPIC_API_KEY":  spec.BrokerToken,
 	}
 	if diff := cmp.Diff(want, envToMap(spec.Env)); diff != "" {
 		t.Errorf("env mismatch (-want +got):\n%s", diff)
@@ -196,52 +211,72 @@ func TestBuildSpec_PullFailureClassifiesImageUnavailable(t *testing.T) {
 	}
 }
 
+// A materialized attempt has no broker at all: no token for the agent to
+// present, no digest for the gateway to check, and no provider credential
+// anywhere but the container the CLI runs in.
+func TestBuildSpec_MaterializedCustodyMintsNoBrokerToken(t *testing.T) {
+	eng := &fakeEngine{inspect: func(string) (dockerapi.ImageInspect, error) {
+		return dockerapi.ImageInspect{RepoDigests: []string{"ghcr.io/x/claude@sha256:beef"}}, nil
+	}}
+	r := newSpecRunner(t, eng)
+	req := requestWithCredential("subscription_token")
+	spec, err := r.buildSpec(t.Context(), req, HarnessSpec{Kind: "claude-code", ImageRef: "ghcr.io/x/claude:latest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Custody != custodyMaterialized {
+		t.Fatalf("custody = %q, want materialized for a subscription token", spec.Custody)
+	}
+	if spec.BrokerToken != "" || spec.BrokerTokenSHA != "" {
+		t.Errorf("materialized spec carries a broker token %q/%q, want neither", spec.BrokerToken, spec.BrokerTokenSHA)
+	}
+	want := map[string]string{
+		"CAESAR_ATTEMPT":   req.Ref.String(),
+		"CAESAR_WORKSPACE": "/workspace",
+		"HTTPS_PROXY":      "http://egress:8080",
+		"HTTP_PROXY":       "http://egress:8080",
+		"NO_PROXY":         "",
+		"HOME":             "/tmp",
+		"PATH":             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	}
+	// The driver's materialized env needs the secret, so Execute appends it
+	// after the credential is opened — buildSpec's half is the allowlist alone.
+	if diff := cmp.Diff(want, envToMap(spec.Env)); diff != "" {
+		t.Errorf("env mismatch (-want +got):\n%s", diff)
+	}
+}
+
 func TestBuildSpec_UnknownHarnessKindRejected(t *testing.T) {
 	eng := &fakeEngine{inspect: func(string) (dockerapi.ImageInspect, error) {
 		return dockerapi.ImageInspect{RepoDigests: []string{"x@sha256:beef"}}, nil
 	}}
 	r := newSpecRunner(t, eng)
-	if _, err := r.buildSpec(t.Context(), testRequest(), HarnessSpec{Kind: "mystery", ImageRef: "x:1"}); err == nil {
-		t.Fatal("want rejection of a harness kind with no pinned provider profile")
+	_, err := r.buildSpec(t.Context(), testRequest(), HarnessSpec{Kind: "mystery", ImageRef: "x:1"})
+	if err == nil {
+		t.Fatal("want rejection of a harness kind with no driver row")
+	}
+	if out := runs.ClassifyOutcome(err); out.Class != runs.OutcomePermanent || out.Code != runs.CodeHarnessError {
+		t.Errorf("outcome = %+v, want permanent/%s", out, runs.CodeHarnessError)
 	}
 }
 
-func TestProviderProfile_PinnedPerKind(t *testing.T) {
-	cases := []struct {
-		kind       string
-		wantHeader string
-		wantPrefix string
-		wantOps    []egress.Op
-	}{
-		{"claude-code", "x-api-key", "", []egress.Op{
-			{Method: "POST", PathPrefix: "/v1/messages"},
-			{Method: "POST", PathPrefix: "/v1/messages/count_tokens"},
-			{Method: "GET", PathPrefix: "/v1/models"},
-		}},
-		{"codex", "authorization", "Bearer ", []egress.Op{
-			{Method: "POST", PathPrefix: "/v1/responses"},
-			{Method: "POST", PathPrefix: "/v1/chat/completions"},
-			{Method: "GET", PathPrefix: "/v1/models"},
-		}},
+// A credential kind this harness cannot authenticate with produces a container
+// that cannot run at all — retrying it finds the same registry, so it fails
+// permanently and before any image work.
+func TestBuildSpec_MismatchedCredentialKindRejected(t *testing.T) {
+	eng := &fakeEngine{inspect: func(string) (dockerapi.ImageInspect, error) {
+		return dockerapi.ImageInspect{RepoDigests: []string{"x@sha256:beef"}}, nil
+	}}
+	r := newSpecRunner(t, eng)
+	_, err := r.buildSpec(t.Context(), requestWithCredential("agent_auth_file"),
+		HarnessSpec{Kind: "claude-code", ImageRef: "ghcr.io/x/claude:latest"})
+	if err == nil {
+		t.Fatal("want rejection: Claude Code cannot read a Codex auth.json")
 	}
-	for _, c := range cases {
-		t.Run(c.kind, func(t *testing.T) {
-			header, prefix, ops, err := providerProfile(c.kind)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if header != c.wantHeader || prefix != c.wantPrefix {
-				t.Errorf("credential = %q/%q, want %q/%q", header, prefix, c.wantHeader, c.wantPrefix)
-			}
-			if diff := cmp.Diff(c.wantOps, ops); diff != "" {
-				t.Errorf("ops mismatch (-want +got):\n%s", diff)
-			}
-		})
+	if out := runs.ClassifyOutcome(err); out.Class != runs.OutcomePermanent || out.Code != runs.CodeHarnessError {
+		t.Errorf("outcome = %+v, want permanent/%s", out, runs.CodeHarnessError)
 	}
-}
-
-func TestProviderProfile_UnknownKindRejected(t *testing.T) {
-	if _, _, _, err := providerProfile("mystery"); err == nil {
-		t.Fatal("an unlisted kind has no allowlist, so it must be refused")
+	if len(eng.pulled) != 0 {
+		t.Errorf("pulled %v, want nothing: an unauthenticable pairing must fail before any image work", eng.pulled)
 	}
 }

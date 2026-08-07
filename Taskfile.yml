@@ -173,6 +173,15 @@ tasks:
     cmds:
       - docker build --build-arg VERSION={{.VERSION}} --build-arg COMMIT={{.COMMIT}} --build-arg DATE={{.DATE}} -t caesar:dev .
       - docker build --target git --build-arg VERSION={{.VERSION}} --build-arg COMMIT={{.COMMIT}} --build-arg DATE={{.DATE}} -t caesar-git:dev .
+      # The runner lane's agent. No build args: the fakecli stage depends on
+      # nothing the version stamping touches.
+      - docker build --target fakecli -t caesar-fakecli:dev .
+
+  image:harness:
+    desc: Build the real harness agent images (operator machine only — never CI)
+    cmds:
+      - docker build -t caesar-harness-claude:dev docker/harness/claude-code
+      - docker build -t caesar-harness-codex:dev docker/harness/codex
 
   backend:ci:
     cmds:

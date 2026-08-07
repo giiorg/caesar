@@ -2,9 +2,40 @@ package app
 
 import (
 	"encoding/base64"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/giiorg/caesar/backend/internal/platform/config"
 )
+
+// The runner's whole on-disk tree exists after wiring, not after the first
+// attempt of each kind happens to create one directory: an operator sizing or
+// mounting logs/ and quarantine/ separately meets them on a fresh install.
+func TestBuildRunner_CreatesTheDataRootTree(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "data")
+	_, err := buildRunner(config.Runner{
+		DataRoot: root, CaesarImage: "caesar:dev", GitImage: "caesar-git:dev",
+	}, nil, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("buildRunner: %v", err)
+	}
+	// Spelled out rather than ranged over runnerDataDirs: a test that read the
+	// production list would keep passing if somebody emptied it.
+	for _, dir := range []string{"attempts", "logs", "auth", "manifests", "quarantine"} {
+		info, err := os.Stat(filepath.Join(root, dir))
+		if err != nil {
+			t.Errorf("%s missing under the data root: %v", dir, err)
+			continue
+		}
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Errorf("%s has mode %04o, want 0700 — attempt workspaces and credentials live here", dir, perm)
+		}
+	}
+}
 
 func TestCloneURL_BuildsHostedURLsAndRejectsUnknownForge(t *testing.T) {
 	tests := []struct {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
 	"github.com/giiorg/caesar/backend/internal/runs"
@@ -102,6 +103,11 @@ func (r *Runner) copyLogs(ctx context.Context, containerID, path string, ref run
 // emitTruncated records the truncation on the run's event stream. A sink
 // failure is logged and dropped: the attempt's own result must not hinge on
 // bookkeeping about its logs.
+//
+// The path it names is where the stream is PUBLISHED, not where it is being
+// written: an attempt's streams are quarantined while they run, and that
+// location is temporary by design. This is the same reference log_ref carries,
+// which is the one an operator can follow.
 func (r *Runner) emitTruncated(ctx context.Context, ref runs.AttemptRef, stream, path string, produced int64) {
 	r.log.Warn("runner.log_truncated", "attempt", ref.String(), "stream", stream,
 		"cap_bytes", r.opts.LogCapBytes, "produced_bytes", produced)
@@ -110,7 +116,7 @@ func (r *Runner) emitTruncated(ctx context.Context, ref runs.AttemptRef, stream,
 	}
 	err := r.events.AppendRuntimeEvent(context.WithoutCancel(ctx), ref, "phase.log_truncated", map[string]any{
 		"stream":         stream,
-		"path":           r.relPath(path),
+		"path":           r.relPath(filepath.Join(r.logsDir(ref), filepath.Base(path))),
 		"cap_bytes":      r.opts.LogCapBytes,
 		"produced_bytes": produced,
 	})

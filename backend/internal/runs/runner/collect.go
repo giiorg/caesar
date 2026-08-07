@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/google/uuid"
+
 	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
 	"github.com/giiorg/caesar/backend/internal/runs"
 	"github.com/giiorg/caesar/backend/internal/runs/runner/gitops"
@@ -41,11 +43,26 @@ const (
 // credential that no container is going to be handed. Everything here is
 // either the ref itself or recoverable from the attempt directory.
 type collection struct {
-	Ref      runs.AttemptRef
-	BaseSHA  string
-	User     string
-	ExitCode int64
-	OOM      bool
+	Ref     runs.AttemptRef
+	BaseSHA string
+	User    string
+	// Kind is the harness the attempt ran, which is what makes its exit
+	// codes legible. Adoption recovers it from the attempt manifest and is
+	// left with the empty kind when there is no manifest to read.
+	Kind string
+	// CredentialID is the binding this attempt was pinned to, named in an
+	// auth failure's message and stamped on the credential itself.
+	CredentialID uuid.UUID
+	ExitCode     int64
+	OOM          bool
+	// Sensitive is the attempt's complete redaction set, which every
+	// workspace-derived artifact is scanned against before it is accepted.
+	Sensitive *sensitiveSet
+	// Unscannable says the set could not be completed — a torn read-back on
+	// the worker path, a set adoption could not rebuild — so nothing this
+	// attempt produced may be persisted (spec §2.7). The typed outcome is
+	// never withheld: only what the agent could have written into.
+	Unscannable bool
 }
 
 // collectResult turns a finished agent container into the attempt's result:
@@ -55,21 +72,69 @@ type collection struct {
 // this process never started.
 func (r *Runner) collectResult(ctx context.Context, c collection) (runs.ExecutionResult, error) {
 	ref := c.Ref
-	// A nonzero exit is transient here on purpose: this layer knows only
-	// that the process failed. Reading meaning into a harness's exit codes
-	// is the harness adapter's job (Plan 07).
+	// A nonzero exit means whatever the harness's own output says it means:
+	// the driver's marker table is the only translator, and an attempt whose
+	// harness cannot be identified keeps the pre-driver answer.
 	if c.ExitCode != 0 {
-		return runs.ExecutionResult{}, transientf(runs.CodeHarnessError,
-			"harness exited %d (oom_killed=%v)", c.ExitCode, c.OOM)
+		d, err := driverFor(c.Kind)
+		if err != nil {
+			return runs.ExecutionResult{}, transientf(runs.CodeHarnessError,
+				"harness exited %d (oom_killed=%v)", c.ExitCode, c.OOM)
+		}
+		out := mapExit(d, c.ExitCode, r.agentTail(ref))
+		if out.Code == runs.CodeAuthExpired {
+			// Fail fast, naming the credential the operator has to fix
+			// (spec §4, §5), and stamp the freshness signal on it.
+			out.Message = fmt.Sprintf("credential %s: %s", c.CredentialID, out.Message)
+			r.markAuthExpired(ctx, c.Ref, c.CredentialID)
+		}
+		return runs.ExecutionResult{}, runs.OutcomeError{Outcome: out}
 	}
 
 	rep, err := r.extractPatch(ctx, ref, c.BaseSHA, c.User)
 	if err != nil {
 		return runs.ExecutionResult{}, err
 	}
+	// A collection with no set is a wiring mistake, and the only safe reading
+	// of one is that nothing was scanned.
+	if c.Unscannable || c.Sensitive == nil {
+		// §2.7: the refreshed sensitive values are unknowable — no complete scan
+		// exists, so nothing workspace-derived may publish.
+		if rep.Changed {
+			// The alternative is a "success" whose patch and logs silently never
+			// appear; permanent, because the same read-back cannot be retried.
+			return runs.ExecutionResult{}, permanentf(runs.CodeInvalidOutput,
+				"auth read-back unscannable: this attempt's logs and artifacts are withheld (spec §2.7)")
+		}
+		return runs.ExecutionResult{Artifacts: nil}, nil
+	}
+	// The scan runs on the CANONICAL bytes, before the base64 the payload
+	// carries them as: a scan over the encoded form would never match (spec §3).
+	if c.Sensitive.scan(rep.Diff) {
+		return runs.ExecutionResult{}, runs.OutcomeError{Outcome: runs.Outcome{
+			Class: runs.OutcomePolicyViolation, Code: runs.CodeSecretInArtifact,
+			Message: "a sensitive value reached the extracted patch; the artifact was not persisted (spec §3)",
+		}}
+	}
 	declared, err := r.declaredArtifacts(ref)
 	if err != nil {
 		return runs.ExecutionResult{}, err
+	}
+	// Declared payloads are scanned as the bytes they will be stored as: the
+	// harness wrote them inside the workspace, so they are agent bytes like
+	// any other.
+	for _, a := range declared {
+		raw, err := json.Marshal(a.Payload)
+		if err != nil {
+			return runs.ExecutionResult{}, permanentf(runs.CodeInvalidOutput,
+				"%s: encode declared %s payload: %v", declaredArtifactsPath, a.Type, err)
+		}
+		if c.Sensitive.scan(raw) {
+			return runs.ExecutionResult{}, runs.OutcomeError{Outcome: runs.Outcome{
+				Class: runs.OutcomePolicyViolation, Code: runs.CodeSecretInArtifact,
+				Message: "a sensitive value reached a declared artifact; the artifact was not persisted (spec §3)",
+			}}
+		}
 	}
 
 	artifacts := make([]runs.NewArtifact, 0, len(declared)+2)
@@ -93,6 +158,44 @@ func (r *Runner) collectResult(ctx context.Context, c collection) (runs.Executio
 	artifacts = append(artifacts, declared...)
 	artifacts = append(artifacts, r.logRefArtifact(ref))
 	return runs.ExecutionResult{Artifacts: artifacts}, nil
+}
+
+// agentTail is the agent's last words, read for CLASSIFICATION only (spec §4).
+// It prefers the quarantined copy, which is where the bytes live until the
+// credential obligation concludes and the only copy a withheld attempt ever
+// has: withholding suppresses an attempt's logs and artifacts, never its typed
+// outcome, so a torn read-back coinciding with a cap hit must still report
+// rate_limited rather than a generic harness_error off an empty logs
+// directory. Once published, the redacted copy carries the same markers — a
+// marker is a phrase the CLI prints about itself, never a secret.
+//
+// The bytes are consumed in memory and never persisted or surfaced: what
+// reaches the outcome is the marker's name, not the tail.
+func (r *Runner) agentTail(ref runs.AttemptRef) []byte {
+	if tail := readTail(filepath.Join(r.quarantineDir(ref), agentLogFile), snapshotTailBytes); len(tail) > 0 {
+		return tail
+	}
+	return readTail(filepath.Join(r.logsDir(ref), agentLogFile), snapshotTailBytes)
+}
+
+// markAuthExpired records that this credential is dead, so the next claimant
+// meets a credential already known to be unusable rather than spending another
+// attempt discovering it. Every auth_expired an attempt reports goes through
+// here, whether the provider said so at exit or the bytes themselves said so
+// before the attempt ever started.
+//
+// Best effort by construction: the outcome the caller returns is the
+// authority, and a signal that could not be written must not turn a typed auth
+// failure into an internal error. An attempt with no binding — or a runner
+// wired without the credential aggregate — has nothing to stamp.
+func (r *Runner) markAuthExpired(ctx context.Context, ref runs.AttemptRef, credentialID uuid.UUID) {
+	if r.leaser == nil || credentialID == uuid.Nil {
+		return
+	}
+	if err := r.leaser.MarkAuthExpired(ctx, credentialID); err != nil {
+		r.log.Warn("runner.mark_auth_expired", "attempt", ref.String(),
+			"credential", credentialID.String(), "error", err)
+	}
 }
 
 // extractPatch runs the trusted extraction container: no network, the whole

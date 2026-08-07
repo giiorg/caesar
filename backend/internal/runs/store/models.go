@@ -23,18 +23,20 @@ type Artifact struct {
 }
 
 type PhaseRun struct {
-	ID          uuid.UUID
-	RunID       uuid.UUID
-	NodeID      string
-	Attempt     int32
-	MaxAttempts int32
-	Status      string
-	WorkerID    pgtype.Text
-	LeasedUntil *time.Time
-	ClaimedAt   *time.Time
-	FinishedAt  *time.Time
-	Outcome     []byte
-	CreatedAt   time.Time
+	ID                 uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	MaxAttempts        int32
+	ChargeableFailures int32
+	NotBefore          *time.Time
+	Status             string
+	WorkerID           pgtype.Text
+	LeasedUntil        *time.Time
+	ClaimedAt          *time.Time
+	FinishedAt         *time.Time
+	Outcome            []byte
+	CreatedAt          time.Time
 }
 
 type Run struct {

@@ -131,7 +131,7 @@ func TestStaleWorkerIsFencedByRowIdentity(t *testing.T) {
 	// The fence is row identity, not (run, node): once a successor attempt
 	// exists and is live under another worker, worker-a's writes — which
 	// name only its own row id — still cannot reach it.
-	succID, err := runs.InsertPhaseForTest(ctx, svc, runID, "plan", 2, 3)
+	succID, err := runs.InsertPhaseForTest(ctx, svc, runID, "plan", 2, 3, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

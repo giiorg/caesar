@@ -6,3 +6,48 @@ paths = [
   '''backend/internal/.*/testdata/.*''',
   '''backend/caesar\.dev\.json''',
 ]
+
+# Narrow exemptions for `generic-api-key`, the only default rule these trip.
+# Each block is scoped to one rule, `condition = "AND"` so the path AND the
+# matched bytes must both agree — an exempt value pasted into another file is
+# still a finding, and an unrelated secret inside an exempt file is too.
+# (Verified against the pinned gitleaks v8.21.2: the plural per-rule
+# `[[rules.allowlists]]` array and `condition` are both honoured there.)
+# These live in already-pushed commits, so gitleaks' history scan reports them
+# no matter what the working tree says; a config entry is the only fix.
+[[rules]]
+id = "generic-api-key"
+
+  # Synthetic redaction fixtures. The redaction suite has to run on values
+  # shaped like the real ones and long enough to clear `minSecretLen`, or a
+  # passing scan would only prove the floor dropped them. Every one of these was
+  # typed by hand for the test and authenticates against nothing.
+  [[rules.allowlists]]
+  description = "hand-written credential fixtures in the redaction tests"
+  condition = "AND"
+  paths = ['''backend/internal/runs/runner/redact(_runner)?_test\.go''']
+  regexes = [
+    # dockerAccessToken / dockerRefreshToken — the fake auth.json the
+    # materialized-custody container cases are handed (redact_runner_test.go).
+    '''at-9f3c1d7e2b408a56c9d1e0f4b7a2c8d5''',
+    '''rt-2e8b4a1c0d97f356e2a8c1b40d7f9e63''',
+    # codexAccessToken — a JWT-shaped string with an unsigned, meaningless
+    # payload; brokeredAPIKey and testBrokerToken stand in for an OpenAI project
+    # key and an attempt-scoped broker token (redact_test.go).
+    '''eyJhbGciOiJIUzI1NiJ9\.YWNjZXNzLTAxMjM0NTY3ODlhYmNkZWY''',
+    '''sk-proj-8vQ2mNbRt6YwL0xKp4Zc9Hj7''',
+    '''cbt1\.pM4nQ7xR2vL9tKc0bY6wZa3fUj8sHd1e''',
+  ]
+
+  # Atlas migration checksums. `atlas.sum` holds nothing but base64 SHA-256
+  # digests of the migration files, one per line, written by `task db:new`. A
+  # line trips the rule when its migration name happens to carry a keyword
+  # ("...credentials.sql h1:<digest>") and its digest happens to contain no `+`,
+  # so this recurs on future migrations — hence the digest shape rather than the
+  # one value. The digests are public by construction: they are recomputable
+  # from the committed .sql files.
+  [[rules.allowlists]]
+  description = "base64 SHA-256 digests in the Atlas migration checksum file"
+  condition = "AND"
+  paths = ['''backend/internal/platform/pg/migrations/atlas\.sum''']
+  regexes = ['''^[A-Za-z0-9+/]{43}=$''']

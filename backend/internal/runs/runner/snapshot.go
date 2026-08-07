@@ -42,6 +42,19 @@ const (
 func buildFailureSnapshot(inspect dockerapi.ContainerInspect, logPath string, tailBytes int64,
 	wsDir string, redact []string,
 ) map[string]any {
+	snap := containerMetadata(inspect, redact)
+	snap["log_tail"] = logTail(logPath, tailBytes, redact)
+	snap["workspace"] = workspaceListing(wsDir, redact)
+	return snap
+}
+
+// containerMetadata is the half of the snapshot the agent never wrote: how the
+// daemon says the container ended. It is the whole snapshot for a withheld
+// attempt — one whose refreshed credential is unknowable, so no complete scan
+// exists (spec §2.7). The two halves that are missing there are exactly the
+// two the agent chose the bytes of: its own output, and the names of the files
+// it left behind.
+func containerMetadata(inspect dockerapi.ContainerInspect, redact []string) map[string]any {
 	return map[string]any{
 		"exit_code":   inspect.State.ExitCode,
 		"oom_killed":  inspect.State.OOMKilled,
@@ -49,8 +62,6 @@ func buildFailureSnapshot(inspect dockerapi.ContainerInspect, logPath string, ta
 		"error":       redactAll(inspect.State.Error, redact),
 		"started_at":  inspect.State.StartedAt,
 		"finished_at": inspect.State.FinishedAt,
-		"log_tail":    logTail(logPath, tailBytes, redact),
-		"workspace":   workspaceListing(wsDir, redact),
 	}
 }
 

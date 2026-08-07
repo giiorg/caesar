@@ -16,9 +16,10 @@ import (
 // RekeyCredentials re-wraps every credential row not already under the
 // active master key (`caesar admin rekey`). One transaction, rows locked
 // FOR UPDATE: concurrent rotations serialize, and a crash mid-run leaves
-// every row either old-key-readable or fully rewrapped. Returns the
-// number of rows re-wrapped. Actor is NULL (system); each row audits
-// credential.rekeyed.
+// every row either old-key-readable or fully rewrapped. The plaintext is
+// untouched, so secret_version and fingerprint stay as they were.
+// Returns the number of rows re-wrapped. Actor is NULL (system); each
+// row audits credential.rekeyed.
 func (s *Service) RekeyCredentials(ctx context.Context) (int, error) {
 	count := 0
 	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
@@ -40,8 +41,8 @@ func (s *Service) RekeyCredentials(ctx context.Context) (int, error) {
 			if err != nil {
 				return fmt.Errorf("assets: rekey seal %s: %w", row.ID, err)
 			}
-			if _, err := q.UpdateCredentialSecret(ctx, store.UpdateCredentialSecretParams{
-				ID: row.ID, KeyID: env.KeyID, WrappedDek: env.WrappedDEK, Ciphertext: env.Ciphertext, UpdatedAt: s.clock.Now(),
+			if err := q.RewrapCredential(ctx, store.RewrapCredentialParams{
+				ID: row.ID, KeyID: env.KeyID, WrappedDek: env.WrappedDEK, Ciphertext: env.Ciphertext,
 			}); err != nil {
 				return fmt.Errorf("assets: rekey update %s: %w", row.ID, err)
 			}

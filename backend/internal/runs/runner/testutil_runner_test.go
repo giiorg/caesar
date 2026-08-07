@@ -66,8 +66,8 @@ func (r staticResolver) HarnessSpec(context.Context, uuid.UUID) (HarnessSpec, er
 
 type staticCreds struct{ value []byte }
 
-func (c staticCreds) OpenCredential(context.Context, uuid.UUID, string) ([]byte, error) {
-	return c.value, nil
+func (c staticCreds) OpenCredential(context.Context, uuid.UUID, string) ([]byte, int64, error) {
+	return c.value, 1, nil
 }
 
 // fixtureGit stands in for the forge: the remote is a bare repo on this
@@ -124,7 +124,6 @@ func scriptedHarness(endpoint, script string) HarnessSpec {
 		Kind:             "claude-code",
 		ImageRef:         gitImage,
 		ProviderEndpoint: endpoint,
-		CredentialID:     uuid.New(),
 		Entrypoint:       []string{"/bin/sh", "-c"},
 		Cmd:              []string{script},
 	}
@@ -189,7 +188,11 @@ func startFakeProvider(t *testing.T) (endpoint string, seen *credentialLog) {
 // newDockerRunner is the suite's constructor: a real daemon client, the
 // fixture forge, a static credential, and tight ceilings so a runaway test
 // costs seconds rather than the shipped defaults.
-func newDockerRunner(t *testing.T, opts Options, hs HarnessSpec, sink EventSink) *Runner {
+//
+// leaser is nil for every case that binds a shareable credential — most of
+// them. A case binding an agent_auth_file must supply one: that kind takes a
+// single-flight lease, and the lease grant is where its bytes come from.
+func newDockerRunner(t *testing.T, opts Options, hs HarnessSpec, sink EventSink, leaser CredentialLeaser) *Runner {
 	t.Helper()
 	if _, err := os.Stat(dockerSocket); err != nil {
 		t.Fatalf("runner suite needs a Docker daemon at %s: %v", dockerSocket, err)
@@ -223,7 +226,7 @@ func newDockerRunner(t *testing.T, opts Options, hs HarnessSpec, sink EventSink)
 	opts.testHostAccess = true
 
 	dir, _ := fixtureRepo(t)
-	r, err := New(engine, staticResolver{spec: hs}, staticCreds{value: []byte("real-provider-key")},
+	r, err := New(engine, staticResolver{spec: hs}, staticCreds{value: []byte("real-provider-key")}, leaser,
 		fixtureGit{dir: dir}, sink, opts, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -322,22 +325,15 @@ func decodedDiff(t *testing.T, payload map[string]any) string {
 	return string(raw)
 }
 
-func artifactsByType(arts []runs.NewArtifact) map[string]runs.NewArtifact {
-	out := make(map[string]runs.NewArtifact, len(arts))
-	for _, a := range arts {
-		out[a.Type] = a
-	}
-	return out
-}
-
 func implementRequest(t *testing.T, ref runs.AttemptRef, baseSHA string) runs.ExecutionRequest {
 	t.Helper()
 	return runs.ExecutionRequest{
-		Ref:       ref,
-		Kind:      runs.KindImplement,
-		HarnessID: uuid.New(),
-		Repo:      runs.RepoRef{Forge: "github", Slug: "giiorg/demo"},
-		BaseSHA:   baseSHA,
-		Deadline:  time.Now().Add(5 * time.Minute),
+		Ref:        ref,
+		Kind:       runs.KindImplement,
+		HarnessID:  uuid.New(),
+		Credential: runs.CredentialBinding{ID: uuid.New(), Kind: "model_key"},
+		Repo:       runs.RepoRef{Forge: "github", Slug: "giiorg/demo"},
+		BaseSHA:    baseSHA,
+		Deadline:   time.Now().Add(5 * time.Minute),
 	}
 }

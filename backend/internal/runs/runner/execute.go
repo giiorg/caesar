@@ -9,10 +9,11 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/giiorg/caesar/backend/internal/platform/config"
 	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
 	"github.com/giiorg/caesar/backend/internal/runs"
-	"github.com/giiorg/caesar/backend/internal/runs/egress"
 	"github.com/giiorg/caesar/backend/internal/runs/runner/gitops"
 )
 
@@ -62,8 +63,11 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	if err := os.MkdirAll(r.attemptDir(ref), 0o700); err != nil {
 		return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "create attempt dir: %v", err)
 	}
-	if err := os.MkdirAll(r.logsDir(ref), 0o700); err != nil {
-		return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "create logs dir: %v", err)
+	// The streams land in quarantine, not in the published logs directory:
+	// what an agent printed cannot be scanned completely until the credential
+	// obligation has concluded (spec §3), and publication is what moves them.
+	if err := os.MkdirAll(r.quarantineDir(ref), 0o700); err != nil {
+		return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "create quarantine dir: %v", err)
 	}
 	defer r.teardown(ctx, ref)
 
@@ -78,36 +82,230 @@ func (r *Runner) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.E
 	if err != nil {
 		return runs.ExecutionResult{}, err
 	}
+	// The driver is re-derived rather than carried on the spec: RunSpec stays
+	// plain data, and buildSpec has already refused any kind that has no row.
+	d, err := driverFor(hs.Kind)
+	if err != nil {
+		return runs.ExecutionResult{}, permanentf(runs.CodeHarnessError, "%v", err)
+	}
+
+	// Past this point the attempt may hold a credential lease, and a fenced
+	// heartbeat has to be able to cut the whole pipeline short: the takeover
+	// means the reconciler owns this attempt now.
+	ctx, cancelAttempt := context.WithCancel(ctx)
+	defer cancelAttempt()
+
+	// The credential resolves before anything else, because everything after
+	// it depends on which bytes this attempt actually holds. It is the one the
+	// request pinned, never one re-resolved off today's harness row: a registry
+	// edit mid-attempt must not swap the secret under a running phase.
+	//
+	// A credential a running attempt can itself replace is taken exclusively
+	// first, before anything usage-bearing starts. Contention is somebody
+	// else's turn rather than this attempt's failure, so it returns as a wait
+	// and nothing has been spent when it does. Such a credential is then never
+	// opened a second time: the acquire transaction handed back both the lease
+	// and the bytes of exactly the version it recorded, and that pairing is
+	// what lets sync-back's CAS tell an operator's rotation apart from the
+	// CLI's own refresh.
+	leased := d.needsLease(req.Credential)
+	var g grant
+	// The manifest variable exists before the lease does so the deferred
+	// conclusion can read it: concludeCredential is the single choke point
+	// where the credential obligation ends, and every exit path — a failure
+	// between acquire and agent start included — funnels through it once.
+	var m attemptManifest
+	concluded := false
+	conclude := func() syncConclusion {
+		concluded = true
+		return r.concludeCredential(ctx, ref, m, req.Credential.ID)
+	}
+	stopHeartbeat := func() {}
+	if leased {
+		lease, secret, err := r.acquireCredential(ctx, ref, req.Credential)
+		if err != nil {
+			return runs.ExecutionResult{}, err
+		}
+		g = grant{secret: secret, version: lease.SecretVersion, epoch: lease.Epoch}
+		// Until manifestFor pins the full manifest, the granted epoch is all
+		// a conclusion needs: an exit in between still releases at the right
+		// fence, with nothing on disk to read back.
+		m.Epoch = lease.Epoch
+		// Registered before the heartbeat so it runs after it, and guarded so
+		// no path concludes twice: the conclusion is the last thing this
+		// attempt does to the credential, on early exits as on full runs.
+		defer func() {
+			if !concluded {
+				conclude()
+			}
+		}()
+		stopHeartbeat = r.startLeaseHeartbeat(ctx, req.Credential.ID, ref, g.epoch, cancelAttempt)
+		defer stopHeartbeat()
+	} else {
+		// Unleased credentials are infrastructure here: an unavailable secret
+		// store says nothing about this attempt's work.
+		secret, version, err := r.creds.OpenCredential(ctx, req.Credential.ID, "attempt:"+ref.String())
+		if err != nil {
+			return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "open provider credential: %v", err)
+		}
+		g = grant{secret: secret, version: version}
+	}
+	spec.ProviderCredential = string(g.secret)
+
+	// The redaction set is assembled the moment the bytes are in hand, and it
+	// is the single source of truth for every scan this attempt runs: the
+	// patch, the declared artifacts, the logs, and the failure snapshot. The
+	// raw credential enters whole — a brokered binding's is an API key, and the
+	// driver's extractor describes an auth file (Task 6's per-kind rule) — and
+	// the driver's fields join it under materialized custody. What the CLI may
+	// refresh mid-run is unknown until the conclusion reads it back, so the set
+	// is completed there and nothing publishes before then (spec §3).
+	set := newSensitiveSet()
+	if short := set.addRaw(g.secret, []byte(spec.BrokerToken)); short > 0 {
+		// Below the floor the credential still redacts — it is secret by
+		// definition — but it now blanks every incidental occurrence of itself.
+		// Operator-caused, and loud rather than silent.
+		r.log.Warn("runner.short_credential", "attempt", ref.String(),
+			"values", short, "floor", minSecretLen)
+	}
+	// withheld starts here because an unreadable field list is already a reason
+	// to withhold: the set holds the WHOLE auth file, so a log line printing
+	// only the access token is not a substring of anything in it. That is an
+	// incomplete scan, not a less precise one, and adoption refuses to publish
+	// on exactly this condition (adoptionSensitive) — the two paths may not
+	// disagree about what counts as a complete scan.
+	withheld := false
+	if spec.Custody == custodyMaterialized && d.sensitive != nil {
+		sens, err := d.sensitive(g.secret)
+		if err != nil {
+			r.log.Warn("runner.sensitive_fields", "attempt", ref.String(), "error", err)
+			withheld = true
+		}
+		set.add(sens...)
+	}
+
+	// Every credential-bearing attempt gets a manifest, whatever its custody:
+	// adoption rebuilds the redaction set from it, and an attempt whose
+	// manifest is missing has to have its logs and artifacts withheld.
+	built, err := r.manifestFor(req, spec, d, g)
+	if err != nil {
+		// Bytes that cannot be identity-pinned are dead for every phase bound
+		// to this credential, not only for this attempt, so the freshness
+		// signal is stamped here exactly as it is for a provider's own
+		// rejection at exit: nothing else fails this way twice.
+		if runs.ClassifyOutcome(err).Code == runs.CodeAuthExpired {
+			r.markAuthExpired(ctx, ref, req.Credential.ID)
+		}
+		return runs.ExecutionResult{}, err
+	}
+	// Assigned only on success: the zero manifest an error rides back with
+	// would erase the epoch the deferred conclusion releases at.
+	m = built
+	if req.Credential.ID != uuid.Nil {
+		if err := r.writeManifest(ref, m); err != nil {
+			return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "write attempt manifest: %v", err)
+		}
+		// A file-delivered credential lands on the host before any container
+		// exists: the bind is resolved when the agent is created, and by then
+		// the manifest describing the directory is already durable. Both live
+		// under the one guard, so a secret can never reach the disk with
+		// nothing on record to say it is there.
+		if d.materializesAuthFile(spec.Custody) {
+			if err := r.materializeAuthDir(ref, d, g.secret); err != nil {
+				return runs.ExecutionResult{}, transientf(runs.CodeInternalError, "materialize auth dir: %v", err)
+			}
+			spec.AuthBind = r.hostPath(r.authDir(ref)) + ":" + d.authMount.containerPath
+		}
+	}
+	// The materialized half of the agent's environment is completed here and
+	// only here: it carries the secret, which buildSpec has no business
+	// reading. A brokered attempt's env was finished before the credential
+	// was ever opened.
+	if spec.Custody == custodyMaterialized {
+		spec.Env = append(spec.Env, d.env(envInput{
+			custody: custodyMaterialized, secret: spec.ProviderCredential,
+		})...)
+	}
+
 	clone, err := r.git.CloneSpec(ctx, req.Repo)
 	if err != nil {
 		return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "resolve clone for %s: %v", req.Repo.Slug, err)
 	}
-	// Brokered credentials are infrastructure here: an unavailable secret
-	// store says nothing about this attempt's work.
-	cred, err := r.creds.OpenCredential(ctx, hs.CredentialID, "attempt:"+ref.String())
-	if err != nil {
-		return runs.ExecutionResult{}, transientf(runs.CodeStagingFailed, "open provider credential: %v", err)
-	}
-	spec.ProviderCredential = string(cred)
 
 	if err := r.ensureNetworks(ctx, ref); err != nil {
 		return runs.ExecutionResult{}, err
 	}
-	if err := r.stageAttempt(ctx, ref, spec, clone); err != nil {
+	if err := r.stageAttempt(ctx, ref, req, spec, clone); err != nil {
 		return runs.ExecutionResult{}, err
 	}
-	agent, err := r.runAgentToCompletion(ctx, ref, spec)
+	agent, err := r.runAgentToCompletion(ctx, ref, spec, d)
+	// The credential obligation settles before any result is assembled: a
+	// success may not be reported while its sync is pending (the receipt
+	// precedes the terminal result), and what the read-back found outranks
+	// whatever the agent exited with — quarantine first, then an unresolved
+	// sync, then the agent's own outcome.
+	//
+	// The conclusion is also what completes the redaction set, so the order is
+	// pinned: conclude, extend the set, publish or withhold, and only then
+	// assemble anything an artifact could carry (spec §3).
+	if leased {
+		// The heartbeat stops (and its goroutine joins) before the conclusion
+		// releases: a tick landing after the release reads as a fence at the
+		// aggregate, and the resulting cancel would fail the result collection
+		// of an attempt that had already synced and released cleanly.
+		stopHeartbeat()
+		conc := conclude()
+		set.add(conc.RefreshedSensitive...)
+		// A read-back nobody could parse means the refreshed value is
+		// unknowable, so no complete scan exists and nothing this attempt
+		// produced may publish (spec §2.7). The streams stay in quarantine as
+		// evidence; only the typed outcome still gets out.
+		withheld = withheld || conc.Status == concUnscannable
+		r.publishOrWithhold(ref, set, withheld)
+		switch {
+		case conc.Outcome != nil:
+			return r.failureResult(ref, agent, set, withheld), runs.OutcomeError{Outcome: *conc.Outcome}
+		case conc.Status == concFenced:
+			// The lease stays held; the stale-lease janitor settles it, and
+			// the retried attempt re-acquires idempotently. Nothing charged.
+			return r.failureResult(ref, agent, set, withheld), transientf(runs.CodeCredentialBusy,
+				"credential %s: sync-back unresolved, custody belongs to reconciliation", req.Credential.ID)
+		}
+	} else {
+		// Nothing about an unleased credential can change while the attempt
+		// runs: the set was as complete when the agent started as it will ever
+		// be, and whether that is complete enough was already decided above.
+		r.publishOrWithhold(ref, set, withheld)
+	}
 	if err != nil {
-		return r.failureResult(ref, spec, agent), err
+		return r.failureResult(ref, agent, set, withheld), err
 	}
 	res, err := r.collectResult(ctx, collection{
 		Ref: ref, BaseSHA: spec.BaseSHA, User: spec.User,
+		Kind: spec.Harness.Kind, CredentialID: req.Credential.ID,
 		ExitCode: agent.exitCode, OOM: agent.oom,
+		Sensitive: set, Unscannable: withheld,
 	})
 	if err != nil {
-		return r.failureResult(ref, spec, agent), err
+		return r.failureResult(ref, agent, set, withheld), err
 	}
 	return res, nil
+}
+
+// publishOrWithhold moves the attempt's quarantined streams into the published
+// logs directory, unless this attempt is withholding them.
+//
+// A publication that fails is logged and survived: the bytes stay quarantined,
+// so nothing unscanned is exposed, and an attempt's real result must not turn
+// on a copy that hit a full disk. The log_ref it leaves behind reads the sizes
+// off disk and reports what actually landed.
+func (r *Runner) publishOrWithhold(ref runs.AttemptRef, set *sensitiveSet, withheld bool) {
+	if withheld {
+		return
+	}
+	if err := r.publishLogs(ref, set); err != nil {
+		r.log.Warn("runner.publish_logs", "attempt", ref.String(), "error", err)
+	}
 }
 
 // agentOutcome is what the untrusted half of the pipeline left behind: the
@@ -123,9 +321,28 @@ type agentOutcome struct {
 // orchestrator, which persists artifacts that ride a failure return. A
 // failure before the agent ever started carries none: nothing ran, so there
 // is nothing to describe, and an empty snapshot would only look like one.
-func (r *Runner) failureResult(ref runs.AttemptRef, spec RunSpec, agent agentOutcome) runs.ExecutionResult {
+//
+// A withheld attempt owes the container metadata and nothing else. The log
+// tail and the workspace listing are both agent-chosen bytes — snapshot.go
+// lists filenames, and a file named after the refreshed token would ride the
+// snapshot into the store — and withheld means precisely that nobody holds the
+// value to redact them against (spec §2.7). The log pointer goes too: there is
+// nothing published for it to point at.
+func (r *Runner) failureResult(ref runs.AttemptRef, agent agentOutcome, set *sensitiveSet, withheld bool) runs.ExecutionResult {
 	if !agent.started {
 		return runs.ExecutionResult{}
+	}
+	if set == nil {
+		// Unreachable by construction, and fails closed the way publishLogs
+		// does: no set means nothing scanned anything, which is what withheld
+		// means. The empty stand-in keeps the metadata redaction total.
+		set, withheld = newSensitiveSet(), true
+	}
+	if withheld {
+		return runs.ExecutionResult{Artifacts: []runs.NewArtifact{{
+			Type:    runs.ArtifactKindFailureSnapshot,
+			Payload: containerMetadata(agent.inspect, set.strings()),
+		}}}
 	}
 	return runs.ExecutionResult{Artifacts: []runs.NewArtifact{
 		r.logRefArtifact(ref),
@@ -134,18 +351,9 @@ func (r *Runner) failureResult(ref runs.AttemptRef, spec RunSpec, agent agentOut
 			Payload: buildFailureSnapshot(agent.inspect,
 				filepath.Join(r.logsDir(ref), agentLogFile), snapshotTailBytes,
 				filepath.Join(r.attemptDir(ref), gitops.WorkspaceDir),
-				attemptSecrets(spec)),
+				set.strings()),
 		},
 	}}
-}
-
-// attemptSecrets is everything about this attempt that must never reach an
-// artifact: the token the agent authenticates to the gateway with, and the
-// provider credential the gateway holds on its behalf. A snapshot is read by
-// humans and stored beside the run, so anything listed here is redacted out
-// of every string it carries.
-func attemptSecrets(spec RunSpec) []string {
-	return []string{spec.BrokerToken, spec.ProviderCredential}
 }
 
 // ensureNetworks brings up the shared egress network (once per host) and this
@@ -179,17 +387,66 @@ func (r *Runner) ensureEgressNetwork(ctx context.Context) error {
 	return nil
 }
 
+// lineageInto maps what the node was compiled with onto the staging contract:
+// the phase's own instructions and task inputs, the one patch its workspace
+// opens from, and a context file per remaining artifact. It is what turns a
+// graph edge into something the agent can read off its filesystem.
+//
+// Exactly one patch, by contract. Extraction diffs from the run's base, so
+// every patch already carries its ancestors' changes and the newest one
+// subsumes the whole linear chain; applying two would apply everything they
+// share a second time. A node with two patch inputs is therefore not a merge
+// this plan can perform, and pretending otherwise would silently corrupt the
+// tree — it is refused instead.
+func lineageInto(in *gitops.StageInput, req runs.ExecutionRequest) error {
+	in.Instructions = req.Instructions
+	in.TaskInputs = req.TaskInputs
+	for i, a := range req.Inputs {
+		if a.Type == runs.ArtifactKindPatch {
+			if in.Patch != "" {
+				return permanentf(runs.CodeStagingFailed,
+					"node declares more than one patch input; multi-patch staging lands with generations (Plan 08)")
+			}
+			// Already the base64 wire form collect wrote, and it travels
+			// unchanged: a patch is arbitrary bytes, so decoding it here only
+			// to re-encode it would be the corruption the wire form avoids.
+			diff, _ := a.Payload["diff"].(string)
+			if diff == "" {
+				// Staging nothing would be worse than failing: the phase would
+				// open at the run base, and its own patch would then read as a
+				// revert of everything its predecessor did.
+				return permanentf(runs.CodeInvalidOutput,
+					"patch input %s carries no diff in the base64 wire form", a.ID)
+			}
+			in.Patch = diff
+			in.InputRefs = append(in.InputRefs, gitops.InputRef{ID: a.ID.String(), Type: a.Type})
+			continue
+		}
+		name := fmt.Sprintf("%d-%s.json", i, a.Type)
+		raw, err := json.Marshal(a.Payload)
+		if err != nil {
+			return permanentf(runs.CodeInvalidOutput, "encode %s input %s: %v", a.Type, a.ID, err)
+		}
+		in.Contexts = append(in.Contexts, gitops.StageContext{Name: name, JSON: raw})
+		in.InputRefs = append(in.InputRefs, gitops.InputRef{ID: a.ID.String(), Type: a.Type, Name: name})
+	}
+	return nil
+}
+
 // stageAttempt runs the trusted stage container: it clones at the pinned SHA,
 // sanitizes and verifies, and reports through a contract file. The report is
 // the signal, never the exit code — a container that died before writing one
 // staged nothing.
-func (r *Runner) stageAttempt(ctx context.Context, ref runs.AttemptRef, spec RunSpec, clone CloneSpec) error {
+func (r *Runner) stageAttempt(ctx context.Context, ref runs.AttemptRef, req runs.ExecutionRequest, spec RunSpec, clone CloneSpec) error {
 	dir := r.attemptDir(ref)
 	in := gitops.StageInput{
 		CloneURL:   clone.URL,
 		BaseSHA:    spec.BaseSHA,
 		QuotaBytes: r.opts.WorkspaceQuotaBytes,
 		QuotaFiles: r.opts.WorkspaceQuotaFiles,
+	}
+	if err := lineageInto(&in, req); err != nil {
+		return err
 	}
 	if err := writeContract(filepath.Join(dir, gitops.StageInputFile), in); err != nil {
 		return transientf(runs.CodeStagingFailed, "write stage contract: %v", err)
@@ -240,9 +497,13 @@ func (r *Runner) stageAttempt(ctx context.Context, ref runs.AttemptRef, spec Run
 
 // runAgentToCompletion owns the untrusted half of the pipeline: the gateway
 // comes up first so the agent never races a missing broker, both containers
-// stream into capped log files, and the gateway is stopped gracefully at the
-// end so its usage summary flushes.
-func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, spec RunSpec) (agentOutcome, error) {
+// stream into capped log files under quarantine, and the gateway is stopped
+// gracefully at the end so its usage summary flushes.
+//
+// Both streams are quarantined, the gateway's included: it should hold no
+// secret of its own, but the broker token transits it, and "should" is not a
+// property worth publishing unscanned bytes for.
+func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, spec RunSpec, d driver) (agentOutcome, error) {
 	var out agentOutcome
 
 	// The log streams deliberately do not inherit the attempt's deadline: a
@@ -252,7 +513,7 @@ func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, 
 	var streams []*logStreamer
 	defer func() { r.drainStreams(ref, streams, stopStreams) }()
 
-	gatewayID, err := r.startGateway(ctx, ref, spec)
+	gatewayID, err := r.startGateway(ctx, ref, spec, d)
 	if err != nil {
 		return out, err
 	}
@@ -260,7 +521,7 @@ func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, 
 	// volume is one line per request, it is already bounded by the per-stream
 	// cap, and it runs before there is an agent to kill.
 	streams = append(streams, r.streamLogs(streamCtx, gatewayID,
-		filepath.Join(r.logsDir(ref), gatewayLogFile), ref, streamOpts{
+		filepath.Join(r.quarantineDir(ref), gatewayLogFile), ref, streamOpts{
 			stream:   "gateway",
 			onDenied: r.denialReporter(ctx, ref),
 		}))
@@ -287,7 +548,7 @@ func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, 
 	}
 
 	streams = append(streams, r.streamLogs(streamCtx, agentID,
-		filepath.Join(r.logsDir(ref), agentLogFile), ref, streamOpts{
+		filepath.Join(r.quarantineDir(ref), agentLogFile), ref, streamOpts{
 			stream: "agent",
 			onFlood: func() {
 				enforce(permanentf(runs.CodeLogFlood,
@@ -354,22 +615,12 @@ func (r *Runner) runAgentToCompletion(ctx context.Context, ref runs.AttemptRef, 
 // startGateway brings up the attempt's egress process: dual-homed onto the
 // attempt's internal network (where it answers to the name "egress") and the
 // shared egress network (where it is the only container with a route out).
-// The provider credential exists in exactly one place — this container's
-// environment — and the agent's network cannot reach the daemon that holds it.
-func (r *Runner) startGateway(ctx context.Context, ref runs.AttemptRef, spec RunSpec) (string, error) {
-	cfg := egress.Config{
-		Attempt:     ref.String(),
-		TokenSHA256: spec.BrokerTokenSHA,
-		Provider: egress.Provider{
-			Endpoint:         spec.Harness.ProviderEndpoint,
-			Credential:       spec.ProviderCredential,
-			CredentialHeader: spec.CredentialHeader,
-			CredentialPrefix: spec.CredentialPrefix,
-			Ops:              spec.ProviderOps,
-		},
-		ConnectAllow: r.opts.ConnectAllow,
-	}
-	raw, err := json.Marshal(cfg)
+// Under brokered custody the provider credential exists in exactly one place —
+// this container's environment — and the agent's network cannot reach the
+// daemon that holds it; under materialized custody the gateway holds no
+// credential at all and is purely the allowlisted route out.
+func (r *Runner) startGateway(ctx context.Context, ref runs.AttemptRef, spec RunSpec, d driver) (string, error) {
+	raw, err := json.Marshal(r.gatewayConfig(spec, d))
 	if err != nil {
 		return "", transientf(runs.CodeInternalError, "encode egress config: %v", err)
 	}
@@ -404,8 +655,15 @@ func (r *Runner) startGateway(ctx context.Context, ref runs.AttemptRef, spec Run
 // other occupant is the gateway.
 func (r *Runner) startAgent(ctx context.Context, ref runs.AttemptRef, spec RunSpec) (string, error) {
 	ws := filepath.Join(r.attemptDir(ref), gitops.WorkspaceDir)
-	host := r.hardenedHost([]string{r.hostPath(ws) + ":" + workspaceDir},
-		networkName(ref), r.opts.MemoryBytes, r.opts.NanoCPUs, r.opts.PidsLimit)
+	// The auth directory rides the same mechanism as the workspace and is the
+	// only other path the agent shares with the host. It is writable on
+	// purpose: the CLI refreshes its own tokens, and that refreshed file is
+	// what sync-back reads back (spec §2.4).
+	binds := []string{r.hostPath(ws) + ":" + workspaceDir}
+	if spec.AuthBind != "" {
+		binds = append(binds, spec.AuthBind)
+	}
+	host := r.hardenedHost(binds, networkName(ref), r.opts.MemoryBytes, r.opts.NanoCPUs, r.opts.PidsLimit)
 
 	id, err := r.engine.ContainerCreate(ctx, agentName(ref), dockerapi.ContainerConfig{
 		Image:      spec.ImageDigest,

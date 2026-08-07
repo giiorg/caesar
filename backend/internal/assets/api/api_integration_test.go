@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -228,5 +229,62 @@ func TestAssetsAPI_RepoEndpointsEnforceManage(t *testing.T) {
 	defer rawResp.Body.Close()
 	if rawResp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown field = %d", rawResp.StatusCode)
+	}
+}
+
+func TestAssetsAPI_CredentialFreshnessFields(t *testing.T) {
+	ctx := context.Background()
+	srv, svc, pool, ports := newTestServer(t)
+	admin := seedUser(t, pool, "root@example.com", authn.RoleAdmin)
+	login(ports, "admin-tok", admin)
+
+	// A full-size auth.json must survive the HTTP layer: the request body
+	// limit has to leave room for the 64 KiB the kind allows.
+	pad := strings.Repeat("x", 64<<10-len(`{"tokens":{"refresh_token":"rt-1"},"pad":""}`))
+	body := `{"tokens":{"refresh_token":"rt-1"},"pad":"` + pad + `"}`
+	if len(body) != 64<<10 {
+		t.Fatalf("fixture is %d bytes, want %d", len(body), 64<<10)
+	}
+	resp := do(t, http.MethodPost, srv.URL+"/api/v1/credentials", "admin-tok",
+		assetsapi.CreateCredentialRequest{Name: "codex-sub", Kind: "agent_auth_file", Secret: body})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create = %d, want 201 for a 64 KiB auth.json", resp.StatusCode)
+	}
+	created := decodeInto[assetsapi.CredentialResponse](t, resp)
+	if created.Kind != "agent_auth_file" || created.SecretVersion != 1 {
+		t.Fatalf("created = %+v", created)
+	}
+	if !created.ProvidedAt.Equal(created.UpdatedAt) {
+		t.Fatalf("provided_at = %s, want updated_at %s", created.ProvidedAt, created.UpdatedAt)
+	}
+	if created.LastUsedAt != nil || created.LastAuthExpiredAt != nil {
+		t.Fatalf("freshness stamps = %v/%v, want unset on create", created.LastUsedAt, created.LastAuthExpiredAt)
+	}
+	// The unset stamps stay off the wire entirely.
+	raw := decodeInto[map[string]any](t, do(t, http.MethodGet, srv.URL+"/api/v1/credentials/"+created.ID, "admin-tok", nil))
+	if _, ok := raw["last_used_at"]; ok {
+		t.Fatal("last_used_at must be omitted while NULL")
+	}
+
+	// The secret round-trips byte for byte, and using it stamps the view.
+	id := uuid.MustParse(created.ID)
+	plain, version, err := svc.UseCredentialVersioned(ctx, id, "materialize-auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(plain) != body || version != 1 {
+		t.Fatalf("use = %d bytes at version %d, want %d bytes at version 1", len(plain), version, len(body))
+	}
+	got := decodeInto[assetsapi.CredentialResponse](t, do(t, http.MethodGet, srv.URL+"/api/v1/credentials/"+created.ID, "admin-tok", nil))
+	if got.LastUsedAt == nil {
+		t.Fatal("last_used_at must be set after a use")
+	}
+
+	if resp := do(t, http.MethodPut, srv.URL+"/api/v1/credentials/"+created.ID+"/secret", "admin-tok",
+		assetsapi.RotateCredentialSecretRequest{Secret: `{"tokens":{"refresh_token":"rt-2"}}`}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("rotate = %d", resp.StatusCode)
+	}
+	if got := decodeInto[assetsapi.CredentialResponse](t, do(t, http.MethodGet, srv.URL+"/api/v1/credentials/"+created.ID, "admin-tok", nil)); got.SecretVersion != 2 {
+		t.Fatalf("secret_version = %d after rotate, want 2", got.SecretVersion)
 	}
 }

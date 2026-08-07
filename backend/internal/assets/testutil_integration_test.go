@@ -4,6 +4,7 @@ package assets_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/clock"
 	"github.com/giiorg/caesar/backend/internal/platform/secrets"
 	"github.com/giiorg/caesar/backend/internal/platform/testdb"
+	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
 
 const testKeyset = "test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -43,6 +45,23 @@ func seedActor(t *testing.T, pool *pgxpool.Pool, email string, role authn.Role) 
 		t.Fatal(err)
 	}
 	return authn.Principal{UserID: id, Email: email, Role: role}
+}
+
+// fieldMessage pulls one field error's message off a classified error so
+// tests can assert what an operator is actually told, not just the class.
+func fieldMessage(t *testing.T, err error, field string) string {
+	t.Helper()
+	var e *xerrors.Error
+	if !errors.As(err, &e) {
+		t.Fatalf("not a classified error: %v", err)
+	}
+	for _, f := range e.Fields {
+		if f.Field == field {
+			return f.Message
+		}
+	}
+	t.Fatalf("no %q field error in %v", field, e.Fields)
+	return ""
 }
 
 func auditCount(t *testing.T, pool *pgxpool.Pool, action string) int {

@@ -51,8 +51,43 @@ func (r *Runner) attemptDir(ref runs.AttemptRef) string {
 }
 
 // logsDir outlives the attempt: logs are evidence, retention is Plan 13's.
+// No attempt streams into it: publishLogs is the only writer of an attempt's
+// logs, so every byte of them under here has passed a complete redaction scan
+// (spec §3). A validation run (Plan 08) writes here directly — it is handed no
+// credential at all, so it has nothing to scan for.
 func (r *Runner) logsDir(ref runs.AttemptRef) string {
 	return filepath.Join(r.opts.DataRoot, "logs", ref.String())
+}
+
+// quarantineDir is where an attempt's streams land while they are still
+// unscannable: a token the CLI refreshes mid-run is unknown to caesar until
+// the read-back reports it, so nothing may be published until the credential
+// obligation has concluded. It is a sibling of logsDir rather than a child of
+// the attempt tree for the same reason the auth directory is — teardown must
+// not take the evidence with it — and it survives publication only when the
+// attempt was withheld (spec §2.7).
+func (r *Runner) quarantineDir(ref runs.AttemptRef) string {
+	return filepath.Join(r.opts.DataRoot, "quarantine", ref.String())
+}
+
+// manifestsDir holds one file per credential-bearing attempt. It lives beside
+// the attempt tree rather than inside it so blanket teardown never takes the
+// manifest with it: the credential obligation outlives the containers.
+func (r *Runner) manifestsDir() string {
+	return filepath.Join(r.opts.DataRoot, "manifests")
+}
+
+func (r *Runner) manifestPath(ref runs.AttemptRef) string {
+	return filepath.Join(r.manifestsDir(), ref.String()+".json")
+}
+
+// authDir holds the one credential the agent's own CLI may rewrite. It sits
+// beside the attempt tree for the same reason the manifest does, and one more:
+// the CLI refreshes the file mid-run, and that refreshed copy is the only one
+// there is — teardown running over it would destroy a live credential (spec
+// §2.4). Nothing removes it blanket; removeAuthDirFenced does, under the lease.
+func (r *Runner) authDir(ref runs.AttemptRef) string {
+	return filepath.Join(r.opts.DataRoot, "auth", ref.String())
 }
 
 // relPath renders a path the way artifacts and events carry it: relative to

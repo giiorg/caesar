@@ -10,30 +10,97 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acquireCredentialRow = `-- name: AcquireCredentialRow :one
+UPDATE credentials SET last_used_at = now()
+WHERE id = $1
+RETURNING id, kind, key_id, wrapped_dek, ciphertext, secret_version
+`
+
+type AcquireCredentialRowRow struct {
+	ID            uuid.UUID
+	Kind          string
+	KeyID         string
+	WrappedDek    []byte
+	Ciphertext    []byte
+	SecretVersion int64
+}
+
+// AcquireCredentialRow is the lease path's counterpart to UseCredentialRow:
+// it row-locks the credential, hands back the envelope and the version the
+// lease is about to grant, and stamps last_used_at in the same statement.
+// Leased kinds never pass through UseCredentialRow, and the freshness view
+// (spec §5) must still see them. Taking the credential lock before the
+// lease row pins the aggregate's lock order.
+func (q *Queries) AcquireCredentialRow(ctx context.Context, id uuid.UUID) (AcquireCredentialRowRow, error) {
+	row := q.db.QueryRow(ctx, acquireCredentialRow, id)
+	var i AcquireCredentialRowRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.KeyID,
+		&i.WrappedDek,
+		&i.Ciphertext,
+		&i.SecretVersion,
+	)
+	return i, err
+}
+
+const acquireLease = `-- name: AcquireLease :one
+INSERT INTO credential_leases (credential_id, attempt_ref, secret_version)
+VALUES ($1, $2, $3)
+ON CONFLICT (credential_id) DO NOTHING
+RETURNING credential_id, attempt_ref, epoch, secret_version, acquired_at, heartbeat_at
+`
+
+type AcquireLeaseParams struct {
+	CredentialID  uuid.UUID
+	AttemptRef    string
+	SecretVersion int64
+}
+
+func (q *Queries) AcquireLease(ctx context.Context, arg AcquireLeaseParams) (CredentialLease, error) {
+	row := q.db.QueryRow(ctx, acquireLease, arg.CredentialID, arg.AttemptRef, arg.SecretVersion)
+	var i CredentialLease
+	err := row.Scan(
+		&i.CredentialID,
+		&i.AttemptRef,
+		&i.Epoch,
+		&i.SecretVersion,
+		&i.AcquiredAt,
+		&i.HeartbeatAt,
+	)
+	return i, err
+}
+
 const createCredential = `-- name: CreateCredential :one
-INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, name, kind, key_id, created_at, updated_at
+INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext, fingerprint)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
 `
 
 type CreateCredentialParams struct {
-	ID         uuid.UUID
-	Name       string
-	Kind       string
-	KeyID      string
-	WrappedDek []byte
-	Ciphertext []byte
+	ID          uuid.UUID
+	Name        string
+	Kind        string
+	KeyID       string
+	WrappedDek  []byte
+	Ciphertext  []byte
+	Fingerprint pgtype.Text
 }
 
 type CreateCredentialRow struct {
-	ID        uuid.UUID
-	Name      string
-	Kind      string
-	KeyID     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                uuid.UUID
+	Name              string
+	Kind              string
+	KeyID             string
+	SecretVersion     int64
+	LastUsedAt        *time.Time
+	LastAuthExpiredAt *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 func (q *Queries) CreateCredential(ctx context.Context, arg CreateCredentialParams) (CreateCredentialRow, error) {
@@ -44,6 +111,7 @@ func (q *Queries) CreateCredential(ctx context.Context, arg CreateCredentialPara
 		arg.KeyID,
 		arg.WrappedDek,
 		arg.Ciphertext,
+		arg.Fingerprint,
 	)
 	var i CreateCredentialRow
 	err := row.Scan(
@@ -51,6 +119,9 @@ func (q *Queries) CreateCredential(ctx context.Context, arg CreateCredentialPara
 		&i.Name,
 		&i.Kind,
 		&i.KeyID,
+		&i.SecretVersion,
+		&i.LastUsedAt,
+		&i.LastAuthExpiredAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -120,6 +191,25 @@ func (q *Queries) CreateRepo(ctx context.Context, arg CreateRepoParams) (Repo, e
 	return i, err
 }
 
+const credentialFingerprintHeldByOther = `-- name: CredentialFingerprintHeldByOther :one
+SELECT EXISTS(SELECT 1 FROM credentials WHERE fingerprint = $2 AND id <> $1)
+`
+
+type CredentialFingerprintHeldByOtherParams struct {
+	ID          uuid.UUID
+	Fingerprint pgtype.Text
+}
+
+// CredentialFingerprintHeldByOther is the sync-back pre-check. Letting the
+// partial unique index raise 23505 instead would abort the transaction, and
+// the discard audit could not be written after that without savepoints.
+func (q *Queries) CredentialFingerprintHeldByOther(ctx context.Context, arg CredentialFingerprintHeldByOtherParams) (bool, error) {
+	row := q.db.QueryRow(ctx, credentialFingerprintHeldByOther, arg.ID, arg.Fingerprint)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const deleteCredential = `-- name: DeleteCredential :execrows
 DELETE FROM credentials WHERE id = $1
 `
@@ -169,17 +259,20 @@ func (q *Queries) DeleteRepo(ctx context.Context, id uuid.UUID) (int64, error) {
 }
 
 const getCredential = `-- name: GetCredential :one
-SELECT id, name, kind, key_id, created_at, updated_at
+SELECT id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
 FROM credentials WHERE id = $1
 `
 
 type GetCredentialRow struct {
-	ID        uuid.UUID
-	Name      string
-	Kind      string
-	KeyID     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                uuid.UUID
+	Name              string
+	Kind              string
+	KeyID             string
+	SecretVersion     int64
+	LastUsedAt        *time.Time
+	LastAuthExpiredAt *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 func (q *Queries) GetCredential(ctx context.Context, id uuid.UUID) (GetCredentialRow, error) {
@@ -190,27 +283,9 @@ func (q *Queries) GetCredential(ctx context.Context, id uuid.UUID) (GetCredentia
 		&i.Name,
 		&i.Kind,
 		&i.KeyID,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
-}
-
-const getCredentialRow = `-- name: GetCredentialRow :one
-SELECT id, name, kind, key_id, wrapped_dek, ciphertext, created_at, updated_at
-FROM credentials WHERE id = $1
-`
-
-func (q *Queries) GetCredentialRow(ctx context.Context, id uuid.UUID) (Credential, error) {
-	row := q.db.QueryRow(ctx, getCredentialRow, id)
-	var i Credential
-	err := row.Scan(
-		&i.ID,
-		&i.Name,
-		&i.Kind,
-		&i.KeyID,
-		&i.WrappedDek,
-		&i.Ciphertext,
+		&i.SecretVersion,
+		&i.LastUsedAt,
+		&i.LastAuthExpiredAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -260,6 +335,64 @@ func (q *Queries) GetHarnessByName(ctx context.Context, name string) (Harness, e
 	return i, err
 }
 
+const getLease = `-- name: GetLease :one
+SELECT credential_id, attempt_ref, epoch, secret_version, acquired_at, heartbeat_at FROM credential_leases WHERE credential_id = $1
+`
+
+func (q *Queries) GetLease(ctx context.Context, credentialID uuid.UUID) (CredentialLease, error) {
+	row := q.db.QueryRow(ctx, getLease, credentialID)
+	var i CredentialLease
+	err := row.Scan(
+		&i.CredentialID,
+		&i.AttemptRef,
+		&i.Epoch,
+		&i.SecretVersion,
+		&i.AcquiredAt,
+		&i.HeartbeatAt,
+	)
+	return i, err
+}
+
+const getLeaseByAttempt = `-- name: GetLeaseByAttempt :one
+SELECT credential_id, attempt_ref, epoch, secret_version, acquired_at, heartbeat_at FROM credential_leases WHERE attempt_ref = $1
+`
+
+func (q *Queries) GetLeaseByAttempt(ctx context.Context, attemptRef string) (CredentialLease, error) {
+	row := q.db.QueryRow(ctx, getLeaseByAttempt, attemptRef)
+	var i CredentialLease
+	err := row.Scan(
+		&i.CredentialID,
+		&i.AttemptRef,
+		&i.Epoch,
+		&i.SecretVersion,
+		&i.AcquiredAt,
+		&i.HeartbeatAt,
+	)
+	return i, err
+}
+
+const getLeaseForUpdate = `-- name: GetLeaseForUpdate :one
+SELECT credential_id, attempt_ref, epoch, secret_version, acquired_at, heartbeat_at FROM credential_leases WHERE credential_id = $1
+FOR UPDATE
+`
+
+// GetLeaseForUpdate fences the sync-back commit against a concurrent
+// takeover: without the row lock a worker could read epoch N, lose the
+// lease to a reconciler, and still commit its stale snapshot.
+func (q *Queries) GetLeaseForUpdate(ctx context.Context, credentialID uuid.UUID) (CredentialLease, error) {
+	row := q.db.QueryRow(ctx, getLeaseForUpdate, credentialID)
+	var i CredentialLease
+	err := row.Scan(
+		&i.CredentialID,
+		&i.AttemptRef,
+		&i.Epoch,
+		&i.SecretVersion,
+		&i.AcquiredAt,
+		&i.HeartbeatAt,
+	)
+	return i, err
+}
+
 const getProject = `-- name: GetProject :one
 SELECT id, name, description, created_at, updated_at
 FROM projects WHERE id = $1
@@ -299,21 +432,75 @@ func (q *Queries) GetRepo(ctx context.Context, id uuid.UUID) (Repo, error) {
 	return i, err
 }
 
+const getSyncReceipt = `-- name: GetSyncReceipt :one
+SELECT credential_id, attempt_ref, epoch, from_version, to_version, committed_at FROM credential_sync_receipts
+WHERE credential_id = $1 AND attempt_ref = $2
+`
+
+type GetSyncReceiptParams struct {
+	CredentialID uuid.UUID
+	AttemptRef   string
+}
+
+func (q *Queries) GetSyncReceipt(ctx context.Context, arg GetSyncReceiptParams) (CredentialSyncReceipt, error) {
+	row := q.db.QueryRow(ctx, getSyncReceipt, arg.CredentialID, arg.AttemptRef)
+	var i CredentialSyncReceipt
+	err := row.Scan(
+		&i.CredentialID,
+		&i.AttemptRef,
+		&i.Epoch,
+		&i.FromVersion,
+		&i.ToVersion,
+		&i.CommittedAt,
+	)
+	return i, err
+}
+
+const heartbeatLease = `-- name: HeartbeatLease :execrows
+UPDATE credential_leases SET heartbeat_at = now()
+WHERE credential_id = $1 AND attempt_ref = $2 AND epoch = $3
+`
+
+type HeartbeatLeaseParams struct {
+	CredentialID uuid.UUID
+	AttemptRef   string
+	Epoch        int64
+}
+
+func (q *Queries) HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, heartbeatLease, arg.CredentialID, arg.AttemptRef, arg.Epoch)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const listCredentialRowsForUpdate = `-- name: ListCredentialRowsForUpdate :many
 SELECT id, name, kind, key_id, wrapped_dek, ciphertext, created_at, updated_at
 FROM credentials ORDER BY id
 FOR UPDATE
 `
 
-func (q *Queries) ListCredentialRowsForUpdate(ctx context.Context) ([]Credential, error) {
+type ListCredentialRowsForUpdateRow struct {
+	ID         uuid.UUID
+	Name       string
+	Kind       string
+	KeyID      string
+	WrappedDek []byte
+	Ciphertext []byte
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+func (q *Queries) ListCredentialRowsForUpdate(ctx context.Context) ([]ListCredentialRowsForUpdateRow, error) {
 	rows, err := q.db.Query(ctx, listCredentialRowsForUpdate)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Credential
+	var items []ListCredentialRowsForUpdateRow
 	for rows.Next() {
-		var i Credential
+		var i ListCredentialRowsForUpdateRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Name,
@@ -335,17 +522,20 @@ func (q *Queries) ListCredentialRowsForUpdate(ctx context.Context) ([]Credential
 }
 
 const listCredentials = `-- name: ListCredentials :many
-SELECT id, name, kind, key_id, created_at, updated_at
+SELECT id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
 FROM credentials ORDER BY name
 `
 
 type ListCredentialsRow struct {
-	ID        uuid.UUID
-	Name      string
-	Kind      string
-	KeyID     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                uuid.UUID
+	Name              string
+	Kind              string
+	KeyID             string
+	SecretVersion     int64
+	LastUsedAt        *time.Time
+	LastAuthExpiredAt *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 func (q *Queries) ListCredentials(ctx context.Context) ([]ListCredentialsRow, error) {
@@ -362,6 +552,9 @@ func (q *Queries) ListCredentials(ctx context.Context) ([]ListCredentialsRow, er
 			&i.Name,
 			&i.Kind,
 			&i.KeyID,
+			&i.SecretVersion,
+			&i.LastUsedAt,
+			&i.LastAuthExpiredAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -506,6 +699,75 @@ func (q *Queries) ListReposByProject(ctx context.Context, projectID uuid.UUID) (
 	return items, nil
 }
 
+const listStaleLeases = `-- name: ListStaleLeases :many
+SELECT credential_id, attempt_ref, epoch, secret_version, acquired_at, heartbeat_at FROM credential_leases
+WHERE heartbeat_at < now() - make_interval(secs => $1::double precision)
+ORDER BY credential_id
+`
+
+// ListStaleLeases finds leases whose owner stopped heartbeating, for the
+// reconciliation sweep. Staleness never releases a lease by itself (spec
+// §2.1): only a concluded reconciliation does.
+func (q *Queries) ListStaleLeases(ctx context.Context, staleSeconds float64) ([]CredentialLease, error) {
+	rows, err := q.db.Query(ctx, listStaleLeases, staleSeconds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []CredentialLease
+	for rows.Next() {
+		var i CredentialLease
+		if err := rows.Scan(
+			&i.CredentialID,
+			&i.AttemptRef,
+			&i.Epoch,
+			&i.SecretVersion,
+			&i.AcquiredAt,
+			&i.HeartbeatAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockCredential = `-- name: LockCredential :one
+SELECT id FROM credentials WHERE id = $1
+FOR UPDATE
+`
+
+// LockCredential takes the credential row lock that opens every write in
+// the mutable-credential aggregate, pinning its lock order. It reads
+// nothing the caller needs: kind is immutable and read on the pool, and
+// the version guard is the CAS itself.
+func (q *Queries) LockCredential(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockCredential, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
+const markCredentialAuthExpired = `-- name: MarkCredentialAuthExpired :execrows
+UPDATE credentials SET last_auth_expired_at = $2 WHERE id = $1
+`
+
+type MarkCredentialAuthExpiredParams struct {
+	ID                uuid.UUID
+	LastAuthExpiredAt *time.Time
+}
+
+func (q *Queries) MarkCredentialAuthExpired(ctx context.Context, arg MarkCredentialAuthExpiredParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markCredentialAuthExpired, arg.ID, arg.LastAuthExpiredAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const projectExists = `-- name: ProjectExists :one
 SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)
 `
@@ -515,6 +777,35 @@ func (q *Queries) ProjectExists(ctx context.Context, id uuid.UUID) (bool, error)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const rebindLeaseVersion = `-- name: RebindLeaseVersion :one
+UPDATE credential_leases SET secret_version = $3
+WHERE credential_id = $1 AND attempt_ref = $2
+RETURNING credential_id, attempt_ref, epoch, secret_version, acquired_at, heartbeat_at
+`
+
+type RebindLeaseVersionParams struct {
+	CredentialID  uuid.UUID
+	AttemptRef    string
+	SecretVersion int64
+}
+
+// RebindLeaseVersion re-points an idempotent re-acquire at the version the
+// caller is about to be handed: the store may have rotated since the first
+// acquire, and lease.secret_version must match the delivered snapshot.
+func (q *Queries) RebindLeaseVersion(ctx context.Context, arg RebindLeaseVersionParams) (CredentialLease, error) {
+	row := q.db.QueryRow(ctx, rebindLeaseVersion, arg.CredentialID, arg.AttemptRef, arg.SecretVersion)
+	var i CredentialLease
+	err := row.Scan(
+		&i.CredentialID,
+		&i.AttemptRef,
+		&i.Epoch,
+		&i.SecretVersion,
+		&i.AcquiredAt,
+		&i.HeartbeatAt,
+	)
+	return i, err
 }
 
 const registerHarness = `-- name: RegisterHarness :one
@@ -556,35 +847,114 @@ func (q *Queries) RegisterHarness(ctx context.Context, arg RegisterHarnessParams
 	return i, err
 }
 
-const updateCredentialSecret = `-- name: UpdateCredentialSecret :one
-UPDATE credentials SET key_id = $2, wrapped_dek = $3, ciphertext = $4, updated_at = $5
-WHERE id = $1
-RETURNING id, name, kind, key_id, created_at, updated_at
+const releaseLease = `-- name: ReleaseLease :execrows
+DELETE FROM credential_leases
+WHERE credential_id = $1 AND attempt_ref = $2 AND epoch = $3
 `
 
-type UpdateCredentialSecretParams struct {
+type ReleaseLeaseParams struct {
+	CredentialID uuid.UUID
+	AttemptRef   string
+	Epoch        int64
+}
+
+func (q *Queries) ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseLease, arg.CredentialID, arg.AttemptRef, arg.Epoch)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const rewrapCredential = `-- name: RewrapCredential :exec
+UPDATE credentials SET key_id = $2, wrapped_dek = $3, ciphertext = $4
+WHERE id = $1
+`
+
+type RewrapCredentialParams struct {
 	ID         uuid.UUID
 	KeyID      string
 	WrappedDek []byte
 	Ciphertext []byte
-	UpdatedAt  time.Time
+}
+
+// RewrapCredential moves a row to another master key. The plaintext is
+// unchanged, so secret_version, fingerprint, and updated_at ("when the
+// operator last supplied the secret") all stay put.
+func (q *Queries) RewrapCredential(ctx context.Context, arg RewrapCredentialParams) error {
+	_, err := q.db.Exec(ctx, rewrapCredential,
+		arg.ID,
+		arg.KeyID,
+		arg.WrappedDek,
+		arg.Ciphertext,
+	)
+	return err
+}
+
+const takeoverLease = `-- name: TakeoverLease :one
+UPDATE credential_leases SET epoch = epoch + 1
+WHERE credential_id = $1 AND attempt_ref = $2
+RETURNING credential_id, attempt_ref, epoch, secret_version, acquired_at, heartbeat_at
+`
+
+type TakeoverLeaseParams struct {
+	CredentialID uuid.UUID
+	AttemptRef   string
+}
+
+func (q *Queries) TakeoverLease(ctx context.Context, arg TakeoverLeaseParams) (CredentialLease, error) {
+	row := q.db.QueryRow(ctx, takeoverLease, arg.CredentialID, arg.AttemptRef)
+	var i CredentialLease
+	err := row.Scan(
+		&i.CredentialID,
+		&i.AttemptRef,
+		&i.Epoch,
+		&i.SecretVersion,
+		&i.AcquiredAt,
+		&i.HeartbeatAt,
+	)
+	return i, err
+}
+
+const updateCredentialSecret = `-- name: UpdateCredentialSecret :one
+UPDATE credentials
+SET key_id = $2, wrapped_dek = $3, ciphertext = $4, fingerprint = $5,
+    secret_version = secret_version + 1, updated_at = $6
+WHERE id = $1
+RETURNING id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
+`
+
+type UpdateCredentialSecretParams struct {
+	ID          uuid.UUID
+	KeyID       string
+	WrappedDek  []byte
+	Ciphertext  []byte
+	Fingerprint pgtype.Text
+	UpdatedAt   time.Time
 }
 
 type UpdateCredentialSecretRow struct {
-	ID        uuid.UUID
-	Name      string
-	Kind      string
-	KeyID     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                uuid.UUID
+	Name              string
+	Kind              string
+	KeyID             string
+	SecretVersion     int64
+	LastUsedAt        *time.Time
+	LastAuthExpiredAt *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
+// UpdateCredentialSecret is the operator-facing rotation: new plaintext,
+// so the version advances and the fingerprint is recomputed. Rekeying
+// re-wraps the same plaintext and goes through RewrapCredential instead.
 func (q *Queries) UpdateCredentialSecret(ctx context.Context, arg UpdateCredentialSecretParams) (UpdateCredentialSecretRow, error) {
 	row := q.db.QueryRow(ctx, updateCredentialSecret,
 		arg.ID,
 		arg.KeyID,
 		arg.WrappedDek,
 		arg.Ciphertext,
+		arg.Fingerprint,
 		arg.UpdatedAt,
 	)
 	var i UpdateCredentialSecretRow
@@ -593,10 +963,47 @@ func (q *Queries) UpdateCredentialSecret(ctx context.Context, arg UpdateCredenti
 		&i.Name,
 		&i.Kind,
 		&i.KeyID,
+		&i.SecretVersion,
+		&i.LastUsedAt,
+		&i.LastAuthExpiredAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const updateCredentialSecretCAS = `-- name: UpdateCredentialSecretCAS :execrows
+UPDATE credentials
+SET key_id = $2, wrapped_dek = $3, ciphertext = $4, fingerprint = $5,
+    secret_version = secret_version + 1, updated_at = now()
+WHERE id = $1 AND secret_version = $6
+`
+
+type UpdateCredentialSecretCASParams struct {
+	ID            uuid.UUID
+	KeyID         string
+	WrappedDek    []byte
+	Ciphertext    []byte
+	Fingerprint   pgtype.Text
+	SecretVersion int64
+}
+
+// UpdateCredentialSecretCAS is the sync-back write: it lands only if the
+// store still holds the version the attempt materialized, so an operator
+// rotation mid-attempt makes the stale refresh lose (spec §2.6).
+func (q *Queries) UpdateCredentialSecretCAS(ctx context.Context, arg UpdateCredentialSecretCASParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateCredentialSecretCAS,
+		arg.ID,
+		arg.KeyID,
+		arg.WrappedDek,
+		arg.Ciphertext,
+		arg.Fingerprint,
+		arg.SecretVersion,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateHarness = `-- name: UpdateHarness :one
@@ -701,6 +1108,79 @@ func (q *Queries) UpdateRepo(ctx context.Context, arg UpdateRepoParams) (Repo, e
 		&i.Slug,
 		&i.DefaultBranch,
 		&i.CredentialID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const upsertSyncReceipt = `-- name: UpsertSyncReceipt :exec
+INSERT INTO credential_sync_receipts (credential_id, attempt_ref, epoch, from_version, to_version)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (credential_id, attempt_ref) DO UPDATE
+SET epoch = EXCLUDED.epoch, from_version = EXCLUDED.from_version,
+    to_version = EXCLUDED.to_version, committed_at = now()
+`
+
+type UpsertSyncReceiptParams struct {
+	CredentialID uuid.UUID
+	AttemptRef   string
+	Epoch        int64
+	FromVersion  int64
+	ToVersion    int64
+}
+
+// UpsertSyncReceipt overwrites the previous owner's receipt when a
+// reconciler commits under a later epoch for the same attempt: the receipt
+// records which epoch's bytes are in the store, so it must move with them.
+func (q *Queries) UpsertSyncReceipt(ctx context.Context, arg UpsertSyncReceiptParams) error {
+	_, err := q.db.Exec(ctx, upsertSyncReceipt,
+		arg.CredentialID,
+		arg.AttemptRef,
+		arg.Epoch,
+		arg.FromVersion,
+		arg.ToVersion,
+	)
+	return err
+}
+
+const useCredentialRow = `-- name: UseCredentialRow :one
+UPDATE credentials SET last_used_at = $2
+WHERE id = $1
+RETURNING id, name, kind, key_id, wrapped_dek, ciphertext, secret_version, created_at, updated_at
+`
+
+type UseCredentialRowParams struct {
+	ID         uuid.UUID
+	LastUsedAt *time.Time
+}
+
+type UseCredentialRowRow struct {
+	ID            uuid.UUID
+	Name          string
+	Kind          string
+	KeyID         string
+	WrappedDek    []byte
+	Ciphertext    []byte
+	SecretVersion int64
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// UseCredentialRow is the use-time read: it stamps last_used_at in the
+// same statement that hands back the envelope, so the freshness view can
+// never drift from what was actually opened.
+func (q *Queries) UseCredentialRow(ctx context.Context, arg UseCredentialRowParams) (UseCredentialRowRow, error) {
+	row := q.db.QueryRow(ctx, useCredentialRow, arg.ID, arg.LastUsedAt)
+	var i UseCredentialRowRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Kind,
+		&i.KeyID,
+		&i.WrappedDek,
+		&i.Ciphertext,
+		&i.SecretVersion,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

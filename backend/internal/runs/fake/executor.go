@@ -146,6 +146,12 @@ func (e *Executor) Inspect(_ context.Context, ref runs.AttemptRef) (runs.Inspect
 	return runs.InspectResult{Completed: true, Result: res}, nil
 }
 
+// ReconcileCredential is the no-op half of runs.CredentialReconciler: the fake
+// harness holds no credentials, so an attempt of its has no obligation to
+// settle. It exists so the janitor paths that type-assert the executor exercise
+// their real ordering in fake-driven tests rather than skipping silently.
+func (e *Executor) ReconcileCredential(context.Context, runs.AttemptRef) error { return nil }
+
 // Completed reports whether ref finished successfully (test assertions).
 func (e *Executor) Completed(ref runs.AttemptRef) bool {
 	e.mu.Lock()

@@ -78,14 +78,56 @@ CREATE TABLE login_rate (
 -- wrapped_dek under master key key_id, ciphertext under the DEK, AAD =
 -- the credential id. Plaintext never lands here; every use is audited.
 CREATE TABLE credentials (
-    id          uuid PRIMARY KEY,
-    name        text NOT NULL UNIQUE,
-    kind        text NOT NULL CHECK (kind IN ('forge_token', 'model_key')),
-    key_id      text NOT NULL,
-    wrapped_dek bytea NOT NULL,
-    ciphertext  bytea NOT NULL,
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
+    id                   uuid PRIMARY KEY,
+    name                 text NOT NULL UNIQUE,
+    kind                 text NOT NULL CHECK (kind IN ('forge_token', 'model_key', 'subscription_token', 'agent_auth_file')),
+    key_id               text NOT NULL,
+    wrapped_dek          bytea NOT NULL,
+    ciphertext           bytea NOT NULL,
+    secret_version       bigint NOT NULL DEFAULT 1 CHECK (secret_version >= 1),
+    fingerprint          text,
+    last_used_at         timestamptz,
+    last_auth_expired_at timestamptz,
+    created_at           timestamptz NOT NULL DEFAULT now(),
+    updated_at           timestamptz NOT NULL DEFAULT now()
+);
+
+-- Two active agent_auth_file rows sharing one refresh token would hold
+-- independent single-flight leases against the same underlying credential
+-- (spec §2 "import is exclusive custody transfer").
+CREATE UNIQUE INDEX credentials_fingerprint_key ON credentials (fingerprint)
+    WHERE fingerprint IS NOT NULL;
+
+-- The single-flight lease: the primary key IS the mechanism (one row per
+-- credential). The epoch fences a paused owner from its own reconciler —
+-- identity alone cannot, because they are the same phase run (spec §2.1).
+CREATE TABLE credential_leases (
+    credential_id  uuid PRIMARY KEY REFERENCES credentials (id) ON DELETE RESTRICT,
+    attempt_ref    text NOT NULL,
+    epoch          bigint NOT NULL DEFAULT 1 CHECK (epoch >= 1),
+    secret_version bigint NOT NULL,
+    acquired_at    timestamptz NOT NULL DEFAULT now(),
+    heartbeat_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- The lease row, indexed by owning attempt, is the recovery authority:
+-- reconciliation consults it even when no manifest and no container exist
+-- (spec §2.3). UNIQUE because one attempt holds at most one credential
+-- lease by design — a second row would make the recovery lookup return an
+-- arbitrary one of them and silently leak the rest.
+CREATE UNIQUE INDEX credential_leases_attempt_ref_key ON credential_leases (attempt_ref);
+
+-- One receipt per (credential, attempt): the commit-then-crash retry is
+-- recognizable as already applied and can never clobber an operator
+-- rotation (spec §2.6).
+CREATE TABLE credential_sync_receipts (
+    credential_id uuid NOT NULL REFERENCES credentials (id) ON DELETE CASCADE,
+    attempt_ref   text NOT NULL,
+    epoch         bigint NOT NULL,
+    from_version  bigint NOT NULL,
+    to_version    bigint NOT NULL,
+    committed_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (credential_id, attempt_ref)
 );
 
 -- Forge repos (spec §2): forge kind + slug + default branch + credential
@@ -198,6 +240,12 @@ CREATE TABLE phase_runs (
     node_id      text NOT NULL,
     attempt      integer NOT NULL CHECK (attempt >= 1),
     max_attempts integer NOT NULL CHECK (max_attempts >= 1),
+    -- Failures that spent the budget (spec §4.3): cap waits and lease
+    -- contention requeue without charging, so the claim predicate bounds
+    -- THIS against max_attempts, never the attempt ordinal.
+    chargeable_failures integer NOT NULL DEFAULT 0 CHECK (chargeable_failures >= 0),
+    -- Earliest moment a parked retry may be claimed (spec §4.4); NULL = now.
+    not_before   timestamptz,
     status       text NOT NULL CHECK (status IN ('pending', 'running', 'reconciling', 'succeeded', 'failed', 'dead', 'superseded')),
     worker_id    text,
     leased_until timestamptz,
@@ -212,6 +260,8 @@ CREATE UNIQUE INDEX phase_runs_live_key ON phase_runs (run_id, node_id)
     WHERE status IN ('pending', 'running', 'reconciling');
 CREATE INDEX phase_runs_claim_idx ON phase_runs (created_at) WHERE status = 'pending';
 CREATE INDEX phase_runs_lease_idx ON phase_runs (leased_until) WHERE status = 'running';
+CREATE INDEX phase_runs_not_before_idx ON phase_runs (not_before)
+    WHERE status = 'pending' AND not_before IS NOT NULL;
 
 -- Attempt-scoped durable work products with recorded lineage (spec §2).
 -- parent_ids: jsonb array of artifact uuid strings (plan decision 8).

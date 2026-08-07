@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/pg"
+	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 	"github.com/giiorg/caesar/backend/internal/runs/store"
 )
 
@@ -25,17 +27,32 @@ type OrchestratorConfig struct {
 	OutboxRetention   time.Duration
 }
 
+// staleLeaseAfter is when a credential lease counts as abandoned: ten times
+// the runner's heartbeat interval, so an attempt that is merely slow is never
+// mistaken for one whose worker died. Staleness alone releases nothing — it
+// only hands the lease to reconciliation (spec §2.1, §2.8).
+const staleLeaseAfter = 5 * time.Minute
+
 // Orchestrator drives the queue: one janitor goroutine (run startup,
-// deadline sweep, lease sweep + reconcile, outbox retention) and N claim
-// workers. It owns no state Postgres doesn't own first (spec §1).
+// deadline sweep, lease sweep + reconcile, stale-credential-lease sweep,
+// outbox retention) and N claim workers. It owns no state Postgres doesn't own
+// first (spec §1).
 type Orchestrator struct {
 	svc       *Service
 	exec      Executor
 	admission Admission
-	cfg       OrchestratorConfig
-	log       *slog.Logger
-	workerTag string
-	lastPrune time.Time
+	// credentials is exec's credential-settling half, resolved once here
+	// rather than asserted per tick. nil means this deployment's executor
+	// holds no credentials, and every path that would settle one is skipped.
+	credentials CredentialReconciler
+	leases      StaleLeaseSource
+	cfg         OrchestratorConfig
+	log         *slog.Logger
+	workerTag   string
+	lastPrune   time.Time
+	// jitter spreads delayed retries so a shared cap window does not wake
+	// every parked attempt at once; a seam so tests can pin the schedule.
+	jitter func() float64
 
 	planMu sync.Mutex
 	plans  map[uuid.UUID]cachedPlan // run id -> compiled plan + context
@@ -49,13 +66,21 @@ type cachedPlan struct {
 	repo       RepoRef
 }
 
-func NewOrchestrator(svc *Service, exec Executor, admission Admission, cfg OrchestratorConfig, log *slog.Logger) *Orchestrator {
+// NewOrchestrator wires the queue driver. leases may be nil: a deployment
+// whose executor holds no provider credentials has no stale-lease sweep to
+// run, and the janitor skips it rather than pretending it swept.
+func NewOrchestrator(svc *Service, exec Executor, admission Admission, leases StaleLeaseSource,
+	cfg OrchestratorConfig, log *slog.Logger,
+) *Orchestrator {
 	if admission == nil {
 		admission = AlwaysAdmit{}
 	}
+	credentials, _ := exec.(CredentialReconciler)
 	return &Orchestrator{
-		svc: svc, exec: exec, admission: admission, cfg: cfg, log: log,
+		svc: svc, exec: exec, admission: admission, credentials: credentials, leases: leases,
+		cfg: cfg, log: log,
 		workerTag: uuid.NewString()[:8],
+		jitter:    rand.Float64, //nolint:gosec // G404: spreading retry wakeups, not a security decision
 		plans:     map[uuid.UUID]cachedPlan{},
 	}
 }
@@ -101,6 +126,9 @@ func (o *Orchestrator) janitorLoop(ctx context.Context) {
 		}
 		if err := o.sweepStuckReconciling(ctx); err != nil {
 			o.log.Error("orchestrator: stuck-reconciling sweep", "error", err)
+		}
+		if err := o.sweepStaleCredentialLeases(ctx); err != nil {
+			o.log.Error("orchestrator: stale credential lease sweep", "error", err)
 		}
 		if o.svc.clock.Now().Sub(o.lastPrune) > time.Hour {
 			o.lastPrune = o.svc.clock.Now()
@@ -265,7 +293,7 @@ func (o *Orchestrator) startPendingRuns(ctx context.Context) error {
 			}
 			maxAttempts := snap.MaxAttempts
 			for _, root := range cp.plan.Roots() {
-				if _, err := o.svc.insertPhaseTx(ctx, tx, runID, root, 1, maxAttempts); err != nil {
+				if _, err := o.svc.insertPhaseTx(ctx, tx, runID, root, 1, maxAttempts, 0, nil); err != nil {
 					return err
 				}
 				evs = append(evs, Event{
@@ -286,18 +314,160 @@ func (o *Orchestrator) startPendingRuns(ctx context.Context) error {
 // sweepExpiredRuns terminalizes wall-deadline breaches (spec §3: the
 // predicate in every deciding statement is the mechanism; this sweep
 // just makes the death visible).
+//
+// Every live phase's credential obligation is settled BEFORE the run dies
+// (spec §2.8: sync receipt and lease release precede the terminal event). A
+// run whose obligation could not be settled this tick is left alone: it stays
+// matched by the expired-run predicate and is retried next tick. Terminalizing
+// anyway would make the ordering violation durable — terminalizeRun supersedes
+// every live phase at once and FinishRun has no deadline predicate to catch it
+// later — where a run stuck here is visible in the log and self-healing.
 func (o *Orchestrator) sweepExpiredRuns(ctx context.Context) error {
 	ids, err := store.New(o.svc.pool).ListExpiredRunIDs(ctx, 16)
 	if err != nil {
 		return err
 	}
 	for _, runID := range ids {
+		if !o.settleRunCredentials(ctx, runID) {
+			continue
+		}
 		out := Outcome{Class: OutcomePermanent, Code: CodeWallDeadlineExceeded, Message: "wall clock expired"}
 		if err := o.terminalizeRun(ctx, runID, RunDead, out, EventRunDead); err != nil {
 			o.log.Error("orchestrator: expire run", "run", runID, "error", err)
 		}
 	}
 	return nil
+}
+
+// settleRunCredentials fences and settles the credential obligation of every
+// phase of an expired run that could still be holding one, and reports whether
+// the run may now be terminalized.
+//
+// The cleanup-only entry is deliberate. Full reconciliation ADOPTS a completed
+// attempt and can evaluate it as a success — and FinishRun carries no deadline
+// predicate, so an exit-0 attempt reconciled after the wall deadline would mark
+// the run succeeded and this sweep's terminalization would silently lose its
+// CAS. Past the deadline the run's outcome is already decided; only the
+// credential obligation is still owed.
+//
+// Rows this sweep already moved to 'reconciling' on an earlier tick are picked
+// up again: without that, a reconciliation that failed once would leave a phase
+// whose credential is never settled and a run that terminalizes over it.
+func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID) bool {
+	if o.credentials == nil {
+		return true // no executor-held credentials in this deployment
+	}
+	q := store.New(o.svc.pool)
+	phases, err := q.ListPhasesForRun(ctx, runID)
+	if err != nil {
+		o.log.Error("orchestrator: expired-run phases", "run", runID, "error", err)
+		return false
+	}
+	settled := true
+	for _, p := range phases {
+		switch PhaseStatus(p.Status) {
+		case PhaseRunning:
+			// Fence first: the phase lease may still be future-dated (the
+			// worker's own deadline exit races this sweep), so the plain
+			// MarkPhaseReconciling cannot serve here.
+			if _, err := q.MarkPhaseReconcilingPastDeadline(ctx, p.ID); err != nil {
+				if errorsIsNoRows(err) {
+					if o.phaseSettledElsewhere(ctx, q, p.ID) {
+						continue
+					}
+					settled = false
+					continue
+				}
+				o.log.Error("orchestrator: fence past-deadline phase", "phase", p.ID, "error", err)
+				settled = false
+				continue
+			}
+		case PhaseReconciling:
+			// Already fenced — by this sweep on an earlier tick, or by the
+			// lease sweep. Either way the obligation may still be owed.
+		default:
+			continue
+		}
+		ref := AttemptRef{RunID: runID, NodeID: p.NodeID, Attempt: p.Attempt}
+		if err := o.credentials.ReconcileCredential(ctx, ref); err != nil {
+			o.log.Error("orchestrator: settle credential past deadline", "ref", ref.String(), "error", err)
+			settled = false
+		}
+	}
+	return settled
+}
+
+// sweepStaleCredentialLeases hands abandoned credential leases to
+// reconciliation (spec §2.8). Expiry never releases a lease by itself: the old
+// container may still be alive and refreshing, so only a concluded
+// reconciliation ends custody.
+//
+// A lease whose phase is still live is left alone — its own heartbeat and the
+// lease/stuck sweeps own it, and taking custody underneath a running attempt
+// would fence a worker that is doing exactly what it should.
+func (o *Orchestrator) sweepStaleCredentialLeases(ctx context.Context) error {
+	if o.leases == nil || o.credentials == nil {
+		return nil
+	}
+	stale, err := o.leases.StaleCredentialLeases(ctx, staleLeaseAfter)
+	if err != nil {
+		return err
+	}
+	q := store.New(o.svc.pool)
+	for _, l := range stale {
+		ref, err := ParseAttemptRef(l.AttemptRef)
+		if err != nil {
+			// Not a ref this build wrote — an operator hold, a future
+			// subsystem. Reconciling it would act on a phase that does not
+			// exist, so it is left where it is.
+			o.log.Warn("orchestrator: stale lease holder is not an attempt",
+				"credential", l.CredentialID, "holder", l.AttemptRef)
+			continue
+		}
+		phase, err := q.GetPhaseByRef(ctx, store.GetPhaseByRefParams{
+			RunID: ref.RunID, NodeID: ref.NodeID, Attempt: ref.Attempt,
+		})
+		switch {
+		case errorsIsNoRows(err):
+			// No phase behind the lease at all: nothing will ever conclude it
+			// except this sweep.
+		case err != nil:
+			o.log.Error("orchestrator: stale lease phase", "ref", ref.String(), "error", err)
+			continue
+		case phaseIsLive(PhaseStatus(phase.Status)):
+			continue
+		}
+		if err := o.credentials.ReconcileCredential(ctx, ref); err != nil {
+			o.log.Error("orchestrator: reconcile stale credential lease",
+				"credential", l.CredentialID, "ref", ref.String(), "error", err)
+		}
+	}
+	return nil
+}
+
+// phaseSettledElsewhere answers the only question the lost fencing CAS leaves
+// open: did the phase move because it is over, or because another sweeper
+// claimed it? Losing that CAS to a concurrent process' MarkPhaseReconciling
+// means that process is mid-reconciliation right now — its receipt and release
+// have not landed yet, and terminalizing on top of it makes exactly the
+// ordering violation this sweep exists to prevent durable. Only a terminal row
+// is proof that nobody is still holding an obligation.
+//
+// A read error is treated as "not proven", which costs a retry next tick.
+func (o *Orchestrator) phaseSettledElsewhere(ctx context.Context, q *store.Queries, phaseID uuid.UUID) bool {
+	row, err := q.GetPhase(ctx, phaseID)
+	if err != nil {
+		o.log.Error("orchestrator: re-read fenced phase", "phase", phaseID, "error", err)
+		return false
+	}
+	return PhaseStatus(row.Status).Terminal()
+}
+
+// phaseIsLive reports whether the attempt's own machinery still owns it: a
+// running phase heartbeats, a reconciling one is mid-recovery. Everything else
+// — terminal, or never claimed — has nobody left to conclude its credential.
+func phaseIsLive(s PhaseStatus) bool {
+	return s == PhaseRunning || s == PhaseReconciling
 }
 
 // terminalizeRun is the shared one-tx run death: CAS the run, supersede
@@ -370,7 +540,11 @@ func (o *Orchestrator) sweepExpiredLeases(ctx context.Context) error {
 			o.log.Error("orchestrator: mark reconciling", "phase", phaseID, "error", err)
 			continue
 		}
-		o.reconcileAttempt(ctx, row, true)
+		o.reconcileAttempt(ctx, reconcileRow{
+			PhaseID: row.ID, RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt,
+			ChargeableFailures: row.ChargeableFailures, MaxAttempts: row.MaxAttempts,
+			ClaimedAt: row.ClaimedAt, RunWallDeadline: row.RunWallDeadline,
+		}, true)
 	}
 	return nil
 }
@@ -391,21 +565,41 @@ func (o *Orchestrator) sweepStuckReconciling(ctx context.Context) error {
 		return err
 	}
 	for _, row := range rows {
-		o.reconcileAttempt(ctx, row, false)
+		o.reconcileAttempt(ctx, reconcileRow{
+			PhaseID: row.ID, RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt,
+			ChargeableFailures: row.ChargeableFailures, MaxAttempts: row.MaxAttempts,
+			ClaimedAt: row.ClaimedAt, RunWallDeadline: row.RunWallDeadline,
+		}, false)
 	}
 	return nil
 }
 
+// reconcileRow is one attempt the reconcile path owns, in the shape both
+// entry points share: the lease sweep and the stuck sweep read the same
+// columns through different statements, and neither generated row type is
+// the other's.
+type reconcileRow struct {
+	PhaseID            uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	ChargeableFailures int32
+	MaxAttempts        int32
+	ClaimedAt          *time.Time
+	RunWallDeadline    time.Time
+}
+
 // reconcileAttempt runs reconcile-before-retry for one row already in
-// 'reconciling' (spec §3): adopt a completed execution idempotently,
-// anything else concludes transient reconcile_lost. announce writes the
-// phase.reconciling event — true for the lease sweep, which is what put
+// 'reconciling' (spec §3): adopt a completed execution idempotently, adopt a
+// completed FAILURE as the typed outcome the harness reported, and conclude
+// anything genuinely unadoptable as transient reconcile_lost. announce writes
+// the phase.reconciling event — true for the lease sweep, which is what put
 // the row in the state, false for the stuck sweep, where the process
 // that died already announced it.
-func (o *Orchestrator) reconcileAttempt(ctx context.Context, row store.PhaseRun, announce bool) {
+func (o *Orchestrator) reconcileAttempt(ctx context.Context, row reconcileRow, announce bool) {
 	cp, err := o.loadPlan(ctx, row.RunID)
 	if err != nil {
-		o.log.Error("orchestrator: reconcile plan load", "phase", row.ID, "error", err)
+		o.log.Error("orchestrator: reconcile plan load", "phase", row.PhaseID, "error", err)
 		return
 	}
 	ref := AttemptRef{RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt}
@@ -417,7 +611,7 @@ func (o *Orchestrator) reconcileAttempt(ctx context.Context, row store.PhaseRun,
 				CorrelationID: ref.String(), Payload: map[string]any{"node_id": row.NodeID, "attempt": row.Attempt},
 			}})
 		}); err != nil {
-			o.log.Error("orchestrator: reconciling event", "phase", row.ID, "error", err)
+			o.log.Error("orchestrator: reconciling event", "phase", row.PhaseID, "error", err)
 		}
 	}
 
@@ -427,20 +621,36 @@ func (o *Orchestrator) reconcileAttempt(ctx context.Context, row store.PhaseRun,
 		o.evaluate(ctx, "", cp, claimedFromRow(row), PhaseReconciling, ExecutionResult{}, OutcomeError{Outcome: out})
 		return
 	}
+	if ins.Outcome != nil {
+		// The attempt finished and said why it failed. That answer is the
+		// evaluation: a cap wait parks with its own reset, a dead credential
+		// terminalizes naming itself — neither is a lost attempt, and
+		// reconcile_lost would charge the node for both.
+		o.evaluate(ctx, "", cp, claimedFromRow(row), PhaseReconciling, ins.Result, OutcomeError{Outcome: *ins.Outcome})
+		return
+	}
 	// Completed with intact outputs: adopt idempotently.
 	o.evaluate(ctx, "", cp, claimedFromRow(row), PhaseReconciling, ins.Result, nil)
 }
 
-func claimedFromRow(row store.PhaseRun) claimed {
+func claimedFromRow(row reconcileRow) claimed {
 	claimedAt := time.Time{}
 	if row.ClaimedAt != nil {
 		claimedAt = *row.ClaimedAt
 	}
 	return claimed{
-		PhaseID:     row.ID,
-		Ref:         AttemptRef{RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt},
-		MaxAttempts: row.MaxAttempts,
-		ClaimedAt:   claimedAt,
+		PhaseID: row.PhaseID,
+		Ref:     AttemptRef{RunID: row.RunID, NodeID: row.NodeID, Attempt: row.Attempt},
+		// The counter must travel every path that evaluates a failure, or
+		// reconcile would restart the node's failure budget each time and
+		// a lost attempt could never exhaust.
+		ChargeableFailures: row.ChargeableFailures,
+		MaxAttempts:        row.MaxAttempts,
+		// The deadline travels for the adopted waits: a reconciled
+		// rate_limited is a real uncharged retry, and it must park or
+		// terminalize on exactly the boundary the worker path uses.
+		RunWallDeadline: row.RunWallDeadline,
+		ClaimedAt:       claimedAt,
 	}
 }
 
@@ -510,7 +720,8 @@ func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) 
 }
 
 // buildRequest assembles explicit inputs: latest artifacts of each input
-// origin, harness resolved fresh against the registry.
+// origin, harness resolved fresh against the registry — and with it the
+// credential binding this attempt is pinned to for its whole life.
 func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node PlanNode, ref AttemptRef, deadline time.Time) (ExecutionRequest, error) {
 	req := ExecutionRequest{
 		Ref: ref, Kind: node.Kind, Repo: cp.repo, Instructions: node.Instructions,
@@ -518,13 +729,27 @@ func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node Pla
 	}
 	if node.Harness != "" {
 		h, err := o.svc.harnesses.HarnessByName(ctx, node.Harness)
-		if err != nil {
+		// Only a harness that is genuinely GONE is permanent: retrying finds
+		// the same nothing, so the node dies naming what an operator has to
+		// re-register. Everything else here is the database being briefly
+		// unreachable, and this resolution is two round trips wide — the row
+		// and the credential kind it pins (app/runsports.go) — so a pool
+		// timeout on either would otherwise kill the node permanently and tell
+		// the operator something that is not true.
+		switch {
+		case err != nil && xerrors.ClassOf(err) == xerrors.ClassNotFound:
 			return ExecutionRequest{}, OutcomeError{Outcome: Outcome{
 				Class: OutcomePermanent, Code: CodeHarnessError,
 				Message: fmt.Sprintf("harness %q no longer registered", node.Harness),
 			}}
+		case err != nil:
+			return ExecutionRequest{}, OutcomeError{Outcome: Outcome{
+				Class: OutcomeTransient, Code: CodeInternalError,
+				Message: fmt.Sprintf("resolve harness %q: %v", node.Harness, err),
+			}}
 		}
 		req.HarnessID = h.ID
+		req.Credential = CredentialBinding{ID: h.CredentialID, Kind: h.CredentialKind}
 	}
 	q := store.New(o.svc.pool)
 	for _, in := range node.Inputs {
@@ -645,7 +870,7 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 		if attempted[nodeID] || !cp.plan.Ready(nodeID, succeeded) {
 			continue
 		}
-		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, nodeID, 1, c.MaxAttempts); err != nil {
+		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, nodeID, 1, c.MaxAttempts, 0, nil); err != nil {
 			return false, err
 		}
 		evs = append(evs, Event{
@@ -752,21 +977,55 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	// worker would each account the same claim->terminal interval
 	// (invariant 11: usage accumulates once).
 	q := store.New(tx)
-	retry := out.Retryable() && c.Ref.Attempt < c.MaxAttempts
+	// A wait is not a failure: only chargeable outcomes spend the node's
+	// budget, so the bound is the counter — never the attempt ordinal,
+	// which outruns max_attempts across parked retries (spec §4.3).
+	newCount := c.ChargeableFailures
+	if out.Chargeable() {
+		newCount++
+	}
+	retry := out.Retryable() && newCount < c.MaxAttempts
 	budgetBreached := false
-	if retry {
+	if retry && out.Code != CodeCredentialBusy {
 		// The fencing CAS must pick failed vs dead up front (failed ->
 		// dead is not a legal transition), and a delta that crosses the
 		// budget must not insert a successor the claim predicate
 		// (execution_used_ms < execution_budget_ms) would refuse forever.
 		// The run-row lock makes the read race-free; usage itself is
-		// still only added after the CAS wins.
+		// still only added after the CAS wins. credential_busy is exempt:
+		// it charges nothing, so demoting its requeue to budget_exhausted
+		// would kill a run for time it never spent. A rate_limited attempt
+		// did run before the window shut, so it keeps the pre-check.
 		runRow, err := q.GetRunForUpdate(ctx, c.Ref.RunID)
 		if err != nil {
 			return false, err
 		}
 		if runRow.ExecutionUsedMs+max(deltaMS, 0) >= runRow.ExecutionBudgetMs {
 			retry, budgetBreached = false, true
+		}
+	}
+
+	// A free requeue parks rather than running now — waiting is the whole
+	// point (spec §4.4). Both the delay's origin and the deadline it is
+	// checked against are database timestamps, so app-clock skew cannot
+	// move the park-vs-terminalize boundary.
+	var notBefore *time.Time
+	parkedPastDeadline := false
+	if retry && !out.Chargeable() {
+		dbNow, err := q.DBNow(ctx)
+		if err != nil {
+			return false, err
+		}
+		nb := dbNow.Add(retryDelay(out, dbNow, c.Ref.Attempt-1-c.ChargeableFailures, o.jitter))
+		// Both paths carry the deadline: an adopted cap wait is as real a
+		// wait as the worker's own, and it parks or terminalizes on the same
+		// boundary. A zero deadline means nobody read one, which is not a
+		// licence to park past it — it only skips a comparison with nothing.
+		if !c.RunWallDeadline.IsZero() && nb.After(c.RunWallDeadline) {
+			// Never park a row that could not legally run when it woke.
+			retry, parkedPastDeadline = false, true
+		} else {
+			notBefore = &nb
 		}
 	}
 	if retry {
@@ -783,17 +1042,24 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		if err != nil {
 			return false, err
 		}
-		if deltaMS > 0 {
+		// credential_busy never touched the harness — charging its
+		// contention window would bill the run for someone else's lease.
+		if deltaMS > 0 && out.Code != CodeCredentialBusy {
 			if _, err := q.AddRunUsage(ctx, store.AddRunUsageParams{ID: c.Ref.RunID, DeltaMs: deltaMS}); err != nil {
 				return false, err
 			}
 		}
-		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, c.Ref.NodeID, c.Ref.Attempt+1, c.MaxAttempts); err != nil {
+		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, c.Ref.NodeID,
+			c.Ref.Attempt+1, c.MaxAttempts, newCount, notBefore); err != nil {
 			return false, err
 		}
 		payload := map[string]any{
 			"node_id": c.Ref.NodeID, "attempt": c.Ref.Attempt,
 			"next_attempt": c.Ref.Attempt + 1, "outcome": out.Map(),
+			"chargeable_failures": newCount,
+		}
+		if notBefore != nil {
+			payload["not_before"] = notBefore.UTC().Format(time.RFC3339)
 		}
 		if len(artifactIDs) > 0 {
 			payload["artifact_ids"] = artifactIDs
@@ -816,7 +1082,7 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	if err != nil {
 		return false, err
 	}
-	if deltaMS > 0 {
+	if deltaMS > 0 && out.Code != CodeCredentialBusy {
 		if _, err := q.AddRunUsage(ctx, store.AddRunUsageParams{ID: c.Ref.RunID, DeltaMs: deltaMS}); err != nil {
 			return false, err
 		}
@@ -825,10 +1091,15 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	switch {
 	case budgetBreached:
 		runOut = Outcome{Class: OutcomePermanent, Code: CodeBudgetExhausted, Message: "execution budget exhausted"}
+	case parkedPastDeadline:
+		// The wait would outlast the run, so the run dies of the wait
+		// itself — nothing was exhausted, and the typed code says which
+		// door was shut.
+		runOut = out
 	case out.Retryable(): // retryable but exhausted
 		runOut = Outcome{
 			Class: OutcomePermanent, Code: CodeAttemptsExhausted,
-			Message: fmt.Sprintf("node %s exhausted %d attempts", c.Ref.NodeID, c.MaxAttempts),
+			Message: fmt.Sprintf("node %s exhausted %d chargeable failures", c.Ref.NodeID, c.MaxAttempts),
 		}
 	}
 	deadPayload := map[string]any{"node_id": c.Ref.NodeID, "attempt": c.Ref.Attempt, "outcome": out.Map()}

@@ -18,6 +18,16 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
 
+// harnessCredentialKinds is how each harness kind may authenticate: a
+// claude-code container takes a Claude subscription token or an
+// Anthropic model key, a codex container takes a Codex auth.json or an
+// OpenAI model key. A pairing outside this table produces a container
+// that cannot authenticate at all, so registration refuses it.
+var harnessCredentialKinds = map[HarnessKind][]CredentialKind{
+	HarnessClaudeCode: {CredentialSubscriptionToken, CredentialModelKey},
+	HarnessCodex:      {CredentialAgentAuthFile, CredentialModelKey},
+}
+
 // NewHarness is the registration payload; nil Defaults means {}.
 type NewHarness struct {
 	Name             string
@@ -121,7 +131,7 @@ func (s *Service) RegisterHarness(ctx context.Context, actor authn.Principal, in
 	var h Harness
 	err = pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		q := store.New(tx)
-		if err := requireCredentialKind(ctx, q, in.CredentialID, CredentialModelKey); err != nil {
+		if err := requireCredentialKindIn(ctx, q, in.CredentialID, harnessCredentialKinds[in.Kind]...); err != nil {
 			return err
 		}
 		row, err := q.RegisterHarness(ctx, store.RegisterHarnessParams{
@@ -223,7 +233,8 @@ func (s *Service) UpdateHarness(ctx context.Context, actor authn.Principal, id u
 			endpoint = *upd.ProviderEndpoint
 		}
 		if upd.CredentialID != nil {
-			if err := requireCredentialKind(ctx, q, *upd.CredentialID, CredentialModelKey); err != nil {
+			// Kind is immutable, so the row's own kind picks the set.
+			if err := requireCredentialKindIn(ctx, q, *upd.CredentialID, harnessCredentialKinds[HarnessKind(current.Kind)]...); err != nil {
 				return err
 			}
 			credID = *upd.CredentialID

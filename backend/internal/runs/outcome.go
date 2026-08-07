@@ -3,6 +3,7 @@ package runs
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // OutcomeClass is the typed outcome taxonomy (spec §2): transient
@@ -41,20 +42,41 @@ const (
 	CodeExtractionFailed          = "extraction_failed"
 	CodePatchTooLarge             = "patch_too_large"
 	CodeEmbeddedRepo              = "embedded_repo"
+
+	// Plan 07: subscription-auth outcomes (spec 2026-08-05 §2, §4).
+	CodeRateLimited           = "rate_limited"           // cap window exhausted — waiting, not failing
+	CodeAuthExpired           = "auth_expired"           // credential dead; message names it
+	CodeCredentialBusy        = "credential_busy"        //nolint:gosec // G101 matches the name: this is a state, not a secret — single-flight lease held elsewhere; charges nothing
+	CodeCredentialQuarantined = "credential_quarantined" //nolint:gosec // G101 matches the name: this is a state, not a secret — read-back identity mismatch (§2.5)
+	CodeSecretInArtifact      = "secret_in_artifact"     // redaction scan hit; artifact withheld (§3)
 )
 
-// Outcome is a typed terminal result for an attempt or a run.
+// Outcome is a typed terminal result for an attempt or a run. RetryAt is
+// the moment a waiting outcome (a cap window, a held lease) becomes worth
+// retrying; nothing else sets it.
 type Outcome struct {
 	Class   OutcomeClass `json:"class"`
 	Code    string       `json:"code"`
 	Message string       `json:"message"`
+	RetryAt *time.Time   `json:"retry_at,omitempty"`
 }
 
 func (o Outcome) Retryable() bool { return o.Class == OutcomeTransient }
 
+// Chargeable reports whether this failure spends the phase's failure budget.
+// Cap waits and lease contention are facts of subscription life, not errors:
+// they requeue without charging (spec §2.2, §4.3).
+func (o Outcome) Chargeable() bool {
+	return o.Class == OutcomeTransient && o.Code != CodeRateLimited && o.Code != CodeCredentialBusy
+}
+
 // Map renders the outcome for event payloads and jsonb columns.
 func (o Outcome) Map() map[string]any {
-	return map[string]any{"class": string(o.Class), "code": o.Code, "message": o.Message}
+	m := map[string]any{"class": string(o.Class), "code": o.Code, "message": o.Message}
+	if o.RetryAt != nil {
+		m["retry_at"] = o.RetryAt.Format(time.RFC3339)
+	}
+	return m
 }
 
 // OutcomeError carries a typed outcome across the Executor port boundary.

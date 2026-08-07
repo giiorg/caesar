@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/giiorg/caesar/backend/internal/platform/dockerapi"
@@ -96,20 +97,26 @@ func (r *Runner) SweepOrphans(ctx context.Context, olderThan time.Duration) erro
 	// Containers first: a network still holding an endpoint cannot be
 	// removed, and the endpoints worth removing are the ones just swept.
 	r.removeByName(ctx, staleContainers, staleNetworks)
-	dirs, dirErr := r.sweepAttemptDirs(cutoff)
-	if len(staleContainers) > 0 || len(staleNetworks) > 0 || dirs > 0 {
+	dirs, dirErr := r.sweepStaleDirs(filepath.Join(r.opts.DataRoot, "attempts"), cutoff)
+	// A quarantine outlives publication only when the attempt was withheld, and
+	// a withheld attempt can never be published later: its refreshed credential
+	// is unknowable forever (spec §2.7). So the evidence ages out with the
+	// attempt directory rather than accumulating without a reaper.
+	quar, quarErr := r.sweepStaleDirs(filepath.Join(r.opts.DataRoot, "quarantine"), cutoff)
+	creds, credErr := r.sweepCredentialLeftovers(ctx, cutoff)
+	if len(staleContainers) > 0 || len(staleNetworks) > 0 || dirs > 0 || quar > 0 || creds > 0 {
 		r.log.Info("runner.sweep", "containers", len(staleContainers), "networks", len(staleNetworks),
-			"attempt_dirs", dirs, "older_than", olderThan.String())
+			"attempt_dirs", dirs, "quarantine_dirs", quar, "credential_leftovers", creds,
+			"older_than", olderThan.String())
 	}
-	return errors.Join(listErr, netErr, dirErr)
+	return errors.Join(listErr, netErr, dirErr, quarErr, credErr)
 }
 
-// sweepAttemptDirs removes the attempt directories left behind by processes
-// that died before their own teardown, and reports how many went. The logs
-// directory is deliberately not swept: logs are evidence, and their retention
-// is a separate decision (Plan 13).
-func (r *Runner) sweepAttemptDirs(cutoff time.Time) (int, error) {
-	root := filepath.Join(r.opts.DataRoot, "attempts")
+// sweepStaleDirs removes the per-attempt directories under one root that were
+// left behind by processes that died before their own teardown, and reports
+// how many went. The published logs directory is deliberately never swept this
+// way: logs are evidence, and their retention is a separate decision (Plan 13).
+func (r *Runner) sweepStaleDirs(root string, cutoff time.Time) (int, error) {
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
@@ -125,12 +132,73 @@ func (r *Runner) sweepAttemptDirs(cutoff time.Time) (int, error) {
 		}
 		path := filepath.Join(root, e.Name())
 		if err := os.RemoveAll(path); err != nil {
-			r.log.Warn("runner.sweep.attempt_dir", "path", path, "error", err)
+			r.log.Warn("runner.sweep.dir", "path", path, "error", err)
 			continue
 		}
 		removed++
 	}
 	return removed, nil
+}
+
+// sweepCredentialLeftovers reaps the credential material a conclusion
+// deliberately left behind: an unscannable or quarantined attempt keeps its
+// auth directory and manifest as evidence (spec §2.7), and nothing else ever
+// comes back for them.
+//
+// The lease is the gate, not the age. A directory whose lease row still exists
+// belongs to reconciliation however old it is — releasing is the ONLY thing
+// that ends custody, and deleting the evidence under a reconciler that is about
+// to read it would destroy the credential the attempt refreshed. Everything
+// past orphanMaxAge with no lease behind it is unreachable by any live run.
+func (r *Runner) sweepCredentialLeftovers(ctx context.Context, cutoff time.Time) (int, error) {
+	if r.leaser == nil {
+		// Without the aggregate there is no way to prove a leftover is not
+		// lease-held, and an unproven removal is what the gate exists to stop.
+		return 0, nil
+	}
+	removed := 0
+	var errs []error
+	for _, sweep := range []struct {
+		dir string
+		// refOf maps a directory entry back to the attempt ref that owns it:
+		// the auth directory is named for the ref, the manifest is that name
+		// plus .json.
+		refOf func(name string) string
+	}{
+		{dir: filepath.Join(r.opts.DataRoot, "auth"), refOf: func(name string) string { return name }},
+		{dir: r.manifestsDir(), refOf: func(name string) string { return strings.TrimSuffix(name, ".json") }},
+	} {
+		entries, err := os.ReadDir(sweep.dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read %s: %w", sweep.dir, err))
+			continue
+		}
+		for _, e := range entries {
+			info, err := e.Info()
+			if err != nil || !info.ModTime().Before(cutoff) {
+				continue
+			}
+			ref := sweep.refOf(e.Name())
+			_, _, held, err := r.leaser.LeaseByAttempt(ctx, ref)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("credential lease for %s: %w", ref, err))
+				continue
+			}
+			if held {
+				continue // reconciliation's, however old
+			}
+			path := filepath.Join(sweep.dir, e.Name())
+			if err := os.RemoveAll(path); err != nil {
+				r.log.Warn("runner.sweep.credential_leftover", "path", path, "error", err)
+				continue
+			}
+			removed++
+		}
+	}
+	return removed, errors.Join(errs...)
 }
 
 // removeByName force-removes a set of containers and then a set of networks,

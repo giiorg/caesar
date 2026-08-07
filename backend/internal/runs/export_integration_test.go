@@ -30,15 +30,21 @@ func HeartbeatForTest(ctx context.Context, s *Service, phaseID uuid.UUID, worker
 	return s.heartbeat(ctx, phaseID, workerID, leaseSeconds)
 }
 
-func InsertPhaseForTest(ctx context.Context, s *Service, runID uuid.UUID, nodeID string, attempt, maxAttempts int32) (uuid.UUID, error) {
+func InsertPhaseForTest(ctx context.Context, s *Service, runID uuid.UUID, nodeID string,
+	attempt, maxAttempts, chargeableFailures int32, notBefore *time.Time,
+) (uuid.UUID, error) {
 	var id uuid.UUID
 	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var err error
-		id, err = s.insertPhaseTx(ctx, tx, runID, nodeID, attempt, maxAttempts)
+		id, err = s.insertPhaseTx(ctx, tx, runID, nodeID, attempt, maxAttempts, chargeableFailures, notBefore)
 		return err
 	})
 	return id, err
 }
+
+// SetJitterForTest pins the retry scheduler's jitter so a test can assert
+// an exact parked window instead of a ±10% band.
+func SetJitterForTest(o *Orchestrator, jitter func() float64) { o.jitter = jitter }
 
 // CachedPlanCountForTest reports how many runs the orchestrator's plan
 // cache holds. Eviction leaves no trace in Postgres, so this is the only
@@ -54,6 +60,14 @@ func LoadPlanForTest(ctx context.Context, o *Orchestrator, runID uuid.UUID) erro
 // PrunePlanCacheForTest drives the hourly backstop on demand; the
 // janitor's own schedule is far too slow for a test to wait on.
 func PrunePlanCacheForTest(ctx context.Context, o *Orchestrator) { o.prunePlanCache(ctx) }
+
+// SweepExpiredRunsForTest drives one wall-deadline sweep by hand. The
+// credential-settlement branches it guards turn on losing a CAS to a
+// concurrent sweeper, which a test can only stage between two calls — not
+// against a loop ticking on its own schedule.
+func SweepExpiredRunsForTest(ctx context.Context, o *Orchestrator) error {
+	return o.sweepExpiredRuns(ctx)
+}
 
 func FinishPhaseForTest(ctx context.Context, s *Service, phaseID uuid.UUID, from, to, workerID string) (int64, error) {
 	var n int64

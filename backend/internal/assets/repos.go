@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -58,19 +59,21 @@ func validateBranch(branch string) error {
 	return nil
 }
 
-// requireCredentialKind loads the referenced credential in-tx and rejects
-// a kind mismatch (repos take forge_token, harnesses take model_key).
-func requireCredentialKind(ctx context.Context, q *store.Queries, id uuid.UUID, want CredentialKind) error {
+// requireCredentialKindIn loads the referenced credential in-tx and
+// rejects a kind outside the accepted set — repos take a forge_token,
+// while each harness kind accepts the credential kinds its container can
+// actually authenticate with.
+func requireCredentialKindIn(ctx context.Context, q *store.Queries, id uuid.UUID, wants ...CredentialKind) error {
 	kind, err := getCredentialKind(ctx, q, id)
 	if err != nil {
 		return err
 	}
-	if kind != want {
-		return xerrors.E(xerrors.ClassInvalid, "validation failed").WithFields(xerrors.FieldError{
-			Field: "credential_id", Message: fmt.Sprintf("credential kind must be %s", want),
-		})
+	if slices.Contains(wants, kind) {
+		return nil
 	}
-	return nil
+	return xerrors.E(xerrors.ClassInvalid, "validation failed").WithFields(xerrors.FieldError{
+		Field: "credential_id", Message: "credential kind must be one of " + joinKinds(wants),
+	})
 }
 
 func (s *Service) CreateRepo(ctx context.Context, actor authn.Principal, projectID uuid.UUID, in NewRepo) (Repo, error) {
@@ -92,7 +95,7 @@ func (s *Service) CreateRepo(ctx context.Context, actor authn.Principal, project
 	var repo Repo
 	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		q := store.New(tx)
-		if err := requireCredentialKind(ctx, q, in.CredentialID, CredentialForgeToken); err != nil {
+		if err := requireCredentialKindIn(ctx, q, in.CredentialID, CredentialForgeToken); err != nil {
 			return err
 		}
 		row, err := q.CreateRepo(ctx, store.CreateRepoParams{
@@ -175,7 +178,7 @@ func (s *Service) UpdateRepo(ctx context.Context, actor authn.Principal, id uuid
 			branch = *upd.DefaultBranch
 		}
 		if upd.CredentialID != nil {
-			if err := requireCredentialKind(ctx, q, *upd.CredentialID, CredentialForgeToken); err != nil {
+			if err := requireCredentialKindIn(ctx, q, *upd.CredentialID, CredentialForgeToken); err != nil {
 				return err
 			}
 			credID = *upd.CredentialID

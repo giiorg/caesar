@@ -121,7 +121,7 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		log.Info("docker runner enabled", "data_root", cfg.Runner.DataRoot)
 	}
 
-	orch := runs.NewOrchestrator(runsSvc, executor, admission, runs.OrchestratorConfig{
+	orch := runs.NewOrchestrator(runsSvc, executor, admission, runsAssetSource{svc: assetsSvc}, runs.OrchestratorConfig{
 		Workers:           cfg.Orchestrator.Workers,
 		PollInterval:      cfg.Orchestrator.PollInterval.Std(),
 		LeaseTTL:          cfg.Orchestrator.LeaseTTL.Std(),

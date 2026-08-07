@@ -5,14 +5,280 @@ package assets_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/giiorg/caesar/backend/internal/assets"
 	"github.com/giiorg/caesar/backend/internal/platform/authn"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
+
+// authJSON builds a Codex auth.json carrying refresh. size, when
+// non-zero, pads the ignored "pad" field so the file is exactly that
+// many bytes — the cap tests need to land on the boundary.
+func authJSON(t *testing.T, refresh string, size int) []byte {
+	t.Helper()
+	base := fmt.Sprintf(
+		`{"auth_mode":"chatgpt","tokens":{"id_token":"eyJhZG0","access_token":"eyJhY2M","refresh_token":%q,"account_id":"acc_1"},"last_refresh":"2026-08-05T00:00:00Z","pad":""}`,
+		refresh)
+	if size == 0 {
+		return []byte(base)
+	}
+	if size < len(base) {
+		t.Fatalf("authJSON: size %d below minimum %d", size, len(base))
+	}
+	return []byte(strings.Replace(base, `"pad":""`, `"pad":"`+strings.Repeat("x", size-len(base))+`"`, 1))
+}
+
+func credFingerprint(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) *string {
+	t.Helper()
+	var fp *string
+	if err := pool.QueryRow(context.Background(),
+		"SELECT fingerprint FROM credentials WHERE id = $1", id).Scan(&fp); err != nil {
+		t.Fatal(err)
+	}
+	return fp
+}
+
+// credentialSecretState reads the three columns that describe which
+// secret a row holds. They move together on an operator rotation and
+// must not move at all on a rekey.
+func credentialSecretState(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) (int64, *string, time.Time) {
+	t.Helper()
+	var (
+		version   int64
+		fp        *string
+		updatedAt time.Time
+	)
+	if err := pool.QueryRow(context.Background(),
+		"SELECT secret_version, fingerprint, updated_at FROM credentials WHERE id = $1", id).
+		Scan(&version, &fp, &updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	return version, fp, updatedAt
+}
+
+func credLastUsed(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) *time.Time {
+	t.Helper()
+	var at *time.Time
+	if err := pool.QueryRow(context.Background(),
+		"SELECT last_used_at FROM credentials WHERE id = $1", id).Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	return at
+}
+
+func TestCreateCredential_SubscriptionKinds(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+
+	// subscription_token is an opaque string under the flat secret cap.
+	sub, err := svc.CreateCredential(ctx, admin, "claude-max", assets.CredentialSubscriptionToken,
+		[]byte("sk-ant-oat01-averysecretsubscriptiontoken"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub.SecretVersion != 1 {
+		t.Fatalf("secret_version = %d, want 1 on create", sub.SecretVersion)
+	}
+	if fp := credFingerprint(t, pool, sub.ID); fp != nil {
+		t.Fatalf("fingerprint = %q, want NULL for a non-auth-file kind", *fp)
+	}
+
+	// agent_auth_file is fingerprinted on tokens.refresh_token.
+	body := authJSON(t, "rt-abc", 0)
+	c, err := svc.CreateCredential(ctx, admin, "codex-sub", assets.CredentialAgentAuthFile, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("rt-abc"))
+	if fp := credFingerprint(t, pool, c.ID); fp == nil || *fp != hex.EncodeToString(sum[:]) {
+		t.Fatalf("fingerprint = %v, want hex sha256 of the refresh token", fp)
+	}
+
+	// Import is an exclusive custody transfer: a second row holding the
+	// same refresh token would run its own lease against one credential.
+	err = func() error {
+		_, err := svc.CreateCredential(ctx, admin, "codex-sub-2", assets.CredentialAgentAuthFile, body)
+		return err
+	}()
+	if xerrors.ClassOf(err) != xerrors.ClassConflict {
+		t.Fatalf("duplicate refresh token: %v, want conflict", err)
+	}
+	// The name is free, so this must be the fingerprint index reporting,
+	// not the name index.
+	if !strings.Contains(err.Error(), "refresh token") {
+		t.Fatalf("conflict = %q, want the custody-transfer message", err)
+	}
+	// A different refresh token is a different credential.
+	if _, err := svc.CreateCredential(ctx, admin, "codex-sub-3", assets.CredentialAgentAuthFile, authJSON(t, "rt-other", 0)); err != nil {
+		t.Fatal(err)
+	}
+	// Two non-fingerprinted kinds coexist: the unique index is partial.
+	if _, err := svc.CreateCredential(ctx, admin, "claude-max-2", assets.CredentialSubscriptionToken, []byte("sk-ant-oat01-second")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateCredential_AgentAuthFileCaps(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+
+	// auth.json is a multi-token file: it gets its own 64 KiB bound,
+	// well past the flat cap the single-token kinds live under.
+	big := authJSON(t, "rt-big", 64<<10)
+	if _, err := svc.CreateCredential(ctx, admin, "at-cap", assets.CredentialAgentAuthFile, big); err != nil {
+		t.Fatalf("64 KiB auth.json must be accepted: %v", err)
+	}
+	if _, err := svc.CreateCredential(ctx, admin, "over-cap", assets.CredentialAgentAuthFile,
+		authJSON(t, "rt-over", 64<<10+1)); xerrors.ClassOf(err) != xerrors.ClassInvalid {
+		t.Fatal("64 KiB + 1 auth.json must be invalid")
+	}
+	if _, err := svc.CreateCredential(ctx, admin, "not-json", assets.CredentialAgentAuthFile,
+		[]byte("rt-plain-token")); xerrors.ClassOf(err) != xerrors.ClassInvalid {
+		t.Fatal("non-JSON auth.json must be invalid")
+	}
+	if _, err := svc.CreateCredential(ctx, admin, "no-refresh", assets.CredentialAgentAuthFile,
+		[]byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"eyJhY2M"}}`)); xerrors.ClassOf(err) != xerrors.ClassInvalid {
+		t.Fatal("auth.json without tokens.refresh_token must be invalid")
+	}
+	// The 64 KiB bound belongs to agent_auth_file alone.
+	if _, err := svc.CreateCredential(ctx, admin, "fat-sub", assets.CredentialSubscriptionToken,
+		bytes.Repeat([]byte("a"), 4097)); xerrors.ClassOf(err) != xerrors.ClassInvalid {
+		t.Fatal("oversized subscription_token must be invalid")
+	}
+}
+
+func TestRotateCredentialSecret_BumpsVersionAndFingerprint(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, fake := newTestService(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+
+	c, err := svc.CreateCredential(ctx, admin, "codex-sub", assets.CredentialAgentAuthFile, authJSON(t, "rt-1", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := credFingerprint(t, pool, c.ID)
+
+	// created_at/updated_at default to the database clock while updates
+	// carry the service clock, so compare the rotation stamp against the
+	// clock that wrote it rather than against the create stamp.
+	fake.Advance(time.Hour)
+	rot, err := svc.RotateCredentialSecret(ctx, admin, c.ID, authJSON(t, "rt-2", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rot.SecretVersion != 2 {
+		t.Fatalf("secret_version = %d, want 2 after one rotation", rot.SecretVersion)
+	}
+	if !rot.UpdatedAt.Equal(fake.Now()) || rot.UpdatedAt.Equal(c.UpdatedAt) {
+		t.Fatalf("updated_at = %s, want the rotation moment %s", rot.UpdatedAt, fake.Now())
+	}
+	after := credFingerprint(t, pool, c.ID)
+	if after == nil || before == nil || *after == *before {
+		t.Fatalf("fingerprint %v → %v, want a new digest", before, after)
+	}
+
+	// Rotating onto a refresh token another row already holds conflicts.
+	other, err := svc.CreateCredential(ctx, admin, "codex-sub-2", assets.CredentialAgentAuthFile, authJSON(t, "rt-3", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.RotateCredentialSecret(ctx, admin, other.ID, authJSON(t, "rt-2", 0)); xerrors.ClassOf(err) != xerrors.ClassConflict {
+		t.Fatalf("rotate onto a held refresh token: %v, want conflict", err)
+	}
+}
+
+func TestUseCredentialVersioned_ReportsVersionAndStampsUse(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, fake := newTestService(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+
+	c, err := svc.CreateCredential(ctx, admin, "codex-sub", assets.CredentialAgentAuthFile, authJSON(t, "rt-1", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := credLastUsed(t, pool, c.ID); got != nil {
+		t.Fatalf("last_used_at = %v before any use, want NULL", got)
+	}
+
+	plain, version, err := svc.UseCredentialVersioned(ctx, c.ID, "materialize-auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != 1 {
+		t.Fatalf("version = %d, want 1", version)
+	}
+	if !bytes.Equal(plain, authJSON(t, "rt-1", 0)) {
+		t.Fatalf("plaintext = %q, want the stored auth.json", plain)
+	}
+	if got := credLastUsed(t, pool, c.ID); got == nil || !got.Equal(fake.Now()) {
+		t.Fatalf("last_used_at = %v, want the use moment %s", got, fake.Now())
+	}
+
+	// The version a use reports is the one whose bytes it handed back:
+	// after a rotation, the same call reports the new version.
+	if _, err := svc.RotateCredentialSecret(ctx, admin, c.ID, authJSON(t, "rt-2", 0)); err != nil {
+		t.Fatal(err)
+	}
+	plain, version, err = svc.UseCredentialVersioned(ctx, c.ID, "materialize-auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 || !bytes.Equal(plain, authJSON(t, "rt-2", 0)) {
+		t.Fatalf("after rotate: version %d, plaintext %q", version, plain)
+	}
+	if got := auditCount(t, pool, "credential.used"); got != 2 {
+		t.Fatalf("credential.used audits = %d, want 2", got)
+	}
+	if _, _, err := svc.UseCredentialVersioned(ctx, uuid.New(), "gone"); xerrors.ClassOf(err) != xerrors.ClassNotFound {
+		t.Fatal("unknown credential must be not found")
+	}
+}
+
+func TestMarkCredentialAuthExpired_RecordsDeathAndAudits(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, fake := newTestService(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+
+	c, err := svc.CreateCredential(ctx, admin, "codex-sub", assets.CredentialAgentAuthFile, authJSON(t, "rt-1", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.MarkCredentialAuthExpired(ctx, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.GetCredential(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastAuthExpiredAt == nil || !got.LastAuthExpiredAt.Equal(fake.Now()) {
+		t.Fatalf("last_auth_expired_at = %v, want %s", got.LastAuthExpiredAt, fake.Now())
+	}
+	if n := auditCount(t, pool, "credential.auth_expired"); n != 1 {
+		t.Fatalf("credential.auth_expired audits = %d, want 1", n)
+	}
+	var actorIsNull bool
+	if err := pool.QueryRow(ctx,
+		"SELECT actor_user_id IS NULL FROM audit_entries WHERE action = 'credential.auth_expired'").Scan(&actorIsNull); err != nil {
+		t.Fatal(err)
+	}
+	if !actorIsNull {
+		t.Fatal("credential.auth_expired audit must have a NULL actor_user_id (machine path)")
+	}
+	if err := svc.MarkCredentialAuthExpired(ctx, uuid.New()); xerrors.ClassOf(err) != xerrors.ClassNotFound {
+		t.Fatal("unknown credential must be not found")
+	}
+}
 
 func TestCredentials_SecretIsEncryptedAtRestAndUseIsAudited(t *testing.T) {
 	ctx := context.Background()

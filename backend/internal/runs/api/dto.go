@@ -60,9 +60,10 @@ type RunListResponse struct {
 }
 
 type OutcomeResponse struct {
-	Class   string `json:"class"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Class   string     `json:"class"`
+	Code    string     `json:"code"`
+	Message string     `json:"message"`
+	RetryAt *time.Time `json:"retry_at,omitempty"`
 }
 
 type PhaseResponse struct {
@@ -136,7 +137,7 @@ func outcomeResponse(o *runs.Outcome) *OutcomeResponse {
 	if o == nil {
 		return nil
 	}
-	return &OutcomeResponse{Class: string(o.Class), Code: o.Code, Message: o.Message}
+	return &OutcomeResponse{Class: string(o.Class), Code: o.Code, Message: o.Message, RetryAt: o.RetryAt}
 }
 
 func eventResponse(e runs.RunEventRecord) RunEventResponse {

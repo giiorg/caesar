@@ -73,7 +73,8 @@ WITH candidate AS (
     FROM phase_runs pr
     JOIN runs r ON r.id = pr.run_id
     WHERE pr.status = 'pending'
-      AND pr.attempt <= pr.max_attempts
+      AND pr.chargeable_failures < pr.max_attempts
+      AND (pr.not_before IS NULL OR pr.not_before <= now())
       AND r.status = 'running'
       AND r.wall_deadline > now()
       AND r.execution_used_ms < r.execution_budget_ms
@@ -87,7 +88,7 @@ SET status = 'running', worker_id = $1,
     claimed_at = $2
 FROM candidate
 WHERE phase_runs.id = candidate.id
-RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at, candidate.wall_deadline AS run_wall_deadline,
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at, candidate.wall_deadline AS run_wall_deadline,
           candidate.execution_budget_ms, candidate.execution_used_ms
 `
 
@@ -98,23 +99,30 @@ type ClaimPhaseParams struct {
 }
 
 type ClaimPhaseRow struct {
-	ID                uuid.UUID
-	RunID             uuid.UUID
-	NodeID            string
-	Attempt           int32
-	MaxAttempts       int32
-	Status            string
-	WorkerID          pgtype.Text
-	LeasedUntil       *time.Time
-	ClaimedAt         *time.Time
-	FinishedAt        *time.Time
-	Outcome           []byte
-	CreatedAt         time.Time
-	RunWallDeadline   time.Time
-	ExecutionBudgetMs int64
-	ExecutionUsedMs   int64
+	ID                 uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	MaxAttempts        int32
+	ChargeableFailures int32
+	NotBefore          *time.Time
+	Status             string
+	WorkerID           pgtype.Text
+	LeasedUntil        *time.Time
+	ClaimedAt          *time.Time
+	FinishedAt         *time.Time
+	Outcome            []byte
+	CreatedAt          time.Time
+	RunWallDeadline    time.Time
+	ExecutionBudgetMs  int64
+	ExecutionUsedMs    int64
 }
 
+// The attempt bound is chargeable_failures < max_attempts, not the attempt
+// ordinal: a cap wait or a held lease requeues without charging, so the
+// ordinal outruns max_attempts on purpose (spec §4.3). not_before parks a
+// delayed retry until the DATABASE clock passes it — same clock as the
+// deadline predicates, so nothing app-side can move the boundary (§4.1).
 func (q *Queries) ClaimPhase(ctx context.Context, arg ClaimPhaseParams) (ClaimPhaseRow, error) {
 	row := q.db.QueryRow(ctx, claimPhase, arg.WorkerID, arg.ClaimedAt, arg.LeaseSeconds)
 	var i ClaimPhaseRow
@@ -124,6 +132,8 @@ func (q *Queries) ClaimPhase(ctx context.Context, arg ClaimPhaseParams) (ClaimPh
 		&i.NodeID,
 		&i.Attempt,
 		&i.MaxAttempts,
+		&i.ChargeableFailures,
+		&i.NotBefore,
 		&i.Status,
 		&i.WorkerID,
 		&i.LeasedUntil,
@@ -147,7 +157,8 @@ WHERE id IN (
     ORDER BY leased_until
     LIMIT $3 FOR UPDATE SKIP LOCKED
 )
-RETURNING id, run_id, node_id, attempt, max_attempts, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
+          (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline
 `
 
 type ClaimStuckReconcilingParams struct {
@@ -156,25 +167,45 @@ type ClaimStuckReconcilingParams struct {
 	MaxRows      int32
 }
 
+type ClaimStuckReconcilingRow struct {
+	ID                 uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	MaxAttempts        int32
+	ChargeableFailures int32
+	NotBefore          *time.Time
+	Status             string
+	WorkerID           pgtype.Text
+	LeasedUntil        *time.Time
+	ClaimedAt          *time.Time
+	FinishedAt         *time.Time
+	Outcome            []byte
+	CreatedAt          time.Time
+	RunWallDeadline    time.Time
+}
+
 // Rows whose owner died between marking 'reconciling' and evaluating:
 // the lease sweep can't see them (its predicate is status = 'running').
 // Extending the lease is the CAS that makes concurrent sweepers safe —
 // one winner per row per grace window.
-func (q *Queries) ClaimStuckReconciling(ctx context.Context, arg ClaimStuckReconcilingParams) ([]PhaseRun, error) {
+func (q *Queries) ClaimStuckReconciling(ctx context.Context, arg ClaimStuckReconcilingParams) ([]ClaimStuckReconcilingRow, error) {
 	rows, err := q.db.Query(ctx, claimStuckReconciling, arg.LeaseSeconds, arg.GraceSeconds, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []PhaseRun
+	var items []ClaimStuckReconcilingRow
 	for rows.Next() {
-		var i PhaseRun
+		var i ClaimStuckReconcilingRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.RunID,
 			&i.NodeID,
 			&i.Attempt,
 			&i.MaxAttempts,
+			&i.ChargeableFailures,
+			&i.NotBefore,
 			&i.Status,
 			&i.WorkerID,
 			&i.LeasedUntil,
@@ -182,6 +213,7 @@ func (q *Queries) ClaimStuckReconciling(ctx context.Context, arg ClaimStuckRecon
 			&i.FinishedAt,
 			&i.Outcome,
 			&i.CreatedAt,
+			&i.RunWallDeadline,
 		); err != nil {
 			return nil, err
 		}
@@ -202,6 +234,21 @@ func (q *Queries) CountOutbox(ctx context.Context) (int64, error) {
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const dBNow = `-- name: DBNow :one
+SELECT now()::timestamptz
+`
+
+// The clock every deciding predicate reads. A caller that computes a
+// not_before, or compares one against a wall deadline, reads it from here
+// inside its own transaction so both sides of the comparison are DB
+// timestamps and app-clock skew cannot move the boundary.
+func (q *Queries) DBNow(ctx context.Context) (time.Time, error) {
+	row := q.db.QueryRow(ctx, dBNow)
+	var column_1 time.Time
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const finishPhase = `-- name: FinishPhase :execrows
@@ -288,7 +335,7 @@ func (q *Queries) GetNodeArtifact(ctx context.Context, arg GetNodeArtifactParams
 }
 
 const getPhase = `-- name: GetPhase :one
-SELECT id, run_id, node_id, attempt, max_attempts, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE id = $1
+SELECT id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE id = $1
 `
 
 func (q *Queries) GetPhase(ctx context.Context, id uuid.UUID) (PhaseRun, error) {
@@ -300,6 +347,43 @@ func (q *Queries) GetPhase(ctx context.Context, id uuid.UUID) (PhaseRun, error) 
 		&i.NodeID,
 		&i.Attempt,
 		&i.MaxAttempts,
+		&i.ChargeableFailures,
+		&i.NotBefore,
+		&i.Status,
+		&i.WorkerID,
+		&i.LeasedUntil,
+		&i.ClaimedAt,
+		&i.FinishedAt,
+		&i.Outcome,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getPhaseByRef = `-- name: GetPhaseByRef :one
+SELECT id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE run_id = $1 AND node_id = $2 AND attempt = $3
+`
+
+type GetPhaseByRefParams struct {
+	RunID   uuid.UUID
+	NodeID  string
+	Attempt int32
+}
+
+// The reverse lookup recovery needs: a credential lease records only the
+// attempt ref, and the janitor must know whether the phase behind it is still
+// live before it takes custody of that credential.
+func (q *Queries) GetPhaseByRef(ctx context.Context, arg GetPhaseByRefParams) (PhaseRun, error) {
+	row := q.db.QueryRow(ctx, getPhaseByRef, arg.RunID, arg.NodeID, arg.Attempt)
+	var i PhaseRun
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ChargeableFailures,
+		&i.NotBefore,
 		&i.Status,
 		&i.WorkerID,
 		&i.LeasedUntil,
@@ -476,17 +560,19 @@ func (q *Queries) InsertOutbox(ctx context.Context, arg InsertOutboxParams) erro
 }
 
 const insertPhase = `-- name: InsertPhase :one
-INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, status, created_at)
-VALUES ($1, $2, $3, $4, 'pending', $5)
-RETURNING id, run_id, node_id, attempt, max_attempts, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at
+INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+RETURNING id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at
 `
 
 type InsertPhaseParams struct {
-	RunID       uuid.UUID
-	NodeID      string
-	Attempt     int32
-	MaxAttempts int32
-	CreatedAt   time.Time
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	MaxAttempts        int32
+	ChargeableFailures int32
+	NotBefore          *time.Time
+	CreatedAt          time.Time
 }
 
 func (q *Queries) InsertPhase(ctx context.Context, arg InsertPhaseParams) (PhaseRun, error) {
@@ -495,6 +581,8 @@ func (q *Queries) InsertPhase(ctx context.Context, arg InsertPhaseParams) (Phase
 		arg.NodeID,
 		arg.Attempt,
 		arg.MaxAttempts,
+		arg.ChargeableFailures,
+		arg.NotBefore,
 		arg.CreatedAt,
 	)
 	var i PhaseRun
@@ -504,6 +592,8 @@ func (q *Queries) InsertPhase(ctx context.Context, arg InsertPhaseParams) (Phase
 		&i.NodeID,
 		&i.Attempt,
 		&i.MaxAttempts,
+		&i.ChargeableFailures,
+		&i.NotBefore,
 		&i.Status,
 		&i.WorkerID,
 		&i.LeasedUntil,
@@ -772,7 +862,7 @@ func (q *Queries) ListPendingRunIDs(ctx context.Context, limit int32) ([]uuid.UU
 }
 
 const listPhasesForRun = `-- name: ListPhasesForRun :many
-SELECT id, run_id, node_id, attempt, max_attempts, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE run_id = $1 ORDER BY created_at, node_id, attempt
+SELECT id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE run_id = $1 ORDER BY created_at, node_id, attempt
 `
 
 func (q *Queries) ListPhasesForRun(ctx context.Context, runID uuid.UUID) ([]PhaseRun, error) {
@@ -790,6 +880,8 @@ func (q *Queries) ListPhasesForRun(ctx context.Context, runID uuid.UUID) ([]Phas
 			&i.NodeID,
 			&i.Attempt,
 			&i.MaxAttempts,
+			&i.ChargeableFailures,
+			&i.NotBefore,
 			&i.Status,
 			&i.WorkerID,
 			&i.LeasedUntil,
@@ -1044,19 +1136,44 @@ func (q *Queries) LockEventCounter(ctx context.Context) (int64, error) {
 
 const markPhaseReconciling = `-- name: MarkPhaseReconciling :one
 UPDATE phase_runs SET status = 'reconciling'
-WHERE id = $1 AND status = 'running' AND leased_until <= now()
-RETURNING id, run_id, node_id, attempt, max_attempts, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at
+WHERE phase_runs.id = $1 AND phase_runs.status = 'running' AND phase_runs.leased_until <= now()
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
+          (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline
 `
 
-func (q *Queries) MarkPhaseReconciling(ctx context.Context, id uuid.UUID) (PhaseRun, error) {
+type MarkPhaseReconcilingRow struct {
+	ID                 uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	MaxAttempts        int32
+	ChargeableFailures int32
+	NotBefore          *time.Time
+	Status             string
+	WorkerID           pgtype.Text
+	LeasedUntil        *time.Time
+	ClaimedAt          *time.Time
+	FinishedAt         *time.Time
+	Outcome            []byte
+	CreatedAt          time.Time
+	RunWallDeadline    time.Time
+}
+
+// The run's wall deadline rides along because reconciliation now adopts
+// typed waits (a cap window with its reset): parking one past the deadline
+// would leave a row that could never legally run when it woke, so the
+// reconcile path needs the same boundary the claim path reads (§4.1).
+func (q *Queries) MarkPhaseReconciling(ctx context.Context, id uuid.UUID) (MarkPhaseReconcilingRow, error) {
 	row := q.db.QueryRow(ctx, markPhaseReconciling, id)
-	var i PhaseRun
+	var i MarkPhaseReconcilingRow
 	err := row.Scan(
 		&i.ID,
 		&i.RunID,
 		&i.NodeID,
 		&i.Attempt,
 		&i.MaxAttempts,
+		&i.ChargeableFailures,
+		&i.NotBefore,
 		&i.Status,
 		&i.WorkerID,
 		&i.LeasedUntil,
@@ -1064,6 +1181,61 @@ func (q *Queries) MarkPhaseReconciling(ctx context.Context, id uuid.UUID) (Phase
 		&i.FinishedAt,
 		&i.Outcome,
 		&i.CreatedAt,
+		&i.RunWallDeadline,
+	)
+	return i, err
+}
+
+const markPhaseReconcilingPastDeadline = `-- name: MarkPhaseReconcilingPastDeadline :one
+UPDATE phase_runs SET status = 'reconciling'
+WHERE phase_runs.id = $1 AND phase_runs.status = 'running'
+  AND EXISTS (SELECT 1 FROM runs r WHERE r.id = phase_runs.run_id AND r.wall_deadline <= now())
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
+          (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline
+`
+
+type MarkPhaseReconcilingPastDeadlineRow struct {
+	ID                 uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	MaxAttempts        int32
+	ChargeableFailures int32
+	NotBefore          *time.Time
+	Status             string
+	WorkerID           pgtype.Text
+	LeasedUntil        *time.Time
+	ClaimedAt          *time.Time
+	FinishedAt         *time.Time
+	Outcome            []byte
+	CreatedAt          time.Time
+	RunWallDeadline    time.Time
+}
+
+// The deadline sweep's variant of MarkPhaseReconciling: fenced by the RUN's
+// expired wall deadline (db clock) instead of the phase lease — a live lease
+// must not shield a phase whose run is already past its deadline (spec §2.8).
+// The worker's own evaluate loses its FinishPhase CAS against this, which is
+// what stops it committing a result the run is no longer entitled to.
+func (q *Queries) MarkPhaseReconcilingPastDeadline(ctx context.Context, id uuid.UUID) (MarkPhaseReconcilingPastDeadlineRow, error) {
+	row := q.db.QueryRow(ctx, markPhaseReconcilingPastDeadline, id)
+	var i MarkPhaseReconcilingPastDeadlineRow
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ChargeableFailures,
+		&i.NotBefore,
+		&i.Status,
+		&i.WorkerID,
+		&i.LeasedUntil,
+		&i.ClaimedAt,
+		&i.FinishedAt,
+		&i.Outcome,
+		&i.CreatedAt,
+		&i.RunWallDeadline,
 	)
 	return i, err
 }

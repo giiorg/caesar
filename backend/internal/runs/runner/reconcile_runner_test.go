@@ -3,6 +3,7 @@
 package runner
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,7 +26,9 @@ func stageAttemptForInspect(t *testing.T, r *Runner, ref runs.AttemptRef) RunSpe
 	if err := os.MkdirAll(r.attemptDir(ref), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(r.logsDir(ref), 0o700); err != nil {
+	// The streams land in quarantine; publication is what moves them into the
+	// logs directory, and on this path adoption is what publishes.
+	if err := os.MkdirAll(r.quarantineDir(ref), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	req := implementRequest(t, ref, fixtureSHA(t))
@@ -44,14 +47,14 @@ func stageAttemptForInspect(t *testing.T, r *Runner, ref runs.AttemptRef) RunSpe
 	if err := r.ensureNetworks(ctx, ref); err != nil {
 		t.Fatalf("ensure networks: %v", err)
 	}
-	if err := r.stageAttempt(ctx, ref, spec, clone); err != nil {
+	if err := r.stageAttempt(ctx, ref, req, spec, clone); err != nil {
 		t.Fatalf("stage: %v", err)
 	}
 	return spec
 }
 
 func TestInspect_NoContainerReportsLost(t *testing.T) {
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	res, err := r.Inspect(t.Context(), ref)
@@ -76,13 +79,17 @@ cat > /workspace/.caesar/out/artifacts.json <<'EOF'
 [{"type":"plan","payload":{"content":"adopted plan"}}]
 EOF
 `
-	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	// The crash window: the agent finished and the worker died before it
 	// could collect, so nothing has torn anything down.
 	spec := stageAttemptForInspect(t, r, ref)
-	agent, err := r.runAgentToCompletion(t.Context(), ref, spec)
+	d, err := driverFor(spec.Harness.Kind)
+	if err != nil {
+		t.Fatalf("driver for %s: %v", spec.Harness.Kind, err)
+	}
+	agent, err := r.runAgentToCompletion(t.Context(), ref, spec, d)
 	if err != nil {
 		t.Fatalf("run agent: %v", err)
 	}
@@ -98,7 +105,7 @@ EOF
 		t.Fatalf("a finished attempt with an intact workspace was not adopted: %+v", res)
 	}
 
-	byType := artifactsByType(res.Result.Artifacts)
+	byType := artifactTypes(res.Result.Artifacts)
 	patch, ok := byType[runs.ArtifactKindPatch]
 	if !ok {
 		t.Fatalf("adoption produced no patch: %v", res.Result.Artifacts)
@@ -129,8 +136,103 @@ EOF
 	}
 }
 
+// A worker that died after its agent had already hit the cap must not lose
+// that answer. The attempt is adopted as the typed failure the harness
+// reported — reset and all — because reporting it lost would charge a cap
+// wait to the node's failure budget. Reading the exit takes the manifest: it
+// is what says which harness's markers apply, and without one adoption has to
+// fall back to the pre-driver answer.
+func TestInspect_NonzeroExitIsAdoptedWithItsTypedOutcome(t *testing.T) {
+	reset := time.Now().Add(45 * time.Minute).UTC().Truncate(time.Second)
+	script := fmt.Sprintf("echo 'Claude AI usage limit reached|%d'; exit 1", reset.Unix())
+
+	capHitAttempt := func(t *testing.T, withManifest bool) runs.InspectResult {
+		t.Helper()
+		r := newDockerRunner(t, Options{}, scriptedHarness("", script), &recordingSink{}, nil)
+		ref := dockerRef()
+		spec := stageAttemptForInspect(t, r, ref)
+		if withManifest {
+			if err := r.writeManifest(ref, attemptManifest{
+				CredentialID: uuid.NewString(), Kind: "model_key",
+				Custody: spec.Custody, HarnessKind: spec.Harness.Kind,
+				// The version the suite's credential store still holds: without
+				// it adoption cannot recover the bytes the container saw, and it
+				// would withhold this attempt's evidence (spec §3).
+				SecretVersion: 1,
+			}); err != nil {
+				t.Fatalf("write manifest: %v", err)
+			}
+		}
+		d, err := driverFor(spec.Harness.Kind)
+		if err != nil {
+			t.Fatalf("driver for %s: %v", spec.Harness.Kind, err)
+		}
+		agent, err := r.runAgentToCompletion(t.Context(), ref, spec, d)
+		if err != nil {
+			t.Fatalf("run agent: %v", err)
+		}
+		if agent.exitCode != 1 {
+			t.Fatalf("agent exited %d, want the scripted 1", agent.exitCode)
+		}
+		res, err := r.Inspect(t.Context(), ref)
+		if err != nil {
+			t.Fatalf("inspect: %v", err)
+		}
+		return res
+	}
+
+	t.Run("with a manifest the marker table applies", func(t *testing.T) {
+		res := capHitAttempt(t, true)
+		if !res.Completed || res.Outcome == nil {
+			t.Fatalf("result = %+v, want an adopted typed outcome", res)
+		}
+		if res.Outcome.Code != runs.CodeRateLimited {
+			t.Errorf("code = %q, want rate_limited", res.Outcome.Code)
+		}
+		if res.Outcome.RetryAt == nil || !res.Outcome.RetryAt.Equal(reset) {
+			t.Errorf("RetryAt = %v, want the marker's own %s", res.Outcome.RetryAt, reset)
+		}
+		// An adopted failure owes the same evidence the worker path attaches
+		// to its own: without the log pointer, a run that died in
+		// reconciliation leaves nothing to read.
+		byType := artifactTypes(res.Result.Artifacts)
+		logRef, ok := byType[runs.ArtifactKindLogRef]
+		if !ok {
+			t.Fatalf("adopted failure carries no log_ref: %v", res.Result.Artifacts)
+		}
+		if logRef.Payload["streams"] == nil {
+			t.Errorf("log_ref payload = %v, want the captured streams", logRef.Payload)
+		}
+		// The snapshot rides along too, now that adoption rebuilds the
+		// redaction set its log tail is scrubbed with (Task 11).
+		snap, ok := byType[runs.ArtifactKindFailureSnapshot]
+		if !ok {
+			t.Fatalf("adopted failure carries no snapshot: %v", res.Result.Artifacts)
+		}
+		if snap.Payload["exit_code"] != int64(1) {
+			t.Errorf("snapshot exit_code = %v, want the harness's own 1", snap.Payload["exit_code"])
+		}
+	})
+
+	t.Run("without one the markers are unreadable", func(t *testing.T) {
+		// The manifest is the route back to the driver, so its absence costs
+		// the meaning of the exit — not the attempt. The failure is adopted,
+		// it just reads as the generic exit it looks like from outside.
+		res := capHitAttempt(t, false)
+		if !res.Completed || res.Outcome == nil {
+			t.Fatalf("result = %+v, want the failure adopted anyway", res)
+		}
+		if res.Outcome.Code != runs.CodeHarnessError {
+			t.Errorf("code = %q, want the pre-driver harness_error", res.Outcome.Code)
+		}
+		if res.Outcome.RetryAt != nil {
+			t.Errorf("RetryAt = %v, want nil: nothing read the cap marker", res.Outcome.RetryAt)
+		}
+	})
+}
+
 func TestInspect_RunningContainerIsKilledThenInspected(t *testing.T) {
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "sleep 600"), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "sleep 600"), &recordingSink{}, nil)
 	ref := dockerRef()
 
 	spec := stageAttemptForInspect(t, r, ref)
@@ -160,7 +262,7 @@ func TestInspect_RunningContainerIsKilledThenInspected(t *testing.T) {
 }
 
 func TestSweepOrphans_RemovesOnlyOldLabeledResources(t *testing.T) {
-	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{})
+	r := newDockerRunner(t, Options{}, scriptedHarness("", "true"), &recordingSink{}, nil)
 	ctx := t.Context()
 
 	// Created stamps cannot be faked against a real daemon, so the age
@@ -191,17 +293,22 @@ func TestSweepOrphans_RemovesOnlyOldLabeledResources(t *testing.T) {
 
 	create()
 	// The dirs half of the sweep answers to mtime, and must answer in both
-	// directions too.
-	attempts := filepath.Join(r.opts.DataRoot, "attempts")
-	stale, fresh := filepath.Join(attempts, "stale"), filepath.Join(attempts, "fresh")
-	for _, dir := range []string{stale, fresh} {
+	// directions too — over the attempt tree and over the quarantine, whose
+	// withheld evidence has no other reaper (spec §2.7).
+	var stale, fresh []string
+	for _, root := range []string{filepath.Join(r.opts.DataRoot, "attempts"), filepath.Join(r.opts.DataRoot, "quarantine")} {
+		stale, fresh = append(stale, filepath.Join(root, "stale")), append(fresh, filepath.Join(root, "fresh"))
+	}
+	for _, dir := range append(append([]string{}, stale...), fresh...) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	old := time.Now().Add(-48 * time.Hour)
-	if err := os.Chtimes(stale, old, old); err != nil {
-		t.Fatal(err)
+	for _, dir := range stale {
+		if err := os.Chtimes(dir, old, old); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if err := r.SweepOrphans(ctx, 24*time.Hour); err != nil {
@@ -214,11 +321,15 @@ func TestSweepOrphans_RemovesOnlyOldLabeledResources(t *testing.T) {
 		}
 	}
 	assertContainer(t, r, bystander)
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Errorf("a 48h-old attempt dir survived the sweep, stat err = %v", err)
+	for _, dir := range stale {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("a 48h-old %s survived the sweep, stat err = %v", dir, err)
+		}
 	}
-	if _, err := os.Stat(fresh); err != nil {
-		t.Errorf("a fresh attempt dir was swept: %v", err)
+	for _, dir := range fresh {
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("a fresh %s was swept: %v", dir, err)
+		}
 	}
 }
 
