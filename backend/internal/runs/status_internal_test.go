@@ -12,6 +12,13 @@ func TestPhaseStatus_WaitingDecisionIsLiveAndDecidable(t *testing.T) {
 	if PhaseWaitingDecision.Terminal() {
 		t.Fatal("waiting_decision is live: a human has not decided yet")
 	}
+	// "Live" in phaseIsLive means a LEASE HOLDER, not "unfinished". A gate
+	// runs no container, so it never took a credential lease; calling it live
+	// would strand any lease whose ref collided with a gate node's, because
+	// the janitor would keep waiting for machinery that does not exist.
+	if phaseIsLive(PhaseWaitingDecision) {
+		t.Error("a gate holds no lease: it must never be live")
+	}
 	for _, to := range []PhaseStatus{PhaseSucceeded, PhaseFailed, PhaseDead, PhaseSuperseded} {
 		if !PhaseWaitingDecision.CanTransition(to) {
 			t.Errorf("waiting_decision -> %s must be legal", to)
