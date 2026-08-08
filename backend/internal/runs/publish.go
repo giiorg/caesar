@@ -281,8 +281,11 @@ func notStartedUnlessTyped(err error) error {
 // are outside the invariant by definition: both are settled, so a permanent
 // answer is honest.
 //
-// Three doors into this run's death are outside this function and are held
-// shut elsewhere, because nothing here can see them:
+// FOUR doors into this run's death are outside this function, and each is held
+// shut by the thing named with it, because nothing here can see them. The list
+// is an enumeration and not a proof of completeness: it is what Task 9 walked,
+// and anything later found to terminalize a run over a live intent belongs in
+// it — the fourth was found exactly that way, after this comment claimed three.
 //
 //   - the EXECUTION BUDGET. unchargedWhileUnfinished exempts these codes from
 //     the node's FAILURE budget; the run's execution budget is a different
@@ -299,6 +302,19 @@ func notStartedUnlessTyped(err error) error {
 //     for the wall deadline, where settlement finishes the record. That is the
 //     whole trade: a run parked for a sweep that WILL come, instead of a run
 //     terminalized 'failed', which no sweep revisits at all.
+//
+//   - the PARK-PAST-DEADLINE refusal, in the same function as that pre-check
+//     and the cheapest of the four to reach: evaluateFailure will not park a
+//     retry whose wake falls past the run's wall deadline, and terminalizes
+//     instead. publish_resumable backs off ~15 seconds, so a single forge
+//     hiccup that late in a run would kill it 'failed' with the branch pushed
+//     and the deadline STILL IN THE FUTURE — the same orphan as the budget
+//     door, reached with nothing exhausted at all. Both publish codes are
+//     exempt from the refusal (exemptFromParkPastDeadline, outcome.go), and
+//     the park is safe rather than a hole: ClaimPhase already carries
+//     wall_deadline > now(), so the parked row is unclaimable either way. Same
+//     trade as above — a run parked for a sweep that WILL come, instead of one
+//     terminalized 'failed'.
 //
 //   - a lost lease. reconcileAttempt hands every other node kind to
 //     Executor.Inspect and concludes CHARGEABLE reconcile_lost; a publish

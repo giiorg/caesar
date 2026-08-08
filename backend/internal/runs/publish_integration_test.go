@@ -942,6 +942,119 @@ func TestPublish_ASpentExecutionBudgetDoesNotTerminalizeAnUnfinishedPublication(
 	}
 }
 
+// The WALL DEADLINE is the third door into a terminalized publication, and the
+// only one that needs nothing to be exhausted: evaluateFailure refuses to park
+// a retry whose wake falls past the run's deadline and terminalizes instead.
+// publish_resumable backs off ~15 seconds, so a single forge hiccup that late
+// in a run kills it 'failed' with the branch already pushed — and at that
+// moment wall_deadline is still in the FUTURE, so ListExpiredRunIDs (pending,
+// running, waiting) never matches the run again and nothing ever settles the
+// branch. It is cheaper to reach than the budget door: no near-spent run
+// needed, only a forge that hiccups near the end.
+//
+// Parking is the safe answer because ClaimPhase carries wall_deadline > now():
+// the parked row is unclaimable either way, so the exemption buys a run that
+// reaches the expiry sweep as 'running' at the cost of nothing that could have
+// run.
+//
+// The deadline is pulled in BETWEEN two attempts rather than during one: the
+// claim reads the deadline into the attempt, so only an attempt claimed after
+// the update carries it. That is why the second attempt is the one under test —
+// and it re-enters at the pull-request step, so the window it needs is a
+// fraction of a second, not a clone and a push.
+func TestPublish_ADeadlineInsideTheBackoffParksRatherThanTerminalizing(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.forge().FailPRTimes(2, runs.CodeForgeUnavailable)
+	p.approve(t, "gate")
+
+	// Attempt 1, against a deadline a day out: the branch lands, the request is
+	// refused, and the successor parks ~15 seconds ahead.
+	waitForIntentStatus(t, p.f, p.run.ID, "publish", "pushed", 45*time.Second)
+	waitForPhaseAttempt(t, p.f, p.run.ID, "publish", 2, 45*time.Second)
+
+	// Now put the deadline INSIDE publish_resumable's backoff and wake the
+	// successor by hand. No backdater: the ordering here is this test's, not a
+	// goroutine's, so the attempt under test is claimed after the update and
+	// cannot be claimed before it.
+	mustExec(t, p.f,
+		`UPDATE runs SET wall_deadline = now() + interval '12 seconds' WHERE id = $1`, p.run.ID)
+	mustExec(t, p.f,
+		`UPDATE phase_runs SET not_before = now() - interval '1 second'
+		 WHERE run_id = $1 AND node_id = 'publish' AND status = 'pending'`, p.run.ID)
+
+	// Attempt 2 fails the same way with the near deadline in hand. A third
+	// attempt row is the whole assertion: waitForPhaseAttempt fails loudly if
+	// the run was terminalized instead, which is the regression.
+	waitForPhaseAttempt(t, p.f, p.run.ID, "publish", 3, 45*time.Second)
+
+	if got := runStatus(t, p.f, p.run.ID); got != "running" {
+		t.Fatalf("run status = %q, want running: a wait that outlasts the deadline must not "+
+			"terminalize a publication whose branch is already on the forge", got)
+	}
+	// The successor really did park past the deadline — an unclaimable row is
+	// exactly the trade, and without this the case could pass on a wait that
+	// fitted inside the deadline and exercised nothing.
+	var parkedPast bool
+	if err := p.f.pool.QueryRow(context.Background(),
+		`SELECT coalesce(p.not_before > r.wall_deadline, false)
+		 FROM phase_runs p JOIN runs r ON r.id = p.run_id
+		 WHERE p.run_id = $1 AND p.node_id = 'publish' AND p.attempt = 3`, p.run.ID,
+	).Scan(&parkedPast); err != nil {
+		t.Fatal(err)
+	}
+	if !parkedPast {
+		t.Errorf("the successor wakes before the wall deadline: this case did not reach the refusal it is about")
+	}
+	if got := intentRow(t, p.f, p.run.ID, "publish").Status; got != "pushed" {
+		t.Errorf("intent status = %q, want pushed: the publication is still live", got)
+	}
+	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+		t.Errorf("chargeable failures = %d, want 0", got)
+	}
+}
+
+// Crash window 10, the last one the plan enumerated: the AUTHORIZE transaction
+// failing at COMMIT. Nothing has reached the forge yet, which is exactly why
+// this is dangerous rather than harmless — notStartedUnlessTyped is the only
+// thing between nine untyped statement errors in that transaction and a
+// permanent internal_error that terminalizes a run which has caused nothing at
+// all, over a database blip.
+//
+// Both statements that write are driven: the one that spends the approval and
+// the one that creates the intent. Each rolls its transaction back, so the
+// retry must re-authorize from an untouched approval and publish exactly once.
+func TestPublish_AFailedAuthorizationTransactionDoesNotKillTheRun(t *testing.T) {
+	for _, stmt := range []string{"ConsumeAuthorization", "CreatePublishIntent"} {
+		t.Run(stmt, func(t *testing.T) {
+			p := publicationAtItsGate(t, gatedConveyorDoc())
+			p.stop()
+			p.approve(t, "gate")
+			p.f.faults.fail(stmt, 0, 1)
+			p.start()
+
+			waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 120*time.Second)
+			if n := p.f.faults.remaining(stmt); n != 0 {
+				t.Fatalf("%d armed %s failures never fired; this test proved nothing", n, stmt)
+			}
+			if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+				t.Errorf("chargeable failures = %d, want 0: nothing had begun, so nothing was spent", got)
+			}
+			// The rollback is what makes the retry honest: one intent from one
+			// approval, and one publication on the remote.
+			if got := countIntents(t, p.f, p.run.ID); got != 1 {
+				t.Errorf("intents = %d, want 1: the rolled-back transaction left no half-authorization", got)
+			}
+			if got := p.publisher().PushCount(); got != 1 {
+				t.Errorf("pushes = %d, want 1", got)
+			}
+			intent := intentRow(t, p.f, p.run.ID, "publish")
+			if intent.Status != "published" || intent.PRNumber == nil {
+				t.Fatalf("the publication must complete on the retry: %+v", intent)
+			}
+		})
+	}
+}
+
 // A halted intent is the one status runPublish must refuse on ARRIVAL. It is
 // reached when the driver that halted was fenced — a lease takeover drops its
 // permanent outcome — and its successor picks the settled row up.

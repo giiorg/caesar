@@ -114,6 +114,36 @@ func exemptFromBudgetPreCheck(code string) bool {
 	return false
 }
 
+// exemptFromParkPastDeadline names the outcomes evaluateFailure must park even
+// when the wait would wake past the run's wall deadline.
+//
+// The refusal it exempts them from is stated as "never park a row that could
+// not legally run when it woke" — but ClaimPhase already enforces exactly that
+// (`AND r.wall_deadline > now()`), so the refusal is belt-and-braces, and for
+// an unfinished publication the braces cost more than they hold up.
+// publish_resumable backs off ~15 seconds, so ANY uncharged publish failure
+// inside a backoff of the deadline would terminalize the run 'failed' with the
+// intent still 'pending' or 'pushed' — and at a moment when wall_deadline is
+// still in the FUTURE, so ListExpiredRunIDs (pending, running, waiting) never
+// matches that run again and the branch is an orphan. Parked instead, the row
+// is unclaimable, the run sits 'running' until the deadline passes, and the
+// expiry sweep hands it to settlement, which finishes the record.
+//
+// This is deliberately NOT the exemptFromBudgetPreCheck set, and the two must
+// not be merged: that predicate asks "did this outcome spend the time the
+// budget protects?", which credential_busy answers no to as squarely as the
+// publish codes do. This one asks "would terminalizing here strand an effect
+// no sweep revisits?" — which only an unfinished publication answers yes to. A
+// credential_busy attempt holds nothing of ours, so a run that runs out of wall
+// clock waiting for a lease is honestly dead.
+func exemptFromParkPastDeadline(code string) bool {
+	switch code {
+	case CodePublishNotStarted, CodePublishResumable:
+		return true
+	}
+	return false
+}
+
 // Map renders the outcome for event payloads and jsonb columns.
 func (o Outcome) Map() map[string]any {
 	m := map[string]any{"class": string(o.Class), "code": o.Code, "message": o.Message}

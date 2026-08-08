@@ -1448,8 +1448,12 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		// wait as the worker's own, and it parks or terminalizes on the same
 		// boundary. A zero deadline means nobody read one, which is not a
 		// licence to park past it — it only skips a comparison with nothing.
-		if !c.RunWallDeadline.IsZero() && nb.After(c.RunWallDeadline) {
-			// Never park a row that could not legally run when it woke.
+		if !c.RunWallDeadline.IsZero() && nb.After(c.RunWallDeadline) &&
+			!exemptFromParkPastDeadline(out.Code) {
+			// Never park a row that could not legally run when it woke —
+			// except where terminalizing is the worse answer, because the
+			// outcome leaves an effect behind that only the expiry sweep can
+			// settle and a failed run is swept by nothing (outcome.go).
 			retry, parkedPastDeadline = false, true
 		} else {
 			notBefore = &nb

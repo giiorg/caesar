@@ -102,6 +102,27 @@ func TestPublish_TheUnfinishedPublicationInvariantHolds(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("the wall deadline is a third door, and parking past it is the safe answer", func(t *testing.T) {
+		// evaluateFailure refuses to park a retry that would wake past the run's
+		// wall deadline and terminalizes instead — with publish_resumable's ~15s
+		// backoff, that kills a run whose branch is on the forge while its
+		// deadline is still in the future, which no sweep revisits.
+		for _, code := range []string{CodePublishNotStarted, CodePublishResumable} {
+			if !exemptFromParkPastDeadline(code) {
+				t.Errorf("%s is not exempt: terminalizing a live publication strands it, while "+
+					"parking it only makes a row ClaimPhase already refuses", code)
+			}
+		}
+		// credential_busy is uncharged and budget-exempt, and deliberately NOT
+		// exempt here: it leaves nothing behind, so a run out of wall clock
+		// waiting for a lease is honestly dead. The two sets differ on purpose.
+		for _, code := range []string{CodeCredentialBusy, CodeRateLimited, CodeForgeUnavailable, CodeTimeout} {
+			if exemptFromParkPastDeadline(code) {
+				t.Errorf("%s must keep the park-past-deadline refusal", code)
+			}
+		}
+	})
 }
 
 // notStartedUnlessTyped is the only thing standing between the nine untyped
