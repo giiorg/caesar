@@ -324,10 +324,10 @@ func (q *Queries) CountSettledPublications(ctx context.Context, runID uuid.UUID)
 const createPublishIntent = `-- name: CreatePublishIntent :one
 INSERT INTO publish_intents (run_id, node_id, attempt, authorization_id, repo_id,
                              forge_kind, repo_slug, credential_id, branch, target_branch,
-                             base_sha, tree_hash, title, body, author_email, status,
-                             created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $16)
-RETURNING id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at
+                             base_sha, tree_hash, title, body, author_email,
+                             commit_message, status, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', $17, $17)
+RETURNING id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, commit_message, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at
 `
 
 type CreatePublishIntentParams struct {
@@ -346,6 +346,7 @@ type CreatePublishIntentParams struct {
 	Title           string
 	Body            string
 	AuthorEmail     string
+	CommitMessage   string
 	CreatedAt       time.Time
 }
 
@@ -366,6 +367,7 @@ func (q *Queries) CreatePublishIntent(ctx context.Context, arg CreatePublishInte
 		arg.Title,
 		arg.Body,
 		arg.AuthorEmail,
+		arg.CommitMessage,
 		arg.CreatedAt,
 	)
 	var i PublishIntent
@@ -386,6 +388,7 @@ func (q *Queries) CreatePublishIntent(ctx context.Context, arg CreatePublishInte
 		&i.Title,
 		&i.Body,
 		&i.AuthorEmail,
+		&i.CommitMessage,
 		&i.Status,
 		&i.HeadSha,
 		&i.PrNumber,
@@ -769,7 +772,7 @@ func (q *Queries) GetPhaseByRef(ctx context.Context, arg GetPhaseByRefParams) (P
 }
 
 const getPublishIntent = `-- name: GetPublishIntent :one
-SELECT id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at FROM publish_intents WHERE run_id = $1 AND node_id = $2
+SELECT id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, commit_message, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at FROM publish_intents WHERE run_id = $1 AND node_id = $2
 `
 
 type GetPublishIntentParams struct {
@@ -797,6 +800,7 @@ func (q *Queries) GetPublishIntent(ctx context.Context, arg GetPublishIntentPara
 		&i.Title,
 		&i.Body,
 		&i.AuthorEmail,
+		&i.CommitMessage,
 		&i.Status,
 		&i.HeadSha,
 		&i.PrNumber,

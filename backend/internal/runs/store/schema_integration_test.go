@@ -276,9 +276,9 @@ func TestPublishIntents_AnAuthorizationIsConsumedByAtMostOneIntent(t *testing.T)
 			INSERT INTO publish_intents (run_id, node_id, attempt, authorization_id, repo_id,
 			                             forge_kind, repo_slug, credential_id,
 			                             branch, target_branch, base_sha, tree_hash, title, body,
-			                             author_email, status, created_at, updated_at)
+			                             author_email, commit_message, status, created_at, updated_at)
 			VALUES ($1,$2,1,$3,$4,'github','acme/widgets',$5,
-			        'caesar/'||$2,'main','abc','def','t','b','who@example.com','pending',now(),now())`,
+			        'caesar/'||$2,'main','abc','def','t','b','who@example.com','m','pending',now(),now())`,
 			runID, node, authID, repoID, credID)
 		return err
 	}

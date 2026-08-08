@@ -434,6 +434,14 @@ CREATE TABLE publish_intents (
     -- the adopt comparison would miss, and a crash-after-push would become a
     -- permanent publish_conflict on a branch that is genuinely ours.
     author_email     text NOT NULL,
+    -- The commit message, rendered once and stored, for the same reason
+    -- author_email is: it is hashed into the commit sha. It interpolates the
+    -- APPROVER's address, which is joined from the mutable users row, so
+    -- re-rendering it per attempt would rebuild a different commit and break
+    -- the adopt comparison recovery depends on. Storing the finished string
+    -- also means the settlement rebuild in a later task cannot drift from
+    -- what was pushed: there is no second renderer to disagree with.
+    commit_message   text NOT NULL,
     status           text NOT NULL CHECK (status IN ('pending', 'pushed', 'published', 'halted')),
     -- Receipts, each written in the transaction after its effect landed.
     head_sha         text,

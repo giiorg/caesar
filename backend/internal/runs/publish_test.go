@@ -209,14 +209,14 @@ func TestTruncateNeverSplitsARune(t *testing.T) {
 }
 
 func TestCommitMessageForIsAPureFunctionOfDurableInputs(t *testing.T) {
-	// Task 10's settlement rebuilds this exact message to prove a receiptless
-	// branch is ours. Any drift between the two changes the commit sha and
-	// every ownership check fails open, so it may read nothing but the intent,
-	// the authorization and the ref.
-	intent := store.PublishIntent{Title: "ship it"}
+	// Task 10's settlement rebuilds this exact commit to prove a receiptless
+	// branch is ours. Any drift changes the commit sha and every ownership
+	// check fails open, which is why the rendered string is stored on the
+	// intent rather than re-rendered — and why the attempt ordinal, the one
+	// input that differs between attempts, may never appear in it.
 	auth := authorization{ApproverEmail: "ada@example.com"}
 	ref := AttemptRef{NodeID: "publish", Attempt: 4}
-	got := commitMessageFor(intent, auth, ref)
+	got := commitMessageFor("ship it", ref, auth)
 	for _, want := range []string{
 		"ship it\n\n", "caesar-run: ", "caesar-node: publish\n",
 		"caesar-artifact: ", "caesar-approved-by: ada@example.com\n",

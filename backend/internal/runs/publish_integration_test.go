@@ -427,6 +427,90 @@ func TestPublish_AnExpiredRunIsNeverEvenClaimed(t *testing.T) {
 	}
 }
 
+// A run terminalized by a SIBLING node between the claim and the authorize
+// transaction must not get a publication.
+//
+// ConsumeAuthorization carries the wall-deadline predicate and NO run-status
+// predicate, and ClaimPhase's own `r.status = 'running'` is evaluated before
+// this window opens. Without the run read at the top of authorizePublish the
+// intent commits and the push lands against a FAILED run — and
+// ListExpiredRunIDs matches only 'pending', 'running' and 'waiting', so that
+// branch is an orphan nothing ever reconciles.
+//
+// The window is entered through the run row's own lock, which is the only
+// rendezvous that is not a race: ClaimPhase locks `FOR UPDATE OF pr` and
+// merely READS runs, so a held transaction that has already flipped the status
+// does not block the claim — while authorizePublish's GetRunForUpdate blocks
+// on it until the flip commits. Taking the lock BEFORE the row becomes
+// claimable is what makes the ordering total.
+func TestPublish_ARunTerminalizedBetweenTheClaimAndTheAuthorizeGetsNoPublication(t *testing.T) {
+	ctx := context.Background()
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.stop()
+	p.approve(t, "gate")
+
+	// Materialize the publish attempt ourselves, parked, so the loop can start
+	// without claiming it. materializeReady will not insert a second live row
+	// for a node that already has one.
+	mustExec(t, p.f,
+		`INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, chargeable_failures,
+		                         status, generation, not_before, created_at)
+		 VALUES ($1, 'publish', 1, 3, 0, 'pending', 1, now() + interval '1 hour', now())`, p.run.ID)
+	p.start()
+
+	// Hold the run row and flip it, uncommitted.
+	tx, err := p.f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT id FROM runs WHERE id = $1 FOR UPDATE`, p.run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE runs SET status = 'failed', finished_at = now() WHERE id = $1`, p.run.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now let a worker claim it. The claim reads the committed 'running'.
+	mustExec(t, p.f,
+		`UPDATE phase_runs SET not_before = now() - interval '1 second'
+		 WHERE run_id = $1 AND node_id = 'publish'`, p.run.ID)
+	waitForPhaseStatus(t, p.f, p.run.ID, "publish", "running", 30*time.Second)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The attempt discovers the dead run and requeues UNCHARGED — a successor
+	// row appears and is never claimable, because the claim predicate refuses
+	// a failed run.
+	waitForPhaseAttempt(t, p.f, p.run.ID, "publish", 2, 30*time.Second)
+	if _, ok := tryIntentRow(t, p.f, p.run.ID, "publish"); ok {
+		t.Fatal("a publication began against a run that is not running: nothing will ever reconcile its branch")
+	}
+	if p.publisher().PushCount() != 0 {
+		t.Fatal("nothing may reach the remote once the run is terminal")
+	}
+	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+		t.Errorf("chargeable failures = %d, want 0: the publication never began, so it spent nothing", got)
+	}
+}
+
+func waitForPhaseStatus(t *testing.T, f fixture, runID uuid.UUID, nodeID, want string, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		var got string
+		if err := f.pool.QueryRow(context.Background(),
+			`SELECT status FROM phase_runs WHERE run_id = $1 AND node_id = $2
+			 ORDER BY attempt DESC LIMIT 1`, runID, nodeID).Scan(&got); err == nil && got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s never reached %q", nodeID, want)
+}
+
 func TestPublish_CrashAfterPushAdoptsTheBranchInsteadOfPushingAgain(t *testing.T) {
 	p := publicationAtItsGate(t, gatedConveyorDoc())
 	p.publisher().CrashAfterPush(true) // the push lands, the process dies before the receipt
@@ -456,6 +540,42 @@ func TestPublish_CrashAfterPushAdoptsTheBranchInsteadOfPushingAgain(t *testing.T
 	// tell the two apart when both can happen.
 	if n := countEvents(t, p.svc, p.run.ID, runs.EventPublishAdopted); n != 1 {
 		t.Errorf("publish.adopted events = %d, want 1", n)
+	}
+}
+
+// The commit's author identity is snapshotted on the intent, and this is why.
+//
+// A commit sha hashes the author identity, and recovery proves a receiptless
+// branch is ours by rebuilding the SAME sha. The requester's address lives on
+// a mutable users row and the orchestrator caches it per process, so an
+// address that changed between two attempts of one publication — a restart is
+// enough to re-resolve it — would rebuild a DIFFERENT commit. gitops.Publish
+// would then find the marker at a sha it cannot claim and halt the
+// publication for a human, with the branch already pushed and correct.
+func TestPublish_AChangedRequesterAddressStillAdoptsTheBranch(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.publisher().CrashAfterPush(true)
+	p.approve(t, "gate")
+	waitForPushCount(t, p.publisher(), 1, 30*time.Second)
+
+	// A restart with a cold plan cache AND a moved address: either alone
+	// leaves a cached value in place.
+	p.stop()
+	mustExec(t, p.f, `UPDATE users SET email = 'renamed@example.com' WHERE id = $1`, p.f.userID)
+	p.publisher().CrashAfterPush(false)
+	startBackdater(t, p.f, p.run.ID)
+	p.start()
+
+	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 90*time.Second)
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if intent.AuthorEmail != "spine@example.com" {
+		t.Errorf("author_email = %q, want the address the intent snapshotted", intent.AuthorEmail)
+	}
+	if got := remoteCommitCount(t, p.f, intent.Branch); got != 2 {
+		t.Fatalf("remote has %d commits on the marker, want 2: the retry rebuilt a different commit", got)
+	}
+	if n := countEvents(t, p.svc, p.run.ID, runs.EventPublishAdopted); n != 1 {
+		t.Errorf("publish.adopted events = %d, want 1: the rebuilt commit must match and be adopted", n)
 	}
 }
 

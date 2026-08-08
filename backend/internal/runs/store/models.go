@@ -91,6 +91,7 @@ type PublishIntent struct {
 	Title           string
 	Body            string
 	AuthorEmail     string
+	CommitMessage   string
 	Status          string
 	HeadSha         pgtype.Text
 	PrNumber        pgtype.Int8

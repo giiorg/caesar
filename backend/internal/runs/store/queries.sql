@@ -407,9 +407,9 @@ RETURNING generation;
 -- name: CreatePublishIntent :one
 INSERT INTO publish_intents (run_id, node_id, attempt, authorization_id, repo_id,
                              forge_kind, repo_slug, credential_id, branch, target_branch,
-                             base_sha, tree_hash, title, body, author_email, status,
-                             created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $16)
+                             base_sha, tree_hash, title, body, author_email,
+                             commit_message, status, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', $17, $17)
 RETURNING *;
 
 -- name: GetPublishIntent :one

@@ -458,9 +458,11 @@ func (o *Orchestrator) authorizePublish(ctx context.Context, cp cachedPlan, c cl
 			Branch:       PublicationBranch(auth.ArtifactID),
 			TargetBranch: auth.TargetBranch, BaseSha: auth.BaseSha, TreeHash: auth.TreeHash,
 			Title: title, Body: body,
-			// Snapshotted, never re-resolved: see publish_intents.author_email.
-			AuthorEmail: requester,
-			CreatedAt:   now,
+			// Both snapshotted, never re-rendered: they are hashed into the
+			// commit sha. See publish_intents.author_email / commit_message.
+			AuthorEmail:   requester,
+			CommitMessage: commitMessageFor(title, c.Ref, auth),
+			CreatedAt:     now,
 		})
 		if isUniqueViolation(err) {
 			// Either another worker created the intent between our read and
@@ -638,7 +640,10 @@ func (o *Orchestrator) pushPublication(ctx context.Context, cp cachedPlan, c cla
 	res, err := o.svc.publisher.PushPatch(ctx, PushRequest{
 		Ref: c.Ref, Repo: intentRepo(intent), Branch: intent.Branch, BaseSHA: intent.BaseSha,
 		TreeHash: intent.TreeHash, Patch: diff,
-		Message: commitMessageFor(intent, auth, c.Ref),
+		// Replayed from the intent, never re-rendered: see the comment on
+		// AuthorName below — the message carries the APPROVER's address, which
+		// is joined from the same mutable users row.
+		Message: intent.CommitMessage,
 		// The author identity is REPLAYED from the intent, never re-resolved
 		// through PrincipalSource: the commit sha hashes it, so an address
 		// that changed between two attempts would rebuild a DIFFERENT commit,
@@ -754,18 +759,25 @@ func artifactDiff(art store.Artifact) (string, bool) {
 	return diff, diff != ""
 }
 
-// commitMessageFor renders the commit message. It is a free function over the
-// three durable things it interpolates — deliberately NOT a method taking
-// cachedPlan and claimed, neither of which it reads.
+// commitMessageFor renders the commit message ONCE, inside the authorize
+// transaction, and the result is stored on the intent.
 //
-// That matters beyond tidiness: Task 10's expired-run settlement rebuilds this
-// exact commit to prove a receiptless branch is ours, and it has no claimed to
-// pass. If the rebuild rendered its message through a different code path, any
-// drift between the two would change the commit sha and every ownership check
-// would fail open — reporting somebody else's branch where ours is.
-func commitMessageFor(intent store.PublishIntent, auth authorization, ref AttemptRef) string {
+// It is rendered once rather than per attempt because the message is hashed
+// into the commit sha and it interpolates the APPROVER's address — joined from
+// the mutable users row, exactly like the author's. An address that changed
+// between two attempts of one publication would rebuild a different commit,
+// miss the adopt comparison, and turn a crash-after-push into a permanent
+// publish_conflict on a branch that is genuinely ours.
+//
+// Storing the finished string also removes the drift risk the other way: Task
+// 10's settlement rebuild reads publish_intents.commit_message, so there is no
+// second renderer that could disagree with what was pushed.
+//
+// The attempt ordinal is deliberately absent: it differs between attempts of
+// one publication, and every input here must not.
+func commitMessageFor(title string, ref AttemptRef, auth authorization) string {
 	return fmt.Sprintf("%s\n\ncaesar-run: %s\ncaesar-node: %s\ncaesar-artifact: %s\ncaesar-approved-by: %s\n",
-		intent.Title, ref.RunID, ref.NodeID, auth.ArtifactID, auth.ApproverEmail)
+		title, ref.RunID, ref.NodeID, auth.ArtifactID, auth.ApproverEmail)
 }
 
 // openPublication opens the pull request and commits its receipt. The FIND
