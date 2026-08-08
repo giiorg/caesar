@@ -324,9 +324,10 @@ func (q *Queries) CountSettledPublications(ctx context.Context, runID uuid.UUID)
 const createPublishIntent = `-- name: CreatePublishIntent :one
 INSERT INTO publish_intents (run_id, node_id, attempt, authorization_id, repo_id,
                              forge_kind, repo_slug, credential_id, branch, target_branch,
-                             base_sha, tree_hash, title, body, status, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'pending', $15, $15)
-RETURNING id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at
+                             base_sha, tree_hash, title, body, author_email, status,
+                             created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $16)
+RETURNING id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at
 `
 
 type CreatePublishIntentParams struct {
@@ -344,6 +345,7 @@ type CreatePublishIntentParams struct {
 	TreeHash        string
 	Title           string
 	Body            string
+	AuthorEmail     string
 	CreatedAt       time.Time
 }
 
@@ -363,6 +365,7 @@ func (q *Queries) CreatePublishIntent(ctx context.Context, arg CreatePublishInte
 		arg.TreeHash,
 		arg.Title,
 		arg.Body,
+		arg.AuthorEmail,
 		arg.CreatedAt,
 	)
 	var i PublishIntent
@@ -382,6 +385,7 @@ func (q *Queries) CreatePublishIntent(ctx context.Context, arg CreatePublishInte
 		&i.TreeHash,
 		&i.Title,
 		&i.Body,
+		&i.AuthorEmail,
 		&i.Status,
 		&i.HeadSha,
 		&i.PrNumber,
@@ -501,6 +505,31 @@ func (q *Queries) FinishRun(ctx context.Context, arg FinishRunParams) (int64, er
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getArtifactByID = `-- name: GetArtifactByID :one
+SELECT id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at FROM artifacts WHERE id = $1
+`
+
+// The publish path's read: an authorization names ONE artifact id and the
+// publication must carry that artifact's diff, not whatever is newest for the
+// node now. Addressing it by id is what makes the approved thing and the
+// published thing the same thing.
+func (q *Queries) GetArtifactByID(ctx context.Context, id uuid.UUID) (Artifact, error) {
+	row := q.db.QueryRow(ctx, getArtifactByID, id)
+	var i Artifact
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Attempt,
+		&i.Generation,
+		&i.Type,
+		&i.Payload,
+		&i.ParentIds,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const getAuthorizationByID = `-- name: GetAuthorizationByID :one
@@ -740,7 +769,7 @@ func (q *Queries) GetPhaseByRef(ctx context.Context, arg GetPhaseByRefParams) (P
 }
 
 const getPublishIntent = `-- name: GetPublishIntent :one
-SELECT id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at FROM publish_intents WHERE run_id = $1 AND node_id = $2
+SELECT id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at FROM publish_intents WHERE run_id = $1 AND node_id = $2
 `
 
 type GetPublishIntentParams struct {
@@ -767,6 +796,7 @@ func (q *Queries) GetPublishIntent(ctx context.Context, arg GetPublishIntentPara
 		&i.TreeHash,
 		&i.Title,
 		&i.Body,
+		&i.AuthorEmail,
 		&i.Status,
 		&i.HeadSha,
 		&i.PrNumber,

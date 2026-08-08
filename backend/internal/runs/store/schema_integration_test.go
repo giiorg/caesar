@@ -276,9 +276,9 @@ func TestPublishIntents_AnAuthorizationIsConsumedByAtMostOneIntent(t *testing.T)
 			INSERT INTO publish_intents (run_id, node_id, attempt, authorization_id, repo_id,
 			                             forge_kind, repo_slug, credential_id,
 			                             branch, target_branch, base_sha, tree_hash, title, body,
-			                             status, created_at, updated_at)
+			                             author_email, status, created_at, updated_at)
 			VALUES ($1,$2,1,$3,$4,'github','acme/widgets',$5,
-			        'caesar/'||$2,'main','abc','def','t','b','pending',now(),now())`,
+			        'caesar/'||$2,'main','abc','def','t','b','who@example.com','pending',now(),now())`,
 			runID, node, authID, repoID, credID)
 		return err
 	}
@@ -293,6 +293,66 @@ func TestPublishIntents_AnAuthorizationIsConsumedByAtMostOneIntent(t *testing.T)
 	if !errors.As(err, &pgErr) || pgErr.ConstraintName != "publish_intents_authorization_id_key" {
 		t.Fatalf("want the single-use authorization key to refuse this, got %v", err)
 	}
+}
+
+// ConsumeAuthorization carries the run's wall-deadline predicate, and it is
+// driven HERE rather than through the orchestrator because nothing driven
+// through the orchestrator can reach it: ClaimPhase's own
+// `r.wall_deadline > now()` refuses the claim first, so an expired run's
+// publish attempt is never entered at all. This statement is the second fence
+// — the one that closes the window between a claim and the authorize
+// transaction — and it is only observable from here.
+func TestConsumeAuthorization_RefusesAnExpiredRun(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	statusOf := func(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) string {
+		t.Helper()
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT status FROM approved_patches WHERE id = $1`, id).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		return status
+	}
+
+	// A clone per subtest: seedAssets inserts a user with a fixed address, so
+	// two seeds in one database collide on users_email_key.
+	t.Run("a live run spends its token exactly once", func(t *testing.T) {
+		pool := testdb.New(t)
+		q := store.New(pool)
+		_, authID, _, _ := seedRunWithAuthorization(ctx, t, pool)
+		n, err := q.ConsumeAuthorization(ctx, store.ConsumeAuthorizationParams{ID: authID, SettledAt: &now})
+		if err != nil || n != 1 {
+			t.Fatalf("first consume = %d, %v; want 1", n, err)
+		}
+		if got := statusOf(t, pool, authID); got != "consumed" {
+			t.Fatalf("status = %q, want consumed", got)
+		}
+		n, err = q.ConsumeAuthorization(ctx, store.ConsumeAuthorizationParams{ID: authID, SettledAt: &now})
+		if err != nil || n != 0 {
+			t.Fatalf("second consume = %d, %v; want 0: the token is single-use", n, err)
+		}
+	})
+
+	t.Run("an expired run may not authorize a forge effect", func(t *testing.T) {
+		pool := testdb.New(t)
+		q := store.New(pool)
+		runID, authID, _, _ := seedRunWithAuthorization(ctx, t, pool)
+		if _, err := pool.Exec(ctx,
+			`UPDATE runs SET wall_deadline = now() - interval '1 second' WHERE id = $1`, runID); err != nil {
+			t.Fatal(err)
+		}
+		n, err := q.ConsumeAuthorization(ctx, store.ConsumeAuthorizationParams{ID: authID, SettledAt: &now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatal("an expired run consumed its authorization: the deadline sweeper would then race a push it cannot cancel")
+		}
+		if got := statusOf(t, pool, authID); got != "valid" {
+			t.Fatalf("status = %q, want valid: a refused consume must leave the row alone", got)
+		}
+	})
 }
 
 func TestPhaseRuns_AWaitingGateBlocksASecondLiveRowForItsNode(t *testing.T) {

@@ -223,6 +223,13 @@ INSERT INTO artifacts (id, run_id, node_id, attempt, generation, type, payload, 
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING *;
 
+-- name: GetArtifactByID :one
+-- The publish path's read: an authorization names ONE artifact id and the
+-- publication must carry that artifact's diff, not whatever is newest for the
+-- node now. Addressing it by id is what makes the approved thing and the
+-- published thing the same thing.
+SELECT * FROM artifacts WHERE id = $1;
+
 -- name: GetNodeArtifact :one
 -- The CURRENT artifact of this type for this node. After a revision the node
 -- has one per generation, and the successor must read the newest.
@@ -400,8 +407,9 @@ RETURNING generation;
 -- name: CreatePublishIntent :one
 INSERT INTO publish_intents (run_id, node_id, attempt, authorization_id, repo_id,
                              forge_kind, repo_slug, credential_id, branch, target_branch,
-                             base_sha, tree_hash, title, body, status, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'pending', $15, $15)
+                             base_sha, tree_hash, title, body, author_email, status,
+                             created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $16)
 RETURNING *;
 
 -- name: GetPublishIntent :one

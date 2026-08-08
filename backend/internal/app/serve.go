@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -98,9 +99,13 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	// The execution spine: real peer-context adapters, the honest
 	// not-implemented executor and forge until Plans 06/08. identity.Service
 	// serves as authenticator, authorizer, and grant source here too.
+	// Plan 12 replaces this with cfg.Forge.PublishWorkDir; until that config
+	// block exists, publications materialize under the system temp dir.
+	publisher := gitPublisher{assets: assetsSvc, workDir: os.TempDir()}
+
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		unavailableForge{}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		unavailableForge{}, publisher, principalSource{svc: svc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc))...)
 
 	// Plan 06: the real Docker runner when configured. Disabled by default —

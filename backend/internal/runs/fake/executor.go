@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/google/uuid"
+
 	"github.com/giiorg/caesar/backend/internal/runs"
 )
 
@@ -78,13 +80,26 @@ type Executor struct {
 	mu        sync.Mutex
 	execCount map[string]int                           // per (run,node): executions seen
 	completed map[runs.AttemptRef]runs.ExecutionResult // successful executions
+	// remotes maps a repo id to a local bare repository. Registering one
+	// switches the implement artifact from a synthetic patch to a PUBLISHABLE
+	// one — see scripted.
+	remotes map[uuid.UUID]string
 }
 
 func NewExecutor() *Executor {
 	return &Executor{
 		execCount: map[string]int{},
 		completed: map[runs.AttemptRef]runs.ExecutionResult{},
+		remotes:   map[uuid.UUID]string{},
 	}
+}
+
+// Remote registers the local bare repository a repo id resolves to, which is
+// what lets this executor emit a patch the publish path can actually push.
+func (e *Executor) Remote(repoID uuid.UUID, bare string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.remotes[repoID] = bare
 }
 
 func nodeKey(ref runs.AttemptRef) string { return ref.RunID.String() + "/" + ref.NodeID }
@@ -108,7 +123,13 @@ func (e *Executor) Execute(ctx context.Context, req runs.ExecutionRequest) (runs
 		return runs.ExecutionResult{}, runs.OutcomeError{Outcome: d.failOut}
 	}
 
-	res := runs.ExecutionResult{Artifacts: []runs.NewArtifact{scripted(req)}}
+	art, err := e.scripted(req)
+	if err != nil {
+		return runs.ExecutionResult{}, runs.OutcomeError{Outcome: runs.Outcome{
+			Class: runs.OutcomePermanent, Code: runs.CodeInvalidOutput, Message: err.Error(),
+		}}
+	}
+	res := runs.ExecutionResult{Artifacts: []runs.NewArtifact{art}}
 	e.mu.Lock()
 	e.completed[req.Ref] = res
 	e.mu.Unlock()
@@ -116,23 +137,50 @@ func (e *Executor) Execute(ctx context.Context, req runs.ExecutionRequest) (runs
 }
 
 // scripted builds the deterministic success artifact for a node kind.
-func scripted(req runs.ExecutionRequest) runs.NewArtifact {
+func (e *Executor) scripted(req runs.ExecutionRequest) (runs.NewArtifact, error) {
 	firstLine, _, _ := strings.Cut(req.Instructions, "\n")
 	switch req.Kind {
 	case runs.KindImplement:
-		diff := fmt.Sprintf("--- a/CAESAR.md\n+++ b/CAESAR.md\n@@ -0,0 +1 @@\n+%s (%s)\n", firstLine, req.Ref.NodeID)
-		sum := sha256.Sum256([]byte(diff + req.BaseSHA))
+		e.mu.Lock()
+		bare, hasRemote := e.remotes[req.Repo.ID]
+		e.mu.Unlock()
+		if !hasRemote {
+			// No remote registered: the historical synthetic patch. It is not
+			// publishable — the diff is raw text where the wire form is
+			// base64, and the tree hash is a digest of the diff rather than a
+			// git tree object id — but nothing without a remote can publish
+			// anyway, and every pre-Plan-08 test asserts against this shape.
+			diff := fmt.Sprintf("--- a/CAESAR.md\n+++ b/CAESAR.md\n@@ -0,0 +1 @@\n+%s (%s)\n", firstLine, req.Ref.NodeID)
+			sum := sha256.Sum256([]byte(diff + req.BaseSHA))
+			return runs.NewArtifact{Type: runs.ArtifactKindPatch, Payload: map[string]any{
+				"diff": diff, "base_sha": req.BaseSHA, "tree_hash": hex.EncodeToString(sum[:]),
+			}}, nil
+		}
+		// A PUBLISHABLE patch: the base64 canonical wire form, and the tree
+		// hash `git write-tree` really produces after applying it at the run's
+		// base. gitops.Publish refuses anything less, so a synthetic tree hash
+		// would fail every publication test for a reason unrelated to what it
+		// exercises.
+		//
+		// The file is named per node so two implement nodes in one definition
+		// cannot both claim to create the same path.
+		name := "CAESAR-" + req.Ref.NodeID + ".md"
+		content := fmt.Sprintf("%s (%s)\n", firstLine, req.Ref.NodeID)
+		tree, err := approvedTree(bare, req.BaseSHA, name, content)
+		if err != nil {
+			return runs.NewArtifact{}, fmt.Errorf("fake: build publishable patch: %w", err)
+		}
 		return runs.NewArtifact{Type: runs.ArtifactKindPatch, Payload: map[string]any{
-			"diff": diff, "base_sha": req.BaseSHA, "tree_hash": hex.EncodeToString(sum[:]),
-		}}
+			"diff": AddFilePatch(name, content), "base_sha": req.BaseSHA, "tree_hash": tree,
+		}}, nil
 	case runs.KindReview:
 		return runs.NewArtifact{Type: runs.ArtifactKindReviewVerdict, Payload: map[string]any{
 			"verdict": "approve", "notes": "fake review",
-		}}
+		}}, nil
 	default: // plan and anything agentic-shaped
 		return runs.NewArtifact{Type: runs.ArtifactKindPlan, Payload: map[string]any{
 			"content": "plan: " + firstLine,
-		}}
+		}}, nil
 	}
 }
 

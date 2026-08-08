@@ -125,9 +125,35 @@ func backdateWallDeadline(t *testing.T, f fixture, runID uuid.UUID) {
 // everything the decision tests need.
 func gatedRunAtItsGate(t *testing.T, doc runs.DefinitionDoc, snap runs.PolicySnapshot) (fixture, *runs.Service, runs.Run) {
 	t.Helper()
-	f := newFixture(t)
-	svc, _ := newService(t, f, doc, snap)
-	startOrchestrator(t, svc, fake.NewExecutor(), 30*time.Second)
+	f, svc, _, _ := publishableRun(t, doc, snap)
+	_, run := createGatedRun(t, f, svc)
+	return f, svc, run
+}
+
+// publishableRun wires a run whose publish nodes can ACTUALLY publish: a real
+// bare repository behind the repo id, a fake executor that emits the base64
+// wire form and the git tree hash gitops.Publish verifies against, and the
+// forge and publisher doubles pointed at that same repository.
+//
+// Before Task 9 a git-publish node ran through the fake Executor and produced
+// a plan artifact, so every gated test reached its end without publishing
+// anything. It now runs the publish state machine, and a fixture with no
+// remote parks it forever on forge_unavailable — which is why this is the
+// bootstrap and not an opt-in.
+func publishableRun(t *testing.T, doc runs.DefinitionDoc, snap runs.PolicySnapshot) (
+	fixture, *runs.Service, fixturePorts, *fake.Executor,
+) {
+	t.Helper()
+	f := newPublishFixture(t)
+	svc, ports := newService(t, f, doc, snap)
+	ex := fake.NewExecutor()
+	ex.Remote(f.repoID, f.remote)
+	startOrchestrator(t, svc, ex, 30*time.Second)
+	return f, svc, ports, ex
+}
+
+func createGatedRun(t *testing.T, f fixture, svc *runs.Service) (fixture, runs.Run) {
+	t.Helper()
 	_, run, err := svc.CreateTask(context.Background(), principal(f), runs.NewTask{
 		RepoID: f.repoID, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: "gated",
 	})
@@ -135,7 +161,7 @@ func gatedRunAtItsGate(t *testing.T, doc runs.DefinitionDoc, snap runs.PolicySna
 		t.Fatal(err)
 	}
 	waitForRun(t, svc, run.ID, runs.RunWaiting)
-	return f, svc, run
+	return f, run
 }
 
 func TestDecideGate_ApproveMintsASingleUseAuthorizationBoundToTheExaminedArtifact(t *testing.T) {

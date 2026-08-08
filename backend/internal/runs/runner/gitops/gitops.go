@@ -47,6 +47,25 @@ type TypedError struct{ Outcome runs.Outcome }
 
 func (e TypedError) Error() string { return e.Outcome.Code + ": " + e.Outcome.Message }
 
+// AsOutcomeError rewraps a TypedError as the runs.OutcomeError the spine
+// classifies, and returns anything else untouched.
+//
+// It exists because runs.ClassifyOutcome matches runs.OutcomeError and nothing
+// else, and is default-deny: a TypedError handed to it straight becomes a
+// PERMANENT internal_error. For the publish path that is not cosmetic — it is
+// the difference between halting a conflicted marker for a human and killing
+// the run, and between retrying a rejected push and terminalizing a run whose
+// branch may already be on the forge. Every adapter that returns a gitops
+// error across the runs.GitPublisher port must call this; the runner's
+// container entrypoints do the equivalent through their report files.
+func AsOutcomeError(err error) error {
+	var te TypedError
+	if !errors.As(err, &te) {
+		return err
+	}
+	return runs.OutcomeError{Outcome: te.Outcome}
+}
+
 func typed(class runs.OutcomeClass, code, format string, args ...any) TypedError {
 	return TypedError{Outcome: runs.Outcome{Class: class, Code: code, Message: fmt.Sprintf(format, args...)}}
 }

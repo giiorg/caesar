@@ -424,6 +424,16 @@ CREATE TABLE publish_intents (
     tree_hash        text NOT NULL,
     title            text NOT NULL,
     body             text NOT NULL,
+    -- The commit's author identity, snapshotted when the intent is created.
+    --
+    -- It cannot be re-resolved per attempt. A commit sha hashes the author
+    -- identity, and recovery proves a receiptless branch is ours by rebuilding
+    -- the SAME sha (spec §3). The requester's address lives on a mutable users
+    -- row and the orchestrator caches it per process, so a restart — or an
+    -- address change between two attempts — would rebuild a DIFFERENT commit,
+    -- the adopt comparison would miss, and a crash-after-push would become a
+    -- permanent publish_conflict on a branch that is genuinely ours.
+    author_email     text NOT NULL,
     status           text NOT NULL CHECK (status IN ('pending', 'pushed', 'published', 'halted')),
     -- Receipts, each written in the transaction after its effect landed.
     head_sha         text,

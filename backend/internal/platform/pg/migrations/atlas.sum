@@ -1,4 +1,4 @@
-h1:oLrJjkSeHGNVlBq6vmFEC/3ASnVb9+9bF0ZvYFEaPXs=
+h1:qPbG0zJYOdGvS3ToZ4ND5K9jVpY+aQSP0CEWJb19WeM=
 20260802144555_identity_foundations.sql h1:soJ89UFIIeqE0af4lVMHTVbZAsc5LRA6CYcL4YXHEjg=
 20260803083633_assets_foundations.sql h1:KFrrQauaoe9vKmUieIGP4OmaCDetw5vJiQ/3OJRD4SI=
 20260803122250_workflow_definitions.sql h1:A1JMcaAFg2hw6L76oxi6K1vYJx7UN6tn9B8HeKj7hxc=
@@ -8,3 +8,4 @@ h1:oLrJjkSeHGNVlBq6vmFEC/3ASnVb9+9bF0ZvYFEaPXs=
 20260805123030_credential_leases.sql h1:ZHNG9MmRxvPOzebHRSQoGFysBTo+mrzKHaapahLz4gU=
 20260805171545_unique_lease_attempt.sql h1:O422waW1eDQuAvqOr5jIqhsRlkEcyG+friPF+KXsPq4=
 20260807125859_gates_and_publishing.sql h1:ZwsJaB2tujvZzh4b3IU9y1XZ4Om9W/M9edgsJFjzU4E=
+20260808144635_publish_author_email.sql h1:7B7b8VSxCQNtV0vj/Q6vHUC6SkuVtYEl9JZE6twKOxs=

@@ -90,6 +90,7 @@ type PublishIntent struct {
 	TreeHash        string
 	Title           string
 	Body            string
+	AuthorEmail     string
 	Status          string
 	HeadSha         pgtype.Text
 	PrNumber        pgtype.Int8

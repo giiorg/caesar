@@ -97,6 +97,12 @@ func (p spinePorts) Repo(_ context.Context, id uuid.UUID) (runs.RepoRef, error) 
 	}, nil
 }
 
+// Email is runs.PrincipalSource. The API suite never publishes, but loadPlan
+// and the publish path take the port, so a double has to exist.
+func (p spinePorts) Email(_ context.Context, userID uuid.UUID) (string, error) {
+	return userID.String() + "@example.com", nil
+}
+
 func (p spinePorts) HarnessByName(_ context.Context, name string) (runs.HarnessRef, error) {
 	if name != "cc" {
 		return runs.HarnessRef{}, xerrors.E(xerrors.ClassNotFound, "no such harness")
@@ -197,9 +203,9 @@ func newHarness(t *testing.T) *harness {
 
 	c := clock.NewFake(time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC))
 	ports := spinePorts{h: h}
-	forge := fake.Forge{Heads: map[uuid.UUID]string{h.repoID: "basesha0000000000000000000000000000000000"}}
+	forge := fake.NewForge(map[uuid.UUID]string{h.repoID: "basesha0000000000000000000000000000000000"})
 	svc := runs.NewService(pool, c, audit.NewRecorder(c), ports, ports, ports, forge,
-		runs.Params{Snapshot: runs.DefaultSnapshot()})
+		fake.NewPublisher(nil), ports, runs.Params{Snapshot: runs.DefaultSnapshot()})
 
 	mux := http.NewServeMux()
 	httpx.Mount(mux, runsapi.Operations(runsapi.New(svc, h.ports, h.ports, h.ports)))

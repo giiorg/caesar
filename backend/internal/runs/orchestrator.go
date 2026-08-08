@@ -64,6 +64,19 @@ type cachedPlan struct {
 	taskInputs map[string]any
 	baseSHA    string
 	repo       RepoRef
+	// The three a publication renders into its pull request. All immutable
+	// for a run's lifetime — a task's title and requester and the run's
+	// pinned definition hash cannot change — so caching them is honest.
+	//
+	// The requester's EMAIL is deliberately not among them: it lives on a
+	// mutable users row, and it is hashed into the publication's commit sha.
+	// A cached copy re-resolved after a restart could differ between two
+	// attempts of the same publication and break the rebuild that recovery
+	// adopts by. authorizePublish resolves it once and writes it to
+	// publish_intents.author_email, which is the durable authority thereafter.
+	taskTitle      string
+	definitionHash string
+	requesterID    uuid.UUID
 	// generation is NOT cached: it changes when a gate opens a revision, and
 	// a stale value would stamp the wrong marker on an artifact. It is read
 	// per use through generationOf.
@@ -279,6 +292,8 @@ func (o *Orchestrator) loadPlan(ctx context.Context, runID uuid.UUID) (cachedPla
 	cp := cachedPlan{
 		plan: plan, projectID: taskRow.ProjectID, taskInputs: inputs,
 		baseSHA: runRow.BaseSha, repo: repo,
+		taskTitle: taskRow.Title, definitionHash: runRow.DefinitionHash,
+		requesterID: taskRow.RequesterID,
 	}
 	o.planMu.Lock()
 	o.plans[runID] = cp
@@ -690,6 +705,23 @@ func (o *Orchestrator) reconcileAttempt(ctx context.Context, row reconcileRow, a
 		}
 	}
 
+	if cp.plan.Nodes[row.NodeID].Kind == KindGitPublish {
+		// A publication left a durable position behind; the Executor never
+		// saw this attempt and cannot answer for it. reconcile_lost is
+		// CHARGEABLE (outcome.go Chargeable), so routing a publish here would
+		// let three lost leases exhaust a node whose branch is already on the
+		// forge — terminalizing the run, superseding every phase, and leaving
+		// nothing that will ever reconcile the branch. That is the exact
+		// failure runPublish's invariant exists to forbid, entered by the one
+		// door runPublish does not guard.
+		o.evaluate(ctx, "", cp, claimedFromRow(row), PhaseReconciling, ExecutionResult{},
+			OutcomeError{Outcome: Outcome{
+				Class: OutcomeTransient, Code: CodePublishResumable,
+				Message: "publish attempt lost its lease; the intent carries the durable position",
+			}})
+		return
+	}
+
 	ins, err := o.exec.Inspect(ctx, ref)
 	if err != nil || !ins.Completed {
 		out := Outcome{Class: OutcomeTransient, Code: CodeReconcileLost, Message: "attempt lost its lease with no adoptable result"}
@@ -754,6 +786,14 @@ func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) 
 		o.log.Error("orchestrator: started event", "error", err)
 	}
 
+	if node.Kind == KindGitPublish {
+		// A publication is a control-plane effect with durable receipts, not
+		// something a container produces. It shares the claim, the lease, the
+		// heartbeat and the evaluation — only the middle differs.
+		o.executePublish(ctx, workerID, cp, c)
+		return
+	}
+
 	// Deadline = the tighter of the two clocks (spec §3 Budgets).
 	deadline := c.RunWallDeadline
 	if rem := RemainingBudgetMS(c.BudgetMS, c.UsedMS); rem > 0 {
@@ -764,7 +804,24 @@ func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) 
 	execCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	// Heartbeat until execution finishes; a fenced heartbeat cancels.
+	hbDone := o.startHeartbeat(execCtx, cancel, c, workerID)
+
+	req, err := o.buildRequest(ctx, cp, node, c.Ref, deadline)
+	var res ExecutionResult
+	if err == nil {
+		res, err = o.exec.Execute(execCtx, req)
+	}
+	close(hbDone)
+	o.evaluate(ctx, workerID, cp, c, PhaseRunning, res, err)
+}
+
+// startHeartbeat keeps the lease alive until the returned channel closes or
+// the attempt's context ends, and cancels the attempt the moment a heartbeat
+// comes back fenced. Both execution paths share it so neither can forget to
+// fence: a publication holds the same lease an agentic attempt does.
+func (o *Orchestrator) startHeartbeat(execCtx context.Context, cancel context.CancelFunc,
+	c claimed, workerID string,
+) chan struct{} {
 	hbDone := make(chan struct{})
 	go func() {
 		tick := time.NewTicker(o.cfg.HeartbeatInterval)
@@ -784,14 +841,7 @@ func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) 
 			}
 		}
 	}()
-
-	req, err := o.buildRequest(ctx, cp, node, c.Ref, deadline)
-	var res ExecutionResult
-	if err == nil {
-		res, err = o.exec.Execute(execCtx, req)
-	}
-	close(hbDone)
-	o.evaluate(ctx, workerID, cp, c, PhaseRunning, res, err)
+	return hbDone
 }
 
 // harnessBinding resolves the node's harness against the registry and with it

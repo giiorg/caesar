@@ -127,10 +127,11 @@ func TestRunnerE2E_TaskThroughRealContainerToPatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	heads := map[uuid.UUID]string{}
+	forge := fake.NewForge(map[uuid.UUID]string{})
 	runsSvc := runs.NewService(pool, clk, rec,
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		fake.Forge{Heads: heads}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		forge, fake.NewPublisher(nil), principalSource{svc: identitySvc},
+		runs.Params{Snapshot: runs.DefaultSnapshot()})
 
 	// The admin sets the stage through the real services.
 	project, err := assetsSvc.CreateProject(ctx, admin, "runner-e2e", "")
@@ -157,7 +158,7 @@ func TestRunnerE2E_TaskThroughRealContainerToPatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	heads[repo.ID] = headSHA
+	forge.Head(repo.ID, headSHA)
 
 	wf, err := workflowsSvc.CreateWorkflow(ctx, admin, "runner-e2e", "")
 	if err != nil {

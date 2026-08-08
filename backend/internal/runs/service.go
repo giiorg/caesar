@@ -32,15 +32,22 @@ type Service struct {
 	repos     RepoSource
 	harnesses HarnessSource
 	forge     Forge
-	params    Params
+	// publisher performs the git half of a publication. There is no
+	// not-implemented stub for it (baked decision 8): this plan wires a real
+	// one everywhere, and a stub would be dead code with no call site.
+	publisher  GitPublisher
+	principals PrincipalSource
+	params     Params
 }
 
 func NewService(pool *pgxpool.Pool, c clock.Clock, rec *audit.Recorder,
-	defs DefinitionSource, repos RepoSource, harnesses HarnessSource, forge Forge, p Params,
+	defs DefinitionSource, repos RepoSource, harnesses HarnessSource, forge Forge,
+	publisher GitPublisher, principals PrincipalSource, p Params,
 ) *Service {
 	return &Service{
 		pool: pool, clock: c, audit: rec, defs: defs, repos: repos,
-		harnesses: harnesses, forge: forge, params: p,
+		harnesses: harnesses, forge: forge, publisher: publisher,
+		principals: principals, params: p,
 	}
 }
 

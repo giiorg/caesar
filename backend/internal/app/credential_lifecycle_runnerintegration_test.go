@@ -119,10 +119,11 @@ func newRunnerEnv(t *testing.T, engine *dockerapi.Client, spec envSpec) *runnerE
 
 	assetsSvc := assets.NewService(pool, clk, rec, keys)
 	workflowsSvc := workflows.NewService(pool, clk, rec)
-	heads := map[uuid.UUID]string{}
+	forge := fake.NewForge(map[uuid.UUID]string{})
 	runsSvc := runs.NewService(pool, clk, rec,
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		fake.Forge{Heads: heads}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		forge, fake.NewPublisher(nil), principalSource{svc: identitySvc},
+		runs.Params{Snapshot: runs.DefaultSnapshot()})
 
 	project, err := assetsSvc.CreateProject(ctx, admin, spec.name, "")
 	if err != nil {
@@ -149,7 +150,7 @@ func newRunnerEnv(t *testing.T, engine *dockerapi.Client, spec envSpec) *runnerE
 	if err != nil {
 		t.Fatal(err)
 	}
-	heads[repo.ID] = spec.headSHA
+	forge.Head(repo.ID, spec.headSHA)
 
 	wf, err := workflowsSvc.CreateWorkflow(ctx, admin, spec.name, "")
 	if err != nil {

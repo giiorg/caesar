@@ -131,10 +131,11 @@ func TestGoldenSet_MonthOneLoopThroughRealRoutes(t *testing.T) {
 
 	// The runs service takes the production adapters but the fake forge
 	// and executor: deterministic head resolution and scripted phases.
-	heads := map[uuid.UUID]string{}
+	forge := fake.NewForge(map[uuid.UUID]string{})
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		fake.Forge{Heads: heads}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		forge, fake.NewPublisher(nil), principalSource{svc: identitySvc},
+		runs.Params{Snapshot: runs.DefaultSnapshot()})
 
 	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc))
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, identitySvc, identitySvc, identitySvc))...)
@@ -182,7 +183,7 @@ func TestGoldenSet_MonthOneLoopThroughRealRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	heads[repoID] = headSHA
+	forge.Head(repoID, headSHA)
 
 	var wf workflowsapi.WorkflowResponse
 	must(t, "create workflow", admin.do(t, http.MethodPost, "/api/v1/workflows",

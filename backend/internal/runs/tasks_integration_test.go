@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/authn"
@@ -27,6 +28,10 @@ type fixturePorts struct {
 	hash        string
 	harness     uuid.UUID
 	harnessCred uuid.UUID
+	// The two doubles a publication drives. They are handed back with the
+	// service so a test can inject into the very instances it wired.
+	forge     *fake.Forge
+	publisher *fake.Publisher
 }
 
 func (p fixturePorts) Definition(_ context.Context, workflowID uuid.UUID, version int32) (runs.PinnedDefinition, error) {
@@ -49,11 +54,29 @@ func (p fixturePorts) DefinitionByVersionID(_ context.Context, versionID uuid.UU
 	}, nil
 }
 
-func (p fixturePorts) Repo(_ context.Context, id uuid.UUID) (runs.RepoRef, error) {
-	if id != p.f.repoID {
+// Repo reads the REAL repos row rather than answering from constants, which
+// is what the production adapter does and what makes the mutable-repo half of
+// revalidateAuthorization testable at all: a rename or a moved default branch
+// has to be visible to the run for the refusal to have anything to refuse.
+func (p fixturePorts) Repo(ctx context.Context, id uuid.UUID) (runs.RepoRef, error) {
+	ref := runs.RepoRef{ID: id, ProjectID: p.f.projectID}
+	err := p.f.pool.QueryRow(ctx,
+		`SELECT forge_kind, slug, default_branch, credential_id FROM repos WHERE id = $1`, id,
+	).Scan(&ref.Forge, &ref.Slug, &ref.DefaultBranch, &ref.CredentialID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return runs.RepoRef{}, xerrors.E(xerrors.ClassNotFound, "no such repo")
 	}
-	return runs.RepoRef{ID: p.f.repoID, ProjectID: p.f.projectID, Forge: "github", Slug: "spine/repo", DefaultBranch: "main"}, nil
+	return ref, err
+}
+
+// Email is runs.PrincipalSource over the fixture's users table.
+func (p fixturePorts) Email(ctx context.Context, userID uuid.UUID) (string, error) {
+	var email string
+	err := p.f.pool.QueryRow(ctx, `SELECT email FROM users WHERE id = $1`, userID).Scan(&email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", xerrors.E(xerrors.ClassNotFound, "no such user")
+	}
+	return email, err
 }
 
 func (p fixturePorts) HarnessByName(_ context.Context, name string) (runs.HarnessRef, error) {
@@ -98,10 +121,24 @@ func gatedConveyorDoc() runs.DefinitionDoc {
 
 func newService(t *testing.T, f fixture, doc runs.DefinitionDoc, snap runs.PolicySnapshot) (*runs.Service, fixturePorts) {
 	t.Helper()
-	ports := fixturePorts{f: f, doc: doc, hash: "deadbeef", harness: uuid.Max, harnessCred: uuid.New()}
-	forge := fake.Forge{Heads: map[uuid.UUID]string{f.repoID: "basesha0000000000000000000000000000000000"}}
+	// A fixture with a real remote pins that remote's head; everything else
+	// keeps the synthetic literal its assertions were written against.
+	head := "basesha0000000000000000000000000000000000"
+	if f.baseSHA != "" {
+		head = f.baseSHA
+	}
+	forge := fake.NewForge(map[uuid.UUID]string{f.repoID: head})
+	publisher := fake.NewPublisher(nil)
+	if f.remote != "" {
+		forge.Remote(f.repoID, f.remote)
+		publisher.Remote(f.repoID, f.remote)
+	}
+	ports := fixturePorts{
+		f: f, doc: doc, hash: "deadbeef", harness: uuid.Max, harnessCred: uuid.New(),
+		forge: forge, publisher: publisher,
+	}
 	svc := runs.NewService(f.pool, clock.System{}, audit.NewRecorder(clock.System{}),
-		ports, ports, ports, forge, runs.Params{Snapshot: snap})
+		ports, ports, ports, forge, publisher, ports, runs.Params{Snapshot: snap})
 	return svc, ports
 }
 

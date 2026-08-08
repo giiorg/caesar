@@ -225,37 +225,83 @@ func executionCount(t *testing.T, f fixture, runID uuid.UUID, nodeID string) int
 	return n
 }
 
-// seedPublishIntent writes the publish_intents row Task 9 will write for real,
-// in whichever state that machine would have left it. Nothing in the tree
-// writes that table yet, so this exists only so Task 6 can exercise
-// openRevision's refusal against a live publication without waiting three
-// tasks for a publisher. The receipt columns follow the status, because each
-// one is written in the transaction after its effect landed: a pending intent
-// has no head sha, a pushed one has no pull request.
-func seedPublishIntent(t *testing.T, f fixture, runID uuid.UUID, nodeID string, authID uuid.UUID, status string) {
+// rewindIntentStatus walks the run's REAL publish intent back to an earlier
+// state of the same machine.
+//
+// Task 9 made the publication real, so the intent this run holds is already
+// 'published' by the time a later gate can be decided at all — the run cannot
+// reach 'waiting' while a publish phase is still live. Rewinding the row is
+// therefore the only way left to ask the refusal about 'pending' and 'pushed',
+// and it is a faithful question: those are states the machine really occupies,
+// and each one is exactly the window openRevision must refuse in. The receipt
+// columns follow the status, because each is written in the transaction after
+// its effect landed: a pending intent has no head sha, a pushed one has no
+// pull request.
+func rewindIntentStatus(t *testing.T, f fixture, runID uuid.UUID, nodeID, status string) {
 	t.Helper()
-	var headSHA, prURL *string
-	var prNumber *int64
-	if status == "pushed" || status == "published" {
-		sha := "headsha0000000000000000000000000000000000"
-		headSHA = &sha
+	tag, err := f.pool.Exec(context.Background(),
+		`UPDATE publish_intents SET status = $3,
+		        head_sha   = CASE WHEN $3 IN ('pushed', 'published') THEN head_sha END,
+		        pr_number  = CASE WHEN $3 = 'published' THEN pr_number END,
+		        pr_url     = CASE WHEN $3 = 'published' THEN pr_url END
+		 WHERE run_id = $1 AND node_id = $2`,
+		runID, nodeID, status)
+	if err != nil {
+		t.Fatalf("rewind %s intent to %s: %v", nodeID, status, err)
 	}
-	if status == "published" {
-		url, num := "https://example.invalid/pr/7", int64(7)
-		prURL, prNumber = &url, &num
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("rewind %s intent to %s: updated %d rows, want the one this run published",
+			nodeID, status, tag.RowsAffected())
 	}
-	if _, err := f.pool.Exec(context.Background(),
-		`INSERT INTO publish_intents (run_id, node_id, attempt, authorization_id, repo_id,
-		     forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash,
-		     title, body, status, head_sha, pr_number, pr_url, created_at, updated_at)
-		 SELECT $1, $2, 1, $3, r.id, r.forge_kind, r.slug, r.credential_id,
-		        'caesar/' || $2, r.default_branch, 'basesha0000000000000000000000000000000000',
-		        'treehash', 'seeded', '', $5, $6, $7, $8, now(), now()
-		 FROM repos r WHERE r.id = $4`,
-		runID, nodeID, authID, f.repoID, status, headSHA, prNumber, prURL,
-	); err != nil {
-		t.Fatalf("seed %s intent: %v", status, err)
+}
+
+// seedValidAuthorization writes an approved_patches row in the shape
+// mintAuthorization writes, for a publish node the run has NOT reached.
+//
+// It is seeded rather than driven, and the reason is worth stating: after
+// Task 9 a gate's approval is followed immediately by its publication, and a
+// run cannot be 'waiting' at another gate while a publish phase is live. So a
+// VALID (unspent) authorization and a decidable gate cannot coexist in this
+// plan's definitions — the authorization the publish consumed is 'consumed',
+// which InvalidateAuthorizations deliberately will not touch. The statement's
+// 'valid'-only predicate still has to hold for the definitions that will exist
+// later, and this is the only way to ask it.
+func seedValidAuthorization(t *testing.T, f fixture, runID uuid.UUID, gateNode, publishNode string) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	var artifactID uuid.UUID
+	if err := f.pool.QueryRow(ctx,
+		`SELECT id FROM artifacts WHERE run_id = $1 AND type = 'patch' ORDER BY created_at DESC LIMIT 1`,
+		runID).Scan(&artifactID); err != nil {
+		t.Fatalf("seed authorization: no patch artifact: %v", err)
 	}
+	var phaseID uuid.UUID
+	if err := f.pool.QueryRow(ctx,
+		`INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, status, generation, created_at)
+		 VALUES ($1, $2, 99, 3, 'succeeded', 1, now()) RETURNING id`,
+		runID, gateNode+"_seed").Scan(&phaseID); err != nil {
+		t.Fatalf("seed authorization: phase: %v", err)
+	}
+	var decisionID uuid.UUID
+	if err := f.pool.QueryRow(ctx,
+		`INSERT INTO gate_decisions (phase_run_id, run_id, node_id, generation, decision,
+		                             examined_artifact_id, acted_by, acted_at)
+		 VALUES ($1, $2, $3, 1, 'approve', $4, $5, now()) RETURNING id`,
+		phaseID, runID, gateNode, artifactID, f.userID).Scan(&decisionID); err != nil {
+		t.Fatalf("seed authorization: decision: %v", err)
+	}
+	var authID uuid.UUID
+	if err := f.pool.QueryRow(ctx,
+		`INSERT INTO approved_patches (run_id, gate_node_id, publish_node_id, gate_decision_id,
+		                               artifact_id, base_sha, tree_hash, repo_id, forge_kind,
+		                               repo_slug, target_branch, generation, status, created_at)
+		 SELECT $1, $2, $3, $4, $5, 'basesha0000000000000000000000000000000000', 'treehash',
+		        r.id, r.forge_kind, r.slug, r.default_branch, 1, 'valid', now()
+		 FROM repos r WHERE r.id = $6 RETURNING id`,
+		runID, gateNode, publishNode, decisionID, artifactID, f.repoID).Scan(&authID); err != nil {
+		t.Fatalf("seed authorization: approved patch: %v", err)
+	}
+	return authID
 }
 
 // auditDetailInt is auditDetailBool's numeric sibling; the revision path's
@@ -616,29 +662,31 @@ func hasPatchInput(req runs.ExecutionRequest, id uuid.UUID) bool {
 	return false
 }
 
-// A gate that approved, then a SECOND gate downstream that requests changes
-// back past it, must leave no spendable token behind.
-func TestRequestChanges_InvalidatesThePriorGenerationsAuthorization(t *testing.T) {
-	f, svc, run := gatedRunAtItsGate(t, twoGateDoc(), runs.DefaultSnapshot())
+// A revision must leave no spendable token behind: every LIVE authorization
+// the run holds is invalidated as the new generation opens (spec §2).
+//
+// It is driven against a seeded authorization, and Task 9 is why. Before it, a
+// gate could approve and its publish node would quietly succeed through the
+// fake executor, so a second gate downstream could still request changes with
+// the first gate's token unspent. Now the approval is followed by a real
+// publication: the token is CONSUMED — which InvalidateAuthorizations
+// deliberately will not touch — and openRevision refuses outright once any
+// intent exists (TestRequestChanges_RefusedOnceAPublicationHasSettled). A
+// valid authorization and a decidable gate no longer coexist in a run this
+// plan's definitions can produce, so the 'valid'-only predicate is asked
+// directly instead of through a shape that cannot happen.
+func TestRequestChanges_InvalidatesEveryLiveAuthorization(t *testing.T) {
+	f, svc, run := gatedRunAtItsGate(t, gatedConveyorDoc(), runs.DefaultSnapshot())
 	ctx := context.Background()
 
-	first, err := svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
-		RunID: run.ID, NodeID: "gate_one", Decision: runs.DecisionApprove,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.AuthorizationID == nil {
-		t.Fatal("gate_one authorizes publish_one")
-	}
-	waitForRun(t, svc, run.ID, runs.RunWaiting) // gate_two
+	authID := seedValidAuthorization(t, f, run.ID, "gate", "publish")
 
 	if _, err := svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
-		RunID: run.ID, NodeID: "gate_two", Decision: runs.DecisionRequestChanges, Note: "start over",
+		RunID: run.ID, NodeID: "gate", Decision: runs.DecisionRequestChanges, Note: "start over",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := authorization(t, f, *first.AuthorizationID).Status; got != "invalidated" {
+	if got := authorization(t, f, authID).Status; got != "invalidated" {
 		t.Fatalf("prior authorization status = %q, want invalidated: a newer generation invalidates it (spec §2)", got)
 	}
 }
@@ -649,12 +697,11 @@ func TestRequestChanges_InvalidatesThePriorGenerationsAuthorization(t *testing.T
 // authorizations does not help: the one that funded the publication is
 // CONSUMED, not valid.
 //
-// Nothing before Task 9 writes a publish_intents row, so this seeds the
-// settled one directly and exercises openRevision's refusal against it. The
-// END-TO-END proof of baked decision 17 — a real push and pull request
-// standing between two gates — is Task 9's
-// TestRequestChanges_RefusedOnceARunHasPublished. The split is deliberate, not
-// a gap: the code under test is this task's, only the driving is not.
+// gate_one's approval now drives a REAL publication — a push and a pull
+// request standing between two gates — so the 'published' case is end to end.
+// The other two are the same row walked back to the earlier states of the same
+// machine (rewindIntentStatus): a run cannot be waiting at gate_two while
+// publish_one is still live, so those windows are unobservable any other way.
 //
 // EVERY status refuses, 'pending' included, and each case is run because the
 // statement's own semantics turn on that: narrowing CountSettledPublications
@@ -678,7 +725,10 @@ func TestRequestChanges_RefusedOnceAPublicationHasSettled(t *testing.T) {
 				t.Fatal("gate_one authorizes publish_one")
 			}
 			waitForRun(t, svc, run.ID, runs.RunWaiting) // gate_two
-			seedPublishIntent(t, f, run.ID, "publish_one", *first.AuthorizationID, status)
+			if got := intentRow(t, f, run.ID, "publish_one").Status; got != "published" {
+				t.Fatalf("publish_one status = %q, want published: gate_one's approval publishes for real now", got)
+			}
+			rewindIntentStatus(t, f, run.ID, "publish_one", status)
 
 			_, err = svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
 				RunID: run.ID, NodeID: "gate_two", Decision: runs.DecisionRequestChanges, Note: "start over",
@@ -688,6 +738,12 @@ func TestRequestChanges_RefusedOnceAPublicationHasSettled(t *testing.T) {
 			}
 			if got := runGeneration(t, f, run.ID); got != 1 {
 				t.Errorf("generation = %d, want 1: the refused revision must open nothing", got)
+			}
+			// The published branch is untouched: no transaction in this
+			// process can un-push a commit, so the refusal must also not
+			// disturb the record of it.
+			if got := intentRow(t, f, run.ID, "publish_one").Status; got != status {
+				t.Errorf("publication status = %q, want it left alone at %q", got, status)
 			}
 			// The human still has both real answers available.
 			if _, err := svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{

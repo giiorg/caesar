@@ -13,17 +13,46 @@ import (
 	"testing"
 
 	"github.com/giiorg/caesar/backend/internal/runs"
-	"github.com/giiorg/caesar/backend/internal/runs/fake"
 )
 
+// stageFixture builds the bare repository every test in this package clones
+// from, with one deterministic seed commit.
+//
+// It is built here rather than borrowed from runs/fake, and that is now
+// structural rather than a preference: fake.Publisher implements
+// runs.GitPublisher over gitops.Publish, so `fake` imports THIS package —
+// and an internal test file here importing `fake` back is an import cycle
+// the test binary cannot link. A library's own fixtures should not reach into
+// the spine's port doubles anyway.
+//
+// Both identities and both dates are pinned, so the head sha is the same on
+// every machine.
 func stageFixture(t *testing.T) (remoteDir, headSHA string) {
 	t.Helper()
 	dir := t.TempDir()
-	sha, err := fake.InitBareRepo(dir)
+	work := filepath.Join(dir, "work")
+	bare := filepath.Join(dir, "bare.git")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("# golden set seed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := append(baseEnv(dir),
+		"GIT_AUTHOR_DATE=2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE=2026-01-01T00:00:00Z")
+	for _, args := range [][]string{
+		{"-C", work, "init", "-q", "-b", "main"},
+		{"-C", work, "add", "."},
+		{"-C", work, "commit", "-q", "-m", "seed"},
+		{"clone", "-q", "--bare", work, bare},
+	} {
+		mustGit(t, dir, env, args...)
+	}
+	out, err := runGit(t.Context(), bare, env, "rev-parse", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return filepath.Join(dir, "bare.git"), sha
+	return bare, strings.TrimSpace(out)
 }
 
 // stageInto stages a fresh attempt dir from an existing fixture remote, so a

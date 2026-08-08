@@ -114,7 +114,7 @@ func TestInspectReportsCompletedExecutions(t *testing.T) {
 
 func TestFakeForge(t *testing.T) {
 	id := uuid.Max
-	f := fake.Forge{Heads: map[uuid.UUID]string{id: "abc"}}
+	f := fake.NewForge(map[uuid.UUID]string{id: "abc"})
 	sha, err := f.ResolveHead(context.Background(), runs.RepoRef{ID: id})
 	if err != nil || sha != "abc" {
 		t.Errorf("ResolveHead = %q, %v", sha, err)
