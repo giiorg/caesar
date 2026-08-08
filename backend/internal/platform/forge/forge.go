@@ -78,11 +78,15 @@ func RetryAfter(err error) (time.Time, bool) {
 // permanent — which is what keeps "the token cannot do this" from retrying
 // until the wall deadline.
 //
-// GitLab is simpler and handled by the same helper: 429 with Retry-After, or
-// with the draft-spec pair RateLimit-Remaining / RateLimit-Reset — which GitHub
-// spells X-RateLimit-*. Both spellings are read for BOTH halves of that pair:
-// reading the reset un-prefixed but the remaining count prefixed would make the
-// GitLab branch unreachable and silently discard every reset GitLab states.
+// GitLab is simpler and handled by the same helper: 429 with Retry-After
+// (delta-seconds), or with the pair RateLimit-Remaining / RateLimit-Reset —
+// which GitHub spells X-RateLimit-*, and which both forges send as EPOCH
+// SECONDS, the form time.Unix reads below. The header name alone does not
+// settle those units: the IETF draft that shares it specifies a delta, and
+// GitLab's own delta/date sibling is RateLimit-ResetTime, which we do not read.
+// Both spellings are read for BOTH halves of that pair: reading the reset
+// un-prefixed but the remaining count prefixed would make the GitLab branch
+// unreachable and silently discard every reset GitLab states.
 func rateLimited(resp *http.Response, body []byte, now time.Time) (time.Time, bool) {
 	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
 		return time.Time{}, false

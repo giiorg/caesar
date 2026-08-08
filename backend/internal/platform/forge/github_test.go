@@ -128,10 +128,15 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 		body         string
 		wantRetry    bool
 		wantConflict bool
-		// wantAt is set only where the forge states an ABSOLUTE reset, which is
-		// the only kind that can be compared to a constant: a Retry-After of 60
-		// seconds is relative to a wall clock the test does not own.
+		// wantAt is set where the forge states an ABSOLUTE reset, which can be
+		// compared to a constant.
 		wantAt time.Time
+		// wantDelta is set where the forge states a RELATIVE one. That is still
+		// exact rather than approximate: the client reads its clock strictly
+		// between this test's `before` and `after`, so the instant it computes
+		// lies in [before+delta, after+delta] by construction, and all three
+		// carry monotonic readings, so no wall-clock jump can widen the window.
+		wantDelta time.Duration
 	}{
 		{name: "pr exists", status: http.StatusUnprocessableEntity, wantConflict: true},
 		// 403 is NOT a synonym for "permanently forbidden" on GitHub: both
@@ -147,8 +152,9 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 		},
 		{
 			name: "secondary limit as 403", status: http.StatusForbidden, wantRetry: true,
-			headers: map[string]string{"Retry-After": "60"},
-			body:    `{"message":"You have exceeded a secondary rate limit"}`,
+			headers:   map[string]string{"Retry-After": "60"},
+			body:      `{"message":"You have exceeded a secondary rate limit"}`,
+			wantDelta: 60 * time.Second,
 		},
 		{name: "too many requests", status: http.StatusTooManyRequests, wantRetry: true},
 		{name: "bad gateway", status: http.StatusBadGateway, wantRetry: true},
@@ -170,7 +176,11 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 			defer srv.Close()
 
 			cl := forge.NewGitHub(srv.URL, srv.Client())
+			// The bracket is what lets a relative reset be asserted exactly: the
+			// client's own time.Now() falls strictly inside it.
+			before := time.Now()
 			_, err := cl.CreatePullRequest(context.Background(), forge.Repo{Slug: "a/b"}, forge.Auth{Token: "t"}, forge.PullRequest{})
+			after := time.Now()
 			if err == nil {
 				t.Fatalf("status %d must error", c.status)
 			}
@@ -194,6 +204,17 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 				at, ok := forge.RetryAfter(err)
 				if !ok || !at.Equal(c.wantAt) {
 					t.Errorf("retry instant = %v (present=%v), want %v", at, ok, c.wantAt)
+				}
+			}
+			// A stated DELAY has to be added to the clock, not swallowed. Coming
+			// back at `now` retries into a window the forge just said is shut,
+			// and on a secondary limit re-requesting immediately is what makes
+			// the limit worse — the argument the table's own comment opens with.
+			if c.wantDelta > 0 {
+				at, ok := forge.RetryAfter(err)
+				if !ok || at.Before(before.Add(c.wantDelta)) || at.After(after.Add(c.wantDelta)) {
+					t.Errorf("retry instant = %v (present=%v), want now+%v, i.e. within [%v, %v]",
+						at, ok, c.wantDelta, before.Add(c.wantDelta), after.Add(c.wantDelta))
 				}
 			}
 		})
