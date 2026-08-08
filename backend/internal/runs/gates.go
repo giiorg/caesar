@@ -49,6 +49,13 @@ type GateDecisionInput struct {
 type GateDecisionResult struct {
 	DecisionID uuid.UUID
 	RunStatus  RunStatus
+	// Generation means two different things by design. Approve and reject
+	// report the generation DECIDED — the one the gate row carried, which is
+	// what the caller just acted on. request_changes reports the NEW
+	// generation the revision opened, because the decided one is already
+	// history by the time the transaction commits and the useful answer is
+	// "which round are we on now". Task 11's API contract has to pick a name
+	// per path rather than assume one meaning.
 	Generation int32
 	// AuthorizationID is set only when the approval authorizes a publish.
 	AuthorizationID *uuid.UUID
@@ -378,13 +385,6 @@ type revisionContext struct {
 	projectID     uuid.UUID
 	correlationID string
 	now           time.Time
-}
-
-// openRevision is Task 6. Until then it refuses rather than approving-by-
-// accident: a stub that returned nil would silently drop the human's
-// decision (decisions §6.13, stubs never fake success).
-func (s *Service) openRevision(context.Context, pgx.Tx, revisionContext, *GateDecisionResult) error {
-	return xerrors.Wrap(xerrors.ClassInvalid, "request_changes arrives in Task 6", xerrors.ErrNotImplemented)
 }
 
 // WaitingGate is one attention item: a gate somebody has to decide.

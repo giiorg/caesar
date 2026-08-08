@@ -1713,6 +1713,52 @@ func (q *Queries) ListRunsForTask(ctx context.Context, taskID uuid.UUID) ([]Run,
 	return items, nil
 }
 
+const listSeedArtifacts = `-- name: ListSeedArtifacts :many
+SELECT id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at FROM artifacts
+WHERE run_id = $1 AND node_id = $2 AND attempt = 0
+  AND generation = (SELECT generation FROM runs WHERE id = $1)
+ORDER BY type, id
+`
+
+type ListSeedArtifactsParams struct {
+	RunID  uuid.UUID
+	NodeID string
+}
+
+// What a revision handed this node. attempt = 0 is unreachable for a
+// produced artifact (phase attempts start at 1), so the ordinal alone
+// distinguishes a control-plane seed from a harness output. Only the newest
+// generation's seeds are returned: an older round's note is spent.
+func (q *Queries) ListSeedArtifacts(ctx context.Context, arg ListSeedArtifactsParams) ([]Artifact, error) {
+	rows, err := q.db.Query(ctx, listSeedArtifacts, arg.RunID, arg.NodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Artifact
+	for rows.Next() {
+		var i Artifact
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Attempt,
+			&i.Generation,
+			&i.Type,
+			&i.Payload,
+			&i.ParentIds,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSucceededNodes = `-- name: ListSucceededNodes :many
 SELECT node_id FROM (
     SELECT DISTINCT ON (node_id) node_id, status

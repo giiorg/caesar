@@ -21,6 +21,11 @@ const (
 	ArtifactKindReviewVerdict   = "review_verdict"
 	ArtifactKindLogRef          = "log_ref"
 	ArtifactKindFailureSnapshot = "failure_snapshot"
+	// Plan 08 runtime outputs. Neither is an edge binding: the definitions
+	// validator only knows plan/patch/review_verdict, and both of these are
+	// written by the control plane rather than produced by a harness.
+	ArtifactKindPublication = "publication"
+	ArtifactKindGateNote    = "gate_note"
 )
 
 func validNodeKind(k string) bool {

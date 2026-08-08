@@ -794,38 +794,54 @@ func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) 
 	o.evaluate(ctx, workerID, cp, c, PhaseRunning, res, err)
 }
 
+// harnessBinding resolves the node's harness against the registry and with it
+// the credential this attempt is pinned to for its whole life. A node that
+// declares no harness binds nothing and that is not an error.
+//
+// It is a function of its own because it is the one part of request assembly
+// that touches no run rows: the rest of buildRequest reads artifacts through
+// the pool, so keeping this callable on its own is what lets the
+// gone-vs-unreachable distinction below be pinned without a database.
+func (o *Orchestrator) harnessBinding(ctx context.Context, node PlanNode) (uuid.UUID, CredentialBinding, error) {
+	if node.Harness == "" {
+		return uuid.Nil, CredentialBinding{}, nil
+	}
+	h, err := o.svc.harnesses.HarnessByName(ctx, node.Harness)
+	// Only a harness that is genuinely GONE is permanent: retrying finds
+	// the same nothing, so the node dies naming what an operator has to
+	// re-register. Everything else here is the database being briefly
+	// unreachable, and this resolution is two round trips wide — the row
+	// and the credential kind it pins (app/runsports.go) — so a pool
+	// timeout on either would otherwise kill the node permanently and tell
+	// the operator something that is not true.
+	switch {
+	case err != nil && xerrors.ClassOf(err) == xerrors.ClassNotFound:
+		return uuid.Nil, CredentialBinding{}, OutcomeError{Outcome: Outcome{
+			Class: OutcomePermanent, Code: CodeHarnessError,
+			Message: fmt.Sprintf("harness %q no longer registered", node.Harness),
+		}}
+	case err != nil:
+		return uuid.Nil, CredentialBinding{}, OutcomeError{Outcome: Outcome{
+			Class: OutcomeTransient, Code: CodeInternalError,
+			Message: fmt.Sprintf("resolve harness %q: %v", node.Harness, err),
+		}}
+	}
+	return h.ID, CredentialBinding{ID: h.CredentialID, Kind: h.CredentialKind}, nil
+}
+
 // buildRequest assembles explicit inputs: latest artifacts of each input
-// origin, harness resolved fresh against the registry — and with it the
-// credential binding this attempt is pinned to for its whole life.
+// origin, the seeds a revision handed this node, and the harness binding.
 func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node PlanNode, ref AttemptRef, deadline time.Time) (ExecutionRequest, error) {
 	req := ExecutionRequest{
 		Ref: ref, Kind: node.Kind, Repo: cp.repo, Instructions: node.Instructions,
 		TaskInputs: cp.taskInputs, BaseSHA: cp.baseSHA, Deadline: deadline,
 	}
-	if node.Harness != "" {
-		h, err := o.svc.harnesses.HarnessByName(ctx, node.Harness)
-		// Only a harness that is genuinely GONE is permanent: retrying finds
-		// the same nothing, so the node dies naming what an operator has to
-		// re-register. Everything else here is the database being briefly
-		// unreachable, and this resolution is two round trips wide — the row
-		// and the credential kind it pins (app/runsports.go) — so a pool
-		// timeout on either would otherwise kill the node permanently and tell
-		// the operator something that is not true.
-		switch {
-		case err != nil && xerrors.ClassOf(err) == xerrors.ClassNotFound:
-			return ExecutionRequest{}, OutcomeError{Outcome: Outcome{
-				Class: OutcomePermanent, Code: CodeHarnessError,
-				Message: fmt.Sprintf("harness %q no longer registered", node.Harness),
-			}}
-		case err != nil:
-			return ExecutionRequest{}, OutcomeError{Outcome: Outcome{
-				Class: OutcomeTransient, Code: CodeInternalError,
-				Message: fmt.Sprintf("resolve harness %q: %v", node.Harness, err),
-			}}
-		}
-		req.HarnessID = h.ID
-		req.Credential = CredentialBinding{ID: h.CredentialID, Kind: h.CredentialKind}
+	harnessID, binding, err := o.harnessBinding(ctx, node)
+	if err != nil {
+		return ExecutionRequest{}, err
 	}
+	req.HarnessID, req.Credential = harnessID, binding
+
 	q := store.New(o.svc.pool)
 	for _, in := range node.Inputs {
 		row, err := q.GetNodeArtifact(ctx, store.GetNodeArtifactParams{
@@ -840,7 +856,55 @@ func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node Pla
 		}
 		req.Inputs = append(req.Inputs, ArtifactInput{ID: row.ID, Type: row.Type, Payload: payload})
 	}
+
+	// Seeded inputs: what a revision handed this node. They are stored at the
+	// node's OWN id with attempt 0, so a successor's structural lookup can
+	// never mistake them for a produced artifact of an ancestor.
+	seeds, err := q.ListSeedArtifacts(ctx, store.ListSeedArtifactsParams{
+		RunID: ref.RunID, NodeID: ref.NodeID,
+	})
+	if err != nil {
+		return ExecutionRequest{}, fmt.Errorf("runs: seed artifacts for %s: %w", ref.NodeID, err)
+	}
+	for _, row := range seeds {
+		payload, err := unmarshalMap(row.Payload)
+		if err != nil {
+			return ExecutionRequest{}, err
+		}
+		req.Inputs = append(req.Inputs, ArtifactInput{ID: row.ID, Type: row.Type, Payload: payload})
+	}
+
+	// One patch reaches a phase, ever (Plan 07's cumulative-patch contract):
+	// every runner-produced patch diffs from the run's base and subsumes its
+	// ancestors, so a chain would double-apply. A seeded patch is strictly
+	// newer than any structural one, so it displaces it. This has to be the
+	// LAST statement: the helper keeps the last patch appended, which is the
+	// seed only because the seed loop above has already run.
+	req.Inputs = collapsePatchInputs(req.Inputs)
 	return req, nil
+}
+
+// collapsePatchInputs keeps at most one patch input: the last one appended,
+// which is the seed when a revision supplied one and the structural binding
+// otherwise. Non-patch inputs pass through untouched and in order.
+func collapsePatchInputs(in []ArtifactInput) []ArtifactInput {
+	lastPatch := -1
+	for i, a := range in {
+		if a.Type == ArtifactKindPatch {
+			lastPatch = i
+		}
+	}
+	if lastPatch < 0 {
+		return in
+	}
+	out := make([]ArtifactInput, 0, len(in))
+	for i, a := range in {
+		if a.Type == ArtifactKindPatch && i != lastPatch {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // evaluate is THE outcome transaction (spec §3 exhaustion never strands
@@ -898,6 +962,23 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 		if err == nil {
 			parentIDs = append(parentIDs, row.ID.String())
 		}
+	}
+	// A revised output descends from what the revision handed this node too:
+	// the patch the gate examined and the note. buildRequest fed both to the
+	// attempt, so leaving them out of parent_ids would record a lineage the
+	// execution did not have.
+	//
+	// The statement's `generation = (SELECT generation FROM runs WHERE id=$1)`
+	// subquery reads the same value this transaction is stamping the rows
+	// with: generationOf above already holds the run row under GetRunForUpdate.
+	seeds, err := q.ListSeedArtifacts(ctx, store.ListSeedArtifactsParams{
+		RunID: c.Ref.RunID, NodeID: c.Ref.NodeID,
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, s := range seeds {
+		parentIDs = append(parentIDs, s.ID.String())
 	}
 	if parentIDs == nil {
 		parentIDs = []string{}
@@ -1072,8 +1153,9 @@ func anyRunnablePhase(rows []store.PhaseRun, exclude uuid.UUID) bool {
 // above is still uncommitted; and no other transaction can be excluding it,
 // because that same CAS admits exactly one evaluator of this row. So the run
 // cannot read 'waiting' here. The CAS is written out rather than omitted so
-// the rule stays symmetric for Task 6, which rewrites this pass for revisions.
-// A zero row count is the expected outcome there, and in the park direction it
+// the rule stays symmetric: readiness answers "is this run waiting" and this
+// pass writes that answer down, whichever way it came out. A zero row count in
+// the un-park direction is the expected outcome, and in the park direction it
 // means the run was already parked or was terminalized under us — success in
 // both cases, never a conflict.
 func (o *Orchestrator) syncWaiting(ctx context.Context, tx pgx.Tx, runID uuid.UUID, waiting bool) error {

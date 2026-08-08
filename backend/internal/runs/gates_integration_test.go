@@ -430,10 +430,9 @@ func TestDecideGate_GateWithoutAPublishAuthorizesNothingAndStillResumesTheRun(t 
 	waitForRun(t, svc, run.ID, runs.RunSucceeded)
 }
 
-// Input validation happens before any row is read, and request_changes is
-// Task 6's: it must REFUSE rather than quietly approve-by-accident
-// (decisions §6.13, stubs never fake success).
-func TestDecideGate_ValidationAndTheRequestChangesStub(t *testing.T) {
+// Input validation happens before any row is read, so a malformed decision
+// leaves the gate exactly as it found it.
+func TestDecideGate_ValidationRefusesBeforeAnyRowIsRead(t *testing.T) {
 	f, svc, run := gatedRunAtItsGate(t, gatedConveyorDoc(), runs.DefaultSnapshot())
 	ctx := context.Background()
 
@@ -478,14 +477,6 @@ func TestDecideGate_ValidationAndTheRequestChangesStub(t *testing.T) {
 				t.Errorf("fields = %+v, want one blaming %q", xe.Fields, tc.field)
 			}
 		})
-	}
-
-	// A well-formed request_changes gets as far as the stub and stops there.
-	_, err := svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
-		RunID: run.ID, NodeID: "gate", Decision: runs.DecisionRequestChanges, Note: "narrow the diff",
-	})
-	if !errors.Is(err, xerrors.ErrNotImplemented) {
-		t.Fatalf("request_changes err = %v, want not-implemented until Task 6", err)
 	}
 
 	// None of the above wrote anything: the gate is still awaiting a decision.

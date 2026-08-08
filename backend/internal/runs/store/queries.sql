@@ -246,6 +246,16 @@ WHERE run_id = $1 AND node_id = $2 AND type = $3
 ORDER BY generation DESC, attempt DESC, created_at DESC, id DESC
 LIMIT 1;
 
+-- name: ListSeedArtifacts :many
+-- What a revision handed this node. attempt = 0 is unreachable for a
+-- produced artifact (phase attempts start at 1), so the ordinal alone
+-- distinguishes a control-plane seed from a harness output. Only the newest
+-- generation's seeds are returned: an older round's note is spent.
+SELECT * FROM artifacts
+WHERE run_id = $1 AND node_id = $2 AND attempt = 0
+  AND generation = (SELECT generation FROM runs WHERE id = $1)
+ORDER BY type, id;
+
 -- name: ListArtifactsForRun :many
 SELECT id, run_id, node_id, attempt, type, parent_ids, created_at
 FROM artifacts WHERE run_id = $1 ORDER BY created_at, id;

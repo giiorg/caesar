@@ -387,3 +387,34 @@ func TestGetNodeArtifact_PrefersTheNewerGenerationOverTheNewerTimestamp(t *testi
 		t.Fatalf("want the generation-2 patch %v, got %v (generation %d)", current, got.ID, got.Generation)
 	}
 }
+
+// A revision seed and the patch the new attempt produces share a GENERATION,
+// so `generation DESC` cannot separate them — `attempt DESC` does. The seed is
+// written from the DATABASE clock inside the decision transaction and the
+// produced row from the injected application clock, so stamp the seed LATER
+// here: that is the skew a host running behind the database produces, and
+// ordering on created_at would then hand the gate the content the agent
+// already replaced.
+func TestGetNodeArtifact_PrefersTheProducedAttemptOverItsGenerationMateSeed(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.New(t)
+	runID := seedRun(ctx, t, pool)
+	q := store.New(pool)
+
+	now := time.Now().UTC()
+	produced := mustInsertArtifactAt(ctx, t, pool, runID, "implement", 2, 2, "patch", now.Add(-time.Hour))
+	seed := mustInsertArtifactAt(ctx, t, pool, runID, "implement", 0, 2, "patch", now)
+
+	got, err := q.GetNodeArtifact(ctx, store.GetNodeArtifactParams{
+		RunID: runID, NodeID: "implement", Type: "patch",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID == seed {
+		t.Fatal("GetNodeArtifact returned the attempt-0 revision seed: selection is ordering on a clock, not on provenance")
+	}
+	if got.ID != produced || got.Attempt != 2 {
+		t.Fatalf("want the produced patch %v, got %v (attempt %d)", produced, got.ID, got.Attempt)
+	}
+}
