@@ -26,9 +26,12 @@ func TestPublish_CreatesTheBranchAndCommitsWithTheHumanAsAuthor(t *testing.T) {
 	dir := t.TempDir()
 	patch := addFilePatch("NEW.md", "hello\n")
 	// Every git command Publish runs sees a non-UTC local zone, so a date
-	// layout that dropped its offset would be interpreted in Tokyo time and the
-	// %aI assertions below would catch it on a UTC host too.
-	pinGitLocalZone(t, "Asia/Tokyo")
+	// layout that dropped its offset would be interpreted in that zone and the
+	// %aI assertions below would catch it on a UTC host too. The zone is a
+	// POSIX TZ string, not "Asia/Tokyo": a name needs a zoneinfo database, and
+	// on an image without one git falls back to UTC WITHOUT erroring — the pin
+	// would evaporate, the mutant would survive, and the test would stay green.
+	pinGitLocalZone(t, "JST-9")
 
 	rep, err := Publish(t.Context(), dir, PublishInput{
 		CloneURL: remote, BaseSHA: base, Branch: "caesar/" + uuid.NewString(),
@@ -392,8 +395,9 @@ func TestPublish_AClonePersistingAuthIsRefusedBeforeAnythingIsBuilt(t *testing.T
 	patch := addFilePatch("NEW.md", "hello\n")
 	tree := approvedTree(t, remote, base, patch)
 	plantAuthConfigAfterClone(t, "Authorization: Basic c3VwZXJzZWNyZXQ=")
+	dir := t.TempDir()
 
-	_, err := Publish(t.Context(), t.TempDir(), PublishInput{
+	_, err := Publish(t.Context(), dir, PublishInput{
 		CloneURL: remote, BaseSHA: base, Branch: "caesar/" + uuid.NewString(),
 		TreeHash: tree, Patch: patch, Message: "m",
 		AuthorName: "a", AuthorEmail: "a@x", Date: publishTestDate,
@@ -410,6 +414,17 @@ func TestPublish_AClonePersistingAuthIsRefusedBeforeAnythingIsBuilt(t *testing.T
 	}
 	if got := gitOut(t, remote, "branch", "--list", "caesar/*"); got != "" {
 		t.Fatalf("nothing may be pushed after this refusal; remote has %q", got)
+	}
+	// The two above pin the refusal; these two pin its PLACEMENT, which is the
+	// guard's whole point and the half a "does the helper work" unit test can
+	// never reach. Without them the guard could be moved to the last statement
+	// of publishPrepare — a full commit built inside a checkout that was never
+	// proven credential-free — and nothing in the package would notice.
+	if _, statErr := os.Stat(filepath.Join(dir, publishPatchFile)); !os.IsNotExist(statErr) {
+		t.Error("the credential proof must come before anything of ours is written into the checkout")
+	}
+	if got := gitOut(t, filepath.Join(dir, publishRepoDir), "branch", "--list", "caesar/*"); got != "" {
+		t.Errorf("the checkout already carries %q; the guard ran after the branch was created", got)
 	}
 }
 

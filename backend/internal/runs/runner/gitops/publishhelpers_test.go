@@ -89,6 +89,10 @@ const unreachedTree = "1111111111111111111111111111111111111111"
 // falsifiable on a host that is not already UTC: a zone-less date layout would
 // be interpreted in local time and still render as +00:00 under TZ=UTC, so the
 // assertion would pass on exactly the machines CI runs on.
+//
+// tz must be a POSIX TZ string ("JST-9"), never a zone NAME ("Asia/Tokyo"):
+// a name that no zoneinfo database can resolve makes git fall back to UTC
+// silently, which would undo the pin without failing anything.
 func pinGitLocalZone(t *testing.T, tz string) {
 	t.Helper()
 	orig := runGitFn
