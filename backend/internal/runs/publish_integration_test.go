@@ -499,6 +499,16 @@ func TestPublish_ARunTerminalizedBetweenTheClaimAndTheAuthorizeGetsNoPublication
 
 // waitForPhaseLeavesRunning returns once the node's newest attempt row is
 // anything but 'running' — settled, or requeued behind a successor.
+func runStatus(t *testing.T, f fixture, runID uuid.UUID) string {
+	t.Helper()
+	var status string
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT status FROM runs WHERE id = $1`, runID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	return status
+}
+
 func waitForPhaseLeavesRunning(t *testing.T, f fixture, runID uuid.UUID, nodeID string, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -721,6 +731,9 @@ func waitForPhaseAttempt(t *testing.T, f fixture, runID uuid.UUID, nodeID string
 		).Scan(&got)
 		if err == nil && got >= want {
 			return
+		}
+		if st := runStatus(t, f, runID); st == "failed" || st == "dead" {
+			t.Fatalf("the run died (%s) before %s reached attempt %d: its failures were charged", st, nodeID, want)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
