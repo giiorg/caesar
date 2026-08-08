@@ -481,10 +481,11 @@ func TestPublish_ARunTerminalizedBetweenTheClaimAndTheAuthorizeGetsNoPublication
 		t.Fatal(err)
 	}
 
-	// The attempt discovers the dead run and requeues UNCHARGED — a successor
-	// row appears and is never claimable, because the claim predicate refuses
-	// a failed run.
-	waitForPhaseAttempt(t, p.f, p.run.ID, "publish", 2, 30*time.Second)
+	// The attempt discovers the dead run and requeues UNCHARGED. Waiting for
+	// it to stop RUNNING rather than for its successor is what makes the
+	// assertions below the ones that fire: without the guard this attempt
+	// succeeds instead, and there is no successor to wait for.
+	waitForPhaseLeavesRunning(t, p.f, p.run.ID, "publish", 30*time.Second)
 	if _, ok := tryIntentRow(t, p.f, p.run.ID, "publish"); ok {
 		t.Fatal("a publication began against a run that is not running: nothing will ever reconcile its branch")
 	}
@@ -494,6 +495,23 @@ func TestPublish_ARunTerminalizedBetweenTheClaimAndTheAuthorizeGetsNoPublication
 	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
 		t.Errorf("chargeable failures = %d, want 0: the publication never began, so it spent nothing", got)
 	}
+}
+
+// waitForPhaseLeavesRunning returns once the node's newest attempt row is
+// anything but 'running' — settled, or requeued behind a successor.
+func waitForPhaseLeavesRunning(t *testing.T, f fixture, runID uuid.UUID, nodeID string, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		var got string
+		if err := f.pool.QueryRow(context.Background(),
+			`SELECT status FROM phase_runs WHERE run_id = $1 AND node_id = $2
+			 ORDER BY attempt DESC LIMIT 1`, runID, nodeID).Scan(&got); err == nil && got != "running" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s never left running", nodeID)
 }
 
 func waitForPhaseStatus(t *testing.T, f fixture, runID uuid.UUID, nodeID, want string, d time.Duration) {
