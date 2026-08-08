@@ -31,8 +31,9 @@ type Forge struct {
 	prs    map[string][]runs.PullRequestRef // head branch -> requests on it
 	nextPR int64
 
-	openPRs      int
-	branchProbes int
+	openPRs        int
+	createAttempts int
+	branchProbes   int
 
 	crashAfterPR bool
 	failPRTimes  int
@@ -115,6 +116,7 @@ func (f *Forge) BranchHead(_ context.Context, repo runs.RepoRef, branch string) 
 
 func (f *Forge) OpenPullRequest(ctx context.Context, repo runs.RepoRef, spec runs.PullRequestSpec) (runs.PullRequestRef, error) {
 	f.mu.Lock()
+	f.createAttempts++
 	if f.failPRTimes > 0 {
 		f.failPRTimes--
 		code := f.failPRCode
@@ -240,6 +242,18 @@ func (f *Forge) SeedPullRequest(headBranch string, ref runs.PullRequestRef) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.prs[headBranch] = append(f.prs[headBranch], ref)
+}
+
+// CreateAttemptCount is how many creates were ATTEMPTED, refusals included.
+//
+// It is the only way to see whether the machine asked before it acted: a forge
+// that refuses a duplicate reaches the same verdict either way, so no outcome
+// assertion can tell "we found the stranger's request and stopped" from "we
+// tried to open one and were told no".
+func (f *Forge) CreateAttemptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.createAttempts
 }
 
 // OpenPRCount is how many creates the forge ACCEPTED, refusals excluded.

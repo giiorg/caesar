@@ -690,8 +690,9 @@ func TestPublish_AForeignPullRequestOnOurMarkerHaltsForAHuman(t *testing.T) {
 	if intent.Status != "halted" || intent.HaltReason == nil || *intent.HaltReason == "" {
 		t.Fatalf("the intent must halt with a reason a human can act on: %+v", intent)
 	}
-	if got := p.forge().OpenPRCount(); got != 0 {
-		t.Errorf("the forge accepted %d creates, want 0: a marker we cannot claim is a human's call", got)
+	if got := p.forge().CreateAttemptCount(); got != 0 {
+		t.Errorf("the forge saw %d create attempts, want 0: the find comes first, unconditionally, "+
+			"and a marker we cannot claim is a human's call before anything is tried", got)
 	}
 	if got := p.forge().PullRequestCount(intent.Branch); got != 1 {
 		t.Errorf("pull requests on %s = %d, want the one stranger's left alone", intent.Branch, got)
