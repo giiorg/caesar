@@ -11,6 +11,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/giiorg/caesar/backend/internal/platform/testdb"
@@ -476,5 +477,79 @@ func TestGetNodeArtifact_PrefersTheProducedAttemptOverItsGenerationMateSeed(t *t
 	}
 	if got.ID != produced || got.Attempt != 2 {
 		t.Fatalf("want the produced patch %v, got %v (attempt %d)", produced, got.ID, got.Attempt)
+	}
+}
+
+// The absence stamp an expired run's settlement takes is scoped to the marker
+// its status makes uncertain: the BRANCH while 'pending', the PULL REQUEST once
+// 'pushed'. Nothing else in the schema says so, which is why the receipt has to
+// clear it.
+//
+// Left behind, a stamp taken while pending is already older than the grace when
+// the pull-request half first probes — so the very first PR-absence sighting
+// halts an intent whose create call may still be on the wire, skipping the
+// entire grace the 'pushed' arm exists for. The receipt is also the proof the
+// stamp was wrong: the branch turned up.
+func TestPublishIntents_ARecordedReceiptClearsTheAbsenceStamp(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.New(t)
+	q := store.New(pool)
+	runID, authID, repoID, credID := seedRunWithAuthorization(ctx, t, pool)
+
+	var intentID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO publish_intents (run_id, node_id, attempt, authorization_id, repo_id,
+		                             forge_kind, repo_slug, credential_id,
+		                             branch, target_branch, base_sha, tree_hash, title, body,
+		                             author_email, commit_message, status, created_at, updated_at)
+		VALUES ($1,'publish',1,$2,$3,'github','acme/widgets',$4,
+		        'caesar/publish','main','abc','def','t','b','who@example.com','m','pending',now(),now())
+		RETURNING id`,
+		runID, authID, repoID, credID,
+	).Scan(&intentID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Settlement finds no branch and stamps the first sighting.
+	n, err := q.MarkPublicationAbsent(ctx, store.MarkPublicationAbsentParams{ID: intentID, Status: "pending"})
+	if err != nil || n != 1 {
+		t.Fatalf("first absence sighting: rows=%d err=%v, want 1", n, err)
+	}
+	// Never refreshed: the grace measures from the FIRST sighting, or it would
+	// be pushed away forever and the intent would never settle.
+	if n, err = q.MarkPublicationAbsent(ctx, store.MarkPublicationAbsentParams{ID: intentID, Status: "pending"}); err != nil || n != 0 {
+		t.Fatalf("second absence sighting: rows=%d err=%v, want 0", n, err)
+	}
+
+	// The push turns up after all, and a live driver records it.
+	if n, err = q.RecordPushReceipt(ctx, store.RecordPushReceiptParams{
+		ID: intentID, HeadSha: pgtype.Text{String: "cafe", Valid: true}, UpdatedAt: time.Now().UTC(),
+	}); err != nil || n != 1 {
+		t.Fatalf("push receipt: rows=%d err=%v, want 1", n, err)
+	}
+	var absent *time.Time
+	if err := pool.QueryRow(ctx, `SELECT absent_since FROM publish_intents WHERE id = $1`, intentID).Scan(&absent); err != nil {
+		t.Fatal(err)
+	}
+	if absent != nil {
+		t.Fatalf("absent_since = %v after the receipt, want NULL: the branch turned up", absent)
+	}
+
+	// So the FIRST pull-request-absence probe cannot halt: the grace has not
+	// started, let alone elapsed.
+	reason := "expired after pushing: no pull request on the forge after the settle grace"
+	if n, err = q.HaltStablyAbsentPublication(ctx, store.HaltStablyAbsentPublicationParams{
+		ID: intentID, HaltReason: pgtype.Text{String: reason, Valid: true},
+		Status: "pushed", GraceSeconds: 30,
+	}); err != nil || n != 0 {
+		t.Fatalf("first PR-absence probe halted rows=%d (err=%v), want 0: the pull-request grace "+
+			"was skipped by a stamp taken while the intent was still pending", n, err)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM publish_intents WHERE id = $1`, intentID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pushed" {
+		t.Fatalf("intent status = %q, want pushed", status)
 	}
 }

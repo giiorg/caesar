@@ -246,6 +246,21 @@ func (q *Queries) ClaimStuckReconciling(ctx context.Context, arg ClaimStuckRecon
 	return items, nil
 }
 
+const clearPublicationAbsent = `-- name: ClearPublicationAbsent :execrows
+UPDATE publish_intents SET absent_since = NULL, updated_at = now()
+WHERE id = $1 AND absent_since IS NOT NULL
+`
+
+// The marker turned up. Whatever we thought was missing is not, and the next
+// absence starts its grace from scratch.
+func (q *Queries) ClearPublicationAbsent(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, clearPublicationAbsent, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const consumeAuthorization = `-- name: ConsumeAuthorization :execrows
 UPDATE approved_patches SET status = 'consumed', settled_at = $2
 WHERE approved_patches.id = $1 AND approved_patches.status = 'valid'
@@ -988,6 +1003,82 @@ type HaltPublishIntentParams struct {
 // loser of the race never reaches this statement at all.
 func (q *Queries) HaltPublishIntent(ctx context.Context, arg HaltPublishIntentParams) (int64, error) {
 	result, err := q.db.Exec(ctx, haltPublishIntent, arg.ID, arg.HaltReason, arg.UpdatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const haltStablyAbsentPublication = `-- name: HaltStablyAbsentPublication :execrows
+UPDATE publish_intents SET status = 'halted', halt_reason = $1, updated_at = now()
+WHERE id = $2 AND status = $3
+  AND absent_since IS NOT NULL
+  AND absent_since <= now() - make_interval(secs => $4::int)
+`
+
+type HaltStablyAbsentPublicationParams struct {
+	HaltReason   pgtype.Text
+	ID           uuid.UUID
+	Status       string
+	GraceSeconds int32
+}
+
+// Halt only if the marker has been absent, continuously, for the whole grace.
+// The comparison is in SQL against the DATABASE clock, like every other
+// deadline predicate in this system: an app-side comparison would let clock
+// skew shorten the one window protecting an in-flight request.
+//
+// The grace arrives as SECONDS and is widened by make_interval rather than
+// being cast from an interval literal: sqlc maps `interval` to pgtype.Interval,
+// so an interval parameter would put a pgtype value in the call signature
+// where a time.Duration belongs.
+func (q *Queries) HaltStablyAbsentPublication(ctx context.Context, arg HaltStablyAbsentPublicationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, haltStablyAbsentPublication,
+		arg.HaltReason,
+		arg.ID,
+		arg.Status,
+		arg.GraceSeconds,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const haltUnverifiablePublication = `-- name: HaltUnverifiablePublication :execrows
+UPDATE publish_intents SET status = 'halted', halt_reason = $1, updated_at = now()
+WHERE publish_intents.id = $2 AND publish_intents.status = $3
+  AND EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.id = publish_intents.run_id
+        AND r.wall_deadline <= now() - make_interval(secs => $4::int)
+  )
+`
+
+type HaltUnverifiablePublicationParams struct {
+	HaltReason          pgtype.Text
+	ID                  uuid.UUID
+	Status              string
+	UnverifiableSeconds int32
+}
+
+// The give-up bound on a publication nobody can verify. Settlement never
+// guesses — an unreachable forge defers to the next tick — but "defer" with no
+// bound is its own durable answer: an outage, or a credential revoked after the
+// intent was created, would leave the run alive past its deadline forever,
+// holding a phase slot and re-probing on every tick.
+//
+// The age is measured against the RUN's wall_deadline, not against this row.
+// updated_at is bumped by both absence statements and created_at would halt on
+// the first blip for any run with a long wall deadline; the deadline is the one
+// timestamp that says how long this run has been owed an answer.
+func (q *Queries) HaltUnverifiablePublication(ctx context.Context, arg HaltUnverifiablePublicationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, haltUnverifiablePublication,
+		arg.HaltReason,
+		arg.ID,
+		arg.Status,
+		arg.UnverifiableSeconds,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -1952,6 +2043,59 @@ func (q *Queries) ListTerminalRunIDsAmong(ctx context.Context, ids []uuid.UUID) 
 	return items, nil
 }
 
+const listUnsettledPublishIntents = `-- name: ListUnsettledPublishIntents :many
+SELECT id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, commit_message, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at FROM publish_intents
+WHERE run_id = $1 AND status IN ('pending', 'pushed')
+`
+
+// Intents that may correspond to an effect on the forge nobody has written
+// down. 'published' and 'halted' are settled by definition.
+func (q *Queries) ListUnsettledPublishIntents(ctx context.Context, runID uuid.UUID) ([]PublishIntent, error) {
+	rows, err := q.db.Query(ctx, listUnsettledPublishIntents, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PublishIntent
+	for rows.Next() {
+		var i PublishIntent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Attempt,
+			&i.AuthorizationID,
+			&i.RepoID,
+			&i.ForgeKind,
+			&i.RepoSlug,
+			&i.CredentialID,
+			&i.Branch,
+			&i.TargetBranch,
+			&i.BaseSha,
+			&i.TreeHash,
+			&i.Title,
+			&i.Body,
+			&i.AuthorEmail,
+			&i.CommitMessage,
+			&i.Status,
+			&i.HeadSha,
+			&i.PrNumber,
+			&i.PrUrl,
+			&i.HaltReason,
+			&i.AbsentSince,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWaitingGates = `-- name: ListWaitingGates :many
 SELECT pr.id, pr.run_id, pr.node_id, pr.attempt, pr.generation, pr.created_at,
        t.id AS task_id, t.project_id, t.title, t.requester_id
@@ -2181,6 +2325,32 @@ func (q *Queries) MarkPhaseReconcilingPastDeadline(ctx context.Context, id uuid.
 	return i, err
 }
 
+const markPublicationAbsent = `-- name: MarkPublicationAbsent :execrows
+
+UPDATE publish_intents SET absent_since = now(), updated_at = now()
+WHERE id = $1 AND status = $2 AND absent_since IS NULL
+`
+
+type MarkPublicationAbsentParams struct {
+	ID     uuid.UUID
+	Status string
+}
+
+// The three statements below carry the NEGATIVE answer for an expired run's
+// settlement: a marker that is not there. All three are :execrows and CAS on
+// status, so a settlement racing a live driver's receipt loses instead of
+// overwriting it.
+// First sighting of an absent marker. Set once and never refreshed: the grace
+// measures from when absence was FIRST seen, so re-stamping it on every tick
+// would push the deadline away forever and the intent would never settle.
+func (q *Queries) MarkPublicationAbsent(ctx context.Context, arg MarkPublicationAbsentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markPublicationAbsent, arg.ID, arg.Status)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const maxAttemptForNode = `-- name: MaxAttemptForNode :one
 SELECT COALESCE(max(attempt), 0)::integer FROM phase_runs WHERE run_id = $1 AND node_id = $2
 `
@@ -2213,7 +2383,8 @@ func (q *Queries) PruneOutbox(ctx context.Context, createdAt time.Time) (int64, 
 }
 
 const recordPRReceipt = `-- name: RecordPRReceipt :execrows
-UPDATE publish_intents SET status = 'published', pr_number = $2, pr_url = $3, updated_at = $4
+UPDATE publish_intents SET status = 'published', pr_number = $2, pr_url = $3,
+                           absent_since = NULL, updated_at = $4
 WHERE id = $1 AND status = 'pushed'
 `
 
@@ -2224,6 +2395,8 @@ type RecordPRReceiptParams struct {
 	UpdatedAt time.Time
 }
 
+// absent_since is cleared for the same reason RecordPushReceipt clears it: a
+// settled intent carries no open question about a missing marker.
 func (q *Queries) RecordPRReceipt(ctx context.Context, arg RecordPRReceiptParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordPRReceipt,
 		arg.ID,
@@ -2239,7 +2412,7 @@ func (q *Queries) RecordPRReceipt(ctx context.Context, arg RecordPRReceiptParams
 
 const recordPushReceipt = `-- name: RecordPushReceipt :execrows
 
-UPDATE publish_intents SET status = 'pushed', head_sha = $2, updated_at = $3
+UPDATE publish_intents SET status = 'pushed', head_sha = $2, absent_since = NULL, updated_at = $3
 WHERE id = $1 AND status = 'pending'
 `
 
@@ -2261,6 +2434,14 @@ type RecordPushReceiptParams struct {
 // crash between the two resume instead of re-pushing blind. head_sha is
 // written once and never rewritten: a second push receipt for a different
 // commit would mean two commits on one marker, which cannot be true.
+//
+// absent_since is cleared in the SAME statement, and that is not tidiness.
+// Settlement stamps absent_since against the marker the intent's STATUS makes
+// uncertain — the branch while 'pending', the pull request once 'pushed'. A
+// stamp taken while pending and left behind would already be older than the
+// grace when the pull-request half first probes, so the very first PR-absence
+// sighting would halt an intent whose create call may still be on the wire.
+// The receipt is also the proof the stamp was wrong: the branch turned up.
 func (q *Queries) RecordPushReceipt(ctx context.Context, arg RecordPushReceiptParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordPushReceipt, arg.ID, arg.HeadSha, arg.UpdatedAt)
 	if err != nil {
