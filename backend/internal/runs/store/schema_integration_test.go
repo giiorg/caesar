@@ -142,18 +142,28 @@ func mustFinishPhase(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 	}
 }
 
-// mustInsertArtifact inserts one artifact of the given type.
+// mustInsertArtifact inserts one artifact of the given type, in the run's
+// first generation and stamped now.
 func mustInsertArtifact(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 	runID uuid.UUID, nodeID string, attempt int, artifactType string,
 ) uuid.UUID {
 	t.Helper()
+	return mustInsertArtifactAt(ctx, t, pool, runID, nodeID, attempt, 1, artifactType, time.Now().UTC())
+}
+
+// mustInsertArtifactAt is mustInsertArtifact with the two columns that decide
+// GetNodeArtifact's ordering under the caller's control.
+func mustInsertArtifactAt(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
+	runID uuid.UUID, nodeID string, attempt, generation int, artifactType string, createdAt time.Time,
+) uuid.UUID {
+	t.Helper()
 	var id uuid.UUID
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO artifacts (id, run_id, node_id, attempt, type, payload, created_at)
-		 VALUES (uuidv7(), $1, $2, $3, $4, '{}'::jsonb, now()) RETURNING id`,
-		runID, nodeID, attempt, artifactType,
+		`INSERT INTO artifacts (id, run_id, node_id, attempt, generation, type, payload, created_at)
+		 VALUES (uuidv7(), $1, $2, $3, $4, $5, '{}'::jsonb, $6) RETURNING id`,
+		runID, nodeID, attempt, generation, artifactType, createdAt,
 	).Scan(&id); err != nil {
-		t.Fatalf("insert %s artifact for %s#%d: %v", artifactType, nodeID, attempt, err)
+		t.Fatalf("insert %s artifact for %s#%d gen %d: %v", artifactType, nodeID, attempt, generation, err)
 	}
 	return id
 }
@@ -342,5 +352,38 @@ func TestListSucceededNodes_ForgetsANodeThatWasRematerialized(t *testing.T) {
 	}
 	if diff := cmp.Diff([]string{"implement"}, got); diff != "" {
 		t.Fatalf("(-want +got):\n%s", diff)
+	}
+}
+
+func TestGetNodeArtifact_PrefersTheNewerGenerationOverTheNewerTimestamp(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.New(t)
+	runID := seedRun(ctx, t, pool)
+	q := store.New(pool)
+
+	// The skew the ORDER BY exists for: the generation-2 patch is stamped
+	// EARLIER than the generation-1 row it supersedes, because the two rows
+	// come from two independent clocks and the host is running behind the
+	// database. Provenance has to win over time.
+	//
+	// Both rows carry the SAME attempt on purpose. Give the newer generation a
+	// higher attempt and `attempt DESC` alone would pick it, and the leading
+	// `generation DESC` term — the one that stays right when the clocks
+	// disagree — would go untested.
+	now := time.Now().UTC()
+	stale := mustInsertArtifactAt(ctx, t, pool, runID, "implement", 1, 1, "patch", now)
+	current := mustInsertArtifactAt(ctx, t, pool, runID, "implement", 1, 2, "patch", now.Add(-time.Hour))
+
+	got, err := q.GetNodeArtifact(ctx, store.GetNodeArtifactParams{
+		RunID: runID, NodeID: "implement", Type: "patch",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID == stale {
+		t.Fatal("GetNodeArtifact returned the generation-1 patch: ordering on time hands the gate stale content to approve")
+	}
+	if got.ID != current || got.Generation != 2 {
+		t.Fatalf("want the generation-2 patch %v, got %v (generation %d)", current, got.ID, got.Generation)
 	}
 }
