@@ -499,10 +499,17 @@ func TestExpiredRun_AnUnreachableForgeDefersTerminalizationRatherThanGuessing(t 
 	probed := p.forge().BranchProbeCount()
 	backdateWallDeadline(t, p.f, p.run.ID)
 
-	// Wait for a POSITIVE signal — settlement ran and failed, twice — rather
-	// than for a fixed sleep, which would report "still alive" even if
-	// settlement had never been called at all.
-	waitForForgeBranchProbe(t, p.forge(), probed+2, 45*time.Second)
+	// Wait for a POSITIVE signal — settlement ran and failed — rather than for
+	// a fixed sleep, which would report "still alive" even if settlement had
+	// never been called at all. Then wait for it to ask AGAIN, which is the
+	// half that says the run is still being carried rather than merely slow to
+	// die: a settlement that guessed would terminalize on the first refusal and
+	// never probe a second time.
+	waitForForgeBranchProbe(t, p.forge(), probed+1, 45*time.Second)
+	if got := runStatus(t, p.f, p.run.ID); got == "dead" {
+		t.Fatal("the run died while its publication was unknowable; the orphan is now permanent")
+	}
+	waitForForgeBranchProbe(t, p.forge(), probed+3, 45*time.Second)
 	if got := runStatus(t, p.f, p.run.ID); got == "dead" {
 		t.Fatal("the run died while its publication was unknowable; the orphan is now permanent")
 	}
