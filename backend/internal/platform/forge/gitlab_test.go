@@ -6,7 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/giiorg/caesar/backend/internal/platform/forge"
 )
@@ -37,14 +40,22 @@ func TestGitLab_HeadReadsTheBranchCommitID(t *testing.T) {
 }
 
 func TestGitLab_BranchHeadReportsAbsenceRatherThanFailing(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The branch is one escaped segment here exactly as it is on GitHub, and
+		// caesar's own marker branches carry a slash. Unescaped, caesar/abc asks
+		// for /branches/caesar/abc, GitLab answers 404, and BranchHead reports
+		// "the marker branch does not exist" for every branch caesar pushes —
+		// an absence that reads as an answer rather than as the bug it is.
+		if got, want := r.URL.EscapedPath(), "/api/v4/projects/g%2Fp/repository/branches/caesar%2Fabc"; got != want {
+			t.Errorf("escaped path = %q, want %q", got, want)
+		}
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = io.WriteString(w, `{"message":"404 Branch Not Found"}`)
 	}))
 	defer srv.Close()
 
 	c := forge.NewGitLab(srv.URL, srv.Client())
-	sha, ok, err := c.BranchHead(context.Background(), forge.Repo{Slug: "g/p"}, forge.Auth{Token: "t"}, "nope")
+	sha, ok, err := c.BranchHead(context.Background(), forge.Repo{Slug: "g/p"}, forge.Auth{Token: "t"}, "caesar/abc")
 	if err != nil {
 		t.Fatalf("an absent branch is an answer, not an error: %v", err)
 	}
@@ -133,5 +144,55 @@ func TestGitLab_FindPullRequestsFollowsEveryPage(t *testing.T) {
 	}
 	if got[0].Base != "main" || got[1].Base != "main" {
 		t.Errorf("candidates = %+v, want every one carrying its target_branch", got)
+	}
+}
+
+func TestGitLab_FindPullRequestsRefusesRatherThanTruncateAtTheCap(t *testing.T) {
+	// The GitHub twin of this test, against the other pagination mechanism: a
+	// truncated probe is how a spent approval gets a second merge request.
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		w.Header().Set("X-Next-Page", strconv.Itoa(page+1))
+		_, _ = io.WriteString(w, `[{"iid":1,"state":"opened","sha":"a","target_branch":"main"}]`)
+	}))
+	defer srv.Close()
+
+	c := forge.NewGitLab(srv.URL, srv.Client())
+	if _, err := c.FindPullRequests(context.Background(), forge.Repo{Slug: "g/p"}, forge.Auth{Token: "t"}, "caesar/abc"); err == nil {
+		t.Fatal("a listing that never ends must be an error, not a truncated answer reported as complete")
+	}
+	if got := requests.Load(); got != 20 {
+		t.Errorf("issued %d requests, want exactly maxPages (20)", got)
+	}
+}
+
+func TestGitLab_ThrottlingCarriesTheResetFromTheUnprefixedHeaders(t *testing.T) {
+	// GitLab emits the draft-spec headers WITHOUT GitHub's X- prefix. Reading
+	// the reset un-prefixed but gating on the prefixed remaining count made this
+	// branch unreachable, so every reset GitLab stated was discarded and the run
+	// backed off on its own curve instead of waiting exactly as long as it was
+	// told to.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("RateLimit-Remaining", "0")
+		w.Header().Set("RateLimit-Reset", "1893456000")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"message":"429 Too Many Requests"}`)
+	}))
+	defer srv.Close()
+
+	c := forge.NewGitLab(srv.URL, srv.Client())
+	_, err := c.CreatePullRequest(context.Background(), forge.Repo{Slug: "g/p"}, forge.Auth{Token: "t"},
+		forge.PullRequest{Head: "caesar/abc", Base: "main"})
+	if err == nil {
+		t.Fatal("a 429 must error")
+	}
+	if !forge.IsRetryable(err) {
+		t.Errorf("throttling must be retryable, got %v", err)
+	}
+	at, ok := forge.RetryAfter(err)
+	if want := time.Unix(1893456000, 0).UTC(); !ok || !at.Equal(want) {
+		t.Errorf("retry instant = %v (present=%v), want %v", at, ok, want)
 	}
 }

@@ -78,8 +78,11 @@ func RetryAfter(err error) (time.Time, bool) {
 // permanent — which is what keeps "the token cannot do this" from retrying
 // until the wall deadline.
 //
-// GitLab is simpler and handled by the same helper: 429 with RateLimit-Reset
-// (epoch seconds) or Retry-After.
+// GitLab is simpler and handled by the same helper: 429 with Retry-After, or
+// with the draft-spec pair RateLimit-Remaining / RateLimit-Reset — which GitHub
+// spells X-RateLimit-*. Both spellings are read for BOTH halves of that pair:
+// reading the reset un-prefixed but the remaining count prefixed would make the
+// GitLab branch unreachable and silently discard every reset GitLab states.
 func rateLimited(resp *http.Response, body []byte, now time.Time) (time.Time, bool) {
 	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
 		return time.Time{}, false
@@ -96,7 +99,11 @@ func rateLimited(resp *http.Response, body []byte, now time.Time) (time.Time, bo
 	if reset == "" {
 		reset = resp.Header.Get("RateLimit-Reset")
 	}
-	if resp.Header.Get("X-RateLimit-Remaining") == "0" && reset != "" {
+	remaining := resp.Header.Get("X-RateLimit-Remaining")
+	if remaining == "" {
+		remaining = resp.Header.Get("RateLimit-Remaining")
+	}
+	if remaining == "0" && reset != "" {
 		if epoch, err := strconv.ParseInt(reset, 10, 64); err == nil {
 			return time.Unix(epoch, 0).UTC(), true
 		}

@@ -8,8 +8,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -125,6 +128,10 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 		body         string
 		wantRetry    bool
 		wantConflict bool
+		// wantAt is set only where the forge states an ABSOLUTE reset, which is
+		// the only kind that can be compared to a constant: a Retry-After of 60
+		// seconds is relative to a wall clock the test does not own.
+		wantAt time.Time
 	}{
 		{name: "pr exists", status: http.StatusUnprocessableEntity, wantConflict: true},
 		// 403 is NOT a synonym for "permanently forbidden" on GitHub: both
@@ -136,6 +143,7 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 		{
 			name: "primary limit as 403", status: http.StatusForbidden, wantRetry: true,
 			headers: map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1893456000"},
+			wantAt:  time.Unix(1893456000, 0).UTC(),
 		},
 		{
 			name: "secondary limit as 403", status: http.StatusForbidden, wantRetry: true,
@@ -177,6 +185,16 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 			// as long as the forge asked.
 			if at, ok := forge.RetryAfter(err); c.wantRetry && len(c.headers) > 0 && !ok {
 				t.Errorf("rate-limited error must carry a retry instant (got %v)", at)
+			}
+			// And it must be the RIGHT instant. Presence alone would accept an
+			// epoch read as milliseconds — 1893456000 becomes the year 61989, and
+			// a run whose RetryAt is a geological age away parks until its wall
+			// deadline instead of retrying in minutes.
+			if !c.wantAt.IsZero() {
+				at, ok := forge.RetryAfter(err)
+				if !ok || !at.Equal(c.wantAt) {
+					t.Errorf("retry instant = %v (present=%v), want %v", at, ok, c.wantAt)
+				}
 			}
 		})
 	}
@@ -259,6 +277,36 @@ func TestGitHub_FindPullRequestsFollowsEveryPage(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].Number != 1 || got[1].Number != 2 {
 		t.Fatalf("candidates = %+v, want both pages in order", got)
+	}
+}
+
+func TestGitHub_FindPullRequestsRefusesRatherThanTruncateAtTheCap(t *testing.T) {
+	// A server that advertises a next page forever must not spin a worker — but
+	// stopping quietly at the cap would be worse than spinning. A partial
+	// listing reported as complete says "no such pull request" for a branch that
+	// has one, and recovery answers that by opening a SECOND request against a
+	// single-use approval. So the cap is an error, never a truncated answer, and
+	// this asserts the error rather than the length: a truncating implementation
+	// returns a plausible-looking slice and must not pass by coincidence.
+	var requests atomic.Int64
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		w.Header().Set("Link", "<"+srv.URL+"/repos/acme/widgets/pulls?page="+strconv.Itoa(page+1)+`>; rel="next"`)
+		_, _ = io.WriteString(w, `[{"number":1,"state":"open","head":{"sha":"a"},"base":{"ref":"main"}}]`)
+	}))
+	defer srv.Close()
+
+	c := forge.NewGitHub(srv.URL, srv.Client())
+	if _, err := c.FindPullRequests(context.Background(), forge.Repo{Slug: "acme/widgets"}, forge.Auth{Token: "t"}, "caesar/abc"); err == nil {
+		t.Fatal("a listing that never ends must be an error, not a truncated answer reported as complete")
+	}
+	// The cap is checked before each request, so exactly maxPages of them go out
+	// and the one past the cap is refused. Pinning the count is what stops the
+	// loop from quietly becoming unbounded, or from stopping one page early.
+	if got := requests.Load(); got != 20 {
+		t.Errorf("issued %d requests, want exactly maxPages (20)", got)
 	}
 }
 
