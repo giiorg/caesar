@@ -1150,7 +1150,22 @@ func (o *Orchestrator) inspectPublication(ctx context.Context, ref AttemptRef) (
 		}}, nil
 	}
 	if err != nil {
-		return InspectResult{}, err
+		// A blip reading the row is not an answer about the publication, and it
+		// must not be charged for one. Returning the error here would reach
+		// reconcileAttempt's `if err != nil || !ins.Completed` and become a
+		// CHARGEABLE reconcile_lost — the one spend this whole path exists to
+		// forbid, through the only door that is a database round trip rather
+		// than a forge call. With a warm plan cache this read is the FIRST round
+		// trip a publish reconciliation makes, so a pool timeout lands here
+		// before anything else; three across the node's life exhaust it and
+		// terminalize the run with its branch already on the forge.
+		//
+		// Uncharged and resumable is also the honest answer: the durable
+		// position is intact and unread, so asking again is the whole remedy.
+		return InspectResult{Completed: true, Outcome: &Outcome{
+			Class: OutcomeTransient, Code: CodePublishResumable,
+			Message: fmt.Sprintf("could not read the publication's intent: %v", err),
+		}}, nil
 	}
 	switch publishStatus(intent.Status) {
 	case publishHalted:
@@ -1341,7 +1356,11 @@ func (o *Orchestrator) settleUnopenedPublication(ctx context.Context, q *store.Q
 	if err != nil {
 		return false, err
 	}
-	pr, found, ambiguous := matchPublication(candidates, intent)
+	// ambiguous is deliberately discarded rather than tested beside the count:
+	// every ambiguous answer matchPublication gives is reached from inside its
+	// candidate loop, so it already implies len(candidates) > 0. Naming it in
+	// the halt condition would read as a case that can occur on its own.
+	pr, found, _ := matchPublication(candidates, intent)
 	switch {
 	case found:
 		if _, err := q.ClearPublicationAbsent(ctx, intent.ID); err != nil {
@@ -1360,7 +1379,7 @@ func (o *Orchestrator) settleUnopenedPublication(ctx context.Context, q *store.Q
 			return o.intentSettledElsewhere(ctx, q, intent)
 		}
 		return true, nil
-	case ambiguous || len(candidates) > 0:
+	case len(candidates) > 0:
 		if _, err := q.ClearPublicationAbsent(ctx, intent.ID); err != nil {
 			return false, err
 		}
