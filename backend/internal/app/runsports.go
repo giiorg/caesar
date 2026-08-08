@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -200,16 +201,44 @@ func (g gitPublisher) scratch(ref runs.AttemptRef) (string, func(), error) {
 	return dir, func() { _ = os.RemoveAll(dir) }, nil
 }
 
-func (g gitPublisher) PushPatch(ctx context.Context, req runs.PushRequest) (runs.PushResult, error) {
-	in, authEnv, err := g.prepare(ctx, req)
-	if err != nil {
-		return runs.PushResult{}, err
+// notStarted types this adapter's OWN failures — the ones raised before
+// gitops is entered at all.
+//
+// gitops.AsOutcomeError covers everything gitops returns, and nothing else
+// here was covered by anything. Resolving the clone URL, opening the
+// credential and materializing the scratch directory all happen strictly
+// BEFORE any effect, and runs.ClassifyOutcome is default-deny: returned raw, a
+// vault blip or a full disk becomes a PERMANENT internal_error, which
+// terminalizes the run rather than retrying it. publish_not_started is the
+// code minted for exactly this — uncharged, and honestly "it never began".
+//
+// An error that already carries its own outcome keeps it: only untyped ones
+// need a verdict invented for them.
+func notStarted(err error) error {
+	var oe runs.OutcomeError
+	if errors.As(err, &oe) {
+		return err
 	}
+	return runs.OutcomeError{Outcome: runs.Outcome{
+		Class: runs.OutcomeTransient, Code: runs.CodePublishNotStarted,
+		Message: fmt.Sprintf("the publication could not be prepared: %v", err),
+	}}
+}
+
+func (g gitPublisher) PushPatch(ctx context.Context, req runs.PushRequest) (runs.PushResult, error) {
+	// scratch first, prepare second. The order is free — a doomed call spends
+	// one mkdir and removes it — and it buys the only thing that makes the
+	// scratch failure testable at all: it is now reachable without a
+	// credential store standing behind prepare.
 	dir, cleanup, err := g.scratch(req.Ref)
 	if err != nil {
-		return runs.PushResult{}, err
+		return runs.PushResult{}, notStarted(err)
 	}
 	defer cleanup()
+	in, authEnv, err := g.prepare(ctx, req)
+	if err != nil {
+		return runs.PushResult{}, notStarted(err)
+	}
 	rep, err := gitops.Publish(ctx, dir, in, authEnv)
 	if err != nil {
 		// gitops speaks its own TypedError; runs.ClassifyOutcome matches only
@@ -222,15 +251,19 @@ func (g gitPublisher) PushPatch(ctx context.Context, req runs.PushRequest) (runs
 }
 
 func (g gitPublisher) ExpectedHead(ctx context.Context, req runs.PushRequest) (string, error) {
-	in, authEnv, err := g.prepare(ctx, req)
-	if err != nil {
-		return "", err
-	}
+	// Same order and same typing as PushPatch, and for the stronger reason:
+	// the settlement that calls this arrives holding an intent that is already
+	// 'pending' or 'pushed', so a permanent answer here would terminalize a
+	// run over a branch that may be live on the forge.
 	dir, cleanup, err := g.scratch(req.Ref)
 	if err != nil {
-		return "", err
+		return "", notStarted(err)
 	}
 	defer cleanup()
+	in, authEnv, err := g.prepare(ctx, req)
+	if err != nil {
+		return "", notStarted(err)
+	}
 	head, err := gitops.ExpectedPublicationHead(ctx, dir, in, authEnv)
 	return head, gitops.AsOutcomeError(err)
 }

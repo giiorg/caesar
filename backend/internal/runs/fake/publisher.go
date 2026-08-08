@@ -27,6 +27,11 @@ type Publisher struct {
 	created  int
 	lastReq  runs.PushRequest
 	crashing bool
+	// failPushTimes refuses the next n calls before anything reaches the
+	// remote — a rejected push, which is what a lost precondition race looks
+	// like from here.
+	failPushTimes int
+	failPushCode  string
 	// holdBeforePush blocks a call BEFORE anything reaches the remote, which
 	// is the shape a wedged worker has: the lease expires with nothing
 	// published and the intent still 'pending'.
@@ -76,6 +81,14 @@ func (p *Publisher) PushPatch(ctx context.Context, req runs.PushRequest) (runs.P
 		return runs.PushResult{}, err
 	}
 	p.mu.Lock()
+	if p.failPushTimes > 0 {
+		p.failPushTimes--
+		code := p.failPushCode
+		p.mu.Unlock()
+		return runs.PushResult{}, runs.OutcomeError{Outcome: runs.Outcome{
+			Class: runs.OutcomeTransient, Code: code, Message: "fake publisher: scripted push failure",
+		}}
+	}
 	hold := p.holdBeforePush
 	p.mu.Unlock()
 	if hold != nil {
@@ -145,6 +158,20 @@ func (p *Publisher) CrashAfterPush(on bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.crashing = on
+}
+
+// FailPushTimes refuses the next n pushes with a typed transient outcome,
+// before anything reaches the remote.
+//
+// The TYPE is the point. push_rejected and forge_unavailable are ordinary
+// CHARGEABLE transients, so this is the only injector that can ask whether the
+// push leg of the state machine downgrades them: a publication that spends its
+// node's failure budget on a forge outage exhausts and terminalizes a run
+// whose branch may already be pushed.
+func (p *Publisher) FailPushTimes(n int, code string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failPushTimes, p.failPushCode = n, code
 }
 
 // HangBeforePush wedges every call before it causes anything, until the

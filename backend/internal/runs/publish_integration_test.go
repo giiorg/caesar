@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -137,6 +138,15 @@ func waitForIntentStatus(t *testing.T, f fixture, runID uuid.UUID, nodeID, want 
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("publish intent for %s never reached %q (last %q)", nodeID, want, last)
+}
+
+// derefOr renders a nullable receipt column for a failure message. A bare %v
+// on the pointer prints an address, which says nothing about what went wrong.
+func derefOr(s *string, fallback string) string {
+	if s == nil {
+		return fallback
+	}
+	return *s
 }
 
 func countIntents(t *testing.T, f fixture, runID uuid.UUID) int {
@@ -726,6 +736,394 @@ func TestPublish_TransientForgeFailureResumesWithoutRePushing(t *testing.T) {
 	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
 		t.Errorf("chargeable failures = %d, want 0: an outage must not exhaust an unfinished publication", got)
 	}
+	// One probe, from the one attempt that ran the push step. PushCount above
+	// says the remote was written once; only this says the two retries skipped
+	// the whole step rather than re-entering it and finding nothing to do.
+	if got := p.forge().BranchProbeCount(); got != 1 {
+		t.Errorf("branch probes = %d, want 1: a resumed publication re-enters the pull-request step, not the push step", got)
+	}
+}
+
+// The push leg of unchargedWhileUnfinished, which nothing else can reach.
+//
+// Every other publisher injection is already uncharged before it arrives —
+// HangBeforePush yields publish_not_started, CrashAfterPush yields
+// publish_resumable — so only a CHARGEABLE transient out of the push asks
+// whether the downgrade happens at that call site. push_rejected is that
+// outcome: max_attempts is 3, so charged, two rejections plus one more failure
+// exhaust the node and terminalize a run whose branch may already be pushed.
+func TestPublish_ARejectedPushDoesNotExhaustTheNode(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.publisher().FailPushTimes(2, runs.CodePushRejected)
+	startBackdater(t, p.f, p.run.ID)
+	p.approve(t, "gate")
+	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 120*time.Second)
+
+	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+		t.Errorf("chargeable failures = %d, want 0: a rejected push must not spend the budget of a "+
+			"publication that is still unfinished", got)
+	}
+	if got := p.publisher().PushCount(); got != 1 {
+		t.Errorf("pushes that reached the remote = %d, want 1: the two refusals landed nothing", got)
+	}
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if got := remoteCommitCount(t, p.f, intent.Branch); got != 2 {
+		t.Errorf("remote has %d commits on the marker, want 2 (seed + one publication)", got)
+	}
+}
+
+// Crash window 8: a receipt transaction that fails at COMMIT, after its effect
+// has landed. Both receipts, one test each, driven by making the receipt
+// statement itself fail — the fault seam, not a mutation of the code under
+// test.
+//
+// Without receiptFailure at the call site the raw error default-denies to a
+// PERMANENT internal_error, evaluate terminalizes the run, terminalizeRun
+// supersedes every live phase, and nothing revisits a failed run — so the
+// branch, and the pull request, are orphans.
+func TestPublish_AFailedPushReceiptResumesRatherThanKillingTheRun(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.f.faults.fail("RecordPushReceipt", 0, 1)
+	startBackdater(t, p.f, p.run.ID)
+	p.approve(t, "gate")
+
+	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 120*time.Second)
+	if n := p.f.faults.remaining("RecordPushReceipt"); n != 0 {
+		t.Fatalf("%d armed receipt failures never fired; this test proved nothing", n)
+	}
+	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+		t.Errorf("chargeable failures = %d, want 0", got)
+	}
+	// The push really happened before its receipt failed, so the retry must
+	// ADOPT the branch rather than build a second commit on it.
+	if got := p.publisher().CreatedCount(); got != 1 {
+		t.Errorf("branch creations = %d, want 1", got)
+	}
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if intent.Status != "published" || intent.HeadSHA == nil || intent.PRNumber == nil {
+		t.Fatalf("the publication must complete on the retry: %+v", intent)
+	}
+	if got := remoteCommitCount(t, p.f, intent.Branch); got != 2 {
+		t.Errorf("remote has %d commits on the marker, want 2", got)
+	}
+}
+
+func TestPublish_AFailedPullRequestReceiptResumesRatherThanKillingTheRun(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.f.faults.fail("RecordPRReceipt", 0, 1)
+	startBackdater(t, p.f, p.run.ID)
+	p.approve(t, "gate")
+
+	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 120*time.Second)
+	if n := p.f.faults.remaining("RecordPRReceipt"); n != 0 {
+		t.Fatalf("%d armed receipt failures never fired; this test proved nothing", n)
+	}
+	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+		t.Errorf("chargeable failures = %d, want 0", got)
+	}
+	// The request was open before the receipt failed: the retry's unconditional
+	// find is what turns a lost receipt into a found one instead of a second
+	// pull request on one approval.
+	if got := p.forge().OpenPRCount(); got != 1 {
+		t.Errorf("the forge opened %d pull requests, want 1", got)
+	}
+	if got := p.publisher().PushCount(); got != 1 {
+		t.Errorf("pushes = %d, want 1: the retry resumes from 'pushed'", got)
+	}
+}
+
+// The halt receipt is the third one, and the worst placed: three of
+// haltPublication's four callers stand on a 'pushed' intent, so a permanent
+// answer here kills the run with the branch live on the forge AND the halt
+// unrecorded — nothing tells the human there is anything to reconcile.
+//
+// Re-running the halt is convergent, which is what makes resuming honest, and
+// this test walks that: the first halt transaction fails, the second lands.
+func TestPublish_AFailedHaltReceiptResumesRatherThanKillingTheRun(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.stop()
+	authID := p.approve(t, "gate")
+	auth := authorization(t, p.f, authID)
+	foreign := pushForeignBranch(t, p.f, runs.PublicationBranch(auth.ArtifactID))
+	p.f.faults.fail("HaltPublishIntent", 0, 1)
+	startBackdater(t, p.f, p.run.ID)
+	p.start()
+
+	got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 120*time.Second)
+	if n := p.f.faults.remaining("HaltPublishIntent"); n != 0 {
+		t.Fatalf("%d armed halt failures never fired; this test proved nothing", n)
+	}
+	if got.Outcome == nil || got.Outcome.Code != runs.CodePublishConflict {
+		t.Fatalf("outcome = %+v, want publish_conflict: a halt that could not commit is a database "+
+			"blip on a live intent, not a verdict about the publication", got.Outcome)
+	}
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if intent.Status != "halted" || intent.HaltReason == nil || *intent.HaltReason == "" {
+		t.Fatalf("the retry must land the halt a human acts on: %+v", intent)
+	}
+	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+		t.Errorf("chargeable failures = %d, want 0", got)
+	}
+	if head := remoteBranchHead(t, p.f, intent.Branch); head != foreign {
+		t.Errorf("the marker is at %q, want the foreign %q left untouched", head, foreign)
+	}
+}
+
+// The artifact read inside pushPublication runs with the intent already
+// created and its authorization already CONSUMED. A permanent answer there
+// kills a publication that nothing can re-authorize, over a failed SELECT.
+//
+// skip = 1 because two places read this artifact: revalidateAuthorization,
+// inside the authorize transaction, and then the push. Only the second is
+// standing on a live intent, and only the second is this finding.
+func TestPublish_AFailedArtifactReadResumesRatherThanKillingTheRun(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.stop()
+	p.approve(t, "gate")
+	p.f.faults.fail("GetArtifactByID", 1, 1)
+	startBackdater(t, p.f, p.run.ID)
+	p.start()
+
+	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 120*time.Second)
+	if n := p.f.faults.remaining("GetArtifactByID"); n != 0 {
+		t.Fatalf("%d armed read failures never fired; this test proved nothing", n)
+	}
+	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+		t.Errorf("chargeable failures = %d, want 0", got)
+	}
+	// The failure was before the effect, so exactly one push and one intent.
+	if got := p.publisher().PushCount(); got != 1 {
+		t.Errorf("pushes = %d, want 1: the failed read happened before anything reached the remote", got)
+	}
+	if got := countIntents(t, p.f, p.run.ID); got != 1 {
+		t.Errorf("intents = %d, want 1: the retry resumes the intent, it does not re-authorize", got)
+	}
+}
+
+// The run's EXECUTION budget is a second door into terminalization, and it is
+// not the node's failure budget: unchargedWhileUnfinished closes the one and
+// says nothing about the other. evaluateFailure pre-checks the execution
+// budget on every retryable failure and demotes a breach to a permanent
+// budget_exhausted — so a run that reaches its publish node nearly spent would
+// die there with its branch on the forge, and ListExpiredRunIDs never revisits
+// a failed run.
+func TestPublish_ASpentExecutionBudgetDoesNotTerminalizeAnUnfinishedPublication(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	release := p.publisher().HangBeforePush()
+	t.Cleanup(release)
+	p.forge().FailPRTimes(1, runs.CodeForgeUnavailable)
+	startBackdater(t, p.f, p.run.ID)
+	p.approve(t, "gate")
+
+	// Spend the run down to its last millisecond WHILE the attempt is wedged.
+	// The claim already read the old figures, so this attempt's own deadline is
+	// untouched — only evaluateFailure's budget pre-check sees the change,
+	// which is the door being tested and nothing else.
+	waitForIntentStatus(t, p.f, p.run.ID, "publish", "pending", 45*time.Second)
+	mustExec(t, p.f,
+		`UPDATE runs SET execution_used_ms = execution_budget_ms - 1 WHERE id = $1`, p.run.ID)
+	release()
+
+	// The branch is on the forge and the forge then refused the request. That
+	// failure is uncharged, so it must requeue — waitForPhaseAttempt fails
+	// loudly if the run died instead, which is exactly the regression.
+	waitForIntentStatus(t, p.f, p.run.ID, "publish", "pushed", 45*time.Second)
+	waitForPhaseAttempt(t, p.f, p.run.ID, "publish", 2, 60*time.Second)
+
+	if got := runStatus(t, p.f, p.run.ID); got != "running" {
+		t.Fatalf("run status = %q, want running: a budget breach must not terminalize a publication "+
+			"whose branch is already pushed", got)
+	}
+	if got := intentRow(t, p.f, p.run.ID, "publish").Status; got != "pushed" {
+		t.Errorf("intent status = %q, want pushed: the publication is still live", got)
+	}
+	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+		t.Errorf("chargeable failures = %d, want 0", got)
+	}
+}
+
+// A halted intent is the one status runPublish must refuse on ARRIVAL. It is
+// reached when the driver that halted was fenced — a lease takeover drops its
+// permanent outcome — and its successor picks the settled row up.
+//
+// Without the refusal the successor walks past both step blocks (neither
+// 'pending' nor 'pushed' matches) and returns SUCCESS carrying a publication
+// artifact with no head sha and no pull request in it.
+func TestPublish_AHaltedIntentRefusesEveryLaterAttempt(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	release := p.publisher().HangBeforePush()
+	t.Cleanup(release)
+	startBackdater(t, p.f, p.run.ID)
+	p.approve(t, "gate")
+
+	// Wedge the first driver with the intent created and nothing pushed, then
+	// halt the intent under it, as its fenced predecessor would have.
+	waitForIntentStatus(t, p.f, p.run.ID, "publish", "pending", 45*time.Second)
+	mustExec(t, p.f,
+		`UPDATE publish_intents SET status = 'halted', halt_reason = 'a human is reconciling this'
+		 WHERE run_id = $1 AND node_id = 'publish'`, p.run.ID)
+	probes := p.forge().BranchProbeCount()
+	expireLease(t, p.f, p.run.ID, "publish")
+
+	got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 90*time.Second)
+	if got.Outcome == nil || got.Outcome.Code != runs.CodePublishConflict {
+		t.Fatalf("outcome = %+v, want publish_conflict", got.Outcome)
+	}
+	if !strings.Contains(got.Outcome.Message, "a human is reconciling this") {
+		t.Errorf("message = %q, want the halt reason carried to the run", got.Outcome.Message)
+	}
+	if after := p.forge().BranchProbeCount(); after != probes {
+		t.Errorf("branch probes went %d -> %d: a halted publication is re-probed by nobody", probes, after)
+	}
+	if got := p.publisher().PushCount(); got != 0 {
+		t.Errorf("pushes = %d, want 0: nothing may reach the remote for a halted intent", got)
+	}
+	if n := scalarCount(t, p.f,
+		`SELECT count(*) FROM artifacts WHERE run_id = $1 AND node_id = 'publish'`, p.run.ID); n != 0 {
+		t.Errorf("a halted publication produced %d artifacts, want 0: success here would record a "+
+			"publication with no head sha and no pull request in it", n)
+	}
+}
+
+// adoptConflictingPublication's THIRD answer: the forge refused a second
+// request and then did not list the first. Read-after-write lag, or a replica
+// behind the write — guessing either way is wrong, so it resumes, uncharged,
+// on a branch that is already pushed.
+//
+// HideListingsAfterCreate(2) is what reaches it: one hidden listing is the
+// second driver's pre-create probe (which is what makes its create conflict at
+// all), and the second is the re-query that would otherwise have adopted.
+func TestPublish_AForgeThatDoesNotYetListItsOwnPullRequestResumes(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	release := p.forge().HoldFirstPullRequest()
+	t.Cleanup(release)
+	p.forge().HideListingsAfterCreate(2)
+	startBackdater(t, p.f, p.run.ID)
+	p.approve(t, "gate")
+
+	waitForIntentStatus(t, p.f, p.run.ID, "publish", "pushed", 45*time.Second)
+	waitForPullRequests(t, p.forge(), 1, 30*time.Second) // the winner is held before its receipt
+
+	expireLease(t, p.f, p.run.ID, "publish")
+	waitForIntentStatus(t, p.f, p.run.ID, "publish", "published", 90*time.Second)
+
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if intent.Status == "halted" {
+		t.Fatalf("a forge that had not listed its own request is not a human's problem: %+v", intent)
+	}
+	if intent.PRNumber == nil || *intent.PRNumber != 1 {
+		t.Fatalf("the intent must record the ONE real request the forge accepted: %+v", intent)
+	}
+	if got := p.forge().PullRequestCount(intent.Branch); got != 1 {
+		t.Errorf("pull requests on %s = %d, want 1", intent.Branch, got)
+	}
+	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+		t.Errorf("chargeable failures = %d, want 0: the forge's own lag must not spend a budget", got)
+	}
+	release()
+	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 90*time.Second)
+}
+
+// adoptConflictingPublication's SECOND answer: the marker really does carry a
+// stranger's request, and the pre-create probe simply did not see it.
+//
+// The halt reason is the assertion that matters. Both halt legs end the same
+// way — failed run, halted intent — and only the message says which one
+// decided; a leg folded into the other still reaches a halt, one probe later.
+func TestPublish_AStrangersPullRequestSeenOnlyAfterTheCreateConflictHalts(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.stop()
+	authID := p.approve(t, "gate")
+	auth := authorization(t, p.f, authID)
+	branch := runs.PublicationBranch(auth.ArtifactID)
+	p.forge().SeedPullRequest(branch, runs.PullRequestRef{
+		Number: 99, URL: "https://fake.forge/spine/repo/pull/99",
+		HeadSHA: "0000000000000000000000000000000000000000", Base: "release", State: "open",
+	})
+	// Hide it from the pre-create probe only. Without this the find before the
+	// create halts first and this leg is never entered.
+	p.forge().HideNextListings(1)
+	p.start()
+
+	got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 90*time.Second)
+	if got.Outcome == nil || got.Outcome.Code != runs.CodePublishConflict {
+		t.Fatalf("outcome = %+v, want publish_conflict", got.Outcome)
+	}
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if intent.HaltReason == nil || !strings.Contains(*intent.HaltReason, "forge refused a second pull request") {
+		t.Fatalf("halt reason = %q, want the one adoptConflictingPublication writes: the "+
+			"pre-create check's message means this leg was never entered", derefOr(intent.HaltReason, "<none>"))
+	}
+	if intent.Status != "halted" {
+		t.Errorf("intent status = %q, want halted", intent.Status)
+	}
+	if got := p.forge().CreateAttemptCount(); got != 1 {
+		t.Errorf("create attempts = %d, want 1: one blind create, then a human", got)
+	}
+	if got := p.forge().PullRequestCount(branch); got != 1 {
+		t.Errorf("pull requests on %s = %d, want the stranger's left alone", branch, got)
+	}
+	if intent.HeadSHA == nil {
+		t.Error("the push receipt must survive a halt at the pull-request step")
+	}
+}
+
+// A title longer than the forge cap is truncated, and truncated on a rune
+// boundary. The task's title is the only unbounded thing that reaches a forge,
+// and a request refused for size would surface as an unexplained permanent
+// failure with the authorization already spent.
+//
+// The title is set after the gate and read by a cold plan cache, because the
+// tasks row is where a title long enough to test this can come from: the
+// intake path caps it well below the publish cap.
+func TestPublish_AnOversizedTitleIsTruncatedOnARuneBoundary(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.stop()
+	// Three-byte runes, so the cap lands INSIDE one: 250 is not a multiple of
+	// 3, and a naive cut would emit a half rune.
+	long := strings.Repeat("日", 100)
+	mustExec(t, p.f,
+		`UPDATE tasks SET title = $2 WHERE id = (SELECT task_id FROM runs WHERE id = $1)`, p.run.ID, long)
+	p.approve(t, "gate")
+	p.start()
+
+	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 60*time.Second)
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if len(intent.Title) != 249 {
+		t.Fatalf("title is %d bytes, want 249 — the 250-byte cap cut back to the last whole rune", len(intent.Title))
+	}
+	if !utf8.ValidString(intent.Title) {
+		t.Error("the truncated title is not valid UTF-8")
+	}
+	if !strings.HasPrefix(long, intent.Title) {
+		t.Error("the truncated title must be a prefix of the task's")
+	}
+}
+
+// A requester whose address has gone missing is our own data being wrong, and
+// it repeats. Committing as `<>` would publish an unattributable commit under
+// a human's approval, which is worse than refusing.
+func TestPublish_ARequesterWithNoAddressRefusesToPublish(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.stop()
+	p.approve(t, "gate")
+	mustExec(t, p.f, `UPDATE users SET email = '' WHERE id = $1`, p.f.userID)
+	p.start()
+
+	got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 60*time.Second)
+	if got.Outcome == nil || got.Outcome.Code != runs.CodeInternalError {
+		t.Fatalf("outcome = %+v, want internal_error: an empty address is not a transient blip, "+
+			"and retrying it would spin until the wall deadline", got.Outcome)
+	}
+	if !strings.Contains(got.Outcome.Message, "has no address") {
+		t.Errorf("message = %q, want it to name the missing address", got.Outcome.Message)
+	}
+	if _, ok := tryIntentRow(t, p.f, p.run.ID, "publish"); ok {
+		t.Error("no intent may be created for a publication that cannot be attributed")
+	}
+	if p.publisher().PushCount() != 0 {
+		t.Error("nothing may reach the remote")
+	}
 }
 
 // A publish attempt that loses its lease is reconciled through the publish
@@ -854,6 +1252,25 @@ func TestPublish_RevalidationRefusesEveryCoordinateTheApprovalPinned(t *testing.
 		mutate  func(t *testing.T, f fixture, runID uuid.UUID)
 		wantMsg string
 	}{
+		{
+			// The id leg, on its own. Every other coordinate still agrees, so
+			// nothing but `auth.RepoID != cp.repo.ID` can refuse this — which
+			// is the point: an approval carrying a different repository ROW is
+			// a different repository even when its slug reads the same.
+			name: "the approval was granted against a different repository row",
+			mutate: func(t *testing.T, f fixture, runID uuid.UUID) {
+				var other uuid.UUID
+				if err := f.pool.QueryRow(context.Background(),
+					`INSERT INTO repos (project_id, forge_kind, slug, default_branch, credential_id)
+					 VALUES ($1, 'github', 'spine/other', 'main', $2) RETURNING id`,
+					f.projectID, f.credID,
+				).Scan(&other); err != nil {
+					t.Fatal(err)
+				}
+				mustExec(t, f, `UPDATE approved_patches SET repo_id = $2 WHERE run_id = $1`, runID, other)
+			},
+			wantMsg: "but the run targets",
+		},
 		{
 			name: "the repository was renamed",
 			mutate: func(t *testing.T, f fixture, runID uuid.UUID) {

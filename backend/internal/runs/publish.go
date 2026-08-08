@@ -193,16 +193,30 @@ func unchargedWhileUnfinished(err error) error {
 	}}
 }
 
+// resumable types a failure that leaves a LIVE intent exactly where it was:
+// transient, uncharged, and safe to ask again.
+//
+// Every caller stands inside an intent that is 'pending' or 'pushed', which is
+// where ClassifyOutcome's default-deny (spec §2) is at its most dangerous: a
+// raw pgx error becomes a PERMANENT internal_error, `evaluate` sends that
+// straight to terminal failure, terminalizeRun supersedes every live phase,
+// and no sweep revisits a failed run — so a branch already on the forge
+// becomes an orphan. Naming the type once, here, is what keeps every exit of
+// runPublish honest; the invariant on runPublish lists them.
+func resumable(format string, args ...any) error {
+	return OutcomeError{Outcome: Outcome{
+		Class: OutcomeTransient, Code: CodePublishResumable,
+		Message: fmt.Sprintf(format, args...),
+	}}
+}
+
 // receiptFailure types the failure of a receipt transaction, and it is the
 // difference between a run that resumes and a run that dies over a database
 // blip with its branch already on the forge.
 //
-// The transaction runs AFTER its effect landed. `ClassifyOutcome` is
-// default-deny (spec §2), so returning the raw pgx error would classify a lost
-// connection as a PERMANENT internal_error: `evaluate` sends permanent
-// outcomes straight to terminal failure, terminalizeRun supersedes every live
-// phase, and a dead run is never claimed again — so nothing would ever go back
-// and finish writing down a push that really happened.
+// The transaction runs AFTER its effect landed — the push, the pull request,
+// or the decision to halt — so nothing would ever go back and finish writing
+// it down if this returned a permanent answer.
 //
 // errIntentAdvanced is not a failure and passes through untouched: it means
 // another driver's receipt won, which is a position to adopt, not an error.
@@ -210,10 +224,7 @@ func receiptFailure(intent store.PublishIntent, effect string, err error) error 
 	if errors.Is(err, errIntentAdvanced) {
 		return err
 	}
-	return OutcomeError{Outcome: Outcome{
-		Class: OutcomeTransient, Code: CodePublishResumable,
-		Message: fmt.Sprintf("%s receipt for %s did not commit: %v", effect, intent.Branch, err),
-	}}
+	return resumable("%s receipt for %s did not commit: %v", effect, intent.Branch, err)
 }
 
 // notStartedUnlessTyped leaves a deliberate outcome alone and types everything
@@ -259,22 +270,41 @@ func notStartedUnlessTyped(err error) error {
 // dies here dies with its branch on the forge and nothing that will ever look
 // again.
 //
-// With the invariant, the wall deadline becomes the ONLY way to terminalize
-// over an unfinished publication — and that path settles first (Task 10 Step
-// 5). Three pieces enforce it, and each one is a place the invariant was
-// broken before it was written down: receiptFailure types the transaction that
-// commits an effect's receipt, reload types the read that recovers the
-// position, and unchargedWhileUnfinished stops a forge outage from spending
-// the budget. Statuses 'published' and 'halted' are outside the invariant by
-// definition: both are settled, so a permanent answer is honest.
+// With the invariant, the wall deadline becomes the only way THIS FUNCTION can
+// terminalize over an unfinished publication — and that path settles first
+// (Task 10 Step 5). Three pieces enforce it, and each one is a place the
+// invariant was broken before it was written down: receiptFailure types the
+// transaction that commits an effect's receipt (the push's, the pull
+// request's, and the halt's), resumable types every other read or write that
+// happens with a live intent, and unchargedWhileUnfinished stops a forge
+// outage from spending the failure budget. Statuses 'published' and 'halted'
+// are outside the invariant by definition: both are settled, so a permanent
+// answer is honest.
 //
-// Two doors into this run's death are outside this function and are held shut
-// elsewhere, because nothing here can see them:
+// Three doors into this run's death are outside this function and are held
+// shut elsewhere, because nothing here can see them:
+//
+//   - the EXECUTION BUDGET. unchargedWhileUnfinished exempts these codes from
+//     the node's FAILURE budget; the run's execution budget is a different
+//     bound, pre-checked in evaluateFailure, and a breach there is demoted to
+//     a permanent budget_exhausted. A publish attempt accrues real deltaMS (a
+//     clone and a push), so a run that reaches its publish node nearly spent
+//     could die exactly there — with its branch on the forge. Both publish
+//     codes therefore join credential_busy in that pre-check's exemption
+//     (orchestrator.go), on credential_busy's own stated reasoning: they
+//     charge nothing, so demoting their requeue would kill a run for time it
+//     never spent. The exemption is bounded and does not hand out free work —
+//     the usage is still accrued, so once it crosses the budget the successor
+//     stops satisfying ClaimPhase's predicate and the publication simply waits
+//     for the wall deadline, where settlement finishes the record. That is the
+//     whole trade: a run parked for a sweep that WILL come, instead of a run
+//     terminalized 'failed', which no sweep revisits at all.
 //
 //   - a lost lease. reconcileAttempt hands every other node kind to
 //     Executor.Inspect and concludes CHARGEABLE reconcile_lost; a publish
 //     attempt ran no container, so it is dispatched to CodePublishResumable
 //     there instead (orchestrator.go).
+//
 //   - a cancelled context. ClassifyOutcome special-cases only
 //     context.DeadlineExceeded, so a cancellation default-denies to a
 //     permanent internal_error. It is unreachable in practice because the only
@@ -288,12 +318,6 @@ func (o *Orchestrator) runPublish(ctx context.Context, cp cachedPlan, c claimed)
 		// publish failure is honestly "it never began".
 		return ExecutionResult{}, notStartedUnlessTyped(err)
 	}
-	if intent.Status == string(publishHalted) {
-		// A prior attempt halted this publication. Nothing resumes it but a
-		// human, so this attempt reports the same permanent answer rather
-		// than re-probing the forge.
-		return ExecutionResult{}, haltedOutcome(intent)
-	}
 	// reload re-reads the durable position after a lost receipt CAS. The
 	// winner's row is the truth; this worker adopts it rather than retrying
 	// its own stale view.
@@ -306,10 +330,7 @@ func (o *Orchestrator) runPublish(ctx context.Context, cp cachedPlan, c claimed)
 			// with an unfinished intent and a real effect already on the
 			// forge, and a raw error would default-deny into a permanent
 			// internal_error that kills the run over a failed SELECT.
-			return OutcomeError{Outcome: Outcome{
-				Class: OutcomeTransient, Code: CodePublishResumable,
-				Message: fmt.Sprintf("reload publication position: %v", rerr),
-			}}
+			return resumable("reload publication position: %v", rerr)
 		}
 		intent = row
 		return nil
@@ -336,7 +357,12 @@ func (o *Orchestrator) runPublish(ctx context.Context, cp cachedPlan, c claimed)
 		}
 	}
 	if intent.Status == string(publishHalted) {
-		// A concurrent driver halted it under us.
+		// Halted: either a prior attempt did it and this one arrived holding
+		// the settled row, or a concurrent driver did it under us and reload
+		// adopted their position. Nothing resumes a halt but a human, so this
+		// is the same permanent answer every later attempt gets — and it is
+		// the only thing standing between a halted intent and a SUCCESS
+		// carrying a publication artifact with no pull request in it.
 		return ExecutionResult{}, haltedOutcome(intent)
 	}
 	return ExecutionResult{Artifacts: []NewArtifact{publicationArtifact(intent)}}, nil
@@ -624,7 +650,12 @@ func (o *Orchestrator) pushPublication(ctx context.Context, cp cachedPlan, c cla
 
 	art, err := store.New(o.svc.pool).GetArtifactByID(ctx, auth.ArtifactID)
 	if err != nil {
-		return intent, err
+		// The intent is LIVE and its authorization is already consumed, so a
+		// raw error here would default-deny to a permanent internal_error and
+		// kill the publication over a failed SELECT — with nothing left that
+		// could re-authorize it. Asking again is the whole answer.
+		return intent, resumable("read the approved artifact %s for %s: %v",
+			auth.ArtifactID, intent.Branch, err)
 	}
 	diff, ok := artifactDiff(art)
 	if !ok {
@@ -957,10 +988,7 @@ func (o *Orchestrator) adoptConflictingPublication(ctx context.Context, cp cache
 ) (PullRequestRef, error) {
 	candidates, ferr := o.svc.forge.FindPullRequests(ctx, intentRepo(intent), intent.Branch)
 	if ferr != nil {
-		return PullRequestRef{}, OutcomeError{Outcome: Outcome{
-			Class: OutcomeTransient, Code: CodePublishResumable,
-			Message: fmt.Sprintf("re-probe after create conflict on %s: %v", intent.Branch, ferr),
-		}}
+		return PullRequestRef{}, resumable("re-probe after create conflict on %s: %v", intent.Branch, ferr)
 	}
 	pr, found, ambiguous := matchPublication(candidates, intent)
 	switch {
@@ -972,10 +1000,7 @@ func (o *Orchestrator) adoptConflictingPublication(ctx context.Context, cp cache
 			intent.Branch, len(candidates)))
 		return PullRequestRef{}, herr
 	default:
-		return PullRequestRef{}, OutcomeError{Outcome: Outcome{
-			Class: OutcomeTransient, Code: CodePublishResumable,
-			Message: fmt.Sprintf("forge reports a pull request on %s that it does not yet list", intent.Branch),
-		}}
+		return PullRequestRef{}, resumable("forge reports a pull request on %s that it does not yet list", intent.Branch)
 	}
 }
 
@@ -1014,7 +1039,18 @@ func (o *Orchestrator) haltPublication(ctx context.Context, cp cachedPlan, c cla
 		})
 	})
 	if txErr != nil {
-		return intent, txErr
+		// A halt is a receipt like the other two, and the worst-placed one:
+		// three of its four callers stand on a 'pushed' intent, so the branch
+		// is already live on the forge. Returning txErr raw would default-deny
+		// to a permanent internal_error and terminalize the run over a failed
+		// COMMIT, leaving that branch orphaned and the halt unrecorded — the
+		// exact outcome the invariant exists to forbid.
+		//
+		// Re-running the halt is convergent, which is what makes a transient
+		// answer honest: a second call against an already-halted row matches
+		// no rows, returns errIntentAdvanced, and the state machine reloads
+		// and reports haltedOutcome.
+		return intent, receiptFailure(intent, "halt", txErr)
 	}
 	intent.Status = string(publishHalted)
 	return intent, OutcomeError{Outcome: Outcome{

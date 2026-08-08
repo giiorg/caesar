@@ -171,7 +171,7 @@ func (e *Executor) scripted(req runs.ExecutionRequest) (runs.NewArtifact, error)
 			return runs.NewArtifact{}, fmt.Errorf("fake: build publishable patch: %w", err)
 		}
 		return runs.NewArtifact{Type: runs.ArtifactKindPatch, Payload: map[string]any{
-			"diff": AddFilePatch(name, content), "base_sha": req.BaseSHA, "tree_hash": tree,
+			"diff": addFilePatch(name, content), "base_sha": req.BaseSHA, "tree_hash": tree,
 		}}, nil
 	case runs.KindReview:
 		return runs.NewArtifact{Type: runs.ArtifactKindReviewVerdict, Payload: map[string]any{

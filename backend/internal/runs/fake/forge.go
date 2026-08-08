@@ -236,6 +236,19 @@ func (f *Forge) HideListingsAfterCreate(n int) {
 	f.hideAfterCreate = n
 }
 
+// HideNextListings makes the next n listings answer empty starting NOW, with
+// no create to wait for.
+//
+// It is the only way to reach adoptConflictingPublication's halt leg: that leg
+// needs a stranger's request to be INVISIBLE to the pre-create probe and
+// visible to the re-query, and a request that was seeded rather than created
+// never arms hideAfterCreate.
+func (f *Forge) HideNextListings(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hiddenListings = n
+}
+
 // SeedPullRequest puts somebody else's request on a head branch, so a
 // publication can find its marker already carrying one it cannot claim.
 func (f *Forge) SeedPullRequest(headBranch string, ref runs.PullRequestRef) {
@@ -272,6 +285,10 @@ func (f *Forge) PullRequestCount(branch string) int {
 	return len(f.prs[branch])
 }
 
+// BranchProbeCount is how many times the recovery probe asked what the marker
+// points at. It is the assertion that separates "resumed from the intent" from
+// "re-entered the push step and found nothing to do": both leave one commit on
+// the remote, and only this can see that the second step was skipped entirely.
 func (f *Forge) BranchProbeCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

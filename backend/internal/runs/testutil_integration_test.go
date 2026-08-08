@@ -5,15 +5,95 @@ package runs_test
 import (
 	"context"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/giiorg/caesar/backend/internal/platform/testdb"
 	"github.com/giiorg/caesar/backend/internal/runs/fake"
 )
+
+// queryFaults makes ONE named statement fail, once, on demand.
+//
+// It exists because this package could not ask the question the publish state
+// machine is mostly built to answer: what happens when a transaction fails
+// AFTER its effect has landed on the forge. Every guard on that path —
+// receiptFailure at both receipts and at the halt, the artifact read a live
+// intent depends on — was previously provable only by mutating the function
+// under test, which proves the function and not the call site.
+//
+// How it works: it is a pgx.QueryTracer on the fixture's pool.
+// TraceQueryStart is handed the SQL sqlc generated (whose leading comment
+// carries the query's name) and returns the context pgx runs the statement on,
+// so an already-cancelled context makes exactly that statement fail. pgconn
+// checks the context BEFORE it writes anything, so nothing reaches the server:
+// the connection stays healthy and the surrounding transaction rolls back
+// normally. That is a database blip in its most honest form — an error the
+// caller has to classify, not a poisoned session.
+//
+// Inert until armed, so every other test in this package is untouched.
+type queryFaults struct {
+	mu    sync.Mutex
+	rules map[string]*queryFault
+}
+
+type queryFault struct{ skip, times int }
+
+func newQueryFaults() *queryFaults { return &queryFaults{rules: map[string]*queryFault{}} }
+
+// fail arms the named sqlc query — the Go method name, e.g. "RecordPushReceipt"
+// — to fail its next `times` executions after letting `skip` of them through.
+// skip is how a statement issued from two places is narrowed to the second.
+func (q *queryFaults) fail(name string, skip, times int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.rules[name] = &queryFault{skip: skip, times: times}
+}
+
+// remaining reports how many armed failures have not fired. A test asserts it
+// is zero, or it proved nothing: an injection that never triggered leaves a
+// green run that looks exactly like a guard that held.
+func (q *queryFaults) remaining(name string) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if r, ok := q.rules[name]; ok {
+		return r.times
+	}
+	return 0
+}
+
+func (q *queryFaults) armed(sql string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for name, rule := range q.rules {
+		if rule.times <= 0 || !strings.Contains(sql, "-- name: "+name+" ") {
+			continue
+		}
+		if rule.skip > 0 {
+			rule.skip--
+			return false
+		}
+		rule.times--
+		return true
+	}
+	return false
+}
+
+func (q *queryFaults) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if !q.armed(data.SQL) {
+		return ctx
+	}
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+	return dead
+}
+
+func (q *queryFaults) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 // fixture is the minimal asset scaffold a spine row graph needs. Rows
 // are inserted with raw SQL: the spine's FKs point at peer-context
@@ -30,6 +110,9 @@ type fixture struct {
 	// keeps the synthetic "basesha000…" pin those tests assert against.
 	remote  string
 	baseSHA string
+	// faults is the database-fault seam, armed on this pool and inert until a
+	// test asks for a statement to fail.
+	faults *queryFaults
 }
 
 // newPublishFixture is newFixture plus a real remote. Nothing in this package
@@ -52,13 +135,19 @@ func newPublishFixture(t *testing.T) fixture {
 func newFixture(t *testing.T) fixture {
 	t.Helper()
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, testdb.NewURL(t))
+	cfg, err := pgxpool.ParseConfig(testdb.NewURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	faults := newQueryFaults()
+	cfg.ConnConfig.Tracer = faults
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
 
-	f := fixture{pool: pool}
+	f := fixture{pool: pool, faults: faults}
 	err = pool.QueryRow(ctx,
 		`INSERT INTO users (email, password_hash, role) VALUES ('spine@example.com', 'x', 'admin') RETURNING id`,
 	).Scan(&f.userID)

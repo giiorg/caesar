@@ -64,10 +64,11 @@ func bareBranchHead(bare, branch string) (string, bool, error) {
 	return out, true, nil
 }
 
-// AddFilePatch is the base64 wire form of a canonical "add this file" diff —
-// the shape Extract produces and the publish path is handed. It is exported
-// so a test can build the same patch the fake executor emits.
-func AddFilePatch(name, content string) string {
+// addFilePatch is the base64 wire form of a canonical "add this file" diff —
+// the shape Extract produces and the publish path is handed. Unexported: the
+// fake executor is its only caller, and this package does not publish a
+// surface nothing outside it uses.
+func addFilePatch(name, content string) string {
 	lines := strings.Count(content, "\n")
 	var b strings.Builder
 	fmt.Fprintf(&b, "diff --git a/%s b/%s\n", name, name)
@@ -84,7 +85,7 @@ func AddFilePatch(name, content string) string {
 	return base64.StdEncoding.EncodeToString([]byte(b.String()))
 }
 
-// approvedTree is the git tree object id that applying AddFilePatch(name,
+// approvedTree is the git tree object id that applying addFilePatch(name,
 // content) to base produces — the value a real approval pins, and the value
 // gitops.Publish compares its own `write-tree` against.
 //

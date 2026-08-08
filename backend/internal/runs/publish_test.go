@@ -70,6 +70,38 @@ func TestPublish_TheUnfinishedPublicationInvariantHolds(t *testing.T) {
 			t.Fatalf("outcome = %+v; want the permanent conflict unchanged", out)
 		}
 	})
+
+	t.Run("every read and write on a live intent", func(t *testing.T) {
+		// resumable is the type every non-receipt exit wears: the artifact
+		// read, the position reload, the re-probe after a create conflict.
+		out := ClassifyOutcome(resumable("read %s: %v", "artifact", errors.New("connection reset")))
+		if out.Class != OutcomeTransient || out.Code != CodePublishResumable || out.Chargeable() {
+			t.Fatalf("outcome = %+v; want a transient, uncharged publish_resumable", out)
+		}
+		if !strings.Contains(out.Message, "connection reset") {
+			t.Errorf("message = %q; the underlying cause must survive", out.Message)
+		}
+	})
+
+	t.Run("the run's execution budget is a separate door", func(t *testing.T) {
+		// Chargeable is the NODE's failure budget. This is the RUN's execution
+		// budget, pre-checked in evaluateFailure, and a breach there is a
+		// permanent budget_exhausted — a terminalized run no sweep revisits,
+		// reached with an intent that may be 'pushed'.
+		for _, code := range []string{CodeCredentialBusy, CodePublishNotStarted, CodePublishResumable} {
+			if !exemptFromBudgetPreCheck(code) {
+				t.Errorf("%s is not exempt: it charges nothing, so demoting its requeue to "+
+					"budget_exhausted kills a run for time it never spent", code)
+			}
+		}
+		// rate_limited is uncharged too and deliberately NOT exempt: the
+		// attempt did run before the window shut.
+		for _, code := range []string{CodeRateLimited, CodeForgeUnavailable, CodePushRejected, CodeTimeout} {
+			if exemptFromBudgetPreCheck(code) {
+				t.Errorf("%s must keep the budget pre-check", code)
+			}
+		}
+	})
 }
 
 // notStartedUnlessTyped is the only thing standing between the nine untyped

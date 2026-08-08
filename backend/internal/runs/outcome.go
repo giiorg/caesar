@@ -90,6 +90,30 @@ func (o Outcome) Chargeable() bool {
 	return true
 }
 
+// exemptFromBudgetPreCheck names the outcomes evaluateFailure must not demote
+// to a permanent budget_exhausted.
+//
+// Chargeable above is about the NODE's failure budget; this is about the RUN's
+// execution budget, and they are separate bounds with separate doors into a
+// terminalized run. An outcome that charges nothing has, by definition, not
+// spent the time the pre-check is protecting, so demoting its requeue would
+// kill a run for time it never spent — credential_busy's original reasoning,
+// which applies unchanged to both publish codes.
+//
+// It matters most for those two: a publish attempt that fails here fails with
+// an intent that is 'pending' or 'pushed', and a run terminalized 'failed' is
+// revisited by nothing (ListExpiredRunIDs matches only pending, running and
+// waiting), so the branch is an orphan. Exempt, the usage still accrues — so
+// once it crosses the budget the successor stops satisfying ClaimPhase's
+// predicate and the publication waits for the wall deadline, which IS swept.
+func exemptFromBudgetPreCheck(code string) bool {
+	switch code {
+	case CodeCredentialBusy, CodePublishNotStarted, CodePublishResumable:
+		return true
+	}
+	return false
+}
+
 // Map renders the outcome for event payloads and jsonb columns.
 func (o Outcome) Map() map[string]any {
 	m := map[string]any{"class": string(o.Class), "code": o.Code, "message": o.Message}

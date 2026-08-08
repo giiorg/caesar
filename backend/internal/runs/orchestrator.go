@@ -1419,16 +1419,14 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	}
 	gen := runRow.Generation
 	budgetBreached := false
-	if retry && out.Code != CodeCredentialBusy {
+	if retry && !exemptFromBudgetPreCheck(out.Code) {
 		// The fencing CAS must pick failed vs dead up front (failed ->
 		// dead is not a legal transition), and a delta that crosses the
 		// budget must not insert a successor the claim predicate
 		// (execution_used_ms < execution_budget_ms) would refuse forever.
 		// The run-row lock makes the read race-free; usage itself is
-		// still only added after the CAS wins. credential_busy is exempt:
-		// it charges nothing, so demoting its requeue to budget_exhausted
-		// would kill a run for time it never spent. A rate_limited attempt
-		// did run before the window shut, so it keeps the pre-check.
+		// still only added after the CAS wins. A rate_limited attempt did
+		// run before the window shut, so it keeps the pre-check.
 		if runRow.ExecutionUsedMs+max(deltaMS, 0) >= runRow.ExecutionBudgetMs {
 			retry, budgetBreached = false, true
 		}
