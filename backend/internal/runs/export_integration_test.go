@@ -36,7 +36,10 @@ func InsertPhaseForTest(ctx context.Context, s *Service, runID uuid.UUID, nodeID
 	var id uuid.UUID
 	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var err error
-		// Task 4 threads the run's real generation here.
+		// Generation 1, not a parameter: this shim exists for the queue's
+		// fencing tests, which stage attempt rows on runs that never revise.
+		// A caller that needs a revised run's rows wants the orchestrator's
+		// own materialization path, which reads the generation from the run.
 		id, err = s.insertPhaseTx(ctx, tx, runID, nodeID, attempt, maxAttempts, chargeableFailures, 1, notBefore)
 		return err
 	})

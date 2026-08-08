@@ -64,6 +64,21 @@ type cachedPlan struct {
 	taskInputs map[string]any
 	baseSHA    string
 	repo       RepoRef
+	// generation is NOT cached: it changes when a gate opens a revision, and
+	// a stale value would stamp the wrong marker on an artifact. It is read
+	// per use through generationOf.
+}
+
+// generationOf reads the run's current generation. Deliberately not cached:
+// a revision bumps it under a different transaction than the one that
+// compiled the plan, and every write that stamps a generation must see the
+// value its own transaction will commit against.
+func (o *Orchestrator) generationOf(ctx context.Context, q *store.Queries, runID uuid.UUID) (int32, error) {
+	row, err := q.GetRun(ctx, runID)
+	if err != nil {
+		return 0, fmt.Errorf("runs: read generation: %w", err)
+	}
+	return row.Generation, nil
 }
 
 // NewOrchestrator wires the queue driver. leases may be nil: a deployment
@@ -256,6 +271,46 @@ func (o *Orchestrator) loadPlan(ctx context.Context, runID uuid.UUID) (cachedPla
 	return cp, nil
 }
 
+// materializeNode inserts one node's next attempt row inside the caller's tx
+// and returns the event announcing it. Gates are inserted 'waiting_decision'
+// — the claim CTE predicates on 'pending', so this single branch is the whole
+// reason a human's thinking time never burns a lease or the execution budget.
+func (o *Orchestrator) materializeNode(ctx context.Context, tx pgx.Tx, cp cachedPlan,
+	runID uuid.UUID, nodeID string, attempt, maxAttempts, generation int32,
+) (Event, error) {
+	ref := AttemptRef{RunID: runID, NodeID: nodeID, Attempt: attempt}
+	payload := map[string]any{"node_id": nodeID, "attempt": attempt, "generation": generation}
+	if cp.plan.Nodes[nodeID].Kind != KindGate {
+		if _, err := o.svc.insertPhaseTx(ctx, tx, runID, nodeID, attempt, maxAttempts, 0, generation, nil); err != nil {
+			return Event{}, err
+		}
+		return Event{
+			RunID: runID, ProjectID: cp.projectID, Kind: EventPhaseMaterialized,
+			CorrelationID: ref.String(), Payload: payload,
+		}, nil
+	}
+	if _, err := store.New(tx).InsertGatePhase(ctx, store.InsertGatePhaseParams{
+		RunID: runID, NodeID: nodeID, Attempt: attempt, MaxAttempts: maxAttempts,
+		Generation: generation, CreatedAt: o.svc.clock.Now(),
+	}); err != nil {
+		return Event{}, fmt.Errorf("runs: insert gate %s/%s#%d: %w", runID, nodeID, attempt, err)
+	}
+	if rev := cp.plan.Nodes[nodeID].Revision; rev != nil {
+		payload["revision_target"] = rev.Target
+		payload["max_rounds"] = rev.MaxRounds
+	}
+	if pub, ok := cp.plan.PublishFor(nodeID); ok {
+		// The attention item says what an approval will authorize. A gate
+		// that authorizes nothing is a checkpoint; one that authorizes a
+		// publish is a release decision, and the UI must not conflate them.
+		payload["authorizes"] = pub
+	}
+	return Event{
+		RunID: runID, ProjectID: cp.projectID, Kind: EventGateWaiting,
+		CorrelationID: ref.String(), Payload: payload,
+	}, nil
+}
+
 // startPendingRuns flips pending runs to running and materializes their
 // roots — one tx per run; the CAS makes concurrent processes safe.
 func (o *Orchestrator) startPendingRuns(ctx context.Context) error {
@@ -293,15 +348,13 @@ func (o *Orchestrator) startPendingRuns(ctx context.Context) error {
 			}
 			maxAttempts := snap.MaxAttempts
 			for _, root := range cp.plan.Roots() {
-				// Task 4 threads the run's real generation here.
-				if _, err := o.svc.insertPhaseTx(ctx, tx, runID, root, 1, maxAttempts, 0, 1, nil); err != nil {
+				// The generation is literally 1: a run that has not started
+				// cannot have revised.
+				ev, err := o.materializeNode(ctx, tx, cp, runID, root, 1, maxAttempts, 1)
+				if err != nil {
 					return err
 				}
-				evs = append(evs, Event{
-					RunID: runID, ProjectID: cp.projectID, Kind: EventPhaseMaterialized,
-					CorrelationID: AttemptRef{RunID: runID, NodeID: root, Attempt: 1}.String(),
-					Payload:       map[string]any{"node_id": root, "attempt": 1},
-				})
+				evs = append(evs, ev)
 			}
 			return appendEvents(ctx, tx, now, evs)
 		})
@@ -387,6 +440,9 @@ func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID
 			// Already fenced — by this sweep on an earlier tick, or by the
 			// lease sweep. Either way the obligation may still be owed.
 		default:
+			// Terminal, never claimed, or waiting on a human. A gate in
+			// particular ran no container and therefore holds no credential;
+			// there is nothing here to settle.
 			continue
 		}
 		ref := AttemptRef{RunID: runID, NodeID: p.NodeID, Attempt: p.Attempt}
@@ -814,6 +870,10 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 		return false, nil
 	}
 	q := store.New(tx)
+	gen, err := o.generationOf(ctx, q, c.Ref.RunID)
+	if err != nil {
+		return false, err
+	}
 
 	// Persist artifacts with lineage = this node's input artifact ids.
 	node := cp.plan.Nodes[c.Ref.NodeID]
@@ -831,8 +891,7 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 	if err != nil {
 		return false, err
 	}
-	// Task 4 threads the run's real generation here.
-	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, 1, res.Artifacts, rawParents, now)
+	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, gen, res.Artifacts, rawParents, now)
 	if err != nil {
 		return false, err
 	}
@@ -875,15 +934,47 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 		if attempted[nodeID] || !cp.plan.Ready(nodeID, succeeded) {
 			continue
 		}
-		// Task 4 threads the run's real generation here.
-		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, nodeID, 1, c.MaxAttempts, 0, 1, nil); err != nil {
+		ev, err := o.materializeNode(ctx, tx, cp, c.Ref.RunID, nodeID, 1, c.MaxAttempts, gen)
+		if err != nil {
 			return false, err
 		}
-		evs = append(evs, Event{
-			RunID: c.Ref.RunID, ProjectID: cp.projectID, Kind: EventPhaseMaterialized,
-			CorrelationID: AttemptRef{RunID: c.Ref.RunID, NodeID: nodeID, Attempt: 1}.String(),
-			Payload:       map[string]any{"node_id": nodeID, "attempt": 1},
-		})
+		evs = append(evs, ev)
+	}
+
+	// The run's status is READ BACK from the database after the inserts, never
+	// inferred from what this pass happened to do (baked decision 20).
+	//
+	// "Did I just insert a gate" is the wrong question twice over, and a
+	// fan-out DAG asks it both ways. Insert a gate beside a runnable sibling
+	// and it says waiting while the sibling is still pending — the run claims
+	// to be waiting on a human who is not the blocker. Let a sibling finish
+	// while a gate is ALREADY waiting and it says nothing, so the run stays
+	// running — and because FinishGatePhase predicates on the run being
+	// waiting, that gate is then undecidable until the wall deadline kills it.
+	// Nothing in the validator forbids either shape: it checks form, cycles,
+	// lineage, revisions and publication dominance, not "one branch at a time".
+	//
+	// The post-insertion state answers it exactly, in one statement that also
+	// excludes this phase's own row — phaseRows was read before this
+	// transaction finished it, and counting it as live would keep the run
+	// running forever.
+	waiting, err := q.RunIsWaitingOnAGate(ctx, store.RunIsWaitingOnAGateParams{
+		RunID: c.Ref.RunID, ExcludePhase: c.PhaseID,
+	})
+	if err != nil {
+		return false, err
+	}
+	if waiting.Bool {
+		// A run whose only remaining work is a human's decision is 'waiting',
+		// not 'running': the status is what the attention stream and the task
+		// list render, and it is what tells a human the machine is done for
+		// now. The CAS is deliberately allowed to find zero rows — the run may
+		// have been terminalized under us, which is not a conflict.
+		if _, err := q.CASRunStatus(ctx, store.CASRunStatusParams{
+			ID: c.Ref.RunID, FromStatus: string(RunRunning), ToStatus: string(RunWaiting),
+		}); err != nil {
+			return false, err
+		}
 	}
 
 	// Completion: every node succeeded.
@@ -1035,6 +1126,13 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 			notBefore = &nb
 		}
 	}
+	// Read once for both branches: whichever way this goes, the rows it
+	// writes are stamped with the generation this transaction sees.
+	gen, err := o.generationOf(ctx, q, c.Ref.RunID)
+	if err != nil {
+		return false, err
+	}
+
 	if retry {
 		// Retry: prior attempt -> failed, next attempt inserted, SAME tx
 		// (spec §2). failed rows always have successors (plan decision 3).
@@ -1045,8 +1143,7 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		if n == 0 {
 			return false, nil // fenced
 		}
-		// Task 4 threads the run's real generation here.
-		artifactIDs, err := insertArtifacts(ctx, q, c.Ref, 1, res.Artifacts, noParents, now)
+		artifactIDs, err := insertArtifacts(ctx, q, c.Ref, gen, res.Artifacts, noParents, now)
 		if err != nil {
 			return false, err
 		}
@@ -1057,9 +1154,8 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 				return false, err
 			}
 		}
-		// Task 4 threads the run's real generation here.
 		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, c.Ref.NodeID,
-			c.Ref.Attempt+1, c.MaxAttempts, newCount, 1, notBefore); err != nil {
+			c.Ref.Attempt+1, c.MaxAttempts, newCount, gen, notBefore); err != nil {
 			return false, err
 		}
 		payload := map[string]any{
@@ -1087,8 +1183,7 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	if n == 0 {
 		return false, nil // fenced
 	}
-	// Task 4 threads the run's real generation here.
-	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, 1, res.Artifacts, noParents, now)
+	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, gen, res.Artifacts, noParents, now)
 	if err != nil {
 		return false, err
 	}
