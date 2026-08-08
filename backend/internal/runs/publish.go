@@ -1575,7 +1575,7 @@ func (o *Orchestrator) pushRequestFor(ctx context.Context, intent store.PublishI
 		// Replayed, never re-resolved: publish.go's live push does the same,
 		// and the sha hashes both.
 		AuthorName: emailLocalPart(intent.AuthorEmail), AuthorEmail: intent.AuthorEmail,
-		Date:       intent.CreatedAt,
+		Date: intent.CreatedAt,
 		// Set for parity with the live path only. No adapter reads this field;
 		// the probeCtx at the call site is the real bound. It is NOT the run's
 		// wall deadline, which is by definition already in the past here —
