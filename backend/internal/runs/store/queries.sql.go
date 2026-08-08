@@ -1632,6 +1632,48 @@ func (q *Queries) ListRunEventsAfter(ctx context.Context, arg ListRunEventsAfter
 	return items, nil
 }
 
+const listRunsAwaitingMaterialization = `-- name: ListRunsAwaitingMaterialization :many
+SELECT r.id FROM runs r
+WHERE r.status = 'running'
+  AND r.wall_deadline > now()
+  AND NOT EXISTS (
+      SELECT 1 FROM phase_runs pr
+      WHERE pr.run_id = r.id
+        AND pr.status IN ('pending', 'running', 'waiting_decision', 'reconciling')
+  )
+ORDER BY r.created_at
+LIMIT $1
+`
+
+// Running runs that have nothing a worker could pick up. Such a run is either
+// finished (every node succeeded) or blocked behind a gate decision that just
+// landed — a decision is not a phase evaluation, so nothing else would ever
+// pick those up.
+//
+// Written as an anti-join rather than recomputing readiness in SQL: the graph
+// lives in Go, so this only has to be a cheap over-approximation that
+// materializeReady then decides precisely. Both answers are idempotent, so a
+// run matched spuriously costs one no-op transaction.
+func (q *Queries) ListRunsAwaitingMaterialization(ctx context.Context, limit int32) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listRunsAwaitingMaterialization, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunsForTask = `-- name: ListRunsForTask :many
 SELECT id, task_id, status, definition_hash, base_sha, policy_snapshot, generation, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at FROM runs WHERE task_id = $1 ORDER BY created_at DESC, id DESC
 `

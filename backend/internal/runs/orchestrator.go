@@ -145,6 +145,9 @@ func (o *Orchestrator) janitorLoop(ctx context.Context) {
 		if err := o.startPendingRuns(ctx); err != nil {
 			o.log.Error("orchestrator: start pending runs", "error", err)
 		}
+		if err := o.materializeResumedRuns(ctx); err != nil {
+			o.log.Error("orchestrator: materialize resumed runs", "error", err)
+		}
 		if err := o.sweepExpiredRuns(ctx); err != nil {
 			o.log.Error("orchestrator: wall-deadline sweep", "error", err)
 		}
@@ -925,30 +928,75 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 			EventRunFailed, now, evs)
 	}
 
-	// Materialize newly-ready successors (readiness from succeeded set).
-	succeededNodes, err := q.ListSucceededNodes(ctx, c.Ref.RunID)
+	// Materialize newly-ready successors and read the run's resulting state
+	// back. Both live in materializeReady, which the janitor's resumed-run
+	// pass also calls: readiness has exactly one definition, so the two
+	// callers cannot answer it differently.
+	evs2, waiting, complete, err := o.materializeReady(ctx, tx, cp, c.Ref.RunID, c.MaxAttempts, gen, c.PhaseID)
 	if err != nil {
 		return false, err
+	}
+	evs = append(evs, evs2...)
+	if complete {
+		return true, o.finishRunTx(ctx, tx, cp, c.Ref.RunID, RunSucceeded, Outcome{}, EventRunSucceeded, now, evs)
+	}
+	if err := o.syncWaiting(ctx, tx, c.Ref.RunID, waiting); err != nil {
+		return false, err
+	}
+	return false, appendEvents(ctx, tx, now, evs)
+}
+
+// materializeReady inserts a phase row for every node of the run whose inputs
+// have all succeeded and which has no row spoken for it yet. It is the ONE
+// definition of readiness: evaluateSuccess calls it after a phase lands, and
+// the janitor calls it for runs a gate decision resumed (a decision is not a
+// phase evaluation, so nothing else would ever pick those up).
+//
+// It returns the events announcing what it materialized, whether the run is
+// now waiting on a human, and whether the run is complete.
+func (o *Orchestrator) materializeReady(ctx context.Context, tx pgx.Tx, cp cachedPlan,
+	runID uuid.UUID, maxAttempts, generation int32, excludePhase uuid.UUID,
+) ([]Event, bool, bool, error) {
+	q := store.New(tx)
+	succeededNodes, err := q.ListSucceededNodes(ctx, runID)
+	if err != nil {
+		return nil, false, false, err
 	}
 	succeeded := map[string]bool{}
 	for _, id := range succeededNodes {
 		succeeded[id] = true
 	}
-	attempted := map[string]bool{}
-	phaseRows, err := q.ListPhasesForRun(ctx, c.Ref.RunID)
+	phaseRows, err := q.ListPhasesForRun(ctx, runID)
 	if err != nil {
-		return false, err
+		return nil, false, false, err
 	}
+	live := map[string]bool{}
+	// The next attempt ordinal per node. phase_runs is UNIQUE on
+	// (run_id, node_id, attempt) (schema.sql:262), so a node a revision
+	// rewound already owns ordinal 1 and materializing another one would be a
+	// 23505, not a fresh attempt. The rows are already in hand, so this costs
+	// nothing beyond the loop we are already running.
+	nextAttempt := map[string]int32{}
 	for _, pr := range phaseRows {
-		attempted[pr.NodeID] = true
+		if !PhaseStatus(pr.Status).Terminal() || succeeded[pr.NodeID] {
+			live[pr.NodeID] = true
+		}
+		if pr.Attempt >= nextAttempt[pr.NodeID] {
+			nextAttempt[pr.NodeID] = pr.Attempt + 1
+		}
 	}
+	var evs []Event
 	for _, nodeID := range cp.plan.Order {
-		if attempted[nodeID] || !cp.plan.Ready(nodeID, succeeded) {
+		if live[nodeID] || !cp.plan.Ready(nodeID, succeeded) {
 			continue
 		}
-		ev, err := o.materializeNode(ctx, tx, cp, c.Ref.RunID, nodeID, 1, c.MaxAttempts, gen)
+		attempt := nextAttempt[nodeID]
+		if attempt == 0 {
+			attempt = 1 // never materialized before
+		}
+		ev, err := o.materializeNode(ctx, tx, cp, runID, nodeID, attempt, maxAttempts, generation)
 		if err != nil {
-			return false, err
+			return nil, false, false, err
 		}
 		evs = append(evs, ev)
 	}
@@ -966,34 +1014,123 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 	// Nothing in the validator forbids either shape: it checks form, cycles,
 	// lineage, revisions and publication dominance, not "one branch at a time".
 	//
-	// The post-insertion state answers it exactly, in one statement that also
-	// excludes this phase's own row — phaseRows was read before this
-	// transaction finished it, and counting it as live would keep the run
-	// running forever.
+	// `waiting` is DECLARED by this statement — there is no earlier
+	// `waiting := false` to shadow, because a pre-insertion default is exactly
+	// the inference decision 20 forbids.
 	waiting, err := q.RunIsWaitingOnAGate(ctx, store.RunIsWaitingOnAGateParams{
-		RunID: c.Ref.RunID, ExcludePhase: c.PhaseID,
+		RunID: runID, ExcludePhase: excludePhase,
 	})
 	if err != nil {
-		return false, err
+		return nil, false, false, err
 	}
-	if waiting.Bool {
-		// A run whose only remaining work is a human's decision is 'waiting',
-		// not 'running': the status is what the attention stream and the task
-		// list render, and it is what tells a human the machine is done for
-		// now. The CAS is deliberately allowed to find zero rows — the run may
-		// have been terminalized under us, which is not a conflict.
-		if _, err := q.CASRunStatus(ctx, store.CASRunStatusParams{
-			ID: c.Ref.RunID, FromStatus: string(RunRunning), ToStatus: string(RunWaiting),
-		}); err != nil {
-			return false, err
+	complete := len(succeeded) == len(cp.plan.Nodes)
+	return evs, waiting.Bool, complete && !anyRunnablePhase(phaseRows, excludePhase), nil
+}
+
+// anyRunnablePhase reports whether the run still has work a worker could pick
+// up. A run is complete only when the ONLY thing left is nothing at all: a
+// parallel branch still running means the last succeeded node was not the last
+// node, whatever the succeeded count says.
+//
+// exclude is the phase whose own completion is being evaluated, dropped for
+// the same reason RunIsWaitingOnAGate takes an exclude_phase: the answer must
+// not depend on when in the transaction the caller read these rows.
+func anyRunnablePhase(rows []store.PhaseRun, exclude uuid.UUID) bool {
+	for _, r := range rows {
+		if r.ID == exclude {
+			continue
+		}
+		switch PhaseStatus(r.Status) {
+		case PhasePending, PhaseRunning, PhaseReconciling:
+			return true
 		}
 	}
+	return false
+}
 
-	// Completion: every node succeeded.
-	if len(succeeded) == len(cp.plan.Nodes) {
-		return true, o.finishRunTx(ctx, tx, cp, c.Ref.RunID, RunSucceeded, Outcome{}, EventRunSucceeded, now, evs)
+// syncWaiting moves the run between running and waiting to match what its
+// phases actually say. Both directions matter: a gate materialized beside a
+// runnable sibling must NOT park the run, and a sibling completing while a
+// gate already waits must park it — that second case is the one that strands
+// a gate forever, because FinishGatePhase refuses to decide a run that is not
+// waiting.
+//
+// Both are plain CAS. A zero row count means the run was already on the right
+// side (or terminalized under us), which is success, not a conflict.
+func (o *Orchestrator) syncWaiting(ctx context.Context, tx pgx.Tx, runID uuid.UUID, waiting bool) error {
+	from, to := RunRunning, RunWaiting
+	if !waiting {
+		from, to = RunWaiting, RunRunning
 	}
-	return false, appendEvents(ctx, tx, now, evs)
+	_, err := store.New(tx).CASRunStatus(ctx, store.CASRunStatusParams{
+		ID: runID, FromStatus: string(from), ToStatus: string(to),
+	})
+	return err
+}
+
+// materializeResumedRuns picks up runs a gate decision moved back to 'running'
+// and materializes whatever the approval unblocked. Cheap: the query returns
+// only running runs with no live phase row at all, so a steady-state run
+// matches nothing.
+func (o *Orchestrator) materializeResumedRuns(ctx context.Context) error {
+	ids, err := store.New(o.svc.pool).ListRunsAwaitingMaterialization(ctx, 16)
+	if err != nil {
+		return err
+	}
+	for _, runID := range ids {
+		cp, err := o.loadPlan(ctx, runID)
+		if err != nil {
+			o.log.Error("orchestrator: resumed plan load", "run", runID, "error", err)
+			continue
+		}
+		now := o.svc.clock.Now()
+		var runFinished bool
+		err = pg.WithTx(ctx, o.svc.pool, func(tx pgx.Tx) error {
+			q := store.New(tx)
+			// FOR UPDATE, and the generation it carries is the one every row
+			// this pass stamps commits against (see generationOf). Taking it
+			// here also serializes this pass against a worker's concurrent
+			// evaluation of the same run.
+			runRow, err := q.GetRunForUpdate(ctx, runID)
+			if err != nil {
+				return err
+			}
+			if RunStatus(runRow.Status) != RunRunning {
+				return nil // terminalized or re-waiting under us; not ours.
+			}
+			snap, err := snapshotFromRow(runRow.PolicySnapshot)
+			if err != nil {
+				return err
+			}
+			evs, waiting, complete, err := o.materializeReady(ctx, tx, cp, runID,
+				snap.MaxAttempts, runRow.Generation, uuid.Nil)
+			if err != nil {
+				return err
+			}
+			if complete {
+				runFinished = true
+				return o.finishRunTx(ctx, tx, cp, runID, RunSucceeded, Outcome{}, EventRunSucceeded, now, evs)
+			}
+			// Reconcile BOTH directions. `waiting` is read from the
+			// post-insertion state rather than from what this pass did, so it
+			// is also the authority on LEAVING the waiting state: a run that
+			// reads as not-waiting while sitting in RunWaiting has a runnable
+			// phase again and must go back to running, or the claim path never
+			// picks it up.
+			if err := o.syncWaiting(ctx, tx, runID, waiting); err != nil {
+				return err
+			}
+			return appendEvents(ctx, tx, now, evs)
+		})
+		if err != nil {
+			o.log.Error("orchestrator: materialize resumed run", "run", runID, "error", err)
+			continue
+		}
+		if runFinished {
+			o.dropPlan(runID)
+		}
+	}
+	return nil
 }
 
 // insertArtifacts persists one attempt's work products under the
@@ -1027,8 +1164,14 @@ func insertArtifacts(ctx context.Context, q *store.Queries, ref AttemptRef, gene
 
 // finishRunTx completes/fails the run inside the caller's tx, appending
 // the accumulated events first so ordering reads naturally.
-func (o *Orchestrator) finishRunTx(ctx context.Context, tx pgx.Tx, cp cachedPlan, runID uuid.UUID,
-	to RunStatus, out Outcome, eventKind string, now time.Time, evs []Event,
+//
+// A free function over exactly the values it needs, because its two callers
+// reach it from different layers — the janitor holds an Orchestrator and a
+// cachedPlan, the gate decision runs in the API's goroutine and holds
+// neither — and a run may have only one way to end.
+func finishRunTx(ctx context.Context, tx pgx.Tx, rec *audit.Recorder,
+	projectID, runID uuid.UUID, to RunStatus, out Outcome, eventKind string,
+	now time.Time, evs []Event,
 ) error {
 	var rawOut []byte
 	payload := map[string]any{}
@@ -1054,7 +1197,7 @@ func (o *Orchestrator) finishRunTx(ctx context.Context, tx pgx.Tx, cp cachedPlan
 		}
 	}
 	evs = append(evs, Event{
-		RunID: runID, ProjectID: cp.projectID, Kind: eventKind,
+		RunID: runID, ProjectID: projectID, Kind: eventKind,
 		CorrelationID: "caesar-run-" + runID.String(), Payload: payload,
 	})
 	if err := appendEvents(ctx, tx, now, evs); err != nil {
@@ -1064,9 +1207,17 @@ func (o *Orchestrator) finishRunTx(ctx context.Context, tx pgx.Tx, cp cachedPlan
 	if to != RunSucceeded {
 		detail["outcome"] = out.Map()
 	}
-	return o.svc.audit.Record(ctx, tx, audit.Entry{
+	return rec.Record(ctx, tx, audit.Entry{
 		Action: "run.finished", SubjectKind: "run", SubjectID: runID.String(), Detail: detail,
 	})
+}
+
+// finishRunTx keeps the orchestrator's method form, now a forwarding shim, so
+// its call sites are untouched.
+func (o *Orchestrator) finishRunTx(ctx context.Context, tx pgx.Tx, cp cachedPlan, runID uuid.UUID,
+	to RunStatus, out Outcome, eventKind string, now time.Time, evs []Event,
+) error {
+	return finishRunTx(ctx, tx, o.svc.audit, cp.projectID, runID, to, out, eventKind, now, evs)
 }
 
 // evaluateFailure terminalizes or retries a failed attempt, reporting

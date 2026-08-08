@@ -69,6 +69,27 @@ UPDATE runs SET execution_used_ms = LEAST(execution_used_ms + GREATEST(sqlc.arg(
 WHERE id = $1
 RETURNING execution_used_ms, execution_budget_ms;
 
+-- name: ListRunsAwaitingMaterialization :many
+-- Running runs that have nothing a worker could pick up. Such a run is either
+-- finished (every node succeeded) or blocked behind a gate decision that just
+-- landed — a decision is not a phase evaluation, so nothing else would ever
+-- pick those up.
+--
+-- Written as an anti-join rather than recomputing readiness in SQL: the graph
+-- lives in Go, so this only has to be a cheap over-approximation that
+-- materializeReady then decides precisely. Both answers are idempotent, so a
+-- run matched spuriously costs one no-op transaction.
+SELECT r.id FROM runs r
+WHERE r.status = 'running'
+  AND r.wall_deadline > now()
+  AND NOT EXISTS (
+      SELECT 1 FROM phase_runs pr
+      WHERE pr.run_id = r.id
+        AND pr.status IN ('pending', 'running', 'waiting_decision', 'reconciling')
+  )
+ORDER BY r.created_at
+LIMIT $1;
+
 -- name: ListExpiredRunIDs :many
 SELECT id FROM runs
 WHERE status IN ('pending', 'running', 'waiting') AND wall_deadline <= now()
