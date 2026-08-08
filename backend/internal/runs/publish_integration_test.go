@@ -552,6 +552,12 @@ func TestPublish_CrashAfterPushAdoptsTheBranchInsteadOfPushingAgain(t *testing.T
 		t.Fatalf("intent status = %q, want pending: the push landed and its receipt did not", got)
 	}
 
+	// Cross a second boundary before the retry. The commit stamp gitops
+	// writes is RFC3339, which has second resolution: a retry inside the same
+	// second rebuilds the same sha even from the wall clock, so without this
+	// the test would pass with Date unpinned — and the whole adopt path rests
+	// on the date being the intent's, not the clock's.
+	time.Sleep(1100 * time.Millisecond)
 	p.publisher().CrashAfterPush(false)
 	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 90*time.Second)
 
