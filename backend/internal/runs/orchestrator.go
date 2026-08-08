@@ -412,7 +412,15 @@ func (o *Orchestrator) sweepExpiredRuns(ctx context.Context) error {
 		return err
 	}
 	for _, runID := range ids {
-		if !o.settleRunCredentials(ctx, runID) {
+		if !o.settleExpiredPhases(ctx, runID) {
+			continue
+		}
+		// A publication that may have landed is an obligation, not a detail.
+		// Terminalizing over one makes the orphan durable — the run is dead,
+		// its phases superseded, and nothing reconciles a dead run — so an
+		// unsettled intent leaves the run for the next tick exactly as an
+		// unsettled lease does.
+		if !o.settleRunPublications(ctx, runID) {
 			continue
 		}
 		out := Outcome{Class: OutcomePermanent, Code: CodeWallDeadlineExceeded, Message: "wall clock expired"}
@@ -423,24 +431,37 @@ func (o *Orchestrator) sweepExpiredRuns(ctx context.Context) error {
 	return nil
 }
 
-// settleRunCredentials fences and settles the credential obligation of every
-// phase of an expired run that could still be holding one, and reports whether
-// the run may now be terminalized.
+// settleExpiredPhases fences every still-running phase of an expired run and
+// settles the credential obligation of each phase it now owns, reporting
+// whether the run may be terminalized.
+//
+// FENCING IS UNCONDITIONAL, and that is the load-bearing part. It used to sit
+// behind this function's `o.credentials == nil` short-circuit, which meant
+// production — whose executor is not a CredentialReconciler, and whose publish
+// nodes bypass the executor entirely — fenced nothing at all. Nothing else
+// fences a past-deadline phase, so an expired run stayed 'running' forever:
+// publication settlement's quiescence could never become true, and the run
+// could never die. A run that cannot die is worse than the orphan settlement
+// exists to prevent. Only the credential half is skipped now.
+//
+// Fencing and settling stay in ONE pass, phase by phase, rather than a fencing
+// sweep followed by a settling sweep. The order is what makes a lost fencing
+// CAS mean something: losing it to another process means that process is
+// mid-reconciliation on that phase right now, and terminalizing on top of it
+// makes the ordering violation durable. A pass that fenced everything up front
+// would take custody of phases a concurrent sweeper was already settling.
 //
 // The cleanup-only entry is deliberate. Full reconciliation ADOPTS a completed
 // attempt and can evaluate it as a success — and FinishRun carries no deadline
 // predicate, so an exit-0 attempt reconciled after the wall deadline would mark
 // the run succeeded and this sweep's terminalization would silently lose its
 // CAS. Past the deadline the run's outcome is already decided; only the
-// credential obligation is still owed.
+// obligations it leaves behind are still owed.
 //
 // Rows this sweep already moved to 'reconciling' on an earlier tick are picked
 // up again: without that, a reconciliation that failed once would leave a phase
 // whose credential is never settled and a run that terminalizes over it.
-func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID) bool {
-	if o.credentials == nil {
-		return true // no executor-held credentials in this deployment
-	}
+func (o *Orchestrator) settleExpiredPhases(ctx context.Context, runID uuid.UUID) bool {
 	q := store.New(o.svc.pool)
 	phases, err := q.ListPhasesForRun(ctx, runID)
 	if err != nil {
@@ -451,19 +472,11 @@ func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID
 	for _, p := range phases {
 		switch PhaseStatus(p.Status) {
 		case PhaseRunning:
-			// Fence first: the phase lease may still be future-dated (the
-			// worker's own deadline exit races this sweep), so the plain
-			// MarkPhaseReconciling cannot serve here.
-			if _, err := q.MarkPhaseReconcilingPastDeadline(ctx, p.ID); err != nil {
-				if errorsIsNoRows(err) {
-					if o.phaseSettledElsewhere(ctx, q, p.ID) {
-						continue
-					}
-					settled = false
-					continue
-				}
-				o.log.Error("orchestrator: fence past-deadline phase", "phase", p.ID, "error", err)
+			owned, ok := o.fencePhase(ctx, q, p.ID)
+			if !ok {
 				settled = false
+			}
+			if !owned {
 				continue
 			}
 		case PhaseReconciling:
@@ -475,6 +488,9 @@ func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID
 			// there is nothing here to settle.
 			continue
 		}
+		if o.credentials == nil {
+			continue // no executor-held credentials in this deployment
+		}
 		ref := AttemptRef{RunID: runID, NodeID: p.NodeID, Attempt: p.Attempt}
 		if err := o.credentials.ReconcileCredential(ctx, ref); err != nil {
 			o.log.Error("orchestrator: settle credential past deadline", "ref", ref.String(), "error", err)
@@ -482,6 +498,37 @@ func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID
 		}
 	}
 	return settled
+}
+
+// fencePhase takes ONE still-running phase away from its worker: the worker
+// loses the CAS it would need to commit anything, so no new effect can be
+// issued and a settling sweep is not racing one.
+//
+// owned says this sweep fenced the phase and therefore owes its settlement; ok
+// says the run may still be terminalized this tick. The three answers are
+// distinct and the middle one is easy to lose: a phase that moved because it is
+// OVER owes nothing (owned false, ok true), while a phase another sweeper moved
+// to 'reconciling' is one it is settling right now, and terminalizing on top of
+// it makes the ordering violation durable (owned false, ok false).
+//
+// A fenced row is left 'reconciling', which is deliberately NOT terminal — the
+// obligation is still owed, it just has no owner that can act on it. Every
+// settlement in this file therefore reads quiescence as "nothing still
+// running", never as "no live row".
+func (o *Orchestrator) fencePhase(ctx context.Context, q *store.Queries, phaseID uuid.UUID) (owned, ok bool) {
+	// The phase lease may still be future-dated (the worker's own deadline exit
+	// races this sweep), so the plain MarkPhaseReconciling cannot serve here:
+	// this variant fences on the RUN's expired deadline.
+	_, err := q.MarkPhaseReconcilingPastDeadline(ctx, phaseID)
+	switch {
+	case err == nil:
+		return true, true
+	case errorsIsNoRows(err):
+		return false, o.phaseSettledElsewhere(ctx, q, phaseID)
+	default:
+		o.log.Error("orchestrator: fence past-deadline phase", "phase", phaseID, "error", err)
+		return false, false
+	}
 }
 
 // sweepStaleCredentialLeases hands abandoned credential leases to
@@ -705,24 +752,24 @@ func (o *Orchestrator) reconcileAttempt(ctx context.Context, row reconcileRow, a
 		}
 	}
 
+	var ins InspectResult
 	if cp.plan.Nodes[row.NodeID].Kind == KindGitPublish {
-		// A publication left a durable position behind; the Executor never
-		// saw this attempt and cannot answer for it. reconcile_lost is
-		// CHARGEABLE (outcome.go Chargeable), so routing a publish here would
-		// let three lost leases exhaust a node whose branch is already on the
-		// forge — terminalizing the run, superseding every phase, and leaving
-		// nothing that will ever reconcile the branch. That is the exact
-		// failure runPublish's invariant exists to forbid, entered by the one
-		// door runPublish does not guard.
-		o.evaluate(ctx, "", cp, claimedFromRow(row), PhaseReconciling, ExecutionResult{},
-			OutcomeError{Outcome: Outcome{
-				Class: OutcomeTransient, Code: CodePublishResumable,
-				Message: "publish attempt lost its lease; the intent carries the durable position",
-			}})
-		return
+		// The Executor never saw this attempt: a publication is a control-plane
+		// effect. Its durable position IS the intent row, and the forge is the
+		// only witness for effects whose receipt was lost.
+		//
+		// It must not reach the Inspect path below, whose every unadoptable
+		// answer is a CHARGEABLE reconcile_lost (outcome.go Chargeable): three
+		// lost leases would exhaust a node whose branch is already on the forge
+		// — terminalizing the run, superseding every phase, and leaving nothing
+		// that will ever reconcile the branch. That is the exact failure
+		// runPublish's invariant exists to forbid, entered by the one door
+		// runPublish does not guard. Every answer inspectPublication gives is
+		// either uncharged or the honest permanent one.
+		ins, err = o.inspectPublication(ctx, ref)
+	} else {
+		ins, err = o.exec.Inspect(ctx, ref)
 	}
-
-	ins, err := o.exec.Inspect(ctx, ref)
 	if err != nil || !ins.Completed {
 		out := Outcome{Class: OutcomeTransient, Code: CodeReconcileLost, Message: "attempt lost its lease with no adoptable result"}
 		o.evaluate(ctx, "", cp, claimedFromRow(row), PhaseReconciling, ExecutionResult{}, OutcomeError{Outcome: out})

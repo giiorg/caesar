@@ -8,6 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -318,8 +319,10 @@ func notStartedUnlessTyped(err error) error {
 //
 //   - a lost lease. reconcileAttempt hands every other node kind to
 //     Executor.Inspect and concludes CHARGEABLE reconcile_lost; a publish
-//     attempt ran no container, so it is dispatched to CodePublishResumable
-//     there instead (orchestrator.go).
+//     attempt ran no container, so it is dispatched to inspectPublication
+//     instead (orchestrator.go), which answers from the intent row and the
+//     forge: publish_not_started, publish_resumable, the halted conflict, or
+//     an adopted publication — never a charged loss.
 //
 //   - a cancelled context. ClassifyOutcome special-cases only
 //     context.DeadlineExceeded, so a cancellation default-denies to a
@@ -759,12 +762,17 @@ func (o *Orchestrator) pushPublication(ctx context.Context, cp cachedPlan, c cla
 // with the pinned date; this function's job is only to fail fast on a
 // disagreement we can already see, and to stay silent otherwise.
 //
-// In THIS task the receipt branch below is unreachable and that is not an
-// oversight: pushPublication only runs while the intent is 'pending', and
+// The receipt branch below is unreachable and that is not an oversight:
+// pushPublication only runs while the intent is 'pending', and
 // RecordPushReceipt is the sole writer of head_sha — it sets status='pushed'
 // in the same statement. So intent.HeadSha.Valid is always false here, and the
-// only live legs are the probe's error and its "no such branch". Task 10's
-// settlement is the caller that arrives holding a receipt.
+// only live legs are the probe's error and its "no such branch".
+//
+// Task 10's settlement does not change that, though an earlier note here said
+// it would: settlement never calls this function. It proves ownership itself,
+// through ExpectedHead, precisely because it may not re-drive the state
+// machine. The branch stays as the statement of an invariant this function
+// must not assume away.
 func (o *Orchestrator) recoverBranch(ctx context.Context, intent store.PublishIntent) (string, error) {
 	head, ok, err := o.svc.forge.BranchHead(ctx, intentRepo(intent), intent.Branch)
 	if err != nil {
@@ -1072,6 +1080,509 @@ func (o *Orchestrator) haltPublication(ctx context.Context, cp cachedPlan, c cla
 	return intent, OutcomeError{Outcome: Outcome{
 		Class: OutcomePermanent, Code: CodePublishConflict, Message: reason,
 	}}
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation and settlement: the two sweeps that meet a half-finished
+// publication, and the opposite answers they need.
+//
+// The LEASE sweep resumes one — the run is alive, so re-driving the state
+// machine is correct — and inspectPublication is how it reads the durable
+// position. The WALL-DEADLINE sweep must not resume anything: the run has no
+// authority left to cause anything, so settleRunPublications only asks the
+// forge what already exists and writes the answer down.
+// ---------------------------------------------------------------------------
+
+const (
+	// publishSettleGrace is how long a marker must stay missing before absence
+	// is an answer. It bounds how long a request can be in flight after its
+	// issuer was fenced — a property of HTTP, not an operator preference —
+	// hence a constant rather than config.
+	publishSettleGrace = 30 * time.Second
+	// publishSettleProbeBudget bounds ONE ownership rebuild. It is not the
+	// wait: ExpectedHead clones and applies, and settlement runs on the
+	// janitor's context, which has no deadline of its own.
+	publishSettleProbeBudget = 2 * time.Minute
+	// publishSettleUnverifiableAfter is the give-up bound on a publication
+	// settlement cannot verify. Deferring on an unreachable forge is right;
+	// deferring forever is its own wrong durable answer — an outage, or a
+	// credential revoked after the intent was created, would leave the run
+	// alive past its deadline indefinitely. Measured from the run's wall
+	// deadline, in SQL, against the database clock.
+	publishSettleUnverifiableAfter = 30 * time.Minute
+)
+
+// inspectPublication answers reconciliation's question for a publish node:
+// what does the durable record say, and does the forge agree?
+//
+// The Executor never saw this attempt — a publication is a control-plane
+// effect — so its durable position IS the intent row. The four positions map
+// cleanly:
+//
+//   - no intent      → nothing happened. Not completed, and NOT a loss: the
+//     next attempt authorizes from scratch. Reported as an uncharged transient
+//     so the node's failure budget is untouched, on publish_not_started's own
+//     schedule ({0,0,0}, retry.go) so the requeue is immediate.
+//   - halted         → terminal. The typed permanent conflict, so the run dies
+//     naming what a human has to reconcile.
+//   - pending/pushed → resume. Re-drive the state machine from the recorded
+//     position; both steps are idempotent by probe.
+//   - published      → done. Adopt the publication artifact.
+//
+// Returning Completed:false anywhere here would be a bug, not a shorthand:
+// reconcileAttempt turns every incomplete inspection into a CHARGEABLE
+// reconcile_lost, and a publication that loses its lease near max_attempts
+// would exhaust and terminalize the run with a branch already on the forge and
+// no later corrector.
+func (o *Orchestrator) inspectPublication(ctx context.Context, ref AttemptRef) (InspectResult, error) {
+	q := store.New(o.svc.pool)
+	intent, err := q.GetPublishIntent(ctx, store.GetPublishIntentParams{
+		RunID: ref.RunID, NodeID: ref.NodeID,
+	})
+	if errorsIsNoRows(err) {
+		// Nothing was authorized, so nothing was published. Say so with an
+		// uncharged transient rather than reconcile_lost: no work was lost, and
+		// charging here would spend a retry on a worker that died before it did
+		// anything at all.
+		return InspectResult{Completed: true, Outcome: &Outcome{
+			Class: OutcomeTransient, Code: CodePublishNotStarted,
+			Message: "publication had not begun when its worker died",
+		}}, nil
+	}
+	if err != nil {
+		return InspectResult{}, err
+	}
+	switch publishStatus(intent.Status) {
+	case publishHalted:
+		// Rendered by haltedOutcome, never here: the arriving-attempt answer
+		// and the reconciled answer must be the same sentence.
+		out := ClassifyOutcome(haltedOutcome(intent))
+		return InspectResult{Completed: true, Outcome: &out}, nil
+	case publishPublished:
+		// Adopting is idempotent, and what makes it so is the finishPhase CAS
+		// (reconciling -> succeeded matches exactly once), NOT a constraint:
+		// artifacts carries plain indexes only. A refactor of evaluateSuccess
+		// that loosened that CAS would silently start duplicating publication
+		// artifacts here.
+		return InspectResult{Completed: true, Result: ExecutionResult{
+			Artifacts: []NewArtifact{publicationArtifact(intent)},
+		}}, nil
+	}
+	// pending or pushed: the publication is real and unfinished, and the next
+	// attempt resumes from this exact row. Nothing was lost.
+	return InspectResult{Completed: true, Outcome: &Outcome{
+		Class: OutcomeTransient, Code: CodePublishResumable,
+		Message: fmt.Sprintf("publication is %s and resumes from its intent", intent.Status),
+	}}, nil
+}
+
+// settleRunPublications gives every unsettled publication of an expired run a
+// final, durable answer, and reports whether the run may now be terminalized.
+//
+// The asymmetry with reconciliation is deliberate. Reconciliation RESUMES a
+// publication: it may push, it may open a pull request. This may do neither —
+// the run is past its deadline and has no authority to cause anything. It only
+// ASKS the forge what already exists and writes down the answer:
+//
+//   - the marker is absent → NOT an answer yet, until absence is STABLE (see
+//     recordStableAbsence). Once it is, the intent is halted with a reason so
+//     the row stops reading as in-flight.
+//   - the marker is ours   → record the receipt the dying attempt never got to.
+//     The effect is real, so the record must say so even though the run dies.
+//   - the marker exists and we cannot prove it is ours → halt with the
+//     conflict, which is the same answer the live path gives.
+//
+// "Ours" is the hard part, because the case that matters most is the one with
+// NO receipt: the push landed and head_sha is still NULL, so there is nothing
+// stored to compare the remote head against. The forge port cannot answer it
+// (it reads a branch sha and no more) and the publisher's PushPatch must not be
+// asked (it is effectful). What closes it is GitPublisher.ExpectedHead: the
+// same clone-apply-commit the publisher performs, stopping before the push,
+// which reproduces the exact sha this authorization produces because every
+// commit input is replayed from the intent row.
+//
+// A forge that cannot be reached returns false: the run stays matched by the
+// expired-run predicate and is retried next tick, up to
+// publishSettleUnverifiableAfter. Guessing here would make the wrong answer
+// durable, and this is the one place with no later corrector.
+func (o *Orchestrator) settleRunPublications(ctx context.Context, runID uuid.UUID) bool {
+	q := store.New(o.svc.pool)
+	intents, err := q.ListUnsettledPublishIntents(ctx, runID)
+	if err != nil {
+		o.log.Error("orchestrator: unsettled publications", "run", runID, "error", err)
+		return false
+	}
+	if len(intents) == 0 {
+		return true
+	}
+	// Quiescence, once for the run: a phase still 'running' may be inside a
+	// forge call right now, and probing under it would race the effect.
+	//
+	// It is spelled "nothing still running" and not "no live phase row", which
+	// is the obvious phrasing and deadlocks the sweep: fencing leaves every
+	// phase 'reconciling', which is NOT terminal, so a live-row test would
+	// never pass on exactly the runs this exists for. What quiescence has to
+	// mean is FENCED — the worker has lost the CAS it would need to commit
+	// anything, so no new effect can be issued.
+	phases, err := q.ListPhasesForRun(ctx, runID)
+	if err != nil {
+		o.log.Error("orchestrator: settle publications phases", "run", runID, "error", err)
+		return false
+	}
+	for _, p := range phases {
+		if PhaseStatus(p.Status) == PhaseRunning {
+			return false // not fenced yet; settleExpiredPhases gets it next tick
+		}
+	}
+
+	settled := true
+	for _, intent := range intents {
+		ok, err := o.settlePublication(ctx, q, intent)
+		if err == nil {
+			if !ok {
+				settled = false
+			}
+			continue
+		}
+		// Never guess. A forge we cannot reach leaves the run matched by the
+		// expired-run predicate and the next tick asks again — but only up to
+		// the bound, or a long outage would make the run immortal.
+		halted, herr := o.haltUnverifiablePublication(ctx, intent, err)
+		if herr != nil {
+			o.log.Error("orchestrator: halt unverifiable publication", "intent", intent.ID, "error", herr)
+		}
+		if halted {
+			continue
+		}
+		o.log.Error("orchestrator: settle publication", "intent", intent.ID, "error", err)
+		settled = false
+	}
+	return settled
+}
+
+// settlePublication gives ONE intent its final answer, or reports that it does
+// not have one yet. It probes the marker its status makes uncertain, and it
+// never causes anything.
+func (o *Orchestrator) settlePublication(ctx context.Context, q *store.Queries,
+	intent store.PublishIntent,
+) (bool, error) {
+	switch publishStatus(intent.Status) {
+	case publishPending:
+		return o.settleUnpushedPublication(ctx, q, intent)
+	case publishPushed:
+		return o.settleUnopenedPublication(ctx, q, intent)
+	}
+	return true, nil // 'published' and 'halted' are settled by definition
+}
+
+// settleUnpushedPublication answers "did the push land?" for an intent with no
+// push receipt. The marker at risk is the BRANCH.
+func (o *Orchestrator) settleUnpushedPublication(ctx context.Context, q *store.Queries,
+	intent store.PublishIntent,
+) (bool, error) {
+	head, exists, err := o.svc.forge.BranchHead(ctx, intentRepo(intent), intent.Branch)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return o.recordStableAbsence(ctx, q, intent,
+			"expired before publishing: no branch on the forge after the settle grace")
+	}
+	if _, err := q.ClearPublicationAbsent(ctx, intent.ID); err != nil {
+		return false, err
+	}
+	// A branch exists and there is no receipt to compare it against, so
+	// ownership is proved the only way it can be: REBUILD the commit this
+	// authorization produces and check the remote head against it (decision 18
+	// — an observed sha is evidence, never permission).
+	req, err := o.pushRequestFor(ctx, intent)
+	if err != nil {
+		return false, err
+	}
+	// The ctx is the real bound: PushRequest.Deadline is consulted by no
+	// adapter today, and settlement runs on the janitor loop's context, which
+	// has no deadline — so a clone against a wedged forge would block the whole
+	// janitor goroutine, deadline sweep and lease sweep with it.
+	probeCtx, cancel := context.WithTimeout(ctx, publishSettleProbeBudget)
+	defer cancel()
+	want, err := o.svc.publisher.ExpectedHead(probeCtx, req)
+	if err != nil {
+		return false, err
+	}
+	if want != head {
+		return o.halt(ctx, intent, fmt.Sprintf(
+			"branch %s exists at %s, which this authorization did not produce", intent.Branch, head))
+	}
+	// Ours, and it landed. Write the receipt the dying attempt never got to.
+	n, err := q.RecordPushReceipt(ctx, store.RecordPushReceiptParams{
+		ID: intent.ID, HeadSha: pgtype.Text{String: head, Valid: true}, UpdatedAt: o.svc.clock.Now(),
+	})
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		// A live driver beat us to it. Only a settled row costs this run
+		// nothing: anything else is re-read next tick.
+		return o.intentSettledElsewhere(ctx, q, intent)
+	}
+	// The intent is now 'pushed' and its pull request is the next question.
+	// Deferring one tick keeps this function to one effect-shaped answer at a
+	// time, and the run is already staying alive for the credential sweep.
+	return false, nil
+}
+
+// settleUnopenedPublication answers "did the pull request land?" for an intent
+// whose push receipt is recorded. Its window is identical to the branch's: a
+// create call issued just before the deadline can still be on the wire.
+func (o *Orchestrator) settleUnopenedPublication(ctx context.Context, q *store.Queries,
+	intent store.PublishIntent,
+) (bool, error) {
+	candidates, err := o.svc.forge.FindPullRequests(ctx, intentRepo(intent), intent.Branch)
+	if err != nil {
+		return false, err
+	}
+	pr, found, ambiguous := matchPublication(candidates, intent)
+	switch {
+	case found:
+		if _, err := q.ClearPublicationAbsent(ctx, intent.ID); err != nil {
+			return false, err
+		}
+		n, err := q.RecordPRReceipt(ctx, store.RecordPRReceiptParams{
+			ID:        intent.ID,
+			PrNumber:  pgtype.Int8{Int64: pr.Number, Valid: true},
+			PrUrl:     pgtype.Text{String: pr.URL, Valid: true},
+			UpdatedAt: o.svc.clock.Now(),
+		})
+		if err != nil {
+			return false, err
+		}
+		if n == 0 {
+			return o.intentSettledElsewhere(ctx, q, intent)
+		}
+		return true, nil
+	case ambiguous || len(candidates) > 0:
+		if _, err := q.ClearPublicationAbsent(ctx, intent.ID); err != nil {
+			return false, err
+		}
+		return o.halt(ctx, intent, fmt.Sprintf(
+			"branch %s carries %d pull request(s) and none is provably this publication's",
+			intent.Branch, len(candidates)))
+	default:
+		// No pull request visible. This is the window a branch-only stable
+		// negative misses entirely: the create call may be on the wire right
+		// now, so absence gets the same grace the branch does.
+		return o.recordStableAbsence(ctx, q, intent,
+			"expired after pushing: no pull request on the forge after the settle grace")
+	}
+}
+
+// recordStableAbsence is the whole reason one probe never settles a negative.
+//
+// A cancelled request cannot prove the remote refused it, and that cuts both
+// ways: a push (or a create) issued microseconds before the deadline may still
+// be in flight when settlement probes. Halting on sight would terminalize the
+// run, and then the effect lands — an orphan on the forge that no path
+// examines, because the run is dead and its phases superseded. Fencing does not
+// close it either: fencing changes database state, while the request is already
+// on the wire.
+//
+// So: stamp the first sighting and defer; halt only once the grace has elapsed
+// with the marker continuously missing. Any probe that finds the marker clears
+// the stamp, and so does either receipt.
+func (o *Orchestrator) recordStableAbsence(ctx context.Context, q *store.Queries,
+	intent store.PublishIntent, reason string,
+) (bool, error) {
+	halted, err := o.settlementHalt(ctx, intent, reason, nil,
+		func(ctx context.Context, tq *store.Queries) (int64, error) {
+			return tq.HaltStablyAbsentPublication(ctx, store.HaltStablyAbsentPublicationParams{
+				ID: intent.ID, HaltReason: pgtype.Text{String: reason, Valid: true},
+				Status: intent.Status, GraceSeconds: int32(publishSettleGrace / time.Second),
+			})
+		})
+	if err != nil {
+		return false, err
+	}
+	if halted {
+		return true, nil // absence held for the whole grace; the intent is settled
+	}
+	// Either this is the first sighting, or the grace has not elapsed. Stamp it
+	// if unstamped (the statement is a no-op otherwise) and defer.
+	if _, err := q.MarkPublicationAbsent(ctx, store.MarkPublicationAbsentParams{
+		ID: intent.ID, Status: intent.Status,
+	}); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// haltUnverifiablePublication is the bound on "ask again next tick". It fires
+// only when the run has been past its wall deadline for
+// publishSettleUnverifiableAfter and settlement still cannot get an answer.
+//
+// The halt reason names the forge because that is the failure this bound
+// exists for; the cause that actually stopped this pass rides in the event
+// payload, so an operator reading the run's stream sees the real error.
+func (o *Orchestrator) haltUnverifiablePublication(ctx context.Context,
+	intent store.PublishIntent, cause error,
+) (bool, error) {
+	reason := fmt.Sprintf(
+		"expired and unverifiable: the forge could not be reached for %s after the run's deadline",
+		publishSettleUnverifiableAfter)
+	return o.settlementHalt(ctx, intent, reason, map[string]any{"cause": cause.Error()},
+		func(ctx context.Context, tq *store.Queries) (int64, error) {
+			return tq.HaltUnverifiablePublication(ctx, store.HaltUnverifiablePublicationParams{
+				ID: intent.ID, HaltReason: pgtype.Text{String: reason, Valid: true},
+				Status:              intent.Status,
+				UnverifiableSeconds: int32(publishSettleUnverifiableAfter / time.Second),
+			})
+		})
+}
+
+// halt is the settlement-side halt: the same row write haltPublication makes,
+// without the attempt-scoped correlation a dead run has no `claimed` to supply.
+//
+// A lost CAS means a live driver moved the intent. Only a SETTLED row lets this
+// run terminalize now; anything else is re-read next tick.
+func (o *Orchestrator) halt(ctx context.Context, intent store.PublishIntent, reason string) (bool, error) {
+	halted, err := o.settlementHalt(ctx, intent, reason, nil,
+		func(ctx context.Context, tq *store.Queries) (int64, error) {
+			return tq.HaltPublishIntent(ctx, store.HaltPublishIntentParams{
+				ID: intent.ID, HaltReason: pgtype.Text{String: reason, Valid: true},
+				UpdatedAt: o.svc.clock.Now(),
+			})
+		})
+	if err != nil {
+		return false, err
+	}
+	if halted {
+		return true, nil
+	}
+	return o.intentSettledElsewhere(ctx, store.New(o.svc.pool), intent)
+}
+
+// settlementHalt runs one halting statement in a transaction with the event and
+// the audit entry EVERY halt in this system carries.
+//
+// One emission path for all three settlement halts, because the most common one
+// is the timed-out absence: writing that through its CAS alone would flip an
+// intent to 'halted' with no publish.halted event and no audit row, and an
+// operator reading the run's stream would see a run that died over a
+// publication that silently changed status.
+//
+// The correlation id is the run's, matching terminalizeRun: a dead run has no
+// attempt to name. The audit entry needs no actor, exactly as haltPublication's
+// does not.
+func (o *Orchestrator) settlementHalt(ctx context.Context, intent store.PublishIntent,
+	reason string, extra map[string]any,
+	halt func(ctx context.Context, q *store.Queries) (int64, error),
+) (bool, error) {
+	// GetRunProjectID rather than loadPlan: it cannot fail for compile reasons,
+	// and a dead run's definition is not worth recompiling to name a project.
+	projectID, err := store.New(o.svc.pool).GetRunProjectID(ctx, intent.RunID)
+	if err != nil {
+		return false, err
+	}
+	now := o.svc.clock.Now()
+	var n int64
+	err = pg.WithTx(ctx, o.svc.pool, func(tx pgx.Tx) error {
+		q := store.New(tx)
+		var herr error
+		if n, herr = halt(ctx, q); herr != nil {
+			return herr
+		}
+		if n == 0 {
+			return nil // the CAS matched nothing; the caller decides what that means
+		}
+		payload := map[string]any{"node_id": intent.NodeID, "branch": intent.Branch, "reason": reason}
+		for k, v := range extra {
+			payload[k] = v
+		}
+		if err := appendEvents(ctx, tx, now, []Event{{
+			RunID: intent.RunID, ProjectID: projectID, Kind: EventPublishHalted,
+			CorrelationID: "caesar-run-" + intent.RunID.String(), Payload: payload,
+		}}); err != nil {
+			return err
+		}
+		return o.svc.audit.Record(ctx, tx, audit.Entry{
+			Action: "publish.halted", SubjectKind: "publish_intent", SubjectID: intent.ID.String(),
+			Detail: map[string]any{
+				"run_id": intent.RunID.String(), "node_id": intent.NodeID,
+				"branch": intent.Branch, "reason": reason,
+			},
+		})
+	})
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// intentSettledElsewhere re-reads an intent whose CAS matched nothing and
+// reports whether somebody else already gave it a final answer. A settled row
+// costs this run no further tick; anything else does.
+func (o *Orchestrator) intentSettledElsewhere(ctx context.Context, q *store.Queries,
+	intent store.PublishIntent,
+) (bool, error) {
+	row, err := q.GetPublishIntent(ctx, store.GetPublishIntentParams{
+		RunID: intent.RunID, NodeID: intent.NodeID,
+	})
+	if err != nil {
+		return false, err
+	}
+	switch publishStatus(row.Status) {
+	case publishPublished, publishHalted:
+		return true, nil
+	}
+	return false, nil
+}
+
+// pushRequestFor rebuilds the PushRequest this intent's authorization implies,
+// entirely from durable rows — settlement holds no `claimed` and no live plan.
+//
+// ExpectedHead's answer is only worth anything if every input that reaches the
+// commit is identical to what PushPatch used, so each field is sourced from the
+// same row the live path read it from: the message and the author address were
+// rendered once inside the authorize transaction and stored, and the date is
+// the intent's created_at. Re-resolving any of them would rebuild a DIFFERENT
+// commit and turn a crash-after-push into a permanent publish_conflict on a
+// branch that is genuinely ours.
+//
+// ExpectHead is deliberately absent: ExpectedPublicationHead calls only
+// publishPrepare and returns the rebuilt head, and in.ExpectHead is consulted
+// only inside Publish, where the precondition guards a write.
+func (o *Orchestrator) pushRequestFor(ctx context.Context, intent store.PublishIntent) (PushRequest, error) {
+	q := store.New(o.svc.pool)
+	row, err := q.GetAuthorizationByID(ctx, intent.AuthorizationID)
+	if err != nil {
+		return PushRequest{}, err
+	}
+	art, err := q.GetArtifactByID(ctx, row.ArtifactID)
+	if err != nil {
+		return PushRequest{}, err
+	}
+	diff, ok := artifactDiff(art)
+	if !ok {
+		return PushRequest{}, fmt.Errorf("runs: approved artifact %s carries no diff", row.ArtifactID)
+	}
+	return PushRequest{
+		Ref:      AttemptRef{RunID: intent.RunID, NodeID: intent.NodeID, Attempt: intent.Attempt},
+		Repo:     intentRepo(intent),
+		Branch:   intent.Branch,
+		BaseSHA:  intent.BaseSha,
+		TreeHash: intent.TreeHash,
+		Patch:    diff,
+		Message:  intent.CommitMessage,
+		// Replayed, never re-resolved: publish.go's live push does the same,
+		// and the sha hashes both.
+		AuthorName: emailLocalPart(intent.AuthorEmail), AuthorEmail: intent.AuthorEmail,
+		Date:       intent.CreatedAt,
+		// Set for parity with the live path only. No adapter reads this field;
+		// the probeCtx at the call site is the real bound. It is NOT the run's
+		// wall deadline, which is by definition already in the past here —
+		// passing that would abort the rebuild before it started and turn "I
+		// could not check" into a permanent-looking failure.
+		Deadline: o.svc.clock.Now().Add(publishSettleProbeBudget),
+	}, nil
 }
 
 func publicationArtifact(intent store.PublishIntent) NewArtifact {
