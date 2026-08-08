@@ -50,6 +50,72 @@ func addFilePatch(name, content string) string {
 	return base64.StdEncoding.EncodeToString([]byte(b.String()))
 }
 
+// approvedTree is the tree hash applying patch to base produces — the value an
+// approval would have pinned, and now a required input. Built with plain git in
+// a throwaway clone rather than through publishPrepare, so the expectation is
+// independent of the code under test.
+func approvedTree(t *testing.T, remote, base, patch string) string {
+	t.Helper()
+	home := t.TempDir()
+	repo := filepath.Join(home, "tree")
+	env := baseEnv(home)
+	mustGit(t, home, env, "clone", "-q", remote, repo)
+	mustGit(t, repo, env, "checkout", "-q", "--detach", base)
+	raw, err := base64.StdEncoding.DecodeString(patch)
+	if err != nil {
+		t.Fatalf("approvedTree needs a decodable patch: %v", err)
+	}
+	if len(raw) > 0 {
+		p := filepath.Join(home, "approved.patch")
+		if err := os.WriteFile(p, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, repo, env, "apply", "--index", "--whitespace=nowarn", p)
+	}
+	out, err := runGit(t.Context(), repo, env, "write-tree")
+	if err != nil {
+		t.Fatalf("write-tree: %v", err)
+	}
+	return strings.TrimSpace(out)
+}
+
+// unreachedTree stands in for the approved tree hash in the cases that refuse
+// before any tree is built. It is never compared against anything; it exists
+// only because an empty TreeHash is itself a refusal.
+const unreachedTree = "1111111111111111111111111111111111111111"
+
+// pinGitLocalZone forces a non-UTC local timezone onto every git command
+// Publish runs. Without it "the commit stamp carries its own zone" is only
+// falsifiable on a host that is not already UTC: a zone-less date layout would
+// be interpreted in local time and still render as +00:00 under TZ=UTC, so the
+// assertion would pass on exactly the machines CI runs on.
+func pinGitLocalZone(t *testing.T, tz string) {
+	t.Helper()
+	orig := runGitFn
+	runGitFn = func(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+		return orig(ctx, dir, append(slices.Clone(env), "TZ="+tz), args...)
+	}
+	t.Cleanup(func() { runGitFn = orig })
+}
+
+// plantAuthConfigAfterClone persists an auth key into the publish checkout the
+// moment it is cloned. git never does this on its own with GIT_CONFIG_*-scoped
+// values, so this seam is the only way to produce the condition
+// assertNoCredentialConfig exists for.
+func plantAuthConfigAfterClone(t *testing.T, value string) {
+	t.Helper()
+	orig := runGitFn
+	runGitFn = func(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+		out, err := orig(ctx, dir, env, args...)
+		if err == nil && len(args) > 0 && args[0] == "clone" {
+			mustGit(t, dir, baseEnv(dir), "-C", args[len(args)-1],
+				"config", "--local", "http.extraheader", value)
+		}
+		return out, err
+	}
+	t.Cleanup(func() { runGitFn = orig })
+}
+
 // pushForeignCommit puts somebody else's commit on branch and returns its sha.
 func pushForeignCommit(t *testing.T, remote, branch, parent string) string {
 	t.Helper()

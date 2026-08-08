@@ -25,6 +25,11 @@ const (
 // not observable against a local bare repo any other way. Deliberately not
 // shared with stage.go or extract.go — one mutable hook across three files is
 // a race under -race.
+//
+// The same reasoning bounds its use here: this var is only safe because no
+// test in this package calls t.Parallel, so it is written from the running
+// test's own goroutine and restored LIFO by t.Cleanup. The first t.Parallel
+// added anywhere in `gitops` turns it into a data race.
 var runGitFn = runGit
 
 // PublishInput is one publication. Patch is the base64 wire form the patch
@@ -35,7 +40,8 @@ type PublishInput struct {
 	BaseSHA  string
 	Branch   string
 	// TreeHash is what the approval pinned. Applying the approved patch must
-	// reproduce exactly this tree or nothing is pushed.
+	// reproduce exactly this tree or nothing is pushed. Required: an empty one
+	// is refused, never treated as "skip the check".
 	TreeHash string
 	Patch    string
 	Message  string
@@ -181,6 +187,17 @@ func publishPrepare(ctx context.Context, dir string, in PublishInput, authEnv []
 		return preparedPublication{}, typed(runs.OutcomePermanent, runs.CodeInvalidOutput,
 			"publish requires a pinned commit date; an unpinned one makes the commit irreproducible")
 	}
+	// The approved tree is the same class of input property as the date — the
+	// publication's integrity depends on it the way reproducibility depends on
+	// the date — so it gets the same hard refusal rather than opting out
+	// through a plain string's zero value. approved_patches.tree_hash is
+	// `text NOT NULL` (backend/internal/platform/pg/schema.sql:372) and the
+	// settlement path threads it as intent.TreeHash, so a tree hash is ALWAYS
+	// available: an empty one is a caller bug, never a legitimate input.
+	if in.TreeHash == "" {
+		return preparedPublication{}, typed(runs.OutcomePermanent, runs.CodeInvalidOutput,
+			"publish requires the approved tree hash; without it the applied patch is never checked against the approval")
+	}
 
 	// 1. A shallow-ish clone is not enough: the push needs the base commit's
 	// full ancestry or the remote refuses a disconnected history. Clone the
@@ -225,7 +242,8 @@ func publishPrepare(ctx context.Context, dir string, in PublishInput, authEnv []
 	if len(patch) > 0 {
 		path := filepath.Join(dir, publishPatchFile)
 		if err := os.WriteFile(path, patch, 0o600); err != nil {
-			return preparedPublication{}, typed(runs.OutcomeTransient, runs.CodeInternalError, "write publish patch: %v", err)
+			return preparedPublication{}, typed(runs.OutcomeTransient, runs.CodeInternalError,
+				"write publish patch: %s", redact(err.Error(), credential))
 		}
 		if _, err := runGitFn(ctx, repo, env, "apply", "--index", "--whitespace=nowarn", path); err != nil {
 			// git quotes hunks and paths out of a patch we did not author;
@@ -239,10 +257,13 @@ func publishPrepare(ctx context.Context, dir string, in PublishInput, authEnv []
 	// approved must never become a commit, let alone a push.
 	tree, err := runGitFn(ctx, repo, env, "write-tree")
 	if err != nil {
-		return preparedPublication{}, typed(runs.OutcomeTransient, runs.CodeInternalError, "write tree: %v", err)
+		return preparedPublication{}, typed(runs.OutcomeTransient, runs.CodeInternalError,
+			"write tree: %s", redact(err.Error(), credential))
 	}
 	treeHash := strings.TrimSpace(tree)
-	if in.TreeHash != "" && treeHash != in.TreeHash {
+	// Unconditional: the empty TreeHash that used to opt out of this check is
+	// refused at the top of this function.
+	if treeHash != in.TreeHash {
 		return preparedPublication{}, typed(runs.OutcomePermanent, runs.CodePublishConflict,
 			"applying the approved patch produced tree %s, not the approved %s", treeHash, in.TreeHash)
 	}
@@ -258,12 +279,19 @@ func publishPrepare(ctx context.Context, dir string, in PublishInput, authEnv []
 		"GIT_COMMITTER_DATE=" + stamp,
 	})
 	if _, err := runGitFn(ctx, repo, commitEnv, "commit", "-q", "--no-verify", "-m", in.Message); err != nil {
+		// git's own words are echoed here where `apply`'s above are not: the
+		// rule that silences `apply` is about hunk BODIES — arbitrary repo
+		// content out of a patch we did not author — and a failing commit can
+		// name paths from that patch but never quote their contents, while
+		// being almost always a caller-construction bug (an empty message, an
+		// empty patch) that is undiagnosable without them.
 		return preparedPublication{}, typed(runs.OutcomePermanent, runs.CodeInvalidOutput,
 			"commit the approved patch: %s", redact(err.Error(), credential))
 	}
 	head, err := runGitFn(ctx, repo, env, "rev-parse", "HEAD")
 	if err != nil {
-		return preparedPublication{}, typed(runs.OutcomeTransient, runs.CodeInternalError, "read publish head: %v", err)
+		return preparedPublication{}, typed(runs.OutcomeTransient, runs.CodeInternalError,
+			"read publish head: %s", redact(err.Error(), credential))
 	}
 
 	return preparedPublication{
