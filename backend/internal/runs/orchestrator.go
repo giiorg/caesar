@@ -1058,14 +1058,24 @@ func anyRunnablePhase(rows []store.PhaseRun, exclude uuid.UUID) bool {
 // a run that is not waiting. Reading `waiting` back from the database rather
 // than inferring it is what gets that case right — see materializeReady.
 //
-// The un-park direction is DEFENSIVE and unreachable at both call sites today:
-// materializeResumedRuns has already proven the locked run row is 'running',
-// and evaluateSuccess only runs for a claimed phase, which ClaimPhase issues
-// only while the run is 'running'. It is written as a CAS rather than omitted
-// so the rule stays symmetric for Task 6, which rewrites this pass for
-// revisions. A zero row count is the expected outcome there, and in the park
-// direction it means the run was already parked or was terminalized under us
-// — success in both cases, never a conflict.
+// The un-park direction is DEFENSIVE; neither call site reaches it today.
+// materializeResumedRuns proves that by its own guard: it has already read the
+// locked run row as 'running'. evaluateSuccess needs a longer argument, and
+// "ClaimPhase issues a claim only while the run is 'running'" is not it — that
+// covers the claim instant, not the interval up to here. What covers the
+// interval is that nothing can have parked the run inside it:
+// RunIsWaitingOnAGate never reports waiting while a pending, running or
+// reconciling row of the run is visible to it other than its own caller's
+// exclude_phase; this phase's row has been live since the claim, because
+// liveness is only ever lost terminally (see phaseTransitions); it stays live
+// to every other transaction until this one commits, since the finishPhase CAS
+// above is still uncommitted; and no other transaction can be excluding it,
+// because that same CAS admits exactly one evaluator of this row. So the run
+// cannot read 'waiting' here. The CAS is written out rather than omitted so
+// the rule stays symmetric for Task 6, which rewrites this pass for revisions.
+// A zero row count is the expected outcome there, and in the park direction it
+// means the run was already parked or was terminalized under us — success in
+// both cases, never a conflict.
 func (o *Orchestrator) syncWaiting(ctx context.Context, tx pgx.Tx, runID uuid.UUID, waiting bool) error {
 	from, to := RunRunning, RunWaiting
 	if !waiting {
