@@ -42,7 +42,14 @@ type Forge struct {
 	// and not yet published it to its list endpoint, which is the ONLY way a
 	// second driver's pre-create probe can see nothing and its create still
 	// be refused.
-	hiddenListings int
+	//
+	// hideAfterCreate is armed by the injector and moved into hiddenListings
+	// when a create SUCCEEDS. Arming hiddenListings directly would hide the
+	// creating driver's own pre-create probe instead, and the second driver
+	// would then see the request and adopt it through the ordinary find —
+	// never reaching the create conflict the injector exists to stage.
+	hiddenListings  int
+	hideAfterCreate int
 	// holdPR blocks the first OpenPullRequest between the request existing on
 	// the forge and the caller learning about it. That gap is the create-PR
 	// race's whole window: the winner has published and its intent still
@@ -154,6 +161,7 @@ func (f *Forge) OpenPullRequest(ctx context.Context, repo runs.RepoRef, spec run
 	f.nextPR++
 	f.prs[spec.Head] = append(f.prs[spec.Head], ref)
 	f.openPRs++
+	f.hiddenListings, f.hideAfterCreate = f.hideAfterCreate, 0
 	crash, hold := f.crashAfterPR, f.holdPR
 	f.holdPR = nil // only the FIRST create is held
 	f.mu.Unlock()
@@ -218,11 +226,20 @@ func (f *Forge) HoldFirstPullRequest() (release func()) {
 	return sync.OnceFunc(func() { close(ch) })
 }
 
-// HideListingsAfterCreate makes the next n listings answer empty.
+// HideListingsAfterCreate makes the n listings that follow the next accepted
+// create answer empty.
 func (f *Forge) HideListingsAfterCreate(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.hiddenListings = n
+	f.hideAfterCreate = n
+}
+
+// SeedPullRequest puts somebody else's request on a head branch, so a
+// publication can find its marker already carrying one it cannot claim.
+func (f *Forge) SeedPullRequest(headBranch string, ref runs.PullRequestRef) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prs[headBranch] = append(f.prs[headBranch], ref)
 }
 
 // OpenPRCount is how many creates the forge ACCEPTED, refusals excluded.

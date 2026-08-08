@@ -661,6 +661,48 @@ func TestPublish_ForeignBranchOnOurMarkerHaltsForAHuman(t *testing.T) {
 	}
 }
 
+// A marker that already carries a pull request nobody can prove is ours halts
+// for a human, and opens nothing.
+//
+// This is the leg that makes the FIND before the create load-bearing. Without
+// it the machine would open a second request on a marker that already has one
+// — and a forge that refuses duplicates would hide the mistake behind a
+// conflict, so "no duplicate opened" is not the property being protected here;
+// "we looked, and we could not prove it was ours" is.
+func TestPublish_AForeignPullRequestOnOurMarkerHaltsForAHuman(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.stop()
+	authID := p.approve(t, "gate")
+	auth := authorization(t, p.f, authID)
+	// A request from our marker to a target nobody approved: definitively not
+	// this publication's, and impossible to adopt.
+	p.forge().SeedPullRequest(runs.PublicationBranch(auth.ArtifactID), runs.PullRequestRef{
+		Number: 99, URL: "https://fake.forge/spine/repo/pull/99",
+		HeadSHA: "0000000000000000000000000000000000000000", Base: "release", State: "open",
+	})
+	p.start()
+
+	got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 60*time.Second)
+	if got.Outcome == nil || got.Outcome.Code != runs.CodePublishConflict {
+		t.Fatalf("outcome = %+v, want publish_conflict", got.Outcome)
+	}
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if intent.Status != "halted" || intent.HaltReason == nil || *intent.HaltReason == "" {
+		t.Fatalf("the intent must halt with a reason a human can act on: %+v", intent)
+	}
+	if got := p.forge().OpenPRCount(); got != 0 {
+		t.Errorf("the forge accepted %d creates, want 0: a marker we cannot claim is a human's call", got)
+	}
+	if got := p.forge().PullRequestCount(intent.Branch); got != 1 {
+		t.Errorf("pull requests on %s = %d, want the one stranger's left alone", intent.Branch, got)
+	}
+	// The branch itself was pushed before the pull request was attempted, and
+	// it stays: the halt is about the request, not the commit.
+	if intent.HeadSHA == nil {
+		t.Error("the push receipt must survive a halt at the pull-request step")
+	}
+}
+
 func TestPublish_TransientForgeFailureResumesWithoutRePushing(t *testing.T) {
 	p := publicationAtItsGate(t, gatedConveyorDoc())
 	p.forge().FailPRTimes(2, runs.CodeForgeUnavailable)
