@@ -321,14 +321,19 @@ func TestDecideGate_RejectTerminalizesTheRun(t *testing.T) {
 	}
 }
 
-// The wall deadline is checked against the DATABASE clock inside the decision
-// transaction, before anything is written (spec §3 Budgets).
+// An expired run's decision is refused UP FRONT, before the transaction
+// writes anything (spec §3 Budgets).
 //
-// The observable end state alone would not pin that: FinishGatePhase carries
-// its own `wall_deadline > now()` predicate, so deleting the up-front check
-// leaves the same rows behind — the transaction just rolls back one statement
-// later. The discriminator is the message. Only the up-front branch names the
-// deadline; the CAS-lost branch says the gate stopped waiting.
+// That is all this test pins. It does not pin which clock the check reads:
+// swapping the transaction's DBNow for the app clock leaves it green, because
+// the two clocks agree in this fixture. The DB-clock requirement is carried by
+// FinishGatePhase's own SQL predicate, which cannot read anything else.
+//
+// The observable end state alone would not pin even the up-front part:
+// FinishGatePhase's predicate produces the same rows, so deleting the up-front
+// check leaves nothing different behind — the transaction just rolls back one
+// statement later. The discriminator is the message. Only the up-front branch
+// names the deadline; the CAS-lost branch says the gate stopped waiting.
 func TestDecideGate_ExpiredRunRefusesTheDecisionAndDoesNotAuthorize(t *testing.T) {
 	f := newFixture(t)
 	svc, _ := newService(t, f, gatedConveyorDoc(), runs.DefaultSnapshot())
@@ -501,12 +506,30 @@ func TestDecideGate_ValidationAndTheRequestChangesStub(t *testing.T) {
 	}
 }
 
-// The approvals inbox and the API's pre-write project lookup. Both are
-// ten-column positional plumbing, which is exactly the kind of code that
-// compiles while transposing two uuids.
+// The approvals inbox and the API's pre-write project lookup. waitingGateFrom
+// is ten-column positional plumbing, which is exactly the kind of code that
+// compiles while transposing two arguments of the same type — four uuids, two
+// strings and two int32s. Every one of the ten is pinned against an
+// independently-read source below, and the fixture is deliberately arranged so
+// no two same-typed fields hold the same value.
 func TestListWaitingGatesAndGateProject(t *testing.T) {
 	f, svc, run := gatedRunAtItsGate(t, gatedConveyorDoc(), runs.DefaultSnapshot())
 	ctx := context.Background()
+
+	// attempt and generation are BOTH 1 at first materialization (attempt
+	// starts at 1; both generation columns are NOT NULL DEFAULT 1), so the one
+	// adjacent same-typed pair would be invisible to any assertion. Move the
+	// generation the way Task 6's revision will, so the two differ.
+	const gateGeneration = 3
+	if _, err := f.pool.Exec(ctx, `UPDATE runs SET generation = $2 WHERE id = $1`,
+		run.ID, gateGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx,
+		`UPDATE phase_runs SET generation = $2 WHERE run_id = $1 AND node_id = 'gate'`,
+		run.ID, gateGeneration); err != nil {
+		t.Fatal(err)
+	}
 
 	projectID, err := svc.GateProject(ctx, run.ID)
 	if err != nil {
@@ -531,23 +554,39 @@ func TestListWaitingGatesAndGateProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	gate := phaseByNode(t, phases, "gate")
-	got := all[0]
-	if got.PhaseID != gate.ID || got.RunID != run.ID || got.TaskID != run.TaskID ||
-		got.ProjectID != f.projectID || got.RequesterID != f.userID {
-		t.Errorf("waiting gate ids wrong: %+v (phase %s, run %s, task %s, project %s, requester %s)",
-			got, gate.ID, run.ID, run.TaskID, f.projectID, f.userID)
+	// Read back rather than trusting the literal above: the assertion has to
+	// come from the row, not from what the test asked for.
+	wantGeneration := phaseGeneration(t, f, run.ID, "gate", gate.Attempt)
+	if wantGeneration == gate.Attempt {
+		t.Fatalf("attempt and generation are both %d; the int32 pair is unpinned", gate.Attempt)
 	}
-	if got.NodeID != "gate" || got.TaskTitle != "gated" || got.Attempt != gate.Attempt {
-		t.Errorf("waiting gate = %+v, want node gate / title gated / attempt %d", got, gate.Attempt)
+	// Both mappings — the admin view and the project-scoped one — go through
+	// waitingGateFrom's ten positional arguments, so both are checked.
+	assertWaitingGate := func(label string, got runs.WaitingGate) {
+		t.Helper()
+		if got.PhaseID != gate.ID || got.RunID != run.ID || got.TaskID != run.TaskID ||
+			got.ProjectID != f.projectID || got.RequesterID != f.userID {
+			t.Errorf("%s ids wrong: %+v (phase %s, run %s, task %s, project %s, requester %s)",
+				label, got, gate.ID, run.ID, run.TaskID, f.projectID, f.userID)
+		}
+		if got.NodeID != "gate" || got.TaskTitle != "gated" {
+			t.Errorf("%s = %+v, want node gate / title gated", label, got)
+		}
+		if got.Attempt != gate.Attempt || got.Generation != wantGeneration {
+			t.Errorf("%s attempt/generation = %d/%d, want %d/%d",
+				label, got.Attempt, got.Generation, gate.Attempt, wantGeneration)
+		}
+		if got.WaitingSince.IsZero() {
+			t.Errorf("%s must say since when", label)
+		}
 	}
-	if got.WaitingSince.IsZero() {
-		t.Error("a waiting gate must say since when")
-	}
+	assertWaitingGate("admin inbox row", all[0])
 
 	scoped, err := svc.ListWaitingGates(ctx, []uuid.UUID{f.projectID}, false)
 	if err != nil || len(scoped) != 1 {
 		t.Fatalf("scoped inbox = %d, %v", len(scoped), err)
 	}
+	assertWaitingGate("scoped inbox row", scoped[0])
 	foreign, err := svc.ListWaitingGates(ctx, []uuid.UUID{uuid.Max}, false)
 	if err != nil || len(foreign) != 0 {
 		t.Fatalf("foreign inbox = %d, %v", len(foreign), err)

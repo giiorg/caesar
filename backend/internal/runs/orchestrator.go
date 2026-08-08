@@ -1049,14 +1049,23 @@ func anyRunnablePhase(rows []store.PhaseRun, exclude uuid.UUID) bool {
 }
 
 // syncWaiting moves the run between running and waiting to match what its
-// phases actually say. Both directions matter: a gate materialized beside a
-// runnable sibling must NOT park the run, and a sibling completing while a
-// gate already waits must park it — that second case is the one that strands
-// a gate forever, because FinishGatePhase refuses to decide a run that is not
-// waiting.
+// phases actually say, so that both callers of materializeReady reconcile the
+// run's status through one rule instead of each branching on the answer.
 //
-// Both are plain CAS. A zero row count means the run was already on the right
-// side (or terminalized under us), which is success, not a conflict.
+// The park direction is the live one: a sibling completing while a gate is
+// ALREADY waiting must park the run, and that is the case which would
+// otherwise strand the gate forever, because FinishGatePhase refuses to decide
+// a run that is not waiting. Reading `waiting` back from the database rather
+// than inferring it is what gets that case right — see materializeReady.
+//
+// The un-park direction is DEFENSIVE and unreachable at both call sites today:
+// materializeResumedRuns has already proven the locked run row is 'running',
+// and evaluateSuccess only runs for a claimed phase, which ClaimPhase issues
+// only while the run is 'running'. It is written as a CAS rather than omitted
+// so the rule stays symmetric for Task 6, which rewrites this pass for
+// revisions. A zero row count is the expected outcome there, and in the park
+// direction it means the run was already parked or was terminalized under us
+// — success in both cases, never a conflict.
 func (o *Orchestrator) syncWaiting(ctx context.Context, tx pgx.Tx, runID uuid.UUID, waiting bool) error {
 	from, to := RunRunning, RunWaiting
 	if !waiting {
@@ -1111,12 +1120,15 @@ func (o *Orchestrator) materializeResumedRuns(ctx context.Context) error {
 				runFinished = true
 				return o.finishRunTx(ctx, tx, cp, runID, RunSucceeded, Outcome{}, EventRunSucceeded, now, evs)
 			}
-			// Reconcile BOTH directions. `waiting` is read from the
-			// post-insertion state rather than from what this pass did, so it
-			// is also the authority on LEAVING the waiting state: a run that
-			// reads as not-waiting while sitting in RunWaiting has a runnable
-			// phase again and must go back to running, or the claim path never
-			// picks it up.
+			// Park the run if this pass left it waiting on a human. `waiting`
+			// is read from the post-insertion state rather than from what this
+			// pass did (see materializeReady).
+			//
+			// The un-park half of syncWaiting cannot fire here: the guard above
+			// proved this run is 'running' under the row lock, and
+			// ListRunsAwaitingMaterialization would not have offered a
+			// 'waiting' run in the first place. It goes through syncWaiting
+			// anyway so this pass and evaluateSuccess share one rule.
 			if err := o.syncWaiting(ctx, tx, runID, waiting); err != nil {
 				return err
 			}
