@@ -1,7 +1,14 @@
-// Package gitops drives the git binary for the trusted containers of the
-// runner pipeline. Every command runs with a constructed environment (spec
-// §3): git never sees the ambient env, so no user or system config, no
-// credential helper and no terminal prompt can reach it.
+// Package gitops drives the git binary for the trusted parts of the run
+// pipeline. Every command runs with a constructed environment (spec §3): git
+// never sees the ambient env, so no user or system config, no credential
+// helper and no terminal prompt can reach it.
+//
+// Two callers live here for one reason. Stage and Extract run INSIDE the
+// caesar-git container because they touch a workspace and a .git the agent
+// controlled. Publish does not — it reads the remote at a pinned commit and
+// applies a canonical patch — and runs in the control-plane process. It lives
+// in this package because this is where the git-driving primitives are, not
+// because it is a runner concern; the runner/ path is an accident of birth.
 package gitops
 
 import (

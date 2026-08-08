@@ -1,0 +1,132 @@
+package gitops
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// initRemote is the brief's name for the fixture stage_test.go already has: a
+// bare repo with one deterministic seed commit, and its head.
+func initRemote(t *testing.T) (remote, base string) {
+	t.Helper()
+	return stageFixture(t)
+}
+
+// gitOut runs a read-only git command in dir on a constructed env and hands
+// back its TRIMMED output — every assertion in this file compares against a
+// bare literal, and git's formats all end in a newline.
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := runGit(t.Context(), dir, baseEnv(t.TempDir()), args...)
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return strings.TrimSpace(out)
+}
+
+// addFilePatch is the base64 wire form of a canonical "add this file" diff —
+// the shape Extract produces and the publish path is handed.
+func addFilePatch(name, content string) string {
+	lines := strings.Count(content, "\n")
+	var b strings.Builder
+	fmt.Fprintf(&b, "diff --git a/%s b/%s\n", name, name)
+	b.WriteString("new file mode 100644\n")
+	b.WriteString("--- /dev/null\n")
+	fmt.Fprintf(&b, "+++ b/%s\n", name)
+	fmt.Fprintf(&b, "@@ -0,0 +1,%d @@\n", lines)
+	for _, l := range strings.SplitAfter(content, "\n") {
+		if l == "" {
+			continue
+		}
+		b.WriteString("+" + l)
+	}
+	return base64.StdEncoding.EncodeToString([]byte(b.String()))
+}
+
+// pushForeignCommit puts somebody else's commit on branch and returns its sha.
+func pushForeignCommit(t *testing.T, remote, branch, parent string) string {
+	t.Helper()
+	home := t.TempDir()
+	repo := filepath.Join(home, "foreign")
+	env := baseEnv(home)
+	mustGit(t, home, env, "clone", "-q", remote, repo)
+	mustGit(t, repo, env, "checkout", "-q", "--detach", parent)
+	if err := os.WriteFile(filepath.Join(repo, "FOREIGN.md"), []byte("not ours\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, env, "add", "-A")
+	mustGit(t, repo, env, "commit", "-q", "-m", "foreign")
+	mustGit(t, repo, env, "push", "-q", "--force", "origin", "HEAD:refs/heads/"+branch)
+	out, err := runGit(t.Context(), repo, env, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(out)
+}
+
+// createBranchAfterPrepare swaps runGitFn so the branch appears on the remote
+// in the window between the ls-remote probe and the push — the create path's
+// race, staged deterministically. It hooks the push specifically: any earlier
+// command would be a different race than the one under test.
+func createBranchAfterPrepare(t *testing.T, remote, branch, base string) {
+	t.Helper()
+	orig := runGitFn
+	var once sync.Once
+	runGitFn = func(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "push" {
+			once.Do(func() {
+				home := t.TempDir()
+				mustGit(t, home, baseEnv(home), "-C", remote, "update-ref", "refs/heads/"+branch, base)
+			})
+		}
+		return orig(ctx, dir, env, args...)
+	}
+	t.Cleanup(func() { runGitFn = orig })
+}
+
+// gitRecorder answers one question per git subcommand: did it see the
+// credential? A local bare repo authenticates nothing, so this is the only
+// way the wiring is observable at all.
+type gitRecorder struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func (r *gitRecorder) ranWithAuth(cmd string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.seen[cmd]
+}
+
+func recordGitInvocations(t *testing.T) *gitRecorder {
+	t.Helper()
+	rec := &gitRecorder{seen: map[string]bool{}}
+	orig := runGitFn
+	runGitFn = func(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+		if len(args) > 0 {
+			hasAuth := slices.ContainsFunc(env, func(kv string) bool {
+				return strings.HasPrefix(kv, "GIT_CONFIG_VALUE_0=")
+			})
+			rec.mu.Lock()
+			rec.seen[args[0]] = rec.seen[args[0]] || hasAuth
+			rec.mu.Unlock()
+		}
+		return orig(ctx, dir, env, args...)
+	}
+	t.Cleanup(func() { runGitFn = orig })
+	return rec
+}
+
+func mustGit(t *testing.T, dir string, env []string, args ...string) {
+	t.Helper()
+	if _, err := runGit(t.Context(), dir, env, args...); err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+}
