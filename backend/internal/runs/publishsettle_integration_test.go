@@ -54,24 +54,6 @@ func phaseOutcome(t *testing.T, f fixture, runID uuid.UUID, nodeID string, attem
 	return class, code, message
 }
 
-func waitForPhaseOutcome(t *testing.T, f fixture, runID uuid.UUID, nodeID string, attempt int32, d time.Duration) (class, code, message string) {
-	t.Helper()
-	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
-		var got [3]string
-		err := f.pool.QueryRow(context.Background(),
-			`SELECT coalesce(outcome->>'class',''), coalesce(outcome->>'code',''), coalesce(outcome->>'message','')
-			 FROM phase_runs WHERE run_id = $1 AND node_id = $2 AND attempt = $3`, runID, nodeID, attempt,
-		).Scan(&got[0], &got[1], &got[2])
-		if err == nil && got[1] != "" {
-			return got[0], got[1], got[2]
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("%s#%d never recorded an outcome", nodeID, attempt)
-	return "", "", ""
-}
-
 // maxPhaseAttempt is how far a node's attempt ordinal got. It is the assertion
 // that separates "this answer was final" from "this answer was retried": a
 // permanent outcome inserts no successor, and an uncharged transient does.
