@@ -36,6 +36,14 @@ type Publisher struct {
 	// is the shape a wedged worker has: the lease expires with nothing
 	// published and the intent still 'pending'.
 	holdBeforePush chan struct{}
+	// holdAfterPush blocks a call AFTER the branch is on the remote and before
+	// the caller can record it: the crash window a receipt cannot close, held
+	// open for as long as a test needs it. CrashAfterPush is the same window
+	// but returns immediately, so no lease ever expires from it.
+	holdAfterPush chan struct{}
+	// delayPush holds a call before the effect and then PERFORMS it, ignoring
+	// the context. See DelayPushDelivery.
+	delayPush chan struct{}
 }
 
 func NewPublisher(remotes map[uuid.UUID]string) *Publisher {
@@ -89,7 +97,7 @@ func (p *Publisher) PushPatch(ctx context.Context, req runs.PushRequest) (runs.P
 			Class: runs.OutcomeTransient, Code: code, Message: "fake publisher: scripted push failure",
 		}}
 	}
-	hold := p.holdBeforePush
+	hold, delay := p.holdBeforePush, p.delayPush
 	p.mu.Unlock()
 	if hold != nil {
 		select {
@@ -104,13 +112,24 @@ func (p *Publisher) PushPatch(ctx context.Context, req runs.PushRequest) (runs.P
 			}}
 		}
 	}
+	if delay != nil {
+		// No ctx case, deliberately: see DelayPushDelivery.
+		<-delay
+	}
 
 	dir, cleanup, err := p.scratch()
 	if err != nil {
 		return runs.PushResult{}, err
 	}
 	defer cleanup()
-	rep, err := gitops.Publish(ctx, dir, in, nil)
+	// The delayed push must land whatever the caller's context says, so it runs
+	// on a context of its own. gitops.Publish would refuse an expired one, and
+	// what is being modelled is a request the remote has already accepted.
+	pushCtx := ctx
+	if delay != nil {
+		pushCtx = context.WithoutCancel(ctx)
+	}
+	rep, err := gitops.Publish(pushCtx, dir, in, nil)
 	if err != nil {
 		// gitops speaks its own TypedError; runs.ClassifyOutcome matches only
 		// runs.OutcomeError and default-denies everything else to a permanent
@@ -125,9 +144,21 @@ func (p *Publisher) PushPatch(ctx context.Context, req runs.PushRequest) (runs.P
 	if rep.Created {
 		p.created++
 	}
-	crash := p.crashing
+	crash, after := p.crashing, p.holdAfterPush
 	p.mu.Unlock()
 
+	if after != nil {
+		select {
+		case <-after:
+		case <-ctx.Done():
+			// The branch IS on the remote, so this is resumable, never a
+			// non-start: the record owes it a receipt either way.
+			return runs.PushResult{}, runs.OutcomeError{Outcome: runs.Outcome{
+				Class: runs.OutcomeTransient, Code: runs.CodePublishResumable,
+				Message: "fake publisher: held after push, then cancelled",
+			}}
+		}
+	}
 	if crash {
 		// The branch is on the remote and no receipt exists: the one window
 		// that makes a publication non-idempotent if recovery is wrong.
@@ -185,6 +216,52 @@ func (p *Publisher) HangBeforePush() (release func()) {
 	return sync.OnceFunc(func() {
 		p.mu.Lock()
 		p.holdBeforePush = nil
+		p.mu.Unlock()
+		close(ch)
+	})
+}
+
+// HangAfterPush wedges every call once its branch is on the remote and before
+// the caller can record the receipt — a worker that died holding an effect
+// nothing has written down. Release at cleanup, as HangBeforePush documents.
+//
+// It is the shape CrashAfterPush cannot make: a crash returns, so the attempt
+// evaluates and its lease is released. This one holds the phase 'running' with
+// the branch live and the intent still 'pending', which is what a lease sweep
+// and an expired-run settlement actually meet.
+func (p *Publisher) HangAfterPush() (release func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ch := make(chan struct{})
+	p.holdAfterPush = ch
+	return sync.OnceFunc(func() {
+		p.mu.Lock()
+		p.holdAfterPush = nil
+		p.mu.Unlock()
+		close(ch)
+	})
+}
+
+// DelayPushDelivery holds every push on the wire and then PERFORMS it,
+// deliberately ignoring the context.
+//
+// That is the difference from HangBeforePush, and it is the whole point. What
+// is being modelled is a request the remote has already accepted: a local
+// cancellation cannot retract it. Both existing hold injectors return on
+// ctx.Done without causing anything, and after a backdated wall deadline the
+// publish context is ALREADY expired — so an injector built like them could
+// never stage "the effect lands after settlement first looked", which is the
+// race the stable-negative grace exists for.
+//
+// Release at cleanup: a held push is a wedged goroutine.
+func (p *Publisher) DelayPushDelivery() (release func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ch := make(chan struct{})
+	p.delayPush = ch
+	return sync.OnceFunc(func() {
+		p.mu.Lock()
+		p.delayPush = nil
 		p.mu.Unlock()
 		close(ch)
 	})
