@@ -964,9 +964,17 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 		}
 	}
 	// A revised output descends from what the revision handed this node too:
-	// the patch the gate examined and the note. buildRequest fed both to the
-	// attempt, so leaving them out of parent_ids would record a lineage the
-	// execution did not have.
+	// the patch the gate examined and the note. Both were fed to the attempt,
+	// and leaving them out would lose the only link between a revised artifact
+	// and the round that asked for it.
+	//
+	// What parent_ids records, then, is DECLARED lineage plus seeds — not the
+	// exact input set the attempt was handed. The two diverge on a revision
+	// round: collapsePatchInputs drops the structurally-declared patch from the
+	// request when a seeded one displaces it, yet the loop above still records
+	// it. That is deliberate. The declared edge is a real ancestor of this
+	// output whether or not its payload rode along in the request, and dropping
+	// it here would be a lineage change with no caller asking for one.
 	//
 	// The statement's `generation = (SELECT generation FROM runs WHERE id=$1)`
 	// subquery reads the same value this transaction is stamping the rows

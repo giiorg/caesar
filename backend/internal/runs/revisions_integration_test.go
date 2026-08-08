@@ -225,25 +225,51 @@ func executionCount(t *testing.T, f fixture, runID uuid.UUID, nodeID string) int
 	return n
 }
 
-// seedPublishedIntent writes the publish_intents row Task 9 will write for
-// real. Nothing in the tree writes that table yet, so this exists only so
-// Task 6 can exercise openRevision's refusal against a live publication
-// without waiting three tasks for a publisher.
-func seedPublishedIntent(t *testing.T, f fixture, runID uuid.UUID, nodeID string, authID uuid.UUID) {
+// seedPublishIntent writes the publish_intents row Task 9 will write for real,
+// in whichever state that machine would have left it. Nothing in the tree
+// writes that table yet, so this exists only so Task 6 can exercise
+// openRevision's refusal against a live publication without waiting three
+// tasks for a publisher. The receipt columns follow the status, because each
+// one is written in the transaction after its effect landed: a pending intent
+// has no head sha, a pushed one has no pull request.
+func seedPublishIntent(t *testing.T, f fixture, runID uuid.UUID, nodeID string, authID uuid.UUID, status string) {
 	t.Helper()
+	var headSHA, prURL *string
+	var prNumber *int64
+	if status == "pushed" || status == "published" {
+		sha := "headsha0000000000000000000000000000000000"
+		headSHA = &sha
+	}
+	if status == "published" {
+		url, num := "https://example.invalid/pr/7", int64(7)
+		prURL, prNumber = &url, &num
+	}
 	if _, err := f.pool.Exec(context.Background(),
 		`INSERT INTO publish_intents (run_id, node_id, attempt, authorization_id, repo_id,
 		     forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash,
 		     title, body, status, head_sha, pr_number, pr_url, created_at, updated_at)
 		 SELECT $1, $2, 1, $3, r.id, r.forge_kind, r.slug, r.credential_id,
 		        'caesar/' || $2, r.default_branch, 'basesha0000000000000000000000000000000000',
-		        'treehash', 'seeded', '', 'published', 'headsha0000000000000000000000000000000000',
-		        7, 'https://example.invalid/pr/7', now(), now()
+		        'treehash', 'seeded', '', $5, $6, $7, $8, now(), now()
 		 FROM repos r WHERE r.id = $4`,
-		runID, nodeID, authID, f.repoID,
+		runID, nodeID, authID, f.repoID, status, headSHA, prNumber, prURL,
 	); err != nil {
-		t.Fatalf("seed published intent: %v", err)
+		t.Fatalf("seed %s intent: %v", status, err)
 	}
+}
+
+// auditDetailInt is auditDetailBool's numeric sibling; the revision path's
+// interesting detail keys are counts and ordinals rather than flags.
+func auditDetailInt(t *testing.T, f fixture, action, subjectID, key string) int {
+	t.Helper()
+	var got int
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT (detail->>$3)::int FROM audit_entries WHERE action = $1 AND subject_id = $2`,
+		action, subjectID, key,
+	).Scan(&got); err != nil {
+		t.Fatalf("read audit %s/%s detail %q: %v", action, subjectID, key, err)
+	}
+	return got
 }
 
 // waitForRequest polls a bindingRecorder for the request one attempt was
@@ -319,6 +345,22 @@ func TestRequestChanges_RewindsTheSliceAndReDecidesOnTheNewPatch(t *testing.T) {
 	// pass as every other node, and a 1 here is legal and therefore silent.
 	if got := phaseGeneration(t, f, run.ID, "gate", 2); got != 2 {
 		t.Errorf("the regenerated gate row carries generation %d, want 2", got)
+	}
+
+	// The timeline records the round. This is the operator's only view of a
+	// revision — the phase rows say a node re-ran, nothing else says WHY — and
+	// Task 11 builds the API on top of it. Asserted before the second decision
+	// so a stray second emission cannot hide behind it.
+	if n := countEvents(t, svc, run.ID, runs.EventRunRevisionOpened); n != 1 {
+		t.Errorf("%s emitted %d times, want 1", runs.EventRunRevisionOpened, n)
+	}
+	if n := countEvents(t, svc, run.ID, runs.EventGateDecided); n != 1 {
+		t.Errorf("%s emitted %d times, want 1", runs.EventGateDecided, n)
+	}
+	// And the audit entry carries the round the decision opened, not the one it
+	// decided. The two differ by one here, so a wrong source is visible.
+	if got := auditDetailInt(t, f, "gate.decided", res.DecisionID.String(), "generation"); got != 2 {
+		t.Errorf("audit gate.decided generation = %d, want the opened 2", got)
 	}
 
 	// And approving now binds the SECOND patch. An old approval can never
@@ -613,36 +655,47 @@ func TestRequestChanges_InvalidatesThePriorGenerationsAuthorization(t *testing.T
 // standing between two gates — is Task 9's
 // TestRequestChanges_RefusedOnceARunHasPublished. The split is deliberate, not
 // a gap: the code under test is this task's, only the driving is not.
+//
+// EVERY status refuses, 'pending' included, and each case is run because the
+// statement's own semantics turn on that: narrowing CountSettledPublications
+// to status = 'published' is a one-word edit that leaves the design's own
+// reasoning unpinned. A pending intent commits BEFORE the first forge call, so
+// it is precisely the window in which a push may be in flight; a pushed one has
+// a branch on the forge already. Neither can be taken back by a revision.
 func TestRequestChanges_RefusedOnceAPublicationHasSettled(t *testing.T) {
-	f, svc, run := gatedRunAtItsGate(t, twoGateDoc(), runs.DefaultSnapshot())
-	ctx := context.Background()
+	for _, status := range []string{"pending", "pushed", "published"} {
+		t.Run(status, func(t *testing.T) {
+			f, svc, run := gatedRunAtItsGate(t, twoGateDoc(), runs.DefaultSnapshot())
+			ctx := context.Background()
 
-	first, err := svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
-		RunID: run.ID, NodeID: "gate_one", Decision: runs.DecisionApprove,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.AuthorizationID == nil {
-		t.Fatal("gate_one authorizes publish_one")
-	}
-	waitForRun(t, svc, run.ID, runs.RunWaiting) // gate_two
-	seedPublishedIntent(t, f, run.ID, "publish_one", *first.AuthorizationID)
+			first, err := svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
+				RunID: run.ID, NodeID: "gate_one", Decision: runs.DecisionApprove,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.AuthorizationID == nil {
+				t.Fatal("gate_one authorizes publish_one")
+			}
+			waitForRun(t, svc, run.ID, runs.RunWaiting) // gate_two
+			seedPublishIntent(t, f, run.ID, "publish_one", *first.AuthorizationID, status)
 
-	_, err = svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
-		RunID: run.ID, NodeID: "gate_two", Decision: runs.DecisionRequestChanges, Note: "start over",
-	})
-	if xerrors.ClassOf(err) != xerrors.ClassConflict {
-		t.Fatalf("error = %v (class %v), want a conflict naming the live publication", err, xerrors.ClassOf(err))
-	}
-	if got := runGeneration(t, f, run.ID); got != 1 {
-		t.Errorf("generation = %d, want 1: the refused revision must open nothing", got)
-	}
-	// The human still has both real answers available.
-	if _, err := svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
-		RunID: run.ID, NodeID: "gate_two", Decision: runs.DecisionApprove,
-	}); err != nil {
-		t.Fatalf("approve must still be available: %v", err)
+			_, err = svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
+				RunID: run.ID, NodeID: "gate_two", Decision: runs.DecisionRequestChanges, Note: "start over",
+			})
+			if xerrors.ClassOf(err) != xerrors.ClassConflict {
+				t.Fatalf("error = %v (class %v), want a conflict naming the live publication", err, xerrors.ClassOf(err))
+			}
+			if got := runGeneration(t, f, run.ID); got != 1 {
+				t.Errorf("generation = %d, want 1: the refused revision must open nothing", got)
+			}
+			// The human still has both real answers available.
+			if _, err := svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
+				RunID: run.ID, NodeID: "gate_two", Decision: runs.DecisionApprove,
+			}); err != nil {
+				t.Fatalf("approve must still be available: %v", err)
+			}
+		})
 	}
 }
 
@@ -827,7 +880,12 @@ func (e *revisionRacer) waitUntilInFlight(t *testing.T) {
 // is in flight. BumpRunGeneration and FinishGatePhase both predicate on the
 // run being 'waiting' (queries.sql), and RunIsWaitingOnAGate reports waiting
 // only when the run has no other live phase row, so the two transactions are
-// serialized by the run's own status rather than by the lock. Task 4's
+// serialized by the run's own status rather than by the lock. The strongest
+// leg is ClaimPhase's own join: it requires r.status = 'running' on the run
+// row, so no attempt can be CLAIMED while the run waits — and none can already
+// be running, because RunIsWaitingOnAGate would not have reported waiting with
+// a live row present. The exclusion therefore holds across the whole waiting
+// interval, not merely at the instant of the transition. Task 4's
 // generationBumper stays the probe for the lock itself.
 func TestRequestChanges_EveryRowOfTheNewGenerationCarriesIt(t *testing.T) {
 	f := newFixture(t)
