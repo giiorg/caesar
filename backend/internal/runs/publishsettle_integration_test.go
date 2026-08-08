@@ -327,6 +327,54 @@ func TestReconcile_AHaltedPublicationIsPermanentAndProbesNothing(t *testing.T) {
 	}
 }
 
+// haltPublication's lost CAS stops being a theoretical leg once settlement
+// exists: an expired run's settlement halts intents too, so a live driver can
+// now reach its own halt and find the row already settled by somebody else.
+//
+// Treating that as a successful halt is the bug. The driver would report ITS
+// reason — a stale view of a conflict it did not resolve — as the run's
+// outcome, and write a second publish.halted event for a decision that was
+// already made and recorded once.
+//
+// The other writer is a plain UPDATE here rather than the settlement path, and
+// deliberately so: settlement only runs past the wall deadline, and fencing an
+// expired run's phase cancels the very driver this test needs alive. What is
+// under test is the driver's side of the race, which is identical whoever won.
+func TestPublish_AHaltRacedByAnotherWriterAdoptsTheSettledRow(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.stop()
+	authID := p.approve(t, "gate")
+	auth := authorization(t, p.f, authID)
+	foreign := pushForeignBranch(t, p.f, runs.PublicationBranch(auth.ArtifactID))
+	release := p.publisher().HangBeforePush()
+	t.Cleanup(release)
+	p.start()
+
+	// The driver is wedged with a live intent and a marker it cannot claim.
+	waitForIntentStatus(t, p.f, p.run.ID, "publish", "pending", 45*time.Second)
+	mustExec(t, p.f,
+		`UPDATE publish_intents SET status = 'halted', halt_reason = 'settled by somebody else'
+		 WHERE run_id = $1 AND node_id = 'publish'`, p.run.ID)
+	release() // it now pushes, is refused, and goes to halt a row already halted
+
+	got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 90*time.Second)
+	if got.Outcome == nil || got.Outcome.Code != runs.CodePublishConflict {
+		t.Fatalf("outcome = %+v, want publish_conflict", got.Outcome)
+	}
+	if !strings.Contains(got.Outcome.Message, "settled by somebody else") {
+		t.Errorf("outcome message = %q, want the reason the row already carries: a driver that "+
+			"lost the halt CAS must adopt the settled row, not report its own stale view",
+			got.Outcome.Message)
+	}
+	if n := countEvents(t, p.svc, p.run.ID, runs.EventPublishHalted); n != 0 {
+		t.Errorf("publish.halted events = %d, want 0: the halt was already made and recorded "+
+			"once; the losing transaction must commit nothing", n)
+	}
+	if head := remoteBranchHead(t, p.f, intentRow(t, p.f, p.run.ID, "publish").Branch); head != foreign {
+		t.Errorf("the marker is at %q, want the foreign %q left untouched", head, foreign)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // The wall-deadline sweep: settlement asks, and never causes.
 // ---------------------------------------------------------------------------
