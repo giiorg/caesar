@@ -34,7 +34,6 @@ type Forge struct {
 	openPRs        int
 	createAttempts int
 	branchProbes   int
-	prProbes       int
 
 	crashAfterPR bool
 	failPRTimes  int
@@ -229,7 +228,6 @@ func (f *Forge) OpenPullRequest(ctx context.Context, repo runs.RepoRef, spec run
 func (f *Forge) FindPullRequests(_ context.Context, _ runs.RepoRef, headBranch string) ([]runs.PullRequestRef, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.prProbes++
 	if f.hiddenListings > 0 {
 		f.hiddenListings--
 		return nil, nil
@@ -367,16 +365,6 @@ func (f *Forge) PullRequestCount(branch string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.prs[branch])
-}
-
-// PullRequestProbeCount is how many times anything asked what sits on a
-// marker. Settlement's pull-request half is otherwise invisible: it causes
-// nothing, so a test cannot tell "it looked and found none" from "it never
-// looked" without this.
-func (f *Forge) PullRequestProbeCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.prProbes
 }
 
 // BranchProbeCount is how many times the recovery probe asked what the marker

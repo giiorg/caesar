@@ -148,6 +148,36 @@ func backdateWallDeadlineBy(t *testing.T, f fixture, runID uuid.UUID, interval s
 		`UPDATE runs SET wall_deadline = now() - $2::interval WHERE id = $1`, runID, interval)
 }
 
+// waitForSettlementNegative waits for settlement's own durable evidence that it
+// probed a marker and found nothing — or for it to have (wrongly) settled the
+// intent on that first sighting, so the caller's assertion is the one that
+// speaks rather than a timeout.
+//
+// It polls absent_since rather than a forge probe counter because settlement is
+// the ONLY writer of that column, and the counters are not exclusive: the live
+// driver probes the branch in recoverBranch and the pull request in
+// openPublication, microseconds after the row a status poll is watching for
+// commits. A baseline captured around that poll can miss the driver's probe, in
+// which case "one more probe" is satisfied by the DRIVER and the test releases
+// its held effect before settlement has looked at all — passing while proving
+// nothing, which is the failure mode this suite can least afford.
+func waitForSettlementNegative(t *testing.T, f fixture, runID uuid.UUID, nodeID string, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		var stamped bool
+		var status string
+		err := f.pool.QueryRow(context.Background(),
+			`SELECT absent_since IS NOT NULL, status FROM publish_intents
+			 WHERE run_id = $1 AND node_id = $2`, runID, nodeID).Scan(&stamped, &status)
+		if err == nil && (stamped || status == "halted") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("settlement never recorded a missing marker for %s", nodeID)
+}
+
 func waitForForgeBranchProbe(t *testing.T, fg *fake.Forge, want int, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -158,19 +188,6 @@ func waitForForgeBranchProbe(t *testing.T, fg *fake.Forge, want int, d time.Dura
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("the forge saw %d branch probes, want %d: settlement never looked", fg.BranchProbeCount(), want)
-}
-
-func waitForForgePRProbe(t *testing.T, fg *fake.Forge, want int, d time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
-		if fg.PullRequestProbeCount() >= want {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("the forge saw %d pull-request probes, want %d: settlement never looked",
-		fg.PullRequestProbeCount(), want)
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +288,46 @@ func TestReconcile_APublicationThatNeverStartedIsNotChargedAsLost(t *testing.T) 
 	}
 }
 
+// A blip READING the intent is not an answer about the publication, and it must
+// not be charged as one.
+//
+// reconcileAttempt turns every error out of the inspect call into a chargeable
+// reconcile_lost, and with a warm plan cache this read is the first database
+// round trip a publish reconciliation makes — so a pool timeout or a statement
+// timeout lands here before anything else. Three across the node's life exhaust
+// it, terminalize the run and supersede every phase, with the branch already on
+// the forge and nothing that will ever reconcile it. It is the same spend the
+// dispatch above exists to prevent, through the one door that is a database
+// call rather than a forge call.
+func TestReconcile_AFailedIntentReadIsNotChargedAsLost(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.stop()
+	authID := p.approve(t, "gate")
+	stagePublishIntent(t, p.f, authID, "pending", nil, nil, nil, nil)
+	strandRunningPublishAttempt(t, p.f, p.run.ID)
+	// The lease sweep's inspect is the first GetPublishIntent this loop runs:
+	// the phase is already 'running', so nothing else claims or materializes.
+	p.f.faults.fail("GetPublishIntent", 0, 1)
+	startBackdater(t, p.f, p.run.ID)
+	p.start()
+
+	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 90*time.Second)
+	if n := p.f.faults.remaining("GetPublishIntent"); n != 0 {
+		t.Fatalf("%d armed read failures never fired; this test proved nothing", n)
+	}
+	class, code, msg := phaseOutcome(t, p.f, p.run.ID, "publish", 1)
+	if class != string(runs.OutcomeTransient) || code != runs.CodePublishResumable {
+		t.Errorf("outcome = %s/%s, want transient/%s: an unread intent is intact, and asking "+
+			"again is the whole remedy", class, code, runs.CodePublishResumable)
+	}
+	if !strings.Contains(msg, "could not read the publication's intent") {
+		t.Errorf("message = %q, want it to name the failed read", msg)
+	}
+	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
+		t.Errorf("chargeable failures = %d, want 0: a failed SELECT is not a lost attempt", got)
+	}
+}
+
 // A halted publication is settled, and reconciliation must say so rather than
 // re-driving it. The run dies naming what a human has to reconcile.
 //
@@ -364,16 +421,42 @@ func TestPublish_AHaltRacedByAnotherWriterAdoptsTheSettledRow(t *testing.T) {
 // The push lands; the deadline expires before its receipt commits. The run must
 // still die — the deadline is not negotiable — but it must not die pretending
 // nothing was pushed, because nothing revisits a dead run.
+//
+// Two things about the staging are load-bearing, and both were learned the hard
+// way after an earlier version of this test could not see either failure.
+//
+// The receipt is lost through the receipt STATEMENT rather than through a
+// wedged publisher. That leaves no held publisher behind, which is what makes
+// "settlement asks, it never causes" observable as a COUNTER: with a hold
+// armed, a settlement that pushed would block on it and the test would fail as
+// a timeout, saying nothing about the push. It also leaves the attempt failed
+// with a parked successor, so settlement runs against a run whose worker is
+// simply gone — the ordinary shape.
+//
+// And a second boundary is crossed before settlement rebuilds. gitops stamps
+// commit dates at RFC3339's one-second resolution, so a rebuild inside the same
+// second the intent was created produces the IDENTICAL sha even from the wall
+// clock. Without the gap, a `pushRequestFor` that reached for time.Now()
+// instead of the durable created_at passes this test — measured, not argued:
+// that mutant survived five runs of the earlier fixture.
 func TestExpiredRun_APushThatLandedIsRecordedBeforeTheRunDies(t *testing.T) {
 	p := publicationAtItsGate(t, gatedConveyorDoc())
-	release := p.publisher().HangAfterPush()
-	t.Cleanup(release)
+	p.f.faults.fail("RecordPushReceipt", 0, 1)
 	p.approve(t, "gate")
 
+	// The successor row is proof the failed receipt was evaluated, which
+	// PushCount alone is not: the counter rises inside the publisher, before
+	// the receipt is even attempted.
 	waitForPushCount(t, p.publisher(), 1, 45*time.Second)
+	waitForPhaseAttempt(t, p.f, p.run.ID, "publish", 2, 45*time.Second)
+	if n := p.f.faults.remaining("RecordPushReceipt"); n != 0 {
+		t.Fatalf("%d armed receipt failures never fired; this test would prove nothing", n)
+	}
 	if got := intentRow(t, p.f, p.run.ID, "publish").Status; got != "pending" {
 		t.Fatalf("intent status = %q, want pending: the push landed and its receipt did not", got)
 	}
+
+	time.Sleep(1500 * time.Millisecond) // see the second boundary, above
 	backdateWallDeadline(t, p.f, p.run.ID)
 	startAbsenceBackdater(t, p.f, p.run.ID)
 
@@ -390,8 +473,16 @@ func TestExpiredRun_APushThatLandedIsRecordedBeforeTheRunDies(t *testing.T) {
 		t.Errorf("intent status = %q: an expired run's intent must reach a settled state, "+
 			"not stay in-flight forever", intent.Status)
 	}
+	// The invariant this whole path rests on. An expired run has no authority
+	// to cause anything, and only this counter can see it break: a settlement
+	// that called PushPatch instead of ExpectedHead would ADOPT the branch
+	// already at its own commit — same head, same commit count, one more push.
+	if got := p.publisher().PushCount(); got != 1 {
+		t.Errorf("pushes that reached the remote = %d, want the driver's one: settlement asks "+
+			"what already exists and never causes anything", got)
+	}
 	if got := p.publisher().CreatedCount(); got != 1 {
-		t.Errorf("branch creations = %d, want 1: settlement asks, it never pushes", got)
+		t.Errorf("branch creations = %d, want 1", got)
 	}
 }
 
@@ -486,11 +577,10 @@ func TestExpiredRun_AnEffectLandingAfterANegativeProbeIsStillRecorded(t *testing
 	p.approve(t, "gate")
 
 	waitForIntentStatus(t, p.f, p.run.ID, "publish", "pending", 45*time.Second)
-	probed := p.forge().BranchProbeCount() // the live path's own recovery probe
 	backdateWallDeadline(t, p.f, p.run.ID)
 
 	// Settlement looks and finds nothing. It must NOT settle on that.
-	waitForForgeBranchProbe(t, p.forge(), probed+1, 45*time.Second)
+	waitForSettlementNegative(t, p.f, p.run.ID, "publish", 45*time.Second)
 	if got := intentRow(t, p.f, p.run.ID, "publish").Status; got == "halted" {
 		t.Fatal("one absent probe settled the intent; a push still on the wire is now an orphan")
 	}
@@ -596,10 +686,9 @@ func TestExpiredRun_APullRequestLandingAfterANegativeProbeIsStillRecorded(t *tes
 	p.approve(t, "gate")
 
 	waitForIntentStatus(t, p.f, p.run.ID, "publish", "pushed", 45*time.Second)
-	probed := p.forge().PullRequestProbeCount()
 	backdateWallDeadline(t, p.f, p.run.ID)
 
-	waitForForgePRProbe(t, p.forge(), probed+1, 45*time.Second)
+	waitForSettlementNegative(t, p.f, p.run.ID, "publish", 45*time.Second)
 	if got := intentRow(t, p.f, p.run.ID, "publish").Status; got == "halted" {
 		t.Fatal("one absent PR probe settled the intent; the request on the wire is now an orphan")
 	}
