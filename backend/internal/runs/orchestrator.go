@@ -69,12 +69,24 @@ type cachedPlan struct {
 	// per use through generationOf.
 }
 
-// generationOf reads the run's current generation. Deliberately not cached:
-// a revision bumps it under a different transaction than the one that
-// compiled the plan, and every write that stamps a generation must see the
-// value its own transaction will commit against.
+// generationOf reads the run's current generation under a row lock, and both
+// halves of that are load-bearing.
+//
+// Not cached: a revision bumps the counter under a different transaction than
+// the one that compiled the plan, so a value carried on cachedPlan would be
+// stale exactly when it matters.
+//
+// Locked: an unlocked SELECT returns the READ COMMITTED snapshot taken at
+// statement start, so a revision committing between the read and the writes it
+// feeds would stamp generation N-1 on a generation-N run — and
+// GetNodeArtifact's provenance-first ordering would then serve the stale
+// artifact to the node downstream. FOR UPDATE holds the row for the rest of
+// the transaction, which is what makes the value the caller stamps the value
+// the caller commits against. The lock is not a new one: every caller updates
+// this same run row later in the same transaction anyway (AddRunUsage,
+// FinishRun); it is only taken before the first stamp instead of after.
 func (o *Orchestrator) generationOf(ctx context.Context, q *store.Queries, runID uuid.UUID) (int32, error) {
-	row, err := q.GetRun(ctx, runID)
+	row, err := q.GetRunForUpdate(ctx, runID)
 	if err != nil {
 		return 0, fmt.Errorf("runs: read generation: %w", err)
 	}
@@ -1083,6 +1095,16 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		newCount++
 	}
 	retry := out.Retryable() && newCount < c.MaxAttempts
+	// One locked read of the run row serves both branches below. It is
+	// unconditional because the generation it carries is stamped on every row
+	// this function writes — the retry's successor and artifacts, the dead
+	// path's artifacts alike — and a generation read outside the lock is one a
+	// concurrent revision can invalidate before this transaction commits.
+	runRow, err := q.GetRunForUpdate(ctx, c.Ref.RunID)
+	if err != nil {
+		return false, err
+	}
+	gen := runRow.Generation
 	budgetBreached := false
 	if retry && out.Code != CodeCredentialBusy {
 		// The fencing CAS must pick failed vs dead up front (failed ->
@@ -1094,10 +1116,6 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		// it charges nothing, so demoting its requeue to budget_exhausted
 		// would kill a run for time it never spent. A rate_limited attempt
 		// did run before the window shut, so it keeps the pre-check.
-		runRow, err := q.GetRunForUpdate(ctx, c.Ref.RunID)
-		if err != nil {
-			return false, err
-		}
 		if runRow.ExecutionUsedMs+max(deltaMS, 0) >= runRow.ExecutionBudgetMs {
 			retry, budgetBreached = false, true
 		}
@@ -1126,13 +1144,6 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 			notBefore = &nb
 		}
 	}
-	// Read once for both branches: whichever way this goes, the rows it
-	// writes are stamped with the generation this transaction sees.
-	gen, err := o.generationOf(ctx, q, c.Ref.RunID)
-	if err != nil {
-		return false, err
-	}
-
 	if retry {
 		// Retry: prior attempt -> failed, next attempt inserted, SAME tx
 		// (spec §2). failed rows always have successors (plan decision 3).
