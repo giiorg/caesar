@@ -21,6 +21,11 @@ const (
 	argonSaltLen          = 16
 	argonKeyLen    uint32 = 32
 
+	// BYTES, not characters: validatePassword and the two length guards on
+	// the login and change paths are all `len()`. The upper bound is a
+	// denial-of-service bound on argon2id's input, and bytes are what argon2id
+	// actually hashes, so counting runes here would let a multi-byte password
+	// past the bound it exists to enforce.
 	MinPasswordLen = 12
 	MaxPasswordLen = 512
 )
