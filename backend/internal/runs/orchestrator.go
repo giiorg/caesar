@@ -1276,8 +1276,14 @@ func (o *Orchestrator) syncWaiting(ctx context.Context, tx pgx.Tx, runID uuid.UU
 
 // materializeResumedRuns picks up runs a gate decision moved back to 'running'
 // and materializes whatever the approval unblocked. Cheap: the query returns
-// only running runs with no live phase row at all, so a steady-state run
+// only running runs with nothing a worker could pick up, so a steady-state run
 // matches nothing.
+//
+// "Nothing a worker could pick up" INCLUDES a run still holding another gate's
+// waiting_decision row — see ListRunsAwaitingMaterialization. That is the
+// parallel-gate case: this pass materializes what the decided gate released,
+// and the syncWaiting below parks the run against the gate that is still open,
+// which is what keeps that one decidable.
 func (o *Orchestrator) materializeResumedRuns(ctx context.Context) error {
 	ids, err := store.New(o.svc.pool).ListRunsAwaitingMaterialization(ctx, 16)
 	if err != nil {

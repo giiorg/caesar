@@ -1883,7 +1883,7 @@ WHERE r.status = 'running'
   AND NOT EXISTS (
       SELECT 1 FROM phase_runs pr
       WHERE pr.run_id = r.id
-        AND pr.status IN ('pending', 'running', 'waiting_decision', 'reconciling')
+        AND pr.status IN ('pending', 'running', 'reconciling')
   )
 ORDER BY r.created_at
 LIMIT $1
@@ -1898,6 +1898,22 @@ LIMIT $1
 // lives in Go, so this only has to be a cheap over-approximation that
 // materializeReady then decides precisely. Both answers are idempotent, so a
 // run matched spuriously costs one no-op transaction.
+//
+// 'waiting_decision' is DELIBERATELY NOT in the anti-join, and it used to be.
+// A waiting gate is precisely not something a worker could pick up — ClaimPhase
+// predicates on 'pending' — so excluding it contradicted this query's own first
+// sentence, and the cost was a permanent strand: with two gates open at once,
+// approving one CASes the run 'waiting' → 'running' while the sibling gate goes
+// on hiding the run from the pass that would materialize what the approval
+// released. Nothing then called syncWaiting, the run never returned to
+// 'waiting', and FinishGatePhase refused the sibling forever.
+//
+// The over-approximation this widens by is bounded, and by the same argument
+// the paragraph above already makes: the newly matched runs are exactly the
+// 'running' ones whose only live phases are waiting gates, and the first pass
+// over such a run parks it back to 'waiting' (syncWaiting, via
+// RunIsWaitingOnAGate), which the outer r.status predicate then excludes. One
+// no-op transaction, once — not a loop.
 func (q *Queries) ListRunsAwaitingMaterialization(ctx context.Context, limit int32) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listRunsAwaitingMaterialization, limit)
 	if err != nil {

@@ -316,3 +316,139 @@ func TestOrchestrator_MaterializedRowsCarryTheRunsCurrentGeneration(t *testing.T
 		})
 	}
 }
+
+// parallelGateDoc forks one plan into two independent implementations, each
+// closed by its own gate and its own publish, so that BOTH gates are open at
+// the same instant.
+//
+// It is a legal definition and that is the point: validateConsumption
+// constrains a gate's INPUTS ("exactly one plan or patch, at most one review
+// verdict", workflows/validate.go), never how many gates a run may hold open
+// at once. Every other gate fixture on this branch is CHAINED — twoGateDoc is
+// gate_one → gate_two, twinGateChain likewise — so the concurrently-open shape
+// had no cover at all, which is how the stranding below survived sixteen tasks
+// and four review rounds.
+//
+// The fork is at the IMPLEMENT nodes rather than at a single shared patch, and
+// that is forced rather than stylistic: PublicationBranch derives the marker
+// from the approved artifact id (ports.go), so two gates examining ONE patch
+// authorize two publications onto one branch name, and the second loses
+// publish_intents_marker_key with a permanent publish_conflict. That shape is
+// worth someone's attention on its own terms; it is not what this test is
+// about, and staging it here would only mean asserting a second, unrelated
+// failure.
+func parallelGateDoc() runs.DefinitionDoc {
+	return runs.DefinitionDoc{
+		Nodes: []runs.DefNode{
+			{ID: "plan", Kind: runs.KindPlan, Harness: "cc", Instructions: "Plan the change."},
+			{ID: "impl_a", Kind: runs.KindImplement, Harness: "cc", Instructions: "Implement it one way."},
+			{ID: "impl_b", Kind: runs.KindImplement, Harness: "cc", Instructions: "Implement it the other."},
+			{ID: "gate_a", Kind: runs.KindGate},
+			{ID: "gate_b", Kind: runs.KindGate},
+			{ID: "publish_a", Kind: runs.KindGitPublish},
+			{ID: "publish_b", Kind: runs.KindGitPublish},
+		},
+		Edges: []runs.DefEdge{
+			{From: "plan", To: "impl_a", Artifact: runs.ArtifactKindPlan},
+			{From: "plan", To: "impl_b", Artifact: runs.ArtifactKindPlan},
+			{From: "impl_a", To: "gate_a", Artifact: runs.ArtifactKindPatch},
+			{From: "impl_b", To: "gate_b", Artifact: runs.ArtifactKindPatch},
+			{From: "gate_a", To: "publish_a", Artifact: runs.ArtifactKindPatch},
+			{From: "gate_b", To: "publish_b", Artifact: runs.ArtifactKindPatch},
+		},
+	}
+}
+
+// Approving ONE of two simultaneously-waiting gates must leave the other
+// decidable, and must release what the approval authorized.
+//
+// The mechanism under test is a SQL predicate, not Go: an approval CASes the
+// run 'waiting' → 'running' and deliberately materializes nothing
+// (gates.go — all successor materialization lives in materializeReady), so the
+// janitor's ListRunsAwaitingMaterialization pass is the only thing that can
+// release gate_a's publish. While that query excluded runs holding a
+// 'waiting_decision' phase, the sibling gate hid the run from its own rescuer:
+// publish_a never materialized, nothing ever called syncWaiting, the run never
+// went back to 'waiting', and FinishGatePhase — which predicates on
+// r.status = 'waiting' — refused gate_b forever. The run then idled to its
+// wall deadline with a publication a human had explicitly authorized.
+//
+// Both halves are asserted deliberately. Reaching RunSucceeded alone would not
+// prove the second: a fix that merely unblocked gate_a's successors while
+// gate_b stayed stuck would fail at the DecideGate call, and a fix that reached
+// gate_b without releasing publish_a would fail on the phase status.
+func TestOrchestrator_ApprovingOneOfTwoParallelGatesLeavesTheOtherDecidable(t *testing.T) {
+	f, svc, run := gatedRunAtItsGate(t, parallelGateDoc(), runs.DefaultSnapshot())
+	ctx := context.Background()
+
+	// The premise: BOTH gates are open at the same instant. Without it this
+	// test degrades into another chained-gate case and proves nothing, so it
+	// fatals rather than asserting.
+	_, phases, _, err := svc.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"gate_a", "gate_b"} {
+		if g := phaseByNode(t, phases, id); g.Status != runs.PhaseWaitingDecision {
+			t.Fatalf("gate %s is %s, want waiting_decision: this test needs both gates open at once", id, g.Status)
+		}
+	}
+
+	if _, err := svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
+		RunID: run.ID, NodeID: "gate_a", Decision: runs.DecisionApprove, Note: "ship a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The run must come back to 'waiting' on its own. That return trip is the
+	// whole fix: the janitor has to pick the run up, materialize publish_a,
+	// let it run, and let evaluateSuccess re-park the run against the gate
+	// that is still open.
+	waitForRun(t, svc, run.ID, runs.RunWaiting)
+	_, phases, _, err = svc.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := phaseByNode(t, phases, "publish_a"); p.Status != runs.PhaseSucceeded {
+		t.Errorf("publish_a is %s, want succeeded: approving gate_a must release what it authorized", p.Status)
+	}
+	if g := phaseByNode(t, phases, "gate_b"); g.Status != runs.PhaseWaitingDecision {
+		t.Errorf("gate_b is %s, want waiting_decision", g.Status)
+	}
+	if _, ok := tryPhaseByNode(phases, "publish_b"); ok {
+		t.Error("publish_b materialized before its own gate was decided")
+	}
+
+	// Parked, not spinning. The widened anti-join now matches a running run
+	// whose only live phase is a waiting gate, which is what it must do; the
+	// re-park above is what stops that from repeating, because the query's
+	// outer predicate is r.status = 'running'. If the park were missing the
+	// run would sit 'running' and be re-picked every tick.
+	time.Sleep(gateIdleWindow)
+	idle, _, _, err := svc.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idle.Status != runs.RunWaiting {
+		t.Errorf("run status = %s after idling at the second gate, want waiting", idle.Status)
+	}
+
+	// And gate_b is genuinely decidable — the assertion the whole test exists
+	// for. FinishGatePhase requires r.status = 'waiting'; before the fix this
+	// call returned a 409 that never stopped being true.
+	if _, err := svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
+		RunID: run.ID, NodeID: "gate_b", Decision: runs.DecisionApprove, Note: "ship b",
+	}); err != nil {
+		t.Fatalf("gate_b was undecidable after its sibling was approved: %v", err)
+	}
+	waitForRun(t, svc, run.ID, runs.RunSucceeded)
+	_, phases, _, err = svc.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"publish_a", "publish_b"} {
+		if p := phaseByNode(t, phases, id); p.Status != runs.PhaseSucceeded {
+			t.Errorf("%s is %s, want succeeded", id, p.Status)
+		}
+	}
+}
