@@ -125,24 +125,21 @@ func TestPublish_TheUnfinishedPublicationInvariantHolds(t *testing.T) {
 	})
 }
 
-// What caesar does when a REAL forge answers badly with the branch already
-// pushed. Both halves are load-bearing and they pull in opposite directions.
+// The halt set's NEGATIVE half: what must stay out of a human's inbox.
 //
-// maybeHalt is the fork. Halting is durable and terminal — a human reconciles
-// it, no later attempt resumes it — so it must fire on exactly the answers no
-// retry can change and on nothing else. Too narrow, and a revoked token
-// terminalizes the run with its branch orphaned on the forge. Too wide, and an
-// ordinary permanent failure (a malformed patch, a base SHA that vanished)
-// summons a human for something the run is entitled to die on.
-func TestMaybeHalt_HaltsOnlyOnAnswersAPersonMustReconcile(t *testing.T) {
-	for _, code := range []string{CodePublishConflict, CodeAuthExpired, CodeRepoUnavailable} {
-		if !haltsPublication(code) {
-			t.Errorf("%s must halt: no number of attempts fixes it, and a run that merely "+
-				"failed would leave its pushed branch with nobody looking for it", code)
-		}
-	}
-	// Every one of these really does reach maybeHalt — the gitops permanents
-	// through the push call site, the transients through both.
+// Only this direction is asserted here. The positive direction — that
+// publish_conflict, auth_expired and repo_unavailable each halt — is a list this
+// file cannot falsify, because asserting haltsPublication(x) for the same three
+// constants the switch names passes for any implementation that compiles the
+// same list. That half is earned end to end instead, by the three conflict
+// tests and by TestPublish_APermanentForgeRefusalHalts..., which drive a real
+// state machine and assert the intent row and the run's outcome CODE.
+//
+// This half does carry information: every code below really does reach
+// maybeHalt — the gitops permanents through the push call site, the transients
+// through both — and each is a failure the run is entitled to die on or to
+// retry. Summoning a person for one of them empties the inbox of meaning.
+func TestHaltsPublication_KeepsOrdinaryFailuresOutOfAHumansInbox(t *testing.T) {
 	for _, code := range []string{
 		CodeForgeUnavailable, CodePushRejected, CodePublishResumable, CodePublishNotStarted,
 		CodeInvalidOutput, CodeBaseSHAUnavailable, CodeInternalError, CodeTimeout,

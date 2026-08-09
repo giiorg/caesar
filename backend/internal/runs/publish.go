@@ -390,6 +390,16 @@ func (o *Orchestrator) runPublish(ctx context.Context, cp cachedPlan, c claimed)
 // haltedOutcome is the permanent answer a halted intent gives every later
 // attempt. It is settled by definition, so a permanent class is honest here
 // where it would be a defect one status earlier.
+//
+// It stays publish_conflict whatever CAUSED the halt, and that is deliberate:
+// this answer is not a report of the cause, it is "this publication is halted
+// and a human owns it" to an attempt that arrives afterwards. The causing code
+// reaches the run through haltPublication, on the attempt that did the halting
+// — which is also the attempt whose outcome terminalizes the run, since
+// terminalization supersedes every remaining phase. Reporting the cause here
+// too would mean reading it back off the intent, and the row has no column for
+// it; the halt reason it does carry is prose, and re-deriving a code from prose
+// is worse than the honest generic answer.
 func haltedOutcome(intent store.PublishIntent) error {
 	return OutcomeError{Outcome: Outcome{
 		Class: OutcomePermanent, Code: CodePublishConflict,
@@ -856,7 +866,7 @@ func (o *Orchestrator) openPublication(ctx context.Context, cp cachedPlan, c cla
 		// should be ours is missing the fields that would prove it. Either
 		// way nothing here can pick correctly, and picking wrong records a
 		// stranger's pull request as this run's publication.
-		return o.haltPublication(ctx, cp, c, intent, fmt.Sprintf(
+		return o.haltPublication(ctx, cp, c, intent, CodePublishConflict, fmt.Sprintf(
 			"%d pull requests on branch %s and none is provably this publication's",
 			len(candidates), intent.Branch))
 	}
@@ -864,7 +874,7 @@ func (o *Orchestrator) openPublication(ctx context.Context, cp cachedPlan, c cla
 	if !found && len(candidates) > 0 {
 		// Requests exist on our marker and none of them is ours. Opening
 		// another would leave two, so a human decides.
-		return o.haltPublication(ctx, cp, c, intent, fmt.Sprintf(
+		return o.haltPublication(ctx, cp, c, intent, CodePublishConflict, fmt.Sprintf(
 			"branch %s already carries %d pull request(s), none matching this publication",
 			intent.Branch, len(candidates)))
 	}
@@ -1009,7 +1019,9 @@ func (o *Orchestrator) maybeHalt(ctx context.Context, cp cachedPlan, c claimed,
 	if !haltsPublication(out.Code) {
 		return intent, err
 	}
-	return o.haltPublication(ctx, cp, c, intent, out.Message)
+	// out.Code, not a constant: this is the one call site whose halt can be
+	// caused by more than one thing, and the cause is what an operator acts on.
+	return o.haltPublication(ctx, cp, c, intent, out.Code, out.Message)
 }
 
 // adoptConflictingPublication re-asks the forge after a create-PR conflict and
@@ -1045,7 +1057,7 @@ func (o *Orchestrator) adoptConflictingPublication(ctx context.Context, cp cache
 	case found:
 		return pr, nil
 	case ambiguous || len(candidates) > 0:
-		_, herr := o.haltPublication(ctx, cp, c, intent, fmt.Sprintf(
+		_, herr := o.haltPublication(ctx, cp, c, intent, CodePublishConflict, fmt.Sprintf(
 			"forge refused a second pull request on branch %s and none of the %d present is provably this publication's",
 			intent.Branch, len(candidates)))
 		return PullRequestRef{}, herr
@@ -1054,8 +1066,20 @@ func (o *Orchestrator) adoptConflictingPublication(ctx context.Context, cp cache
 	}
 }
 
+// haltPublication settles the intent for a human and answers with the code
+// that CAUSED the halt.
+//
+// The code is a parameter rather than a constant because the halt set grew.
+// While publish_conflict was the only answer that halted, stamping it here was
+// true by construction; now a revoked token halts as auth_expired and a
+// vanished repository as repo_unavailable, and those are the strings an
+// operator greps and a UI or an alert keys on. The halt REASON names the cause
+// in prose, but prose is not a field anything can match on — discarding the
+// code would leave "the credential is dead" indistinguishable from "somebody
+// else's branch is on our marker" everywhere except a human's reading of a
+// sentence.
 func (o *Orchestrator) haltPublication(ctx context.Context, cp cachedPlan, c claimed,
-	intent store.PublishIntent, reason string,
+	intent store.PublishIntent, code, reason string,
 ) (store.PublishIntent, error) {
 	now := o.svc.clock.Now()
 	txErr := pg.WithTx(ctx, o.svc.pool, func(tx pgx.Tx) error {
@@ -1104,7 +1128,7 @@ func (o *Orchestrator) haltPublication(ctx context.Context, cp cachedPlan, c cla
 	}
 	intent.Status = string(publishHalted)
 	return intent, OutcomeError{Outcome: Outcome{
-		Class: OutcomePermanent, Code: CodePublishConflict, Message: reason,
+		Class: OutcomePermanent, Code: code, Message: reason,
 	}}
 }
 
