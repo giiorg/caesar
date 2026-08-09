@@ -1200,6 +1200,78 @@ func TestPublish_APermanentForgeRefusalHaltsRatherThanStrandingThePushedBranch(t
 	}
 }
 
+// The same permanent answer, arriving at the two PROBES instead of at the
+// create — and the probes are where it arrives FIRST, because both of them run
+// before the effect they guard.
+//
+// pushPublication's first act is the recovery probe, before the artifact read
+// and before the push; openPublication's is the pull-request listing, before
+// any create. So a credential revoked mid-run is refused at a probe, never at
+// the create, and a probe that discarded the adapter's verdict would leave the
+// halt set unreachable for the one cause it was extended for. The publication
+// would park as a transient instead and re-probe until the wall deadline: no
+// halt, no halt_reason, no publish.halted event, and a person told nothing.
+//
+// Each leg asserts its own probe COUNT, and that is the assertion the outcome
+// cannot make: a machine that retries a permanent refusal reaches the same
+// intent row eventually — via settlement, at the deadline — so only "asked
+// once" separates halting from spinning.
+func TestPublish_APermanentForgeRefusalAtAProbeHaltsRatherThanRetrying(t *testing.T) {
+	t.Run("the recovery probe, with nothing pushed yet", func(t *testing.T) {
+		p := publicationAtItsGate(t, gatedConveyorDoc())
+		p.forge().FailBranchProbesPermanently(runs.CodeAuthExpired)
+		p.approve(t, "gate")
+
+		got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 45*time.Second)
+		if got.Outcome == nil || got.Outcome.Code != runs.CodeAuthExpired {
+			t.Fatalf("outcome = %+v, want auth_expired: a credential the forge rejected is "+
+				"proven permanent, and relabelling it transient retries a dead token", got.Outcome)
+		}
+		intent := intentRow(t, p.f, p.run.ID, "publish")
+		if intent.Status != "halted" || intent.HaltReason == nil || *intent.HaltReason == "" {
+			t.Fatalf("the intent must halt with a reason a human can act on: %+v", intent)
+		}
+		if intent.HeadSHA != nil {
+			t.Errorf("head_sha = %q; the probe refused before the push, so no receipt exists", *intent.HeadSHA)
+		}
+		if n := countEvents(t, p.svc, p.run.ID, runs.EventPublishHalted); n != 1 {
+			t.Errorf("publish.halted events = %d, want 1: the halt is what tells a person to look", n)
+		}
+		if n := p.forge().BranchProbeCount(); n != 1 {
+			t.Errorf("branch probes = %d, want 1: an answer no retry can change is asked once", n)
+		}
+	})
+
+	t.Run("the pull-request listing, on a branch already pushed", func(t *testing.T) {
+		p := publicationAtItsGate(t, gatedConveyorDoc())
+		p.forge().FailFindPermanently(runs.CodeAuthExpired)
+		p.approve(t, "gate")
+
+		got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 45*time.Second)
+		if got.Outcome == nil || got.Outcome.Code != runs.CodeAuthExpired {
+			t.Fatalf("outcome = %+v, want auth_expired", got.Outcome)
+		}
+		intent := intentRow(t, p.f, p.run.ID, "publish")
+		if intent.Status != "halted" || intent.HaltReason == nil || *intent.HaltReason == "" {
+			t.Fatalf("the intent must halt with a reason a human can act on: %+v", intent)
+		}
+		// The branch IS pushed, which is the whole reason this halts rather
+		// than fails: a failed run strands it.
+		if intent.HeadSHA == nil {
+			t.Fatal("the push receipt must survive a halt at the pull-request step")
+		}
+		if head := remoteBranchHead(t, p.f, intent.Branch); head != *intent.HeadSHA {
+			t.Errorf("the marker is at %q, want the pushed %q", head, *intent.HeadSHA)
+		}
+		if n := p.forge().FindAttemptCount(); n != 1 {
+			t.Errorf("listings = %d, want 1: an answer no retry can change is asked once", n)
+		}
+		if n := p.forge().OpenPRCount(); n != 0 {
+			t.Errorf("pull requests opened = %d, want 0: the listing never said the marker was clear", n)
+		}
+	})
+}
+
 // adoptConflictingPublication's THIRD answer: the forge refused a second
 // request and then did not list the first. Read-after-write lag, or a replica
 // behind the write — guessing either way is wrong, so it resumes, uncharged,

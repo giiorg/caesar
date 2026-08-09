@@ -70,6 +70,21 @@ type Forge struct {
 	// failBranchProbes makes BranchHead answer with an error, which is how a
 	// forge that cannot be reached looks to settlement.
 	failBranchProbes bool
+	// permanentProbeCode refuses every BranchHead with a PERMANENT typed
+	// outcome — what the real adapter's publishError produces from
+	// forge.ErrUnauthorized or forge.ErrNotFound. failBranchProbes above is the
+	// opposite answer, an UNTYPED reachability failure, and the two must stay
+	// separate: the recovery probe is entitled to classify the second and must
+	// not re-classify the first.
+	permanentProbeCode string
+	// permanentFindCode does the same for FindPullRequests, whose refusal
+	// arrives one step later — on an intent that is already 'pushed'.
+	permanentFindCode string
+	// findAttempts counts every listing ATTEMPT, refusals included. Like
+	// createAttempts it is the only way to see that the machine stopped asking:
+	// a permanent refusal reaches the same intent row whether it was asked once
+	// or until the wall deadline.
+	findAttempts int
 }
 
 func NewForge(heads map[uuid.UUID]string) *Forge {
@@ -123,8 +138,15 @@ func (f *Forge) BranchHead(_ context.Context, repo runs.RepoRef, branch string) 
 	// probe, and it is the signal a test polls to prove settlement ran at all.
 	f.branchProbes++
 	failing := f.failBranchProbes
+	permanent := f.permanentProbeCode
 	bare, ok := f.remotes[repo.ID]
 	f.mu.Unlock()
+	if permanent != "" {
+		return "", false, runs.OutcomeError{Outcome: runs.Outcome{
+			Class: runs.OutcomePermanent, Code: permanent,
+			Message: "fake forge: scripted permanent branch-probe refusal",
+		}}
+	}
 	if failing {
 		return "", false, fmt.Errorf("fake forge: branch probes are refused")
 	}
@@ -241,6 +263,13 @@ func (f *Forge) OpenPullRequest(ctx context.Context, repo runs.RepoRef, spec run
 func (f *Forge) FindPullRequests(_ context.Context, _ runs.RepoRef, headBranch string) ([]runs.PullRequestRef, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.findAttempts++
+	if f.permanentFindCode != "" {
+		return nil, runs.OutcomeError{Outcome: runs.Outcome{
+			Class: runs.OutcomePermanent, Code: f.permanentFindCode,
+			Message: "fake forge: scripted permanent pull-request listing refusal",
+		}}
+	}
 	if f.hiddenListings > 0 {
 		f.hiddenListings--
 		return nil, nil
@@ -333,6 +362,26 @@ func (f *Forge) FailBranchProbes(on bool) {
 	f.failBranchProbes = on
 }
 
+// FailBranchProbesPermanently refuses every branch probe with a PERMANENT typed
+// outcome — a revoked token, or a repository the forge will not show. It is the
+// recovery probe's version of FailPRPermanently and unbounded for the same
+// reason: the property under test is that the machine STOPS asking, and a
+// script that ran out of refusals would let a machine that retries pass.
+func (f *Forge) FailBranchProbesPermanently(code string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.permanentProbeCode = code
+}
+
+// FailFindPermanently refuses every pull-request listing with a PERMANENT typed
+// outcome. Its refusal lands one step further along than the branch probe's, on
+// an intent whose branch is already pushed.
+func (f *Forge) FailFindPermanently(code string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.permanentFindCode = code
+}
+
 // HideListingsAfterCreate makes the n listings that follow the next accepted
 // create answer empty.
 func (f *Forge) HideListingsAfterCreate(n int) {
@@ -398,4 +447,12 @@ func (f *Forge) BranchProbeCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.branchProbes
+}
+
+// FindAttemptCount is how many listings were ATTEMPTED, refusals included —
+// BranchProbeCount's counterpart for the pull-request step.
+func (f *Forge) FindAttemptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.findAttempts
 }

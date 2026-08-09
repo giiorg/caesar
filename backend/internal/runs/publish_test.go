@@ -137,8 +137,9 @@ func TestPublish_TheUnfinishedPublicationInvariantHolds(t *testing.T) {
 //
 // This half does carry information: every code below really does reach
 // maybeHalt — the gitops permanents through the push call site, the transients
-// through both — and each is a failure the run is entitled to die on or to
-// retry. Summoning a person for one of them empties the inbox of meaning.
+// through all four, the two probes included — and each is a failure the run is
+// entitled to die on or to retry. Summoning a person for one of them empties
+// the inbox of meaning.
 func TestHaltsPublication_KeepsOrdinaryFailuresOutOfAHumansInbox(t *testing.T) {
 	for _, code := range []string{
 		CodeForgeUnavailable, CodePushRejected, CodePublishResumable, CodePublishNotStarted,

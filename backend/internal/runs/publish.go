@@ -249,6 +249,41 @@ func notStartedUnlessTyped(err error) error {
 	}}
 }
 
+// probeFailure types the failure of a recovery PROBE — the branch probe that
+// opens a push, and the pull-request listing that opens an open — and its whole
+// content is that a verdict the adapter already reached SURVIVES.
+//
+// The forge port is the only layer that can see what a forge actually said:
+// publishError (app) types permanent exactly what it can prove — a rejected
+// credential as auth_expired, a repository it will not show as
+// repo_unavailable — and leaves everything else transient on purpose. Both
+// probes used to re-wrap that verdict as an unconditional transient
+// forge_unavailable, which discarded the one thing it had proved. A revoked
+// token then parked as a retry and re-probed until the wall deadline: no halt,
+// no halt_reason, no publish.halted event, and a person told nothing while the
+// pushed branch sat on the forge — an auth_expired presenting as a transient,
+// which is the failure the halt set exists to prevent.
+//
+// Only an UNTYPED error is this function's to classify, and transient is the
+// honest answer for one: a forge that failed in a way nobody has taught us to
+// read has proved nothing, so ask again. The typed pass-through also carries
+// RetryAt, so a rate limit that named its own reset is still obeyed rather than
+// backed off on a guess.
+//
+// Typing is NOT deciding: a permanent verdict only halts because both call
+// sites route it through maybeHalt, and haltsPublication is what says which
+// permanents are a person's problem.
+func probeFailure(subject string, err error) error {
+	var oe OutcomeError
+	if errors.As(err, &oe) {
+		return err
+	}
+	return OutcomeError{Outcome: Outcome{
+		Class: OutcomeTransient, Code: CodeForgeUnavailable,
+		Message: fmt.Sprintf("probe %s: %v", subject, err),
+	}}
+}
+
 // runPublish is the state machine proper.
 //
 // Every step reloads the intent when it loses a receipt CAS, so the loop is
@@ -672,9 +707,16 @@ func (o *Orchestrator) pushPublication(ctx context.Context, cp cachedPlan, c cla
 	intent store.PublishIntent, auth authorization,
 ) (store.PublishIntent, error) {
 	// Recovery first: does the marker already exist, and is it ours?
+	//
+	// Through maybeHalt rather than returned raw, because this probe is the
+	// FIRST thing a publication does: a credential revoked mid-run is refused
+	// here, before the push it guards, so this is where the halt set's
+	// auth_expired and repo_unavailable actually arrive. Returning them raw
+	// would leave the intent 'pending' and terminalize the run with no
+	// halt_reason for the person who has to reissue the token.
 	expect, err := o.recoverBranch(ctx, intent)
 	if err != nil {
-		return intent, err
+		return o.maybeHalt(ctx, cp, c, intent, err)
 	}
 
 	art, err := store.New(o.svc.pool).GetArtifactByID(ctx, auth.ArtifactID)
@@ -786,10 +828,7 @@ func (o *Orchestrator) pushPublication(ctx context.Context, cp cachedPlan, c cla
 func (o *Orchestrator) recoverBranch(ctx context.Context, intent store.PublishIntent) (string, error) {
 	head, ok, err := o.svc.forge.BranchHead(ctx, intentRepo(intent), intent.Branch)
 	if err != nil {
-		return "", OutcomeError{Outcome: Outcome{
-			Class: OutcomeTransient, Code: CodeForgeUnavailable,
-			Message: fmt.Sprintf("probe %s: %v", intent.Branch, err),
-		}}
+		return "", probeFailure("branch "+intent.Branch, err)
 	}
 	if !ok {
 		return "", nil
@@ -855,10 +894,7 @@ func (o *Orchestrator) openPublication(ctx context.Context, cp cachedPlan, c cla
 ) (store.PublishIntent, error) {
 	candidates, err := o.svc.forge.FindPullRequests(ctx, intentRepo(intent), intent.Branch)
 	if err != nil {
-		return intent, OutcomeError{Outcome: Outcome{
-			Class: OutcomeTransient, Code: CodeForgeUnavailable,
-			Message: fmt.Sprintf("probe pull request for %s: %v", intent.Branch, err),
-		}}
+		return o.maybeHalt(ctx, cp, c, intent, probeFailure("pull requests on "+intent.Branch, err))
 	}
 	pr, found, ambiguous := matchPublication(candidates, intent)
 	if ambiguous {
@@ -985,8 +1021,8 @@ func matchPublication(candidates []PullRequestRef, intent store.PublishIntent) (
 // haltsPublication names the answers a person must reconcile, as opposed to
 // the ones another attempt might fix.
 //
-// The rule is "proven permanent", not "permanent": both callers of maybeHalt
-// stand inside an intent that is 'pending' or 'pushed', so failing the run
+// The rule is "proven permanent", not "permanent": every caller of maybeHalt
+// stands inside an intent that is 'pending' or 'pushed', so failing the run
 // strands whatever is already on the forge. An answer only belongs here if no
 // number of retries could change it AND nothing automatic can put it right.
 //
