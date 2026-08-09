@@ -894,16 +894,27 @@ uuidv7 unique per node per generation, so recovery reconstructs it from
 the authorization row alone and a new generation necessarily gets a new
 branch. Human readability lives in the PR title, not the ref.
 
-**Known gap, reachable now that parallel gates are.** The marker is a
+**Known gap, and it does not need parallel gates.** The marker is a
 function of the approved *artifact*, not of the publish node. A legal
 definition where two gates examine the **same** patch and each authorizes
 its own publish therefore produces two intents on one branch name, and
 the second loses `publish_intents_marker_key` as a permanent
-`publish_conflict`. Whether the marker should include the publish node id
-is an open design question — changing it would rename every publication's
-branch — so it is recorded rather than guessed at, at `parallelGateDoc`
-in `orchestrator_gates_integration_test.go`. That fixture forks at the
-implement nodes, which is why it does not hit this.
+`publish_conflict`. `twoGateDoc` (`revisions_integration_test.go`) is
+exactly that shape with the gates **chained**, and `validate_test.go`
+blesses it by name — so this reproduces on a chained definition, and
+reproduces identically at `0a4383e`, before the parallel-gate fix. It is
+latent on the whole branch, not opened by that fix.
+
+The loss is bounded: the losing INSERT fails before any forge call, so
+there is no orphaned branch and nothing to reconcile — the run dies
+`publish_conflict` and a re-run is unaffected. The message is
+misdirecting, though: it names a marker conflict, which reads like
+recovery found somebody else's branch. Whether the marker should include
+the publish node id is an open design question — changing it would rename
+every publication's branch — so it is recorded rather than guessed at,
+here and at `parallelGateDoc` in `orchestrator_gates_integration_test.go`.
+That fixture forks at the implement nodes, which is why it does not hit
+this.
 
 **Ownership is proved by rebuilding the commit, never by observing a
 sha.** Recovery reconstructs the commit it would push and compares shas,

@@ -58,8 +58,12 @@ Tasks 1-6, plus everything Tasks 7-16 added) and at `19bd487`.
 3. **`orchestrator.go:653`'s `run.finished` audit has NO coverage** — two agents
    independently destroyed its subject and nothing failed. The golden set finishes
    through `orchestrator.go:1419` instead.
-   → **NOT RAISED by any of the three reviewers, and NOT fixed.** It survives as an open
-   coverage gap. Carry it.
+   → **CLOSED in `3533466`.** R1 did investigate it (survivor confirmed, live code reached
+   via `TestOrchestrator_WallDeadlineStillKillsAWaitingRun`), but the controller dropped it
+   when consolidating the three reviews, so no fixer was assigned it; Fixer C caught the
+   omission. The pin asserts one `run.finished` row for the run, NULL actor, and the
+   outcome class/code, and the re-review killed two mutants against it. The sibling
+   `EventRunDead` assertion landed with it and the re-review verified that one too.
 4. **Task 16's fix has an UNPINNED PREMISE.** Mutation M-C — routing
    `authorizePublish`'s exit through `unchargedWhileUnfinished` — **SURVIVES** the unit
    lane AND survives `TestGoldenSet_CrashBeforeTheIntentCommitsPublishesNothing`, the one
@@ -239,8 +243,8 @@ earlier prescriptions; they are recorded here as corrections, not as discoveries
      (I8) first; `publish_intents.halt_code` is a one-line migration, not the impossible
      column this ledger implied; `generationOf` now has three spellings of one locked read
      and its own stated inline-it condition has been met.
-   - **`orchestrator.go:653`'s `run.finished` audit still has no coverage** (item 3
-     above) — no reviewer raised it and no fixer touched it.
+   - ~~**`orchestrator.go:653`'s `run.finished` audit still has no coverage**~~ — CLOSED
+     in `3533466`; see item 3 above.
    - **`runner/driver.go:276`** says "sanity clamping is `retryDelay`'s job (spec §4.1)"
      for a provider-captured epoch. `retryDelay` explicitly does NOT clamp a stated reset;
      it floor-clamps only. Survivable post-A (the run terminalizes rather than hanging),
@@ -254,11 +258,18 @@ earlier prescriptions; they are recorded here as corrections, not as discoveries
      gates consume the same `impl` patch and each authorizes its own publish produces two
      intents on one branch name; the second loses `publish_intents_marker_key` and dies
      `publish_conflict`. A hit this live while building the C1 fixture, which is why that
-     fixture forks at the implement nodes. **This became REACHABLE when A fixed C1** —
-     before that, the second gate could not be decided at all. It is a design question
-     (should the marker include the publish node id?), left recorded in `parallelGateDoc`'s
-     comment and now in the README rather than guessed at, because changing it renames
-     every publication's branch.
+     fixture forks at the implement nodes. **CORRECTED BY THE RE-REVIEW: this did NOT
+     become reachable when A fixed C1.** The controller inferred that from A's report and
+     wrote it into the brief, the README and this ledger; the re-reviewer disproved it
+     twice — reproduced on `twoGateDoc`, whose two gates are **CHAINED**
+     (`revisions_integration_test.go:28`) and which `validate_test.go:323` blesses by name,
+     and reproduced again in a clean worktree at the pre-fix base `0a4383e`. The anti-join
+     was never the blocker. **It is latent on the whole branch, not opened by the fix.**
+     Bounded: the losing INSERT fails before any forge call, so no orphan and nothing to
+     reconcile; the misdirecting message is the residual's second half. It is a design
+     question (should the marker include the publish node id?), left recorded in
+     `parallelGateDoc`'s comment and in the README rather than guessed at, because changing
+     it renames every publication's branch.
    - **The INBOX fixture's `attempt` ≠ `generation` is FORCED, not modelled.** A gate is
      materialized once per generation starting at generation 1, so in every run this
      system can actually produce, a gate's attempt EQUALS its generation — which is why
