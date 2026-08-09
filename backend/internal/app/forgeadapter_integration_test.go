@@ -341,6 +341,47 @@ func TestForgeAdapter_EveryRunPathExitIsATypedUnchargedOutcome(t *testing.T) {
 	}
 }
 
+// Both clone paths must follow the SAME configured root.
+//
+// cloneURL is one function with two production call sites — the runner's
+// staging clone and the publication checkout — and they are asserted
+// separately on purpose: a caller that reached for the public host directly
+// would leave the other one right, and the run would stage from one server and
+// push to another. Neither leg fails loudly; the run reads as "can see the
+// repo, publishes nothing".
+//
+// Real assets service, real credential: prepare and CloneSpec both open one
+// before they hand back a URL, so a double would not reach the line under test.
+func TestConfiguredCloneRootsReachBothClonePaths(t *testing.T) {
+	env := newForgeEnv(t)
+	eps := forgeEndpoints{
+		GitHub:      "https://git.example.internal/api/v3",
+		GitHubClone: "https://git.example.internal",
+	}
+	const want = "https://git.example.internal/acme/widgets.git"
+
+	t.Run("the runner's staging clone", func(t *testing.T) {
+		spec, err := appGitSource{svc: env.assets, endpoints: eps}.CloneSpec(env.ctx, env.repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if spec.URL != want {
+			t.Errorf("staging clone URL = %q, want %q", spec.URL, want)
+		}
+	})
+
+	t.Run("the publication checkout", func(t *testing.T) {
+		in, _, err := gitPublisher{assets: env.assets, workDir: t.TempDir(), endpoints: eps}.
+			prepare(env.ctx, runs.PushRequest{Repo: env.repo})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if in.CloneURL != want {
+			t.Errorf("publication clone URL = %q, want %q", in.CloneURL, want)
+		}
+	})
+}
+
 // Absence is an ANSWER for BranchHead, not a failure: recovery asks it first,
 // and turning "the branch is not there" into an error would stop the machine
 // from ever deciding to push.
