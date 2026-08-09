@@ -714,6 +714,43 @@ func TestPublish_AForeignPullRequestOnOurMarkerHaltsForAHuman(t *testing.T) {
 	}
 }
 
+// The AMBIGUOUS halt, which is a different branch of openPublication from the
+// one above and reached only by a candidate that can be neither confirmed nor
+// ruled out — here, a request on our marker with no base recorded.
+//
+// It is a separate test because it is a separate call site. The two halts read
+// alike from outside, so a single test proves nothing about the other one; that
+// showed up as a live gap when the halt's outcome code became per-site, and a
+// wrong code at this branch went uncaught.
+func TestPublish_AnUnprovableRequestOnOurMarkerHaltsForAHuman(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.stop()
+	authID := p.approve(t, "gate")
+	auth := authorization(t, p.f, authID)
+	// No base: absent evidence must not become permission. matchPublication
+	// cannot rule it in or out, so nobody here may choose.
+	p.forge().SeedPullRequest(runs.PublicationBranch(auth.ArtifactID), runs.PullRequestRef{
+		Number: 41, URL: "https://fake.forge/spine/repo/pull/41",
+		HeadSHA: "0000000000000000000000000000000000000000", Base: "", State: "open",
+	})
+	p.start()
+
+	got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 60*time.Second)
+	if got.Outcome == nil || got.Outcome.Code != runs.CodePublishConflict {
+		t.Fatalf("outcome = %+v, want publish_conflict: a marker we cannot read is a conflict, "+
+			"not a dead credential and not a missing repository", got.Outcome)
+	}
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if intent.Status != "halted" || intent.HaltReason == nil ||
+		!strings.Contains(*intent.HaltReason, "none is provably this publication's") {
+		t.Fatalf("the intent must halt naming the ambiguity a human has to resolve: %+v", intent)
+	}
+	if got := p.forge().CreateAttemptCount(); got != 0 {
+		t.Errorf("the forge saw %d create attempts, want 0: nothing is tried against a marker "+
+			"whose contents we cannot read", got)
+	}
+}
+
 func TestPublish_TransientForgeFailureResumesWithoutRePushing(t *testing.T) {
 	p := publicationAtItsGate(t, gatedConveyorDoc())
 	p.forge().FailPRTimes(2, runs.CodeForgeUnavailable)
