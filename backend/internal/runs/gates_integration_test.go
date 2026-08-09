@@ -358,8 +358,11 @@ func TestDecideGate_RejectTerminalizesTheRun(t *testing.T) {
 // The observable end state alone would not pin even the up-front part:
 // FinishGatePhase's predicate produces the same rows, so deleting the up-front
 // check leaves nothing different behind — the transaction just rolls back one
-// statement later. The discriminator is the message. Only the up-front branch
-// names the deadline; the CAS-lost branch says the gate stopped waiting.
+// statement later. The discriminator is the message, and since the CAS-lost
+// branch also names the deadline when the deadline is what expired, the
+// discriminator is the exact WORDING: only the up-front branch says the
+// deadline "has passed"; the lost CAS says it "passed while this decision was
+// being made". Loosening this to "wall deadline" un-pins the up-front check.
 func TestDecideGate_ExpiredRunRefusesTheDecisionAndDoesNotAuthorize(t *testing.T) {
 	f := newFixture(t)
 	svc, _ := newService(t, f, gatedConveyorDoc(), runs.DefaultSnapshot())
@@ -383,8 +386,8 @@ func TestDecideGate_ExpiredRunRefusesTheDecisionAndDoesNotAuthorize(t *testing.T
 	if xerrors.ClassOf(err) != xerrors.ClassConflict {
 		t.Fatalf("error = %v (class %v), want a conflict naming the expired run", err, xerrors.ClassOf(err))
 	}
-	if !strings.Contains(err.Error(), "wall deadline") {
-		t.Errorf("error = %q, want the up-front deadline branch, which names the wall deadline", err)
+	if !strings.Contains(err.Error(), "wall deadline has passed; it can no longer be decided") {
+		t.Errorf("error = %q, want the up-front deadline branch's exact wording", err)
 	}
 	if countAuthorizations(t, f, run.ID) != 0 {
 		t.Fatal("an expired run must authorize nothing")
@@ -396,6 +399,100 @@ func TestDecideGate_ExpiredRunRefusesTheDecisionAndDoesNotAuthorize(t *testing.T
 	if gate := phaseByNode(t, phases, "gate"); gate.Status != runs.PhaseWaitingDecision {
 		t.Errorf("a refused decision must leave the gate waiting, got %s", gate.Status)
 	}
+}
+
+// A decision refused because the RUN moved must not be reported as an expired
+// deadline.
+//
+// Both deciding statements carry the same pair of run predicates — the run is
+// 'waiting', and its wall deadline is still ahead (FinishGatePhase's EXISTS and
+// BumpRunGeneration's WHERE) — and an empty result says only that ONE of them
+// stopped holding, never which. Chained and parallel gates are legal, so the
+// ordinary way to lose here is a concurrent decision on a SIBLING gate, whose
+// last act is CASRunStatus(waiting -> running). Mapping that onto either the
+// deadline or "the gate stopped waiting" tells a human something observably
+// false: the clock has not moved and the gate row is still waiting_decision.
+//
+// The staging is the sibling's own mutation rather than a mock of it — a
+// decision on another gate of the same run changes nothing else that this
+// gate's transaction reads — with the janitor frozen first, because
+// RunIsWaitingOnAGate would otherwise park the run back to 'waiting' underneath
+// the test.
+func TestDecideGate_ARunResumedBySiblingIsNotReportedAsAnExpiredDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		decision runs.Decision
+		note     string
+	}{
+		{"request_changes", runs.DecisionRequestChanges, "again"},
+		{"approve", runs.DecisionApprove, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			svc, _ := newService(t, f, gatedConveyorDoc(), runs.DefaultSnapshot())
+			_, stop := startStoppableOrchestrator(t, svc, fake.NewExecutor(), 30*time.Second)
+			ctx := context.Background()
+
+			_, run, err := svc.CreateTask(ctx, principal(f), runs.NewTask{
+				RepoID: f.repoID, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: "sibling",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitForRun(t, svc, run.ID, runs.RunWaiting)
+
+			stop()
+			resumeRun(t, f, run.ID)
+
+			_, err = svc.DecideGate(ctx, principal(f), runs.GateDecisionInput{
+				RunID: run.ID, NodeID: "gate", Decision: tc.decision, Note: tc.note,
+			})
+			if xerrors.ClassOf(err) != xerrors.ClassConflict {
+				t.Fatalf("error = %v (class %v), want a conflict", err, xerrors.ClassOf(err))
+			}
+			if strings.Contains(err.Error(), "wall deadline") {
+				t.Errorf("error = %q, but the wall deadline has not passed", err)
+			}
+			// The positive half is what makes this a falsifier: "not the
+			// deadline message" alone is satisfied by every other wrong answer.
+			if !strings.Contains(err.Error(), "no longer waiting") || !strings.Contains(err.Error(), string(runs.RunRunning)) {
+				t.Errorf("error = %q, want it to name the run's actual status", err)
+			}
+			// And the refusal wrote nothing: the gate is still there to decide
+			// once the run is waiting again, which is also why a message
+			// claiming the GATE stopped waiting would be false.
+			_, phases, _, err := svc.GetRun(ctx, run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gate := phaseByNode(t, phases, "gate"); gate.Status != runs.PhaseWaitingDecision {
+				t.Errorf("gate status = %s, want it left waiting_decision", gate.Status)
+			}
+			if n := countDecisions(t, f, run.ID); n != 0 {
+				t.Errorf("gate_decisions rows = %d, want none: the transaction rolled back", n)
+			}
+		})
+	}
+}
+
+// resumeRun performs exactly what a concurrent decision on a sibling gate ends
+// with: the run leaves 'waiting' while this gate's row stays waiting_decision.
+func resumeRun(t *testing.T, f fixture, runID uuid.UUID) {
+	t.Helper()
+	if _, err := f.pool.Exec(context.Background(),
+		`UPDATE runs SET status = 'running' WHERE id = $1`, runID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func countDecisions(t *testing.T, f fixture, runID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM gate_decisions WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func TestDecideGate_SelfApprovalIsRefusedWhenThePolicyForbidsIt(t *testing.T) {

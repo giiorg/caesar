@@ -264,7 +264,10 @@ WHERE run_id = $1 AND node_id = $2 AND attempt = 0
 ORDER BY type, id;
 
 -- name: ListArtifactsForRun :many
-SELECT id, run_id, node_id, attempt, type, parent_ids, created_at
+-- Metadata only: payload is deliberately absent, and generation is present
+-- because after a revision a node has one artifact per round and a reader
+-- cannot tell them apart without it.
+SELECT id, run_id, node_id, attempt, generation, type, parent_ids, created_at
 FROM artifacts WHERE run_id = $1 ORDER BY created_at, id;
 
 -- name: LockEventCounter :one
@@ -348,6 +351,24 @@ RETURNING *;
 -- run, and generations are global, so the count cannot be read off either.
 SELECT count(*) FROM gate_decisions
 WHERE run_id = $1 AND node_id = $2 AND decision = 'request_changes';
+
+-- name: ListGateDecisionsForRun :many
+-- The run projection's decided gates, keyed by phase_run_id so a decision
+-- lands on the attempt row that was actually decided. Keying on node_id would
+-- attach every round's decision to every round's row: after a revision both
+-- gate attempts carry the same node id.
+--
+-- The approver's address is joined because a run page renders "approved by"
+-- and the uuid is not readable; the id rides along for the audit trail. Both
+-- are projected under names that say which is which.
+SELECT gd.*, u.email AS acted_by_email
+FROM gate_decisions gd
+JOIN users u ON u.id = gd.acted_by
+WHERE gd.run_id = $1
+ORDER BY gd.acted_at;
+
+-- name: ListPublishIntentsForRun :many
+SELECT * FROM publish_intents WHERE run_id = $1 ORDER BY created_at;
 
 -- name: InsertApprovedPatch :one
 INSERT INTO approved_patches (run_id, gate_node_id, publish_node_id, gate_decision_id,

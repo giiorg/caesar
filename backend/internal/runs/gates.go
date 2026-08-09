@@ -61,6 +61,29 @@ type GateDecisionResult struct {
 	AuthorizationID *uuid.UUID
 }
 
+// GateDecision is a settled verdict as the run projection carries it. The
+// approver appears twice on purpose: a run page renders an address, an audit
+// trail needs the id, and naming them separately makes the disclosure of the
+// address to every view-only member of the project a decision rather than an
+// accident of which column the query happened to select.
+type GateDecision struct {
+	Decision           string
+	Note               string
+	ActedByID          uuid.UUID
+	ActedByEmail       string
+	ActedAt            time.Time
+	SelfApproval       bool
+	ExaminedArtifactID uuid.UUID
+}
+
+func gateDecisionFromRow(r store.ListGateDecisionsForRunRow) GateDecision {
+	return GateDecision{
+		Decision: r.Decision, Note: r.Note, ActedByID: r.ActedBy,
+		ActedByEmail: r.ActedByEmail, ActedAt: r.ActedAt,
+		SelfApproval: r.SelfApproval, ExaminedArtifactID: r.ExaminedArtifactID,
+	}
+}
+
 func validateDecision(in GateDecisionInput) error {
 	e := xerrors.E(xerrors.ClassInvalid, "validation failed")
 	ok := true
@@ -219,7 +242,7 @@ func (s *Service) DecideGate(ctx context.Context, actor authn.Principal, in Gate
 				Class: OutcomePermanent, Code: CodeGateRejected,
 				Message: fmt.Sprintf("gate %q was rejected", in.NodeID),
 			}
-			if err := s.finishGate(ctx, tx, gate.ID, PhaseFailed, rejected, dbNow); err != nil {
+			if err := s.finishGate(ctx, tx, in.RunID, gate.ID, PhaseFailed, rejected, dbNow); err != nil {
 				return err
 			}
 			res.RunStatus = RunFailed
@@ -228,7 +251,7 @@ func (s *Service) DecideGate(ctx context.Context, actor authn.Principal, in Gate
 				return err
 			}
 		case DecisionApprove:
-			if err := s.finishGate(ctx, tx, gate.ID, PhaseSucceeded, Outcome{}, dbNow); err != nil {
+			if err := s.finishGate(ctx, tx, in.RunID, gate.ID, PhaseSucceeded, Outcome{}, dbNow); err != nil {
 				return err
 			}
 			if publishNode, ok := plan.PublishFor(in.NodeID); ok {
@@ -285,7 +308,7 @@ func (s *Service) DecideGate(ctx context.Context, actor authn.Principal, in Gate
 // finishGate is the gate's fencing CAS. There is no worker identity to
 // match — a gate has no worker — so winning means being the transaction
 // that found the row still waiting.
-func (s *Service) finishGate(ctx context.Context, tx pgx.Tx, phaseID uuid.UUID, to PhaseStatus, out Outcome, now time.Time) error {
+func (s *Service) finishGate(ctx context.Context, tx pgx.Tx, runID, phaseID uuid.UUID, to PhaseStatus, out Outcome, now time.Time) error {
 	if !PhaseWaitingDecision.CanTransition(to) {
 		return fmt.Errorf("runs: illegal gate transition waiting_decision -> %s", to)
 	}
@@ -296,16 +319,54 @@ func (s *Service) finishGate(ctx context.Context, tx pgx.Tx, phaseID uuid.UUID, 
 			return err
 		}
 	}
-	n, err := store.New(tx).FinishGatePhase(ctx, store.FinishGatePhaseParams{
+	q := store.New(tx)
+	n, err := q.FinishGatePhase(ctx, store.FinishGatePhaseParams{
 		ID: phaseID, ToStatus: string(to), Outcome: raw, FinishedAt: &now,
 	})
 	if err != nil {
 		return fmt.Errorf("runs: finish gate: %w", err)
 	}
 	if n == 0 {
-		return xerrors.E(xerrors.ClassConflict, "the gate stopped waiting while this decision was being made")
+		return decisionRefused(ctx, q, runID, "the gate stopped waiting while this decision was being made")
 	}
 	return nil
+}
+
+// decisionRefused explains a lost gate CAS from what is ACTUALLY false rather
+// than from which statement noticed.
+//
+// Every deciding statement carries the same pair of run predicates — the run is
+// 'waiting', and its wall deadline is still ahead — and an empty result says
+// only that one of them stopped holding, never which. Parallel and chained
+// gates are legal, so the ordinary way to lose is a concurrent decision on a
+// SIBLING gate, whose last act moves the run from 'waiting' to 'running'.
+// Reporting that as an expired deadline sends a human to look at a clock that
+// has not moved; reporting it as the gate having stopped waiting is equally
+// false, because the gate row is still waiting_decision and still decidable
+// once the run is parked again.
+//
+// The fallback covers the case where both run predicates still hold, which
+// leaves only the phase row itself as the thing that moved.
+func decisionRefused(ctx context.Context, q *store.Queries, runID uuid.UUID, fallback string) error {
+	run, err := q.GetRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("runs: read run after a refused decision: %w", err)
+	}
+	now, err := q.DBNow(ctx)
+	if err != nil {
+		return err
+	}
+	switch {
+	case !run.WallDeadline.After(now):
+		return xerrors.E(xerrors.ClassConflict,
+			"the run's wall deadline passed while this decision was being made")
+	case RunStatus(run.Status) != RunWaiting:
+		return xerrors.E(xerrors.ClassConflict, fmt.Sprintf(
+			"the run is no longer waiting on a decision (it is %s); another decision on this run resumed it",
+			run.Status))
+	default:
+		return xerrors.E(xerrors.ClassConflict, fallback)
+	}
 }
 
 type mintInput struct {

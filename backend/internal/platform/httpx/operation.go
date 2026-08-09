@@ -13,7 +13,13 @@ type Operation struct {
 	Request  any // zero value of the request body struct; nil = no body
 	Response any // zero value of the success response struct; nil = no body
 	Status   int // success status code
-	Handler  http.Handler
+	// Errors are the additional non-2xx statuses this endpoint really answers
+	// with. 400 is documented on every operation; list only the extras. It
+	// lives here rather than in the generator because an endpoint's answer set
+	// is a property of the endpoint, which is what keeps route and contract in
+	// one value.
+	Errors  []int
+	Handler http.Handler
 }
 
 // Mount registers every operation on mux.

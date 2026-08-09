@@ -92,6 +92,14 @@ type runEventsParams struct {
 	After string `query:"after" description:"return events with id greater than this"`
 }
 
+// gateDecisionParams covers POST …/runs/{id}/gates/{node}/decision — two path
+// parameters plus a body.
+type gateDecisionParams struct {
+	idParams
+	Node string `path:"node" description:"gate node id"`
+	runsapi.GateDecisionRequest
+}
+
 // requestOverrides maps operation IDs whose request combines a body with
 // path parameters onto their wrapper structs. Every new id-bearing body
 // gets an entry; requestStructure panics loudly otherwise.
@@ -108,6 +116,7 @@ var requestOverrides = map[string]any{
 	"createWorkflowVersion":  idAndCreateWorkflowVersion{},
 	"getWorkflowVersion":     workflowVersionParams{},
 	"listRunEvents":          runEventsParams{},
+	"decideGate":             gateDecisionParams{},
 }
 
 // operationTables collects every context's route table with nil
@@ -151,6 +160,11 @@ func Build() ([]byte, error) {
 			oc.AddRespStructure(httpx.ProblemDetails{},
 				openapi.WithHTTPStatus(http.StatusBadRequest),
 				openapi.WithContentType("application/problem+json"))
+			for _, code := range op.Errors {
+				oc.AddRespStructure(httpx.ProblemDetails{},
+					openapi.WithHTTPStatus(code),
+					openapi.WithContentType("application/problem+json"))
+			}
 
 			if err := r.AddOperation(oc); err != nil {
 				return nil, fmt.Errorf("contracts: add %s: %w", op.Pattern, err)

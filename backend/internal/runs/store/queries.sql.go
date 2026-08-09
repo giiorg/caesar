@@ -1563,20 +1563,24 @@ func (q *Queries) LatestRunForUpdate(ctx context.Context, taskID uuid.UUID) (Run
 }
 
 const listArtifactsForRun = `-- name: ListArtifactsForRun :many
-SELECT id, run_id, node_id, attempt, type, parent_ids, created_at
+SELECT id, run_id, node_id, attempt, generation, type, parent_ids, created_at
 FROM artifacts WHERE run_id = $1 ORDER BY created_at, id
 `
 
 type ListArtifactsForRunRow struct {
-	ID        uuid.UUID
-	RunID     uuid.UUID
-	NodeID    string
-	Attempt   int32
-	Type      string
-	ParentIds []byte
-	CreatedAt time.Time
+	ID         uuid.UUID
+	RunID      uuid.UUID
+	NodeID     string
+	Attempt    int32
+	Generation int32
+	Type       string
+	ParentIds  []byte
+	CreatedAt  time.Time
 }
 
+// Metadata only: payload is deliberately absent, and generation is present
+// because after a revision a node has one artifact per round and a reader
+// cannot tell them apart without it.
 func (q *Queries) ListArtifactsForRun(ctx context.Context, runID uuid.UUID) ([]ListArtifactsForRunRow, error) {
 	rows, err := q.db.Query(ctx, listArtifactsForRun, runID)
 	if err != nil {
@@ -1591,6 +1595,7 @@ func (q *Queries) ListArtifactsForRun(ctx context.Context, runID uuid.UUID) ([]L
 			&i.RunID,
 			&i.NodeID,
 			&i.Attempt,
+			&i.Generation,
 			&i.Type,
 			&i.ParentIds,
 			&i.CreatedAt,
@@ -1655,6 +1660,70 @@ func (q *Queries) ListExpiredRunIDs(ctx context.Context, limit int32) ([]uuid.UU
 	return items, nil
 }
 
+const listGateDecisionsForRun = `-- name: ListGateDecisionsForRun :many
+SELECT gd.id, gd.phase_run_id, gd.run_id, gd.node_id, gd.generation, gd.decision, gd.examined_artifact_id, gd.note, gd.acted_by, gd.self_approval, gd.acted_at, u.email AS acted_by_email
+FROM gate_decisions gd
+JOIN users u ON u.id = gd.acted_by
+WHERE gd.run_id = $1
+ORDER BY gd.acted_at
+`
+
+type ListGateDecisionsForRunRow struct {
+	ID                 uuid.UUID
+	PhaseRunID         uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Generation         int32
+	Decision           string
+	ExaminedArtifactID uuid.UUID
+	Note               string
+	ActedBy            uuid.UUID
+	SelfApproval       bool
+	ActedAt            time.Time
+	ActedByEmail       string
+}
+
+// The run projection's decided gates, keyed by phase_run_id so a decision
+// lands on the attempt row that was actually decided. Keying on node_id would
+// attach every round's decision to every round's row: after a revision both
+// gate attempts carry the same node id.
+//
+// The approver's address is joined because a run page renders "approved by"
+// and the uuid is not readable; the id rides along for the audit trail. Both
+// are projected under names that say which is which.
+func (q *Queries) ListGateDecisionsForRun(ctx context.Context, runID uuid.UUID) ([]ListGateDecisionsForRunRow, error) {
+	rows, err := q.db.Query(ctx, listGateDecisionsForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListGateDecisionsForRunRow
+	for rows.Next() {
+		var i ListGateDecisionsForRunRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.PhaseRunID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Generation,
+			&i.Decision,
+			&i.ExaminedArtifactID,
+			&i.Note,
+			&i.ActedBy,
+			&i.SelfApproval,
+			&i.ActedAt,
+			&i.ActedByEmail,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingRunIDs = `-- name: ListPendingRunIDs :many
 SELECT id FROM runs WHERE status = 'pending' ORDER BY created_at LIMIT $1
 `
@@ -1708,6 +1777,56 @@ func (q *Queries) ListPhasesForRun(ctx context.Context, runID uuid.UUID) ([]Phas
 			&i.FinishedAt,
 			&i.Outcome,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPublishIntentsForRun = `-- name: ListPublishIntentsForRun :many
+SELECT id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, commit_message, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at FROM publish_intents WHERE run_id = $1 ORDER BY created_at
+`
+
+func (q *Queries) ListPublishIntentsForRun(ctx context.Context, runID uuid.UUID) ([]PublishIntent, error) {
+	rows, err := q.db.Query(ctx, listPublishIntentsForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PublishIntent
+	for rows.Next() {
+		var i PublishIntent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Attempt,
+			&i.AuthorizationID,
+			&i.RepoID,
+			&i.ForgeKind,
+			&i.RepoSlug,
+			&i.CredentialID,
+			&i.Branch,
+			&i.TargetBranch,
+			&i.BaseSha,
+			&i.TreeHash,
+			&i.Title,
+			&i.Body,
+			&i.AuthorEmail,
+			&i.CommitMessage,
+			&i.Status,
+			&i.HeadSha,
+			&i.PrNumber,
+			&i.PrUrl,
+			&i.HaltReason,
+			&i.AbsentSince,
+			&i.CreatedAt,
+			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}

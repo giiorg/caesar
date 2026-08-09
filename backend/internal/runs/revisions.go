@@ -119,7 +119,7 @@ func (s *Service) openRevision(ctx context.Context, tx pgx.Tx, rc revisionContex
 	// This is also the statement carrying the wall-deadline predicate, so a
 	// run that expired under the decision refuses here rather than opening a
 	// generation nothing may execute.
-	if err := s.finishGate(ctx, tx, rc.gate.ID, PhaseSuperseded, Outcome{
+	if err := s.finishGate(ctx, tx, rc.in.RunID, rc.gate.ID, PhaseSuperseded, Outcome{
 		Class: OutcomePermanent, Code: CodeSuperseded,
 		Message: fmt.Sprintf("changes requested at gate %q", rc.in.NodeID),
 	}, rc.now); err != nil {
@@ -128,8 +128,11 @@ func (s *Service) openRevision(ctx context.Context, tx pgx.Tx, rc revisionContex
 
 	generation, err := q.BumpRunGeneration(ctx, rc.in.RunID)
 	if errorsIsNoRows(err) {
-		return xerrors.E(xerrors.ClassConflict,
-			"the run's wall deadline has passed; it can no longer be decided")
+		// The same two run predicates finishGate just cleared, re-evaluated
+		// under this statement's row lock. Reaching here means one of them
+		// stopped holding in between, and only the row says which.
+		return decisionRefused(ctx, q, rc.in.RunID,
+			"the run stopped accepting decisions while this revision was being opened")
 	}
 	if err != nil {
 		return fmt.Errorf("runs: bump generation: %w", err)

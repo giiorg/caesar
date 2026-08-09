@@ -71,6 +71,24 @@ func Operations(a *API) []httpx.Operation {
 			Response: RunEventsResponse{}, Status: http.StatusOK,
 			Handler: a.authenticated(a.handleListRunEvents),
 		},
+		{
+			Pattern: "POST /api/v1/runs/{id}/gates/{node}/decision", ID: "decideGate",
+			Summary: "Approve, request changes on, or reject a waiting gate (approve grant). " +
+				"The generation in the response is the one decided on approve and reject, " +
+				"and the new one the revision opened on request_changes.",
+			Request: GateDecisionRequest{}, Response: GateDecisionResponse{}, Status: http.StatusOK,
+			// 409 is this endpoint's ordinary non-success answer — the gate was
+			// already decided, the run moved, the revision rounds are spent — and
+			// a client that cannot see it in the contract reads it as a bug.
+			Errors:  []int{http.StatusConflict},
+			Handler: a.authenticated(a.handleDecideGate),
+		},
+		{
+			Pattern: "GET /api/v1/approvals", ID: "listApprovals",
+			Summary:  "List gates awaiting a decision, scoped to the caller's grants (view). Unbounded by design at V1.",
+			Response: ApprovalListResponse{}, Status: http.StatusOK,
+			Handler: a.authenticated(a.handleListApprovals),
+		},
 	}
 }
 
@@ -213,27 +231,31 @@ func (a *API) taskScoped(w http.ResponseWriter, r *http.Request, sess authn.Auth
 }
 
 // runScoped resolves {id} to a run and enforces min on the project its
-// task belongs to — runs carry no project of their own.
-func (a *API) runScoped(w http.ResponseWriter, r *http.Request, sess authn.AuthSession, min authn.GrantLevel) (runs.Run, []runs.Phase, []runs.ArtifactMeta, bool) {
+// task belongs to — runs carry no project of their own. The fetch precedes
+// the check, so an unknown id is 404 for everyone.
+//
+// It reads the run row only. The projection its one page-rendering caller
+// needs is five queries, and the event poll runs this on every tick.
+func (a *API) runScoped(w http.ResponseWriter, r *http.Request, sess authn.AuthSession, min authn.GrantLevel) (runs.Run, bool) {
 	id, err := pathUUID(r, "no such run")
 	if err != nil {
 		httpx.Problem(w, r, err)
-		return runs.Run{}, nil, nil, false
+		return runs.Run{}, false
 	}
-	run, phases, arts, err := a.svc.GetRun(r.Context(), id)
+	run, err := a.svc.GetRunSummary(r.Context(), id)
 	if err != nil {
 		httpx.Problem(w, r, err)
-		return runs.Run{}, nil, nil, false
+		return runs.Run{}, false
 	}
 	task, err := a.svc.GetTask(r.Context(), run.TaskID)
 	if err != nil {
 		httpx.Problem(w, r, err)
-		return runs.Run{}, nil, nil, false
+		return runs.Run{}, false
 	}
 	if !a.authorize(w, r, sess, task.ProjectID, min) {
-		return runs.Run{}, nil, nil, false
+		return runs.Run{}, false
 	}
-	return run, phases, arts, true
+	return run, true
 }
 
 func (a *API) handleGetTask(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
@@ -254,7 +276,7 @@ func (a *API) handleRerunTask(w http.ResponseWriter, r *http.Request, sess authn
 		httpx.Problem(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, runResponse(run, nil, nil))
+	httpx.JSON(w, http.StatusCreated, runResponse(runs.RunDetail{Run: run}))
 }
 
 func (a *API) handleListTaskRuns(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
@@ -269,21 +291,110 @@ func (a *API) handleListTaskRuns(w http.ResponseWriter, r *http.Request, sess au
 	}
 	out := RunListResponse{Runs: make([]RunResponse, 0, len(list))}
 	for _, run := range list {
-		out.Runs = append(out.Runs, runResponse(run, nil, nil))
+		out.Runs = append(out.Runs, runResponse(runs.RunDetail{Run: run}))
 	}
 	httpx.JSON(w, http.StatusOK, out)
 }
 
 func (a *API) handleGetRun(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
-	run, phases, arts, ok := a.runScoped(w, r, sess, authn.GrantView)
+	run, ok := a.runScoped(w, r, sess, authn.GrantView)
 	if !ok {
 		return
 	}
-	httpx.JSON(w, http.StatusOK, runResponse(run, phases, arts))
+	detail, err := a.svc.GetRunDetail(r.Context(), run.ID)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, runResponse(detail))
+}
+
+// handleDecideGate settles one gate. The project comes from the run, so the
+// grant check precedes any write; GateProject answers 404 for a run that does
+// not exist, which keeps an unknown id a 404 for everybody rather than an
+// existence oracle. A run that DOES exist outside the caller's grants is a 403,
+// the same as every other run-scoped route.
+func (a *API) handleDecideGate(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	req, err := decode[GateDecisionRequest](r)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	runID, err := pathUUID(r, "no such run")
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	// Unreachable through the mux, which redirects an empty wildcard segment
+	// rather than matching it — kept because a route table is edited by hand
+	// and this is the cheap half of being wrong about that. No test covers it.
+	node := r.PathValue("node")
+	if node == "" {
+		httpx.Problem(w, r, xerrors.E(xerrors.ClassNotFound, "no such gate"))
+		return
+	}
+	projectID, err := a.svc.GateProject(r.Context(), runID)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	if !a.authorize(w, r, sess, projectID, authn.GrantApprove) {
+		return
+	}
+	res, err := a.svc.DecideGate(r.Context(), sess.Principal, runs.GateDecisionInput{
+		RunID: runID, NodeID: node, Decision: runs.Decision(req.Decision), Note: req.Note,
+	})
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	out := GateDecisionResponse{
+		DecisionID: res.DecisionID.String(), Decision: req.Decision,
+		RunStatus: string(res.RunStatus), Generation: res.Generation,
+	}
+	if res.AuthorizationID != nil {
+		out.AuthorizationID = res.AuthorizationID.String()
+	}
+	httpx.JSON(w, http.StatusOK, out)
+}
+
+// handleListApprovals is the approvals inbox. It is unbounded by design at V1:
+// the waiting set is the size of a human's attention, not of the run history.
+func (a *API) handleListApprovals(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	var (
+		list []runs.WaitingGate
+		err  error
+	)
+	if sess.Role == authn.RoleAdmin {
+		list, err = a.svc.ListWaitingGates(r.Context(), nil, true)
+	} else {
+		var grants []authn.Grant
+		grants, err = a.grants.GrantsForUser(r.Context(), sess.UserID)
+		if err == nil {
+			// The inbox shows what the caller can SEE; the decision endpoint
+			// is what enforces approve. A view-only member seeing that a gate
+			// is pending is information they already have from the run, and
+			// every other list endpoint here scopes the same way.
+			ids := make([]uuid.UUID, 0, len(grants))
+			for _, g := range grants {
+				ids = append(ids, g.ProjectID)
+			}
+			list, err = a.svc.ListWaitingGates(r.Context(), ids, false)
+		}
+	}
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	out := ApprovalListResponse{Approvals: make([]ApprovalResponse, 0, len(list))}
+	for _, g := range list {
+		out.Approvals = append(out.Approvals, approvalResponse(g))
+	}
+	httpx.JSON(w, http.StatusOK, out)
 }
 
 func (a *API) handleListRunEvents(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
-	run, _, _, ok := a.runScoped(w, r, sess, authn.GrantView)
+	run, ok := a.runScoped(w, r, sess, authn.GrantView)
 	if !ok {
 		return
 	}
