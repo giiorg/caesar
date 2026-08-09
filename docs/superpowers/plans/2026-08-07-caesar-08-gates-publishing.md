@@ -42,7 +42,9 @@
 
 13. **A gate decision is recorded once per gate *attempt* row** (`gate_decisions.phase_run_id UNIQUE`). A rematerialized gate is a new attempt row and therefore decidable again; the same row is never decided twice, which is the CAS the API needs.
 
-14. **Publish failures split three ways.** `push_rejected` (transient — the remote moved or the network blinked; retries within `max_attempts`), `forge_unavailable` (transient — the API is down), `publish_conflict` (**permanent** — recovery found a marker at a state we cannot prove is ours; the intent is `halted` and a human reconciles). Recovery never guesses.
+14. **Publish failures split five ways, and three of them halt.** `push_rejected` (transient — the remote moved or the network blinked; retries within `max_attempts`) and `forge_unavailable` (transient — the API is down or throttling) are ordinary retries. Three are **permanent AND halting**, because each leaves something of ours half-done on the forge that no retry can finish: `publish_conflict` (recovery found a marker at a state we cannot prove is ours), `auth_expired` (the forge rejected the repository's credential — somebody must issue a new token), and `repo_unavailable` (the forge will not show the repository at all — deleted, renamed, or no longer visible to this token). In all three the intent is `halted` and a human reconciles. Recovery never guesses.
+
+    **Amended during execution.** As written this decision named three codes with `publish_conflict` the only halting one. `repo_unavailable` was added in Task 12: decision 4 named no code for the forge's `ErrNotFound`, and mapping a vanished repository onto `forge_unavailable` would have retried it until the wall deadline while the pushed branch sat orphaned. It halts for the same reason `auth_expired` does. `haltsPublication` in `internal/runs/publish.go` is the single authority on the halting set, and `internal/app/runsports.go` is where a forge answer becomes one of these codes.
 
     "Ours" is checked on every field the intent pinned, not just the head sha. A pull request found on our marker must also target the branch the approval named — a head branch is not a unique description of a publication, and a second request opened from our marker to a different base would otherwise be adopted as ours and reported as the publication.
 
@@ -8913,9 +8915,10 @@ git commit -m "fix(runs): classify concurrent reruns as conflicts and re-resolve
 
 **Files:**
 - Modify: `backend/README.md`
-- Modify: `docs/superpowers/plans/2026-08-02-caesar-v1-roadmap.md` (row 08 :25)
-- Create: `docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md` (this file, committed)
-- Modify: `.github/workflows/ci.yml` if a lane needs the `git` binary declared
+- Modify: `docs/superpowers/plans/2026-08-02-caesar-v1-roadmap.md` (row 08 and the note under the table)
+- Modify: `docs/superpowers/plans/2026-08-03-caesar-05-execution-spine.md` (the `phase.materialized` payload row)
+- Modify: `docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md` — this file is **already tracked** (`5cb627b`); this task AMENDS it, see Step 4
+- `.github/workflows/ci.yml`: **no change needed.** Verified — the `backend` job runs on `ubuntu-latest` with `actions/checkout@v4`, so `git` is present by construction, and `git` was already required by the untagged `internal/runs/fake/executor_test.go` before this plan.
 
 - [ ] **Step 1: Confirm CI needs no new lane**
 
@@ -8933,36 +8936,78 @@ Confirm `backend:ci` runs `backend:test:integration`. If the forge tests were ac
 
 Under the existing Plan 06/07 sections, add **"Plan 08 — Gates and publishing"** covering:
 
-- **The gate lifecycle.** A gate materializes as `waiting_decision`, the run becomes `waiting`, and the execution budget stops accruing because nothing is claimed. The wall clock does not stop. `GET /api/v1/approvals` is the inbox; `POST /api/v1/runs/{id}/gates/{node}/decision` is the door, and it needs `approve` on the run's project.
-- **What an approval authorizes.** The single-use `ApprovedPatch`: artifact id, base SHA, tree hash, repo, target branch, generation. Scoped to the one publish node its gate dominates. A newer generation invalidates it. It is consumed by exactly one publish intent, enforced by a unique index.
-- **Revisions.** `request_changes` bumps the generation, rewinds the target→gate slice, invalidates live authorizations, and seeds the target with the examined artifact plus the note. `max_rounds` is per gate; exhausting it refuses the decision (409) rather than killing the run.
-- **The publish state machine.** `pending → pushed → published`, with `halted` as the terminal manual-reconciliation state. Each effect's receipt commits before the next call. Recovery probes the deterministic branch marker `caesar/<approved-artifact-id>` and the pull request on that head, adopting an exact match and halting on anything it cannot prove is ours.
-- **Attribution**, verbatim: author = requester, committer = caesar, the four `caesar-*` trailers, no machine co-author trailer.
-- **Operating a halted publication** — the runbook. Read `publish_intents.halt_reason`; inspect the branch on the forge; then either delete the foreign ref and re-run the task, or accept the existing publication and mark the run manually. Say plainly that caesar will never resolve this itself, and why.
-- **Config**: the `forge` block, its defaults, and that `publish_work_dir` must be writable by the caesar process.
+- **The gate lifecycle.** A gate materializes as `waiting_decision`, and the execution budget stops accruing because nothing is claimed. The wall clock does not stop. The run parks to `waiting` only once nothing else on the graph is runnable — a gate in one branch of a parallel graph leaves the run `running` while its sibling executes — and that answer is read back from the database (`RunIsWaitingOnAGate`), never inferred. `GET /api/v1/approvals` is the inbox; `POST /api/v1/runs/{id}/gates/{node}/decision` is the door, and it needs `approve` on the project resolved from the run.
+- **What an approval authorizes.** The single-use `ApprovedPatch`: artifact id, base SHA, tree hash, the repository AS APPROVED (`repo_id` **plus** `forge_kind` and `repo_slug`, pinned because `UpdateRepo` can rename a repo mid-run and a rename must become a refusal, not a patch delivered to the wrong repository), target branch, generation. Scoped to the one publish node its gate dominates. A newer generation invalidates it. Name **both** indexes: `publish_intents.authorization_id … UNIQUE` (a second consumption is a constraint violation, not a lost CAS) and `approved_patches_live_key ON approved_patches (run_id, publish_node_id) WHERE status = 'valid'` (what makes "invalidate then mint" impossible to get half-done).
+- **Revisions.** `request_changes` bumps the generation, rewinds the target→gate slice, invalidates live authorizations, and seeds the target with the examined artifact plus the note. `max_rounds` is per gate, but the generation counter and the authorization invalidation are per **run** — a revision at one gate advances the whole run's generation and invalidates every live authorization on it. Exhausting `max_rounds` refuses the decision (409) rather than killing the run. A **second** 409 refuses `request_changes` once the run has begun ANY publication — including a `pending` intent, whose row commits before the first forge call and whose authorization is already spent. Nothing in that transaction can un-push a commit, so refusing is the honest answer; the human keeps approve and reject.
+- **The publish state machine.** `pending → pushed → published`, with `halted` as the terminal manual-reconciliation state. Each effect's receipt commits before the next call. Recovery probes the deterministic branch marker `caesar/<approved-artifact-id>` and the pull requests on that marker. A request is adopted only if it carries both a base and a head, its base equals the branch the approval named, and its head equals the sha we recorded. A candidate missing either field, two candidates matching, or any candidate present that cannot be ruled out all halt — absent evidence is never permission.
+- **Attribution**, verbatim. Author = the requester (`GIT_AUTHOR_NAME` is the email's local part, `GIT_AUTHOR_EMAIL` the address); committer = `caesar <caesar@invalid>`. `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` are one pinned RFC3339 stamp, because the commit sha is what recovery rebuilds to prove a receiptless branch is ours. Four trailers, in this order: `caesar-run`, `caesar-node`, `caesar-artifact`, `caesar-approved-by` (the APPROVER's address — the author is the requester, and the message is where the approver is recorded). No machine co-author trailer; `gitops/publish_test.go` asserts none appears. Say that both `author_email` and `commit_message` are SNAPSHOTTED on the intent and never re-rendered, and why: both are hashed into the commit sha, both interpolate a mutable `users` row, and a re-render between attempts would turn a crash-after-push into a permanent `publish_conflict` on a branch that is ours.
+- **Operating a halted publication** — the runbook. The run is already `failed` with the halting code (`publish_conflict`, `auth_expired` or `repo_unavailable`); caesar will never resume it, because `HaltPublishIntent` is terminal by design and no later attempt reopens a halted intent. Read `halt_reason` (surfaced on the run's publication projection) and the `publish.halted` run event, then inspect the branch on the forge. Two answers: re-run the task — a new run mints a new artifact id and therefore a NEW `caesar/<id>` marker, so the abandoned ref never blocks it and deleting that ref is hygiene rather than a precondition — or accept what is already on the forge and close the task by hand. **There is no endpoint that marks a halted publication resolved**, and that is deliberate: it belongs with Plan 09's operator surface.
+- **Config**: do NOT re-document the `forge` block — the README's Config section already covers both endpoints per forge, the self-hosted trap, `publish_work_dir` and its default, and the base-URL validation rules. Cross-reference it, verify the key names still match `config.Forge` (`internal/platform/config/config.go`), and add only what is operational: `publish_work_dir` must be writable by the caesar process, and `serve` creates it at boot rather than lazily.
+
+- [ ] **Step 2b: Fix the two stale README paragraphs this plan falsified**
+
+`backend/README.md`'s Plan 05 section claimed `serve` wires "a forge that refuses to resolve a head" and that "a definition containing gate or `git-publish` nodes is rejected at intake (`waiting` stays unreachable until Plan 08)". Both are false as of Task 12: `serve.go` wires the real forge adapter and the real `gitPublisher`, and `unavailableForge` and `ExecPlan.HasUnsupportedNodes` are deleted. Only the executor half survives — `NotImplementedExecutor` is still the default, so a phase claimed with `runner.enabled` false still dies `not_implemented`. The Plan 06 section repeats the same false claim ("task intake is refused until Plan 08's forge adapters land, so an enabled runner is unreachable today"); an enabled runner is now reachable end to end. The ledger calls for a coordinated rewrite of the first, not a one-line edit.
+
+- [ ] **Step 2c: Write the live-forge smoke checklist**
+
+Row 08 closes on it (Step 3), so it is load-bearing rather than optional. ~25 lines in `backend/README.md`, mirroring "Manual smoke checklist (operator-run, real subscriptions)": a throwaway repo per forge, a real `forge_token`, one task through a gate — with one revision round — to an approve, then verify the branch, the four trailers, the committer identity, and the pull request's base, plus the two halting answers (`auth_expired`, `repo_unavailable`).
 
 - [ ] **Step 3: Update the roadmap row**
 
+Only the Status column changes; the deliverable cell is already correct.
+
+**>>> USER RULING (sofo): row 08 does NOT flip to done. <<<** It reads
+**`implementation complete — live-forge smoke pending`**, mirroring row 07
+exactly. The reasoning: row 07's note establishes that a plan whose acceptance
+evidence is an operator event does not flip to done on green CI, and the failure
+mode here is identical in kind — the GitHub and GitLab response shapes and error
+mappings are invented in `httptest` fixtures exactly as the codex exit markers
+were invented in a CI fixture. Marking 08 done would set the precedent that the
+row-07 rule was a one-off. Row 08 closes on Step 2c's smoke checklist.
+
 ```markdown
-| 08 | Gates & publishing | Gate decisions (CAS + deadline predicate), single-use ApprovedPatch, `git-publish` effect state machine + deterministic markers + recovery, forge port + GitHub + GitLab adapters, commit/PR attribution format pinned here, publish status enums, golden-set crash injection around every publish step, **generations / revision rematerialization (moved from 07)**. **Milestone: month-one loop complete via API.** | **done** — `2026-08-07-caesar-08-gates-publishing.md` |
+| 08 | Gates & publishing | … | **implementation complete — live-forge smoke pending** — `2026-08-07-caesar-08-gates-publishing.md` |
 ```
 
-Also update the note under the table: row 07's smoke-pending caveat stands unchanged (this plan does not touch harness drivers), and add one line recording that **row 08's forge adapters are exercised only against `httptest` and local bare repos** — no CI lane makes a live forge call, so the first real GitHub/GitLab publication is an operator event exactly as row 07's smoke run is. Do not claim it as verified.
+Also add a note under the table (row 07's caveat stands unchanged — this plan touches no harness driver) recording that **row 08's forge adapters are exercised only against `httptest` and local bare repos**: no CI lane makes a live forge call, so the first real GitHub/GitLab publication is an operator event exactly as row 07's smoke run is, and the row's own *Milestone: month-one loop complete via API* claim rides on the same evidence. Do not claim it as verified.
 
-- [ ] **Step 4: Commit the plan document**
+- [ ] **Step 4: Verify the plan document is committed, then amend its stale text**
 
-The plan lives untracked in the main checkout by the 03/04/05/06/07 convention and is committed by this task, amendments included.
-
-- [ ] **Step 5: Run the full gate**
+The plan is ALREADY tracked — it landed at `5cb627b` (8,993 lines), a deliberate deviation from the 03/04/05/06/07 convention recorded in the ledger, because that much corrected text should not sit untracked while thirteen tasks execute against it. Verify, do not create:
 
 ```bash
-task ci
-task backend:test:integration
-task backend:test:runner   # Plan 06/07's lane must still be green
-task contracts:check
+git log --oneline -- docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md
+# expect: 5cb627b docs(plan): add plan 08 with its pre-flight cross-task corrections applied
 ```
 
-Expected: all green. From a linked worktree, `task ci`'s `secrets` lane cannot run; use the parent-repo absolute gitleaks mount instead and record the commit count scanned.
+Then apply the amendments execution proved necessary:
+
+1. **Decision 14** above — publish failures split five ways, three halting, not three ways with one halting.
+2. **Plan 05's docs table** — `phase.materialized` gained a `generation` key.
+3. **`CountSettledPublications` is deliberately misnamed** — record it in the residuals.
+4. **`CodeRevisionRoundsExhausted` is deliberately unused** — record it in the residuals.
+5. **The `problemShapes` residual is false and this plan falsified it** — rewrite it.
+6. **The `schema.sql` equality gap** becomes a residual, not a test in this task.
+
+- [ ] **Step 5: Run the gate**
+
+`task ci` CANNOT go green from a linked worktree: its `secrets` lane mounts `ROOT_DIR` and a worktree's `.git` is a file pointing outside that mount. Do not run `task ci`. Run its parts:
+
+```bash
+task backend:ci        # includes backend:test:integration — do not run it twice
+task contracts:check
+task lint:actions      # measured green from a worktree; it never touches .git
+
+# gitleaks, via the PARENT repo's absolute mount. gitleaks scans all refs, so
+# this covers this branch even though the parent's HEAD is main.
+docker run --rm -u "$(id -u):$(id -g)" \
+  -v "/Users/sofo/Projects/caesar/repos/caesar:/repo" \
+  zricethezav/gitleaks:v8.21.2 git /repo --config /repo/.gitleaks.toml --verbose
+```
+
+Record the commit count. At `f8a59a8` it was **234 commits scanned, no leaks** (= `git rev-list --count --all --no-merges`). A gitleaks run that says "partial scan" has FAILED even when it also says "no leaks found" — check the exit status, not the words.
+
+`task backend:test:runner` (Plan 06/07's Docker lane) belongs to the **whole-branch review**, not to this task: Task 15 changes zero Go files, and its last attestation already came from an implementer.
 
 - [ ] **Step 6: Commit**
 
@@ -8977,17 +9022,20 @@ git commit -m "docs(plans): record plan 08 gates and publishing"
 
 The plan is done when all of the following hold:
 
-1. `task ci`, `task backend:test:integration`, `task backend:test:runner` and `task contracts:check` are green.
+1. `task backend:ci`, `task contracts:check` and `task lint:actions` are green, and the parent-repo gitleaks scan reports its full commit count with no leaks. `task ci` is not runnable from a linked worktree (see Task 15, Step 5). `task backend:test:runner` is green — attested by the whole-branch review, not by an implementer.
 2. `TestGoldenSet_FullConveyorThroughTheAPI` passes: a task created through the API reaches a gate, survives one revision round, is approved, and lands a branch and a pull request on a real (local, bare) remote — with the artifact, event and audit assertions holding.
-3. All five `TestGoldenSet_CrashInjectionAroundEveryPublishStep` cases pass with exactly one push, one pull request, one branch, one intent and one consumed authorization.
+3. All five `TestGoldenSet_CrashInjectionAroundEveryPublishStep` cases pass. The asserted properties are one branch CREATION (`publisher.CreatedCount() == 1`), one pull request, one caesar branch on the remote, one intent, one consumed authorization, one `pr_number` event, one `publish.intent_created`, no leftover attention item — and `publish.adopted == 1` for the four forge-reaching cases, `0` for `pre-db-commit-on-intent`. **PUSH COUNT IS NOT ASSERTED and must not be**: `CrashAfterPush` is sticky (measured 8 pushes) and a receipt failure costs the push plus its recovery (measured 2). `publish.adopted` is the only assertion that separates "crashed then recovered" from "never crashed" — two cases once passed with both crash switches turned into no-ops.
 4. `unavailableForge` no longer exists and `ExecPlan.HasUnsupportedNodes` no longer exists.
-5. Roadmap row 08 reads **done**, with the honest note that no CI lane has ever made a live forge call.
+5. Roadmap row 08 reads **implementation complete — live-forge smoke pending** (user ruling; see Task 15, Step 3), with the honest note that no CI lane has ever made a live forge call, and `backend/README.md` carries the manual forge smoke checklist the row closes on.
 
 ## Known residuals (name them in the final review, do not silently carry them)
 
-- **No live-forge evidence.** Every forge assertion in this plan is against `httptest` and local bare repos. The first real GitHub or GitLab publication is an operator event. Consider a manual smoke checklist in `backend/README.md` mirroring row 07's, run once against a throwaway repo, before anyone calls the milestone verified.
-- **`FailNextStatement` is a production-visible test seam** (Task 13, Step 3), guarded by a params flag. If the final review dislikes it, the alternative is a faulting decorator over a `store.Queries` interface — a much larger change that should be argued explicitly.
+- **No live-forge evidence.** Every forge assertion in this plan is against `httptest` and local bare repos. The first real GitHub or GitLab publication is an operator event. Task 15 wrote the manual forge smoke checklist into `backend/README.md`, mirroring row 07's; roadmap row 08 stays *implementation complete — live-forge smoke pending* until it runs against throwaway repos and its result is committed. **This residual is open, not carried:** it has a named closing action.
+- **Statement-fault injection is test-only, not a production seam.** Task 13 added zero production lines. The mechanism is `testdb.QueryFaults`, a `pgx.QueryTracer` in `backend/internal/platform/testdb/faults.go` behind `//go:build integration || runnerintegration`, matching sqlc statements by name. No production file, no params flag, nothing importable from a non-test build. The residual is therefore that fault injection matches statements by their sqlc NAME (a string), so renaming a query silently disarms the case that used it.
+- **`CountSettledPublications` is deliberately misnamed.** It counts EVERY `publish_intents` row for the run, `pending` included — `SELECT count(*) FROM publish_intents WHERE run_id = $1`. The name reads as "settled", but a pending intent has already committed its row and consumed its authorization before the first forge call, so it is precisely the window a revision cannot take back. The query's own comment carries the reasoning; the name was left alone rather than churn a generated store, and this line is the record that it is wrong on purpose.
+- **`runs.CodeRevisionRoundsExhausted` is deliberately unused.** Exhausting `max_rounds` refuses the DECISION with a 409 (`internal/runs/revisions.go`) and terminalizes nothing, so no attempt or run ever carries this code — one definition in `outcome.go`, one row in an `outcome_test.go` table, no production reference. It stays defined because it names a real answer the API gives, and because deleting it would invite someone to re-invent it as a terminal outcome, which is exactly what decision 12 forbids.
+- **Nothing asserts the migrated schema equals `schema.sql`.** `migrate_updown_integration_test.go` walks every migration down and back up and then checks that two tables exist by name. `schema.sql` is the declarative source Atlas diffs migrations from and sqlc generates every store from, so a hand-edited migration that drifts from it is invisible to CI until a generated query fails at runtime. The check is a real test, not a doc line: either an Atlas lane (atlas is not in CI today) or a Go integration test that applies `schema.sql` to a second database and compares catalogs, whose real cost is the false-positive tail — constraint naming, check-constraint text normalization, index expression formatting. **Scheduled, not written**; it deserves its own task with its own review.
 - **A halted publication has no API.** It is visible in the run projection and in `publish.halted` events, and reconciled by hand per the README runbook. A resolve endpoint belongs with Plan 09's operator surface.
 - **`publish_intents` is never pruned.** Like `run_events`, it is history; unlike the outbox, it has no retention sweeper. Fold it into the retention story when Plan 09 pins retention numbers.
 - **The seed carry-forward duplicates a patch payload per revision round.** A run with `max_rounds: 10` over a 4 MiB patch stores 40 MiB of near-identical artifacts. Acceptable at V1 scale and with the pinned caps; revisit if patch sizes grow.
-- **Plan 02's `problemShapes` gap persists**: only `400` and now `409` on `decideGate` are documented among error statuses. The systematic fix belongs to a contracts pass, not here.
+- **Documented non-2xx statuses are still opt-in, and only three operations opt in.** 400 is emitted on every operation by the generator; `httpx.Operation.Errors` lists the extras, and across the whole tree exactly three routes declare any: `createTask` and `rerunTask` (404 + 429, both added by THIS plan) and `decideGate` (409). Every other endpoint's 401/403/404/409 answers are real but undocumented in the OpenAPI contract. The systematic fix belongs to a contracts pass, not here.

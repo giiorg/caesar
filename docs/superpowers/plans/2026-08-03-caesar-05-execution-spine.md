@@ -89,12 +89,14 @@ Everything in Plans 01–04's Global Constraints still applies verbatim (module 
   | `run.succeeded` | — |
   | `run.failed` | `outcome` |
   | `run.dead` | `outcome` |
-  | `phase.materialized` | `node_id`, `attempt` |
+  | `phase.materialized` | `node_id`, `attempt`, `generation` |
   | `phase.started` | `node_id`, `attempt`, `worker_id` |
   | `phase.reconciling` | `node_id`, `attempt` |
   | `phase.retried` | `node_id`, `attempt`, `next_attempt`, `outcome` |
   | `phase.succeeded` | `node_id`, `attempt`, `artifact_ids` |
   | `phase.dead` | `node_id`, `attempt`, `outcome` |
+
+  `phase.materialized` gained `generation` in Plan 08: a revision rematerializes the same node at the same or a later attempt under a NEW generation, so `{node_id, attempt}` alone stopped identifying the materialization.
 
   Event ids come from the counter row; ordering by id **is** commit order. One outbox row per event, same tx; outbox retention 7 days.
 
