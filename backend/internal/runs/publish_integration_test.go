@@ -671,6 +671,73 @@ func TestPublish_ForeignBranchOnOurMarkerHaltsForAHuman(t *testing.T) {
 	}
 }
 
+// A PERMANENT failure reached with a live intent settles that intent, whatever
+// the code is. It does not leave the row 'pending' forever on a run nothing
+// will ever revisit.
+//
+// The edge staged here is the production-plausible one, and it is reached
+// through the real gitops code rather than a scripted error: the branch is
+// already on the remote from an ordinary crash-after-push, and the RESUMED
+// attempt then fails at `git commit`, which runner/gitops/publish.go types
+// permanent invalid_output for every cause including environmental ones. The
+// stored commit message is emptied to provoke it because gitops replays that
+// message verbatim and git refuses an empty one — the same "Aborting commit due
+// to empty commit message" a reviewer reached by hand.
+//
+// Before this was fixed the intent stayed 'pending' with halt_reason NULL, no
+// publish.halted event and no audit row, on a failed run that
+// ListExpiredRunIDs does not match — while the branch sat on the forge with
+// nothing naming it. The run dying is honest; the record saying a publication
+// is still in flight is not.
+func TestPublish_APermanentCommitFailureOnAResumedPublicationHaltsTheIntent(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.publisher().CrashAfterPush(true)
+	p.approve(t, "gate")
+	waitForPushCount(t, p.publisher(), 1, 30*time.Second)
+
+	// Freeze before staging: without the backdater the retry is parked ~15s,
+	// so the mutation below cannot race the attempt it is meant to poison.
+	p.stop()
+	branch := intentRow(t, p.f, p.run.ID, "publish").Branch
+	pushed := remoteBranchHead(t, p.f, branch)
+	if got := intentRow(t, p.f, p.run.ID, "publish").Status; got != "pending" {
+		t.Fatalf("intent status = %q, want pending: this test needs the branch pushed with no receipt", got)
+	}
+	mustExec(t, p.f,
+		`UPDATE publish_intents SET commit_message = '' WHERE run_id = $1 AND node_id = 'publish'`, p.run.ID)
+	p.publisher().CrashAfterPush(false)
+	startBackdater(t, p.f, p.run.ID)
+	p.start()
+
+	got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 90*time.Second)
+	if got.Outcome == nil || got.Outcome.Code != runs.CodeInvalidOutput {
+		t.Fatalf("run outcome = %+v, want a permanent invalid_output", got.Outcome)
+	}
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if intent.Status != "halted" {
+		t.Errorf("intent status = %q, want halted: a permanent answer with a live intent must settle "+
+			"the row, or Task 11 renders an in-flight publication on a dead run forever", intent.Status)
+	}
+	if intent.HaltReason == nil || *intent.HaltReason == "" {
+		t.Errorf("halt_reason = %q, want the reason naming what died", derefOr(intent.HaltReason, "<null>"))
+	} else if !strings.Contains(*intent.HaltReason, "commit") {
+		t.Errorf("halt_reason = %q; it must name the step that failed", *intent.HaltReason)
+	}
+	if n := countEvents(t, p.svc, p.run.ID, runs.EventPublishHalted); n != 1 {
+		t.Errorf("publish.halted events = %d, want 1", n)
+	}
+	if n := scalarCount(t, p.f,
+		`SELECT count(*) FROM audit_entries WHERE action = 'publish.halted' AND subject_id = $1`,
+		intent.ID.String()); n != 1 {
+		t.Errorf("publish.halted audit rows = %d, want 1: the orphaned branch has to be attributable", n)
+	}
+	// The branch is still exactly where the crash left it. That is the point of
+	// naming it: the halt does not clean up, it makes the orphan findable.
+	if head := remoteBranchHead(t, p.f, branch); head != pushed {
+		t.Errorf("marker %s is at %q, want the pushed %q", branch, head, pushed)
+	}
+}
+
 // A marker that already carries a pull request nobody can prove is ours halts
 // for a human, and opens nothing.
 //

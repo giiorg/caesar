@@ -125,34 +125,29 @@ func TestPublish_TheUnfinishedPublicationInvariantHolds(t *testing.T) {
 	})
 }
 
-// The halt set's NEGATIVE half: what must stay out of a human's inbox.
+// There is deliberately no unit test on the halt DECISION any more.
 //
-// Only this direction is asserted here. The positive direction — that
-// publish_conflict, auth_expired and repo_unavailable each halt — is a list this
-// file cannot falsify, because asserting haltsPublication(x) for the same three
-// constants the switch names passes for any implementation that compiles the
-// same list. That half is earned end to end instead, by the three conflict
-// tests and by TestPublish_APermanentForgeRefusalHalts..., which drive a real
-// state machine and assert the intent row and the run's outcome CODE.
+// It used to be an allow-list of three codes, and this file asserted its
+// negative half — that invalid_output, base_sha_unavailable and the ordinary
+// transients stayed out of a human's inbox. Both halves are now gone, for
+// different reasons. The positive half was always unfalsifiable, and said so:
+// asserting the predicate against the same constants its switch names passes
+// for any implementation that compiles the same list. The negative half was
+// worse than unfalsifiable — it was WRONG about the permanents, and its
+// reasoning ("the run is entitled to die on these") answered the question
+// "is this a person's problem?" when the question maybeHalt's position forces
+// is "must this publication's row be closed?". Nine permanent gitops exits
+// left the intent 'pending' forever on a dead run behind that argument.
 //
-// This half does carry information: every code below really does reach
-// maybeHalt — the gitops permanents through the push call site, the transients
-// through all four, the two probes included — and each is a failure the run is
-// entitled to die on or to retry. Summoning a person for one of them empties
-// the inbox of meaning.
-func TestHaltsPublication_KeepsOrdinaryFailuresOutOfAHumansInbox(t *testing.T) {
-	for _, code := range []string{
-		CodeForgeUnavailable, CodePushRejected, CodePublishResumable, CodePublishNotStarted,
-		CodeInvalidOutput, CodeBaseSHAUnavailable, CodeInternalError, CodeTimeout,
-	} {
-		if haltsPublication(code) {
-			t.Errorf("%s must not halt: halting is a human's inbox, and filling it with "+
-				"answers that retry or that honestly end the run empties it of meaning", code)
-		}
-	}
-}
+// maybeHalt now decides on the CLASS, so a predicate test would restate one
+// comparison. The property is earned end to end instead, where it can fail:
+// the conflict tests and TestPublish_APermanentCommitFailureOnAResumed... drive
+// a real state machine and assert the intent row, the halt reason, the event
+// and the audit row. What this file still owes the halt is the assertion just
+// below — that a permanent answer reaches maybeHalt STILL permanent, since a
+// downgrade would mean the halt never happens at all.
 
-// The other half: what the forge adapter cannot PROVE permanent must come back
+// What the forge adapter cannot PROVE permanent must come back
 // transient, so unchargedWhileUnfinished downgrades it to an uncharged,
 // resumable retry rather than terminalizing a run whose branch is on the forge.
 func TestPublish_AForgeAnswerWeCannotProvePermanentResumesUncharged(t *testing.T) {
@@ -170,9 +165,16 @@ func TestPublish_AForgeAnswerWeCannotProvePermanentResumesUncharged(t *testing.T
 	if !strings.Contains(out.Message, "teapot") {
 		t.Errorf("message = %q; the forge's own words must survive the downgrade", out.Message)
 	}
-	// And the proven-permanent ones are deliberately NOT downgraded: they have
-	// to arrive at maybeHalt still permanent, or the halt never happens.
-	for _, code := range []string{CodeAuthExpired, CodeRepoUnavailable} {
+	// And the permanent ones are deliberately NOT downgraded: they have to
+	// arrive at maybeHalt still permanent, or the halt never happens.
+	//
+	// invalid_output and base_sha_unavailable are on this list because they are
+	// what gitops raises — nine of its exits between them — and they are the
+	// codes the old allow-list left stranded. A downgrade here would put them
+	// straight back to a 'pending' row that no sweep revisits.
+	for _, code := range []string{
+		CodeAuthExpired, CodeRepoUnavailable, CodeInvalidOutput, CodeBaseSHAUnavailable,
+	} {
 		perm := OutcomeError{Outcome: Outcome{Class: OutcomePermanent, Code: code}}
 		if got := ClassifyOutcome(unchargedWhileUnfinished(perm)); got.Class != OutcomePermanent || got.Code != code {
 			t.Errorf("%s = %+v; a proven-permanent forge answer must reach maybeHalt intact", code, got)

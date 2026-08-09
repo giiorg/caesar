@@ -289,8 +289,8 @@ func notStartedUnlessTyped(err error) error {
 // backed off on a guess.
 //
 // Typing is NOT deciding: a permanent verdict only halts because both call
-// sites route it through maybeHalt, and haltsPublication is what says which
-// permanents are a person's problem.
+// sites route it through maybeHalt, which is what turns a proven-permanent
+// answer into a settled row instead of a run that dies over a live intent.
 func probeFailure(subject string, err error) error {
 	var oe OutcomeError
 	if errors.As(err, &oe) {
@@ -312,8 +312,16 @@ func probeFailure(subject string, err error) error {
 // ONE INVARIANT HOLDS THIS WHOLE DESIGN UP, and it is worth stating plainly
 // because the recovery machinery in Task 10 is only sound if it is true:
 //
-//	While an intent is 'pending' or 'pushed', every error leaving this
-//	function is TRANSIENT and UNCHARGED.
+//	Every error leaving this function with an intent still 'pending' or
+//	'pushed' is TRANSIENT and UNCHARGED. A permanent answer only leaves
+//	after it has SETTLED the intent — it halts, and the row records why.
+//
+// The second sentence is the part that was missing, and its absence was a
+// defect rather than a wording gap: for a while this comment asserted the first
+// sentence alone while nine permanent gitops exits returned raw, leaving a
+// 'pending' row with no reason on a dead run. State the invariant in the form
+// the code can actually keep, or the next permanent gets added without a halt
+// for exactly the same reason the last nine were.
 //
 // Why it has to be an invariant rather than a tendency: `evaluate` terminalizes
 // a run on a permanent outcome or on an exhausted failure budget, and
@@ -322,20 +330,29 @@ func probeFailure(subject string, err error) error {
 // again. There is no sweep that revisits a FAILED run, only expired ones
 // (ListExpiredRunIDs matches 'pending', 'running', 'waiting'). So a run that
 // dies here dies with its branch on the forge and nothing that will ever look
-// again.
+// again — unless the row it dies over says so itself.
 //
 // With the invariant, the wall deadline becomes the only way THIS FUNCTION can
-// terminalize over an unfinished publication — and that path settles first
-// (Task 10 Step 5). Three pieces enforce it, and each one is a place the
+// terminalize over an UNSETTLED publication — and that path settles first
+// (Task 10 Step 5). Four pieces enforce it, and each one is a place the
 // invariant was broken before it was written down: receiptFailure types the
 // transaction that commits an effect's receipt (the push's, the pull
 // request's, and the halt's), resumable types every other read or write that
-// happens with a live intent, and unchargedWhileUnfinished stops a forge
+// happens with a live intent, unchargedWhileUnfinished stops a forge
 // outage from spending the failure budget — and a pre-flight failure that says
-// "nothing began" from requeuing with no delay when something has.
+// "nothing began" from requeuing with no delay when something has — and
+// maybeHalt turns every permanent that reaches it into a settled row.
 // Statuses 'published' and 'halted'
 // are outside the invariant by definition: both are settled, so a permanent
 // answer is honest.
+//
+// ONE EXCEPTION SURVIVES, and it is honest rather than tolerated: the
+// authorizePublish leg. It runs before this function has an intent of its own,
+// and notStartedUnlessTyped deliberately preserves the permanents it can
+// raise — a stale or concurrently-spent authorization, and a marker that
+// already carries a publication intent. Both roll their transaction back, so
+// this attempt created nothing and has nothing half-done to strand. Everything
+// untyped there becomes an uncharged publish_not_started instead.
 //
 // FOUR doors into this run's death are outside this function, and each is held
 // shut by the thing named with it, because nothing here can see them. The list
@@ -753,10 +770,15 @@ func (o *Orchestrator) pushPublication(ctx context.Context, cp cachedPlan, c cla
 		// The plan-07 contract: a patch artifact's payload["diff"] is the
 		// base64 canonical diff. Missing or non-string is a permanently
 		// invalid artifact, never an empty publication.
-		return intent, OutcomeError{Outcome: Outcome{
+		//
+		// Through maybeHalt, not returned raw: this is the one permanent this
+		// function raises itself, and it is reachable on a RESUMED attempt with
+		// the branch already pushed. Returning it raw left the intent 'pending'
+		// forever on a run no sweep revisits.
+		return o.maybeHalt(ctx, cp, c, intent, OutcomeError{Outcome: Outcome{
 			Class: OutcomePermanent, Code: CodeInvalidOutput,
 			Message: fmt.Sprintf("approved artifact %s carries no diff", auth.ArtifactID),
-		}}
+		}})
 	}
 
 	res, err := o.svc.publisher.PushPatch(ctx, PushRequest{
@@ -1038,41 +1060,47 @@ func matchPublication(candidates []PullRequestRef, intent store.PublishIntent) (
 	return pr, found, false
 }
 
-// haltsPublication names the answers a person must reconcile, as opposed to
-// the ones another attempt might fix.
+// maybeHalt settles the intent when the answer is PERMANENT and leaves every
+// other error alone. Halting is durable and terminal: a human reconciles it,
+// and no later attempt resumes it (spec §3: "halts for manual reconciliation
+// on mismatch").
 //
-// The rule is "proven permanent", not "permanent": every caller of maybeHalt
-// stands inside an intent that is 'pending' or 'pushed', so failing the run
-// strands whatever is already on the forge. An answer only belongs here if no
-// number of retries could change it AND nothing automatic can put it right.
+// It decides on the CLASS, and it used to decide on an allow-list of three
+// codes (publish_conflict, auth_expired, repo_unavailable). That list was the
+// wrong question asked well. It asked "is this a person's problem?" — and the
+// honest answer for a bad patch or a lost base sha is "not really" — when the
+// question this position forces is "must this publication's row be closed?",
+// whose answer with a live intent is always yes.
 //
-//   - publish_conflict: the marker is in a state we cannot prove is ours.
-//     Guessing records a stranger's branch or request as this run's output.
-//   - auth_expired: the forge rejected the repository's credential. Somebody
-//     has to issue a new token; retrying only spends the wall clock.
-//   - repo_unavailable: the forge will not show the repository — deleted,
-//     renamed, or no longer visible to this token. Same answer, same reason.
+// The cost of the old shape was not theoretical. gitops types NINE permanent
+// exits (eight invalid_output, one base_sha_unavailable) and none of them was
+// on the list, so each returned raw: the run terminalized 'failed', the intent
+// stayed 'pending' with halt_reason NULL, no publish.halted event and no audit
+// row — and ListExpiredRunIDs matches only 'pending'/'running'/'waiting' runs,
+// so nothing ever looked again. On a RESUMED publication the branch was already
+// on the forge, which is the orphan runPublish's invariant exists to forbid.
+// An allow-list is fail-OPEN by construction: this defect is exactly what
+// happens when someone adds a permanent code and does not think of this list.
 //
-// Everything else stays out deliberately. A rejected push, a forge outage, a
-// gitops failure: those are ordinary transients, or permanents the run is
-// entitled to die on because nothing of ours is left half-done behind them.
-func haltsPublication(code string) bool {
-	switch code {
-	case CodePublishConflict, CodeAuthExpired, CodeRepoUnavailable:
-		return true
-	}
-	return false
-}
-
-// maybeHalt turns an answer a person must reconcile into a halted intent and
-// leaves every other error alone. Halting is durable and terminal: a human
-// reconciles it, and no later attempt resumes it (spec §3: "halts for manual
-// reconciliation on mismatch").
+// Deciding by class costs nothing that was working. A permanent outcome
+// terminalizes the run either way — unchargedWhileUnfinished downgrades
+// transients only — so this never converts a live run into a halt. The whole
+// delta is whether the record says why. It also means an UNTYPED error, which
+// ClassifyOutcome default-denies to a permanent internal_error, now settles the
+// row instead of leaving it in flight; the run was dying on that either way, so
+// a reason is strictly more than nothing.
+//
+// The three codes the old list named are still the ones an operator most often
+// meets here, and they are still the ones worth knowing by sight:
+// publish_conflict (the marker is in a state we cannot prove is ours),
+// auth_expired (the credential was rejected; somebody must reissue it) and
+// repo_unavailable (the forge will not show the repository). They now halt
+// because they are permanent, not because they are listed.
 func (o *Orchestrator) maybeHalt(ctx context.Context, cp cachedPlan, c claimed,
 	intent store.PublishIntent, err error,
 ) (store.PublishIntent, error) {
 	out := ClassifyOutcome(err)
-	if !haltsPublication(out.Code) {
+	if out.Class != OutcomePermanent {
 		return intent, err
 	}
 	// out.Code, not a constant: this is the one call site whose halt can be
