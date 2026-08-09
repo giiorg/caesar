@@ -917,23 +917,33 @@ func TestGoldenSet_CrashInjectionAroundEveryPublishStep(t *testing.T) {
 		// CREATION is the invariant — the retry adopted rather than replaced.
 		wantCreates, wantPRs int
 	}{
-		{"post-push",
+		{
+			"post-push",
 			func(g *goldenEnv) { g.publisher.CrashAfterPush(true) },
 			func(g *goldenEnv) { g.publisher.CrashAfterPush(false) },
-			func(g *goldenEnv) bool { return g.publisher.PushCount() >= 1 }, 1, 1},
-		{"post-pr-create",
+			func(g *goldenEnv) bool { return g.publisher.PushCount() >= 1 }, 1, 1,
+		},
+		{
+			"post-pr-create",
 			func(g *goldenEnv) { g.forge.CrashAfterPR(true) },
 			func(g *goldenEnv) { g.forge.CrashAfterPR(false) },
-			func(g *goldenEnv) bool { return g.forge.CreateAttemptCount() >= 1 }, 1, 1},
-		{"pre-db-commit-on-push-receipt",
+			func(g *goldenEnv) bool { return g.forge.CreateAttemptCount() >= 1 }, 1, 1,
+		},
+		{
+			"pre-db-commit-on-push-receipt",
 			func(g *goldenEnv) { g.faults.Fail("RecordPushReceipt", 0, 1) }, func(*goldenEnv) {},
-			func(g *goldenEnv) bool { return g.faults.Fired("RecordPushReceipt") > 0 }, 1, 1},
-		{"pre-db-commit-on-pr-receipt",
+			func(g *goldenEnv) bool { return g.faults.Fired("RecordPushReceipt") > 0 }, 1, 1,
+		},
+		{
+			"pre-db-commit-on-pr-receipt",
 			func(g *goldenEnv) { g.faults.Fail("RecordPRReceipt", 0, 1) }, func(*goldenEnv) {},
-			func(g *goldenEnv) bool { return g.faults.Fired("RecordPRReceipt") > 0 }, 1, 1},
-		{"pre-db-commit-on-intent",
+			func(g *goldenEnv) bool { return g.faults.Fired("RecordPRReceipt") > 0 }, 1, 1,
+		},
+		{
+			"pre-db-commit-on-intent",
 			func(g *goldenEnv) { g.faults.Fail("CreatePublishIntent", 0, 1) }, func(*goldenEnv) {},
-			func(g *goldenEnv) bool { return g.faults.Fired("CreatePublishIntent") > 0 }, 1, 1},
+			func(g *goldenEnv) bool { return g.faults.Fired("CreatePublishIntent") > 0 }, 1, 1,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
