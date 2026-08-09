@@ -307,12 +307,12 @@ func TestReconcile_AFailedIntentReadIsNotChargedAsLost(t *testing.T) {
 	strandRunningPublishAttempt(t, p.f, p.run.ID)
 	// The lease sweep's inspect is the first GetPublishIntent this loop runs:
 	// the phase is already 'running', so nothing else claims or materializes.
-	p.f.faults.fail("GetPublishIntent", 0, 1)
+	p.f.faults.Fail("GetPublishIntent", 0, 1)
 	startBackdater(t, p.f, p.run.ID)
 	p.start()
 
 	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 90*time.Second)
-	if n := p.f.faults.remaining("GetPublishIntent"); n != 0 {
+	if n := p.f.faults.Remaining("GetPublishIntent"); n != 0 {
 		t.Fatalf("%d armed read failures never fired; this test proved nothing", n)
 	}
 	class, code, msg := phaseOutcome(t, p.f, p.run.ID, "publish", 1)
@@ -441,7 +441,7 @@ func TestPublish_AHaltRacedByAnotherWriterAdoptsTheSettledRow(t *testing.T) {
 // that mutant survived five runs of the earlier fixture.
 func TestExpiredRun_APushThatLandedIsRecordedBeforeTheRunDies(t *testing.T) {
 	p := publicationAtItsGate(t, gatedConveyorDoc())
-	p.f.faults.fail("RecordPushReceipt", 0, 1)
+	p.f.faults.Fail("RecordPushReceipt", 0, 1)
 	p.approve(t, "gate")
 
 	// The successor row is proof the failed receipt was evaluated, which
@@ -449,7 +449,7 @@ func TestExpiredRun_APushThatLandedIsRecordedBeforeTheRunDies(t *testing.T) {
 	// the receipt is even attempted.
 	waitForPushCount(t, p.publisher(), 1, 45*time.Second)
 	waitForPhaseAttempt(t, p.f, p.run.ID, "publish", 2, 45*time.Second)
-	if n := p.f.faults.remaining("RecordPushReceipt"); n != 0 {
+	if n := p.f.faults.Remaining("RecordPushReceipt"); n != 0 {
 		t.Fatalf("%d armed receipt failures never fired; this test would prove nothing", n)
 	}
 	if got := intentRow(t, p.f, p.run.ID, "publish").Status; got != "pending" {

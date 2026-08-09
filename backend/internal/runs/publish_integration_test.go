@@ -820,12 +820,12 @@ func TestPublish_ARejectedPushDoesNotExhaustTheNode(t *testing.T) {
 // branch, and the pull request, are orphans.
 func TestPublish_AFailedPushReceiptResumesRatherThanKillingTheRun(t *testing.T) {
 	p := publicationAtItsGate(t, gatedConveyorDoc())
-	p.f.faults.fail("RecordPushReceipt", 0, 1)
+	p.f.faults.Fail("RecordPushReceipt", 0, 1)
 	startBackdater(t, p.f, p.run.ID)
 	p.approve(t, "gate")
 
 	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 120*time.Second)
-	if n := p.f.faults.remaining("RecordPushReceipt"); n != 0 {
+	if n := p.f.faults.Remaining("RecordPushReceipt"); n != 0 {
 		t.Fatalf("%d armed receipt failures never fired; this test proved nothing", n)
 	}
 	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
@@ -847,12 +847,12 @@ func TestPublish_AFailedPushReceiptResumesRatherThanKillingTheRun(t *testing.T) 
 
 func TestPublish_AFailedPullRequestReceiptResumesRatherThanKillingTheRun(t *testing.T) {
 	p := publicationAtItsGate(t, gatedConveyorDoc())
-	p.f.faults.fail("RecordPRReceipt", 0, 1)
+	p.f.faults.Fail("RecordPRReceipt", 0, 1)
 	startBackdater(t, p.f, p.run.ID)
 	p.approve(t, "gate")
 
 	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 120*time.Second)
-	if n := p.f.faults.remaining("RecordPRReceipt"); n != 0 {
+	if n := p.f.faults.Remaining("RecordPRReceipt"); n != 0 {
 		t.Fatalf("%d armed receipt failures never fired; this test proved nothing", n)
 	}
 	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
@@ -882,12 +882,12 @@ func TestPublish_AFailedHaltReceiptResumesRatherThanKillingTheRun(t *testing.T) 
 	authID := p.approve(t, "gate")
 	auth := authorization(t, p.f, authID)
 	foreign := pushForeignBranch(t, p.f, runs.PublicationBranch(auth.ArtifactID))
-	p.f.faults.fail("HaltPublishIntent", 0, 1)
+	p.f.faults.Fail("HaltPublishIntent", 0, 1)
 	startBackdater(t, p.f, p.run.ID)
 	p.start()
 
 	got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 120*time.Second)
-	if n := p.f.faults.remaining("HaltPublishIntent"); n != 0 {
+	if n := p.f.faults.Remaining("HaltPublishIntent"); n != 0 {
 		t.Fatalf("%d armed halt failures never fired; this test proved nothing", n)
 	}
 	if got.Outcome == nil || got.Outcome.Code != runs.CodePublishConflict {
@@ -917,12 +917,12 @@ func TestPublish_AFailedArtifactReadResumesRatherThanKillingTheRun(t *testing.T)
 	p := publicationAtItsGate(t, gatedConveyorDoc())
 	p.stop()
 	p.approve(t, "gate")
-	p.f.faults.fail("GetArtifactByID", 1, 1)
+	p.f.faults.Fail("GetArtifactByID", 1, 1)
 	startBackdater(t, p.f, p.run.ID)
 	p.start()
 
 	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 120*time.Second)
-	if n := p.f.faults.remaining("GetArtifactByID"); n != 0 {
+	if n := p.f.faults.Remaining("GetArtifactByID"); n != 0 {
 		t.Fatalf("%d armed read failures never fired; this test proved nothing", n)
 	}
 	if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
@@ -1066,11 +1066,11 @@ func TestPublish_AFailedAuthorizationTransactionDoesNotKillTheRun(t *testing.T) 
 			p := publicationAtItsGate(t, gatedConveyorDoc())
 			p.stop()
 			p.approve(t, "gate")
-			p.f.faults.fail(stmt, 0, 1)
+			p.f.faults.Fail(stmt, 0, 1)
 			p.start()
 
 			waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 120*time.Second)
-			if n := p.f.faults.remaining(stmt); n != 0 {
+			if n := p.f.faults.Remaining(stmt); n != 0 {
 				t.Fatalf("%d armed %s failures never fired; this test proved nothing", n, stmt)
 			}
 			if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
