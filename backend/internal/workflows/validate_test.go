@@ -376,3 +376,27 @@ func TestValidate_DuplicateEdgeIsReportedOnceNotTwice(t *testing.T) {
 		}
 	}
 }
+
+// The multiplicity phase counts over the edges the well-formedness pass
+// accepted, so an edge that was already rejected for naming an unknown node
+// must not also inflate its target's consumption count.
+func TestValidate_AMalformedEdgeIsNotCountedTowardsConsumption(t *testing.T) {
+	doc := Document{
+		Schema: SchemaVersion,
+		Nodes: []Node{
+			{ID: "implement", Type: NodeImplement, Harness: "h", Instructions: "x"},
+			{ID: "review", Type: NodeReview, Harness: "h", Instructions: "x"},
+		},
+		Edges: []Edge{
+			{From: "implement", To: "review", Artifact: ArtifactPatch},
+			{From: "ghost", To: "review", Artifact: ArtifactPatch},
+		},
+	}
+	vs := Validate(doc)
+	wantViolation(t, vs, "edges[1].from", `unknown node "ghost"`)
+	for _, v := range vs {
+		if strings.Contains(v.Message, "consumes exactly 1 patch") {
+			t.Errorf("review consumes one accepted patch; the rejected edge was counted anyway: %+v", vs)
+		}
+	}
+}
