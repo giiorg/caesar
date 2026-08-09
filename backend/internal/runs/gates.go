@@ -327,7 +327,7 @@ func (s *Service) finishGate(ctx context.Context, tx pgx.Tx, runID, phaseID uuid
 		return fmt.Errorf("runs: finish gate: %w", err)
 	}
 	if n == 0 {
-		return decisionRefused(ctx, q, runID, "the gate stopped waiting while this decision was being made")
+		return decisionRefused(ctx, q, runID, now, "the gate stopped waiting while this decision was being made")
 	}
 	return nil
 }
@@ -347,17 +347,34 @@ func (s *Service) finishGate(ctx context.Context, tx pgx.Tx, runID, phaseID uuid
 //
 // The fallback covers the case where both run predicates still hold, which
 // leaves only the phase row itself as the thing that moved.
-func decisionRefused(ctx context.Context, q *store.Queries, runID uuid.UUID, fallback string) error {
+//
+// This is the BEST AVAILABLE DIAGNOSIS, not a replay of the predicate that
+// failed. The re-read is a new statement, so under READ COMMITTED it takes a
+// new snapshot: between the lost CAS and this read the janitor's
+// RunIsWaitingOnAGate pass can park the run back to 'waiting', restoring both
+// predicates and dropping this into the fallback. That is a rarer version of
+// the very lie it exists to stop, and it is the honest ceiling of diagnosing a
+// CAS after the fact — the alternative is a lock this transaction cannot take
+// without deadlocking against the sibling it is racing.
+//
+// now is the caller's dbNow rather than a fresh read. Postgres now() is
+// transaction_timestamp(), frozen for the whole transaction, and both call
+// sites run inside the decision's transaction — so a fresh DBNow here would
+// return this exact value at the cost of a round trip.
+func decisionRefused(ctx context.Context, q *store.Queries, runID uuid.UUID, now time.Time, fallback string) error {
 	run, err := q.GetRun(ctx, runID)
 	if err != nil {
 		return fmt.Errorf("runs: read run after a refused decision: %w", err)
 	}
-	now, err := q.DBNow(ctx)
-	if err != nil {
-		return err
-	}
 	switch {
 	case !run.WallDeadline.After(now):
+		// UNREACHABLE TODAY, kept for the day it stops being. wall_deadline is
+		// written once at insert and never updated, and the frozen now() above
+		// is the same instant DecideGate's up-front check used — so that check
+		// and this arm compare the same two immutable values and cannot
+		// disagree. A lost CAS therefore never lands here. The day a deadline
+		// becomes extendable mid-run, this is the arm that stops the refusal
+		// from being reported as the gate having moved.
 		return xerrors.E(xerrors.ClassConflict,
 			"the run's wall deadline passed while this decision was being made")
 	case RunStatus(run.Status) != RunWaiting:

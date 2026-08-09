@@ -131,7 +131,16 @@ func (s *Service) openRevision(ctx context.Context, tx pgx.Tx, rc revisionContex
 		// The same two run predicates finishGate just cleared, re-evaluated
 		// under this statement's row lock. Reaching here means one of them
 		// stopped holding in between, and only the row says which.
-		return decisionRefused(ctx, q, rc.in.RunID,
+		//
+		// NO TEST REACHES THIS ARM, and none can without fault injection.
+		// Getting here needs a sibling decision to commit BETWEEN the two
+		// statements above inside this one transaction, and the suite has no
+		// seam to suspend a transaction mid-flight. The sibling-race test
+		// (TestDecideGate_ARunResumedBySiblingIsNotReportedAsAnExpiredDeadline)
+		// pins the SAME helper through finishGate, which is the statement a
+		// resumed run actually loses at — this arm is the narrower interleaving
+		// behind it and is a named survivor in the ledger.
+		return decisionRefused(ctx, q, rc.in.RunID, rc.now,
 			"the run stopped accepting decisions while this revision was being opened")
 	}
 	if err != nil {

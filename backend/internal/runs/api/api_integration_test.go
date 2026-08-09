@@ -324,17 +324,51 @@ func (h *harness) createTaskInRepo(t *testing.T, token string, repoID uuid.UUID,
 
 // stagedTreeHash is the git tree hash the staged patch claims. Any non-empty
 // value satisfies mintAuthorization; nothing in this suite publishes.
-const stagedTreeHash = "1111111111111111111111111111111111111111"
+// supersededTreeHash belongs to the earlier round's patch and exists only to be
+// a DIFFERENT value: an approval that bound it would be approving content the
+// revision replaced.
+const (
+	stagedTreeHash     = "1111111111111111111111111111111111111111"
+	supersededTreeHash = "2222222222222222222222222222222222222222"
+)
+
+// gateStamps is what stageGate wrote and what the projections have to carry
+// back unchanged. Every value is read off the writing statement's RETURNING
+// rather than computed in Go: the timestamps come from the DATABASE clock,
+// while this harness injects an app clock pinned to a fixed date in 2026, so a
+// Go-side time.Now() would compare two unrelated clocks.
+type gateStamps struct {
+	waitingSince time.Time // the LIVE gate attempt's created_at
+	priorActedAt time.Time // the SUPERSEDED attempt's decision's acted_at
+	priorPatchID string    // the artifact that superseded decision examined
+	livePatchID  string    // the artifact a decision on the live gate examines
+}
 
 // stageGate parks a run at a gate awaiting a decision, without a conveyor.
 //
 // This suite answers HTTP and authorization questions — statuses, grants,
-// scoping, body validation — and none of them need an agent to have run. What
-// a materialized gate leaves behind is three writes, so they are made directly:
-// the run waits, the examined patch exists with the tree hash an approval binds,
-// and the gate's attempt row is waiting_decision. The conveyor that produces
-// them for real is Task 13's golden set.
-func (h *harness) stageGate(t *testing.T, task runsapi.TaskResponse) uuid.UUID {
+// scoping, body validation — and none of them need an agent to have run, so the
+// rows a materialized gate leaves behind are written directly. The conveyor
+// that produces them for real is Task 13's golden set.
+//
+// It stages TWO rounds, not one, and that is load-bearing rather than colour:
+//
+//	generation 1: impl produced a patch, the gate was sent back for changes
+//	              — both rows superseded, the decision row still there
+//	generation 2: impl re-ran, and its gate is the one now waiting
+//
+// One round cannot falsify the projection's central claim. After a revision
+// both gate attempts carry the SAME node id and differ only by attempt row, so
+// a join keyed on node_id instead of phase_run_id smears the newer verdict
+// across both — and a fixture with a single gate attempt has no second row for
+// it to smear onto. Two rounds also make attempt and generation something other
+// than the constant 1, which is what an inbox entry's fields are read against.
+//
+// What it deliberately does NOT stage is the pair of seed artifacts a real
+// revision writes (the gate note and the carried-forward patch, both at attempt
+// 0). Nothing on this surface reads them, and they would only pad the artifact
+// count this file asserts on.
+func (h *harness) stageGate(t *testing.T, task runsapi.TaskResponse) (uuid.UUID, gateStamps) {
 	t.Helper()
 	ctx := context.Background()
 	runID, err := uuid.Parse(task.LatestRunID)
@@ -346,42 +380,101 @@ func (h *harness) stageGate(t *testing.T, task runsapi.TaskResponse) uuid.UUID {
 	// harness's app clock is pinned to a fixed date in 2026 — so a run left with
 	// the deadline intake computed would be refused as expired on any day after
 	// it, and every assertion below would be about the wrong refusal.
+	//
+	// Every timestamp below is a distinct offset from that same clock. Equal
+	// timestamps would let a projection read the wrong column and still match.
 	var baseSHA string
 	if err := h.pool.QueryRow(ctx,
-		`UPDATE runs SET status = 'waiting', started_at = now(), wall_deadline = now() + interval '1 hour'
+		`UPDATE runs SET status = 'waiting', generation = 2, started_at = now() - interval '90 minutes',
+		        wall_deadline = now() + interval '1 hour'
 		 WHERE id = $1 RETURNING base_sha`,
 		runID).Scan(&baseSHA); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.pool.Exec(ctx,
-		`INSERT INTO artifacts (id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at)
-		 VALUES (uuidv7(), $1, 'impl', 1, 1, 'patch',
-		         jsonb_build_object('tree_hash', $2::text, 'base_sha', $3::text), '[]'::jsonb, now())`,
-		runID, stagedTreeHash, baseSHA); err != nil {
+
+	// Ages are passed as whole minutes and turned into intervals in SQL, so
+	// every row's timestamp comes off the same database clock as the deadline
+	// above and no two of them collide.
+	patch := func(attempt, generation, agoMin int32, hash string) uuid.UUID {
+		t.Helper()
+		var id uuid.UUID
+		if err := h.pool.QueryRow(ctx,
+			`INSERT INTO artifacts (id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at)
+			 VALUES (uuidv7(), $1, 'impl', $4, $5, 'patch',
+			         jsonb_build_object('tree_hash', $2::text, 'base_sha', $3::text), '[]'::jsonb,
+			         now() - make_interval(mins => $6::int))
+			 RETURNING id`,
+			runID, hash, baseSHA, attempt, generation, agoMin).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	// finished is a *int32 rather than a bool: make_interval of NULL is NULL, so
+	// the same expression writes the timestamp or leaves the column unset.
+	phase := func(node, status string, attempt, generation, agoMin int32, finishedMin *int32) uuid.UUID {
+		t.Helper()
+		var id uuid.UUID
+		if err := h.pool.QueryRow(ctx,
+			`INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, status, generation, finished_at, created_at)
+			 VALUES ($1, $2, $4, 3, $3, $5,
+			         now() - make_interval(mins => $6::int),
+			         now() - make_interval(mins => $7::int))
+			 RETURNING id`,
+			runID, node, status, attempt, generation, finishedMin, agoMin).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	at := func(m int32) *int32 { return &m }
+
+	// Generation 1: the implementation failed once, retried, produced a patch,
+	// and the gate sent the round back for changes.
+	//
+	// The failed retry is not colour either. A revision bumps attempt and
+	// generation together, so without one extra attempt somewhere every row in
+	// this fixture would carry attempt == generation — and a projection that
+	// swapped the two columns would satisfy every assertion in this file.
+	var st gateStamps
+	phase("impl", "failed", 1, 1, 70, at(65))
+	priorPatch := patch(2, 1, 60, supersededTreeHash)
+	st.priorPatchID = priorPatch.String()
+	phase("impl", "superseded", 2, 1, 60, at(50))
+	priorGate := phase("gate", "superseded", 1, 1, 50, at(45))
+	// The requester decides their own gate here, so the superseded round differs
+	// from the live one in every projected field — verdict, decider, the
+	// self-approval marker and the artifact examined — and not only in verdict.
+	// requester_id is read off the row rather than passed in, so this stays
+	// correct for a run staged in either project.
+	if err := h.pool.QueryRow(ctx,
+		`INSERT INTO gate_decisions (phase_run_id, run_id, node_id, generation, decision,
+		                             examined_artifact_id, note, acted_by, self_approval, acted_at)
+		 SELECT $1, $2, 'gate', 1, 'request_changes', $3, 'the first round needed work',
+		        t.requester_id, true, now() - interval '45 minutes'
+		 FROM runs r JOIN tasks t ON t.id = r.task_id WHERE r.id = $2
+		 RETURNING acted_at`,
+		priorGate, runID, priorPatch).Scan(&st.priorActedAt); err != nil {
 		t.Fatal(err)
 	}
-	// The finished phase that produced the patch is staged too. It is what a
-	// real gate is always preceded by, and it is the only undecided phase the
-	// projection has to leave alone — without it, "a decision lands on the row
-	// it was made on" has nothing to be wrong about.
-	if _, err := h.pool.Exec(ctx,
-		`INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, status, generation, finished_at, created_at)
-		 VALUES ($1, 'impl', 1, 3, 'succeeded', 1, now(), now())`, runID); err != nil {
+
+	// Generation 2: re-run, and waiting on its own gate. The attempt ordinal
+	// continues rather than restarting — see MaxAttemptForNode.
+	st.livePatchID = patch(3, 2, 20, stagedTreeHash).String()
+	phase("impl", "succeeded", 3, 2, 20, at(15))
+	liveGate := phase("gate", "waiting_decision", 2, 2, 10, nil)
+	if err := h.pool.QueryRow(ctx,
+		`SELECT created_at FROM phase_runs WHERE id = $1`, liveGate).Scan(&st.waitingSince); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.pool.Exec(ctx,
-		`INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, status, generation, created_at)
-		 VALUES ($1, 'gate', 1, 3, 'waiting_decision', 1, now())`, runID); err != nil {
-		t.Fatal(err)
-	}
-	return runID
+	return runID, st
 }
 
-// gatedRun is createTask + stageGate: a run of the caller's, sitting at its gate.
-func (h *harness) gatedRun(t *testing.T, token string, repoID uuid.UUID, title string) (runsapi.TaskResponse, uuid.UUID) {
+// gatedRun is createTask + stageGate: a run of the caller's, sitting at its gate
+// with one spent revision round behind it.
+func (h *harness) gatedRun(t *testing.T, token string, repoID uuid.UUID, title string) (runsapi.TaskResponse, uuid.UUID, gateStamps) {
 	t.Helper()
 	task := h.createTaskInRepo(t, token, repoID, title)
-	return task, h.stageGate(t, task)
+	runID, stamps := h.stageGate(t, task)
+	return task, runID, stamps
 }
 
 func decisionPath(runID uuid.UUID, node string) string {
@@ -693,9 +786,16 @@ func TestAPI_GateDecisionRequiresApproveGrant(t *testing.T) {
 	h := newHarness(t)
 	// The runner requests the task and the approver decides it, so nothing
 	// here depends on the shipped policy permitting self-approval.
-	_, runID := h.gatedRun(t, "runner-tok", h.repoID, "ship it")
+	_, runID, _ := h.gatedRun(t, "runner-tok", h.repoID, "ship it")
 	body := runsapi.GateDecisionRequest{Decision: "approve"}
 
+	// THE ORDER OF THESE SUBTESTS IS LOAD-BEARING, and so is their sharing one
+	// gate. The two refusals run first against a gate that is still waiting, and
+	// the approval that follows only succeeds because neither of them wrote
+	// anything — which is how "the grant is checked BEFORE the write" becomes an
+	// observable property instead of an assertion about a status code. Reorder
+	// them, give each its own run, or add t.Parallel, and a handler that decides
+	// first and checks the grant afterwards passes every line below.
 	t.Run("a run grant may not decide", func(t *testing.T) {
 		resp := h.do(t, http.MethodPost, decisionPath(runID, "gate"), "runner-tok", body)
 		if resp.StatusCode != http.StatusForbidden {
@@ -730,8 +830,11 @@ func TestAPI_GateDecisionRequiresApproveGrant(t *testing.T) {
 		if out.RunStatus != string(runs.RunRunning) {
 			t.Errorf("run_status = %q, want running: an approval resumes the run", out.RunStatus)
 		}
-		if out.Generation != 1 {
-			t.Errorf("generation = %d, want 1: approve reports the generation decided", out.Generation)
+		// 2, not 1: the fixture has one revision round behind it, and approve
+		// reports the generation of the attempt it DECIDED. A response echoing
+		// the run's first generation, or a constant, is a different number.
+		if out.Generation != 2 {
+			t.Errorf("generation = %d, want 2: approve reports the generation decided", out.Generation)
 		}
 		// The gate dominates a git-publish node, so the approval mints the
 		// single-use authorization that node will spend.
@@ -743,7 +846,7 @@ func TestAPI_GateDecisionRequiresApproveGrant(t *testing.T) {
 
 func TestAPI_GateDecisionOnAnUnknownRunIs404AndOnADecidedGateIs409(t *testing.T) {
 	h := newHarness(t)
-	_, runID := h.gatedRun(t, "approver-tok", h.repoID, "ship it")
+	_, runID, _ := h.gatedRun(t, "approver-tok", h.repoID, "ship it")
 	approve := runsapi.GateDecisionRequest{Decision: "approve"}
 
 	t.Run("an unknown run is not found", func(t *testing.T) {
@@ -778,7 +881,7 @@ func TestAPI_GateDecisionOnAnUnknownRunIs404AndOnADecidedGateIs409(t *testing.T)
 
 func TestAPI_GateDecisionValidatesItsBody(t *testing.T) {
 	h := newHarness(t)
-	_, runID := h.gatedRun(t, "approver-tok", h.repoID, "ship it")
+	_, runID, _ := h.gatedRun(t, "approver-tok", h.repoID, "ship it")
 
 	for _, c := range []struct {
 		name  string
@@ -821,8 +924,8 @@ func TestAPI_GateDecisionValidatesItsBody(t *testing.T) {
 
 func TestAPI_ApprovalsInboxIsScopedToGrants(t *testing.T) {
 	h := newHarness(t)
-	taskA, runA := h.gatedRun(t, "approver-tok", h.repoID, "gate on A")
-	taskB, runB := h.gatedRun(t, "approver-b-tok", h.repoB, "gate on B")
+	taskA, runA, stampsA := h.gatedRun(t, "approver-tok", h.repoID, "gate on A")
+	taskB, runB, _ := h.gatedRun(t, "approver-b-tok", h.repoB, "gate on B")
 
 	inbox := func(t *testing.T, token string) runsapi.ApprovalListResponse {
 		t.Helper()
@@ -881,16 +984,27 @@ func TestAPI_ApprovalsInboxIsScopedToGrants(t *testing.T) {
 
 	t.Run("an entry carries everything a list view renders", func(t *testing.T) {
 		got := onlyRun(t, "approver-tok", runA)
+		// Attempt and generation are 2, and that is the point of staging a spent
+		// revision round: at 1 they are indistinguishable from a hardcoded 1,
+		// from the run's first generation, and from a column read off the wrong
+		// row. The waiting entry must be the SECOND gate attempt.
 		want := runsapi.ApprovalResponse{
 			RunID: runA.String(), TaskID: taskA.ID, ProjectID: h.projectID.String(),
-			TaskTitle: "gate on A", NodeID: "gate", Attempt: 1, Generation: 1,
+			TaskTitle: "gate on A", NodeID: "gate", Attempt: 2, Generation: 2,
 			RequesterID: h.approver.UserID.String(), WaitingSince: got.WaitingSince,
 		}
 		if got != want {
 			t.Errorf("entry = %+v, want %+v", got, want)
 		}
-		if got.WaitingSince.IsZero() {
-			t.Error("waiting_since is zero; an inbox sorts and ages on it")
+		// WaitingSince is compared apart from the struct because time.Time
+		// equality includes the location pointer, and the value has been through
+		// JSON. The staged value is a distinct offset from every other timestamp
+		// on the run, so reading the wrong column — the run's started_at, the
+		// superseded attempt's created_at, the decision's acted_at — lands
+		// somewhere else and fails here. IsZero alone only catches NULL.
+		if !got.WaitingSince.Equal(stampsA.waitingSince) {
+			t.Errorf("waiting_since = %s, want the live gate attempt's created_at %s",
+				got.WaitingSince, stampsA.waitingSince)
 		}
 		// B's entry names B's project, so the projection is not echoing one
 		// project id at every caller.
@@ -924,28 +1038,28 @@ func (h *harness) stagePublication(t *testing.T, runID, authID uuid.UUID) {
 // generation, each phase's generation and its decision, each artifact's
 // generation, and the run's publications.
 //
-// It asserts the SHAPE over staged rows, deliberately not the conveyor arc.
-// Two generations, request_changes followed by approve, and a publication that
-// actually reaches 'published' on a forge belong to Task 13's
+// It asserts the SHAPE over staged rows, deliberately not the conveyor arc. A
+// publication that actually reaches 'published' on a forge belongs to Task 13's
 // TestGoldenSet_FullConveyorThroughTheAPI, which drives the real thing; there
-// is no value in a second, fake version of it here.
+// is no value in a second, fake version of it here. What it DOES need from the
+// arc is two gate attempts with different verdicts, because that is the only
+// shape in which "a decision lands on the attempt it was made on" can be wrong
+// — see stageGate.
 func TestAPI_RunProjectionCarriesTheGateFields(t *testing.T) {
 	h := newHarness(t)
 	// The runner requests, the approver decides: self_approval is then a
 	// projected fact rather than a constant this fixture cannot help but be.
-	task, runID := h.gatedRun(t, "runner-tok", h.repoID, "ship it")
-	var patchID string
-	if err := h.pool.QueryRow(context.Background(),
-		`SELECT id::text FROM artifacts WHERE run_id = $1 AND node_id = 'impl' AND type = 'patch'`,
-		runID).Scan(&patchID); err != nil {
-		t.Fatal(err)
-	}
+	// The superseded round was decided by the requester, so this one run carries
+	// the marker in both states.
+	task, runID, stamps := h.gatedRun(t, "runner-tok", h.repoID, "ship it")
 
+	before := h.dbNow(t)
 	resp := h.do(t, http.MethodPost, decisionPath(runID, "gate"), "approver-tok",
 		runsapi.GateDecisionRequest{Decision: "approve", Note: "ship it"})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("decision = %d, want 200", resp.StatusCode)
 	}
+	after := h.dbNow(t)
 	authID, err := uuid.Parse(decodeInto[runsapi.GateDecisionResponse](t, resp).AuthorizationID)
 	if err != nil {
 		t.Fatal(err)
@@ -963,50 +1077,108 @@ func TestAPI_RunProjectionCarriesTheGateFields(t *testing.T) {
 	run := getRun(t, runID)
 
 	t.Run("the run and its rows carry their generation", func(t *testing.T) {
-		if run.Generation != 1 {
-			t.Errorf("run generation = %d, want 1", run.Generation)
+		// The run has one revision round behind it, so every generation here is
+		// a value the projection had to read rather than the 1 a default gives
+		// away for free.
+		if run.Generation != 2 {
+			t.Errorf("run generation = %d, want 2", run.Generation)
 		}
-		gate := phaseByNodeID(t, run, "gate")
-		if gate.Generation != 1 {
-			t.Errorf("gate phase generation = %d, want 1", gate.Generation)
+		if g := phaseAt(t, run, "gate", 2).Generation; g != 2 {
+			t.Errorf("live gate phase generation = %d, want 2", g)
 		}
-		if len(run.Artifacts) != 1 || run.Artifacts[0].Generation != 1 {
-			t.Errorf("artifacts = %+v, want one at generation 1", run.Artifacts)
+		if g := phaseAt(t, run, "gate", 1).Generation; g != 1 {
+			t.Errorf("superseded gate phase generation = %d, want 1: it keeps the "+
+				"generation it ran in, it does not follow the run's", g)
+		}
+		if len(run.Artifacts) != 2 {
+			t.Fatalf("artifacts = %+v, want the patch of each round", run.Artifacts)
+		}
+		// Ordered by created_at, so the superseded round comes first. The two
+		// ordinals differ on both rows — the first round retried once — so a
+		// projection that swapped the columns is caught here rather than passing
+		// on a fixture where every attempt happens to equal its generation.
+		if a := run.Artifacts[0]; a.Attempt != 2 || a.Generation != 1 {
+			t.Errorf("older artifact = %+v, want attempt 2 generation 1", a)
+		}
+		if a := run.Artifacts[1]; a.Attempt != 3 || a.Generation != 2 {
+			t.Errorf("newer artifact = %+v, want attempt 3 generation 2", a)
 		}
 	})
 
 	t.Run("the decided gate phase carries who decided and what they examined", func(t *testing.T) {
-		gate := phaseByNodeID(t, run, "gate")
+		gate := phaseAt(t, run, "gate", 2)
 		if gate.Decision == nil {
 			t.Fatal("the decided gate phase carries no decision")
 		}
 		want := runsapi.GateDecisionSummary{
 			Decision: "approve", Note: "ship it",
 			ActedByID: h.approver.UserID.String(), ActedByEmail: "approver@example.com",
-			ActedAt: gate.Decision.ActedAt, SelfApproval: false, ExaminedArtifactID: patchID,
+			ActedAt: gate.Decision.ActedAt, SelfApproval: false, ExaminedArtifactID: stamps.livePatchID,
 		}
 		if *gate.Decision != want {
 			t.Errorf("decision = %+v, want %+v", *gate.Decision, want)
 		}
-		if gate.Decision.ActedAt.IsZero() {
-			t.Error("acted_at is zero")
+		// ActedAt is excluded from the comparison above (time.Time equality
+		// carries a location pointer through JSON) and the service picks it, so
+		// it is bounded by two reads of the DATABASE clock taken either side of
+		// the request. Comparing against a Go-side time.Now would be comparing
+		// two unrelated clocks; IsZero alone passes for any wrong-but-set column,
+		// including the acted_at of the round before.
+		if got := gate.Decision.ActedAt; got.Before(before) || got.After(after) {
+			t.Errorf("acted_at = %s, want inside [%s, %s]", got, before, after)
 		}
-		// The decision attaches to the phase row it was made on and to no
-		// other. Counting is what catches a join keyed on anything else: after
-		// a revision both gate attempts share a node id, and a decision
-		// smeared across them reads as two verdicts nobody gave.
-		decided := 0
+	})
+
+	// THE CENTRAL CLAIM of the projection, and the only one that needs both
+	// rounds. Both gate attempts carry the same node id, so a join keyed on
+	// node_id instead of phase_run_id smears one round's verdict over the other
+	// and everything below still has a decision to find — it just has the wrong
+	// one. Asserting the two verdicts differ is what makes that observable.
+	t.Run("each gate attempt carries the verdict given on it and no other", func(t *testing.T) {
+		live, prior := phaseAt(t, run, "gate", 2), phaseAt(t, run, "gate", 1)
+		if live.Decision == nil || prior.Decision == nil {
+			t.Fatalf("both gate attempts must carry their own decision: live=%+v prior=%+v",
+				live.Decision, prior.Decision)
+		}
+		if live.Decision.Decision != "approve" || prior.Decision.Decision != "request_changes" {
+			t.Errorf("verdicts = live %q / prior %q, want approve / request_changes",
+				live.Decision.Decision, prior.Decision.Decision)
+		}
+		// Every other projected field of the two decisions differs too, so a
+		// smear is caught even by a reader that only looks at one of them.
+		if prior.Decision.ActedByID != h.runner.UserID.String() ||
+			prior.Decision.ActedByEmail != "runner@example.com" ||
+			!prior.Decision.SelfApproval ||
+			prior.Decision.ExaminedArtifactID != stamps.priorPatchID ||
+			!prior.Decision.ActedAt.Equal(stamps.priorActedAt) {
+			t.Errorf("superseded decision = %+v, want the requester's self-approved "+
+				"request_changes on %s at %s", *prior.Decision, stamps.priorPatchID, stamps.priorActedAt)
+		}
+		// Counting catches the other way of getting the key wrong: a join on
+		// run_id hands the same decision to every phase of the run, gates and
+		// implementations alike.
+		decided, gates := 0, 0
 		for _, p := range run.Phases {
 			if p.Decision != nil {
 				decided++
 			}
+			if p.NodeID == "gate" {
+				gates++
+			}
 		}
-		if decided != 1 {
-			t.Errorf("phases carrying a decision = %d of %d, want exactly the decided gate",
+		if gates != 2 {
+			t.Fatalf("gate attempts = %d of %+v, want the fixture's two", gates, run.Phases)
+		}
+		if decided != 2 {
+			t.Errorf("phases carrying a decision = %d of %d, want exactly the two gate attempts",
 				decided, len(run.Phases))
 		}
-		if impl := phaseByNodeID(t, run, "impl"); impl.Decision != nil {
-			t.Errorf("the undecided impl phase carries a decision: %+v", impl.Decision)
+		// All three implementation attempts, by ordinal: the lookup itself fails
+		// if the projection reported an attempt other than the one on the row.
+		for _, attempt := range []int32{1, 2, 3} {
+			if impl := phaseAt(t, run, "impl", attempt); impl.Decision != nil {
+				t.Errorf("impl attempt %d carries a decision: %+v", attempt, impl.Decision)
+			}
 		}
 	})
 
@@ -1062,12 +1234,12 @@ func TestAPI_RunProjectionCarriesTheGateFields(t *testing.T) {
 		// The requester decides their own gate. The shipped policy permits it
 		// and marks the row distinctly (spec §6); the marker is worth nothing
 		// if it stops at the database.
-		_, ownRun := h.gatedRun(t, "approver-tok", h.repoID, "my own gate")
+		_, ownRun, _ := h.gatedRun(t, "approver-tok", h.repoID, "my own gate")
 		if resp := h.do(t, http.MethodPost, decisionPath(ownRun, "gate"), "approver-tok",
 			runsapi.GateDecisionRequest{Decision: "approve"}); resp.StatusCode != http.StatusOK {
 			t.Fatalf("self-approval = %d, want 200", resp.StatusCode)
 		}
-		gate := phaseByNodeID(t, getRun(t, ownRun), "gate")
+		gate := phaseAt(t, getRun(t, ownRun), "gate", 2)
 		if gate.Decision == nil || !gate.Decision.SelfApproval {
 			t.Errorf("decision = %+v, want self_approval true", gate.Decision)
 		}
@@ -1085,20 +1257,31 @@ func TestAPI_RunProjectionCarriesTheGateFields(t *testing.T) {
 	})
 }
 
-func tryPhaseByNodeID(run runsapi.RunResponse, nodeID string) (runsapi.PhaseResponse, bool) {
+// phaseAt selects a phase by node id AND attempt. Node id alone is ambiguous
+// once a run has a revision behind it — that is the whole reason the projection
+// keys decisions on phase_run_id — so a lookup that takes the first match would
+// quietly assert against whichever row the ordering happened to put first.
+func phaseAt(t *testing.T, run runsapi.RunResponse, nodeID string, attempt int32) runsapi.PhaseResponse {
+	t.Helper()
 	for _, p := range run.Phases {
-		if p.NodeID == nodeID {
-			return p, true
+		if p.NodeID == nodeID && p.Attempt == attempt {
+			return p
 		}
 	}
-	return runsapi.PhaseResponse{}, false
+	t.Fatalf("no phase for node %q attempt %d in %+v", nodeID, attempt, run.Phases)
+	return runsapi.PhaseResponse{}
 }
 
-func phaseByNodeID(t *testing.T, run runsapi.RunResponse, nodeID string) runsapi.PhaseResponse {
+// dbNow reads the DATABASE clock. Timestamps this suite bounds are written by
+// database now(), and the harness injects an app clock pinned to a fixed date
+// in 2026 — so bounding them with a Go-side time.Now would compare two
+// unrelated clocks and fail or pass for reasons that have nothing to do with
+// the projection.
+func (h *harness) dbNow(t *testing.T) time.Time {
 	t.Helper()
-	p, ok := tryPhaseByNodeID(run, nodeID)
-	if !ok {
-		t.Fatalf("no phase for node %q in %+v", nodeID, run.Phases)
+	var now time.Time
+	if err := h.pool.QueryRow(context.Background(), `SELECT now()`).Scan(&now); err != nil {
+		t.Fatal(err)
 	}
-	return p
+	return now
 }
