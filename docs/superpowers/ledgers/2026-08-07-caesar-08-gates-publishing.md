@@ -3,67 +3,88 @@
 
 ## >>> RESUME HERE (fresh session, 2026-08-09 — written by session 53) <<<
 
-**Tasks 1-14 COMPLETE, all gated and reviewed clean. ONE task remains (15), then the
-WHOLE-BRANCH REVIEW.**
-**Task 14's last code commit is `06c9afe`, gate GREEN there AND the runner lane green.
-HEAD carries one docs-only commit on top (the tracked ledger snapshot). Tree clean.**
-**Run `git rev-parse HEAD` and use THAT as Task 15's BASE** — not `06c9afe`. The
-docs-only commit on top is exactly the trap that made session 53 re-derive Task 13's
-base; the review package needs the true HEAD or it truncates the task.
+# >>> ALL 16 TASKS ARE COMPLETE. THE NEXT ACTION IS THE WHOLE-BRANCH REVIEW. <<<
 
-Session 53 executed Tasks 13 AND 14 end to end. Task 13: zero production lines, one
-fix round. Task 14: seven commits, three production files, **no fix round** — the
-first task on this plan to pass its review clean on the first pass.
+**Tasks 1-16 COMPLETE, every one gated by the controller and reviewed clean.**
+**HEAD = `eb91334`, tree clean, 88 commits ahead of `main`.** No task is mid-flight;
+no fix round is open. Session 53 executed Tasks 13, 14, 15 and 16 end to end.
 
-**NEXT ACTION: generate the Task 15 brief, then PRE-FLIGHT it before dispatching.**
+**There is no Task 17.** Task 16 was created mid-session by a user ruling (see below)
+and is not in the plan document. The plan's own task list ends at 15.
+
+**BASE for the whole-branch review = `git merge-base main HEAD` = `38b4f75`.**
+
+### The one action
 
 ```
-<skill>/scripts/task-brief docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md 15
+<skill>/scripts/review-package docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md 38b4f75 <HEAD>
 ```
 where `<skill>` = `/Users/sofo/.claude/plugins/cache/claude-plugins-official/superpowers/6.2.0/skills/subagent-driven-development`
 
-**The pre-flight has paid for itself on every single task of this plan** — 9 BLOCKER
-on Task 14's brief, including a central assertion that was UNSATISFIABLE both before
-and after the brief's own prescribed fix. Do not skip it for Task 15 on the grounds
-that it is "only docs": Task 15 is where the plan's own text gets corrected, so a
-wrong premise there is a wrong premise in the permanent record.
+Then dispatch `../requesting-code-review/code-reviewer.md` **on the most capable model**
+(this is an architecture-and-judgement job, not a diff scan). One fix dispatch with the
+COMPLETE findings list — not one fixer per finding — then exactly ONE scoped re-review,
+then adjudicate residuals. There is no second fix wave.
 
-### >>> WHAT TASK 15 OWNS <<<
+### >>> WHAT THE WHOLE-BRANCH REVIEW MUST BE TOLD EXPLICITLY <<<
 
-**Task 15 VERIFIES rather than creates** — the plan was already committed (`5cb627b`),
-a deliberate deviation, because 8,993 lines of corrected text should not sit
-untracked. Known doc items, accumulated across the plan:
+Point it at every `minor (deferred)` and `parked` line in this ledger (~28 across
+Tasks 1-6, plus everything Tasks 7-16 added) and at `19bd487`, whose new test never got
+a quality review. Beyond that, these are the items no diff scan will surface:
 
-1. **Plan line 45 (decision 14) is now WRONG.** It says publish failures split THREE
-   ways with `publish_conflict` the only halting code. It is now FOUR, with
-   `repo_unavailable` and `auth_expired` also halting.
-2. Plan 05's docs table (that plan, line 92) documents the `phase.materialized`
-   payload as `{node_id, attempt}`; it gained a `generation` key.
-3. Add an assertion that the migrated schema equals `schema.sql` — **nothing checks
-   that today**; `migrate_updown_integration_test.go` only walks down-then-up and
-   checks two table names.
-4. Record that `CountSettledPublications` counts EVERY intent including `pending`,
-   the name being deliberately wrong.
-5. Record that `CodeRevisionRoundsExhausted` is deliberately unused (the max-rounds
-   refusal terminalizes nothing, so it carries no outcome code).
-6. `backend/README.md` + roadmap row 08.
+1. **W1 — A PRE-EXISTING TEST IS A SURVIVOR.**
+   `TestPublish_CrashAfterPRCreateAdoptsTheExistingPullRequest`
+   (`publish_integration_test.go:626`, Task 9's file) **PASSES with `CrashAfterPR`
+   turned into a no-op.** Its sibling push test kills the same mutation. **Mutate BOTH.**
+2. **`task backend:test:runner` is attested by IMPLEMENTERS, never by a reviewer**, and
+   `scripts/gate` does not cover it. Last green at `09638c4`. **Run it.**
+3. **`orchestrator.go:653`'s `run.finished` audit has NO coverage** — two agents
+   independently destroyed its subject and nothing failed. The golden set finishes
+   through `orchestrator.go:1419` instead.
+4. **Task 16's fix has an UNPINNED PREMISE.** Mutation M-C — routing
+   `authorizePublish`'s exit through `unchargedWhileUnfinished` — **SURVIVES** the unit
+   lane AND survives `TestGoldenSet_CrashBeforeTheIntentCommitsPublishesNothing`, the one
+   test whose comment narrates its dependence on the `{0,0,0}` requeue. A future refactor
+   would silently turn every honest non-start into a 15s park, suite green.
+5. **PARKED BY USER RULING:** `newGoldenEnv` duplicates ~55 lines of the seed test's
+   world-staging. Deferred because Task 13 was acceptance evidence and
+   `TestGoldenSet_MonthOneLoopThroughRealRoutes` is the ONLY cover for the synthetic patch
+   shape (`fake/executor.go:150-163`), which it gets by NOT wiring a remote. Remedy is in
+   `task-13-review.md` finding 2. **Triage, do not silently adopt or discard.**
+6. **The double `gate.decided` emission** (`gates.go:265`) is RECORDED, not fixed — the
+   golden set pins 3 events against 2 audit rows with a comment saying Task 13 records
+   rather than endorses it. Whether a distinct kind (`gate.authorized`?) is more honest
+   is this review's call.
+7. **`unchargedWhileUnfinished` downgrades TRANSIENTS only** (`publish.go:180-189`), so a
+   permanent that neither halts nor precedes the intent — e.g. `invalid_output` from the
+   commit step, `gitops/publish.go:289` — leaves the path with the intent still `pending`.
+   `runPublish`'s comment states the invariant without that qualification. If the edge is
+   real it belongs in the code's comment first and the README second.
+8. `pushPublication:694-698` returns a permanent `invalid_output` while the intent is
+   `pending` and does not halt — defensible (nothing reached the forge) but a literal
+   exception to the same invariant.
+9. `GET /api/v1/approvals`'s OpenAPI summary (`api.go:97`) says "scoped to the caller's
+   grants (view)" while the handler scopes to ANY grant. Pre-existing; the README no
+   longer repeats it.
+10. `publish_integration_test.go:786-788`'s comment says "HangBeforePush yields
+    `publish_not_started`" — still true of the fake, but that code no longer survives to
+    the run level from that injection.
+11. **`characters`-for-bytes survives in five messages** (`workflows.go:67`,
+    `identity/service.go:76`, `assets/assets.go:138` and `:147`, `assets/harnesses.go:68`,
+    `assets/repos.go:56`) — all count with `len()`. Deliberately not widened in Task 14.
+12. **The `schema.sql` equality gap is SCHEDULED, NOT WRITTEN** — a named plan residual.
+    Nothing asserts the migrated schema equals `schema.sql`. ~140 test-only lines with a
+    known false-positive tail; it deserves its own task.
+13. **`repo_unavailable`'s unreachable arm** is a named plan residual with a concrete
+    closing action: a fault-injected integration case at the PR-open step, NOT another
+    operator run. Note the residual's own concession: that closes the PLUMBING half; the
+    forge's real 404 shape on the PR endpoints stays invented.
 
-### >>> THEN: THE WHOLE-BRANCH REVIEW <<<
+### After the review
 
-Point it at every `minor (deferred)` and `parked` line in this ledger — there are
-~28 across Tasks 1-6 plus everything Tasks 7-14 added — and at `19bd487`, whose new
-test never got a quality review. Dispatch it on the most capable model.
-
-**Three things it must be told explicitly:**
-
-- **W1 — a pre-existing test is a SURVIVOR.**
-  `TestPublish_CrashAfterPRCreateAdoptsTheExistingPullRequest`
-  (`publish_integration_test.go:626`, Task 9's file) PASSES with `CrashAfterPR`
-  turned into a no-op; its sibling push test kills the same mutation. **Mutate BOTH.**
-- **`task backend:test:runner` is attested by an IMPLEMENTER, not a reviewer, and
-  `scripts/gate` does not cover it.** Run it.
-- **`orchestrator.go:653`'s `run.finished` audit has NO coverage** — two agents
-  independently destroyed its subject and nothing failed.
+`superpowers:finishing-a-development-branch`. **The merge/PR decision is sofo's** — do not
+pre-commit it. Two loose ends to reconcile then: a stale `caesar-07-harness-drivers`
+worktree on disk though plan 07 merged, and roadmap row 07's smoke run still open.
 
 ### Task 13's two carry-forwards into the WHOLE-BRANCH REVIEW (not into Task 14)
 
@@ -2796,6 +2817,417 @@ Task 14: minor (deferred): the split put ~2 files of distance between two near-i
 Task 14: >>> **COMPLETE** (commits `1a3da79`..`06c9afe`, 7 commits, review clean, NO fix
   round, 5 minors deferred). <<< Gated by the controller at `06c9afe` (9 lanes, stamped),
   plus the runner lane green by the implementer's attestation.
+
+## Task 15 — CI, docs, roadmap, the plan's record (BASE `f8a59a8` — session 53)
+
+Task 15: brief generated (`task-15-brief.md`, 82 lines).
+Task 15: PRE-FLIGHT NOT CLEAN — **8 BLOCKER, 12 CORRECTION, 4 DESIGN QUESTION, and
+  >>> 11 STATEMENTS IN THE BRIEF THAT ARE FALSE ABOUT THE TREE <<<**
+  (`task-15-preflight.md`). Worktree verified clean at `f8a59a8` before and after.
+  This is the task whose product is the PERMANENT RECORD, so a false premise here does
+  not fail a test — it ships as documentation.
+  1. **The plan is ALREADY COMMITTED** (`5cb627b`, 8,993 lines, tracked two days). The
+     brief's `Files:` header says "Create:" and Step 4 says it "lives untracked."
+  2. **The `FailNextStatement` residual describes code that has NEVER existed** —
+     `grep` exits 1. Task 13 added zero production lines. TWO residuals rest on it.
+  3. **Verification item 3 asserts "exactly one push"** — the shipped test deliberately
+     refuses to assert push count (measured 8 and 2) and asserts properties instead.
+  4. **`task ci` under "Expected: all green"** — measured `fatal: not a git repository`
+     on the `secrets` lane; the brief then says so itself one paragraph later.
+  5. **The `problemShapes` residual is false and THIS PLAN falsified it** — `api.go:47,65`
+     declare 404 + 429 on `createTask`/`rerunTask`, added by this branch (`d6b72e7`).
+  6. >>> **TWO README PARAGRAPHS ARE FALSE RIGHT NOW** <<< and the brief never mentions
+     them: `README:152-160` ("`serve` wires a forge that refuses to resolve a head";
+     "a definition containing gate or `git-publish` nodes is rejected at intake") and
+     `README:245-248` ("task intake is refused until Plan 08's forge adapters land").
+     `serve.go:108` wires the REAL forge, `:125` the real `gitPublisher`.
+  7. **The halted runbook's second option is not actionable** — no endpoint marks a run,
+     and the run is already `failed`.
+  8. The brief omits four of the six doc corrections Task 15 owns.
+Task 15: RULINGS — **DQ1 = >>> USER RULING (sofo): (b), row 08 does NOT flip to done <<<**.
+  It reads `implementation complete — live-forge smoke pending`, mirroring row 07 exactly.
+  Row 07's note establishes that a plan whose acceptance evidence is an operator event
+  does not flip to done on green CI, and the failure mode is identical in kind: the
+  GitHub/GitLab response shapes and error mappings are invented in `httptest` fixtures
+  exactly as the codex exit markers were invented in a CI fixture. Marking 08 done would
+  set the precedent that the row-07 rule was a one-off.
+  **DQ3 = YES**, write the live-forge smoke checklist (~25 lines, mirroring `README:624`)
+  — now load-bearing, since row 08 closes on it.
+  **DQ2 = the `schema.sql` equality assertion is a RESIDUAL, not this task's code.**
+  ~140 test-only lines with a known false-positive tail (constraint naming, check-text
+  normalization, index expression formatting); dropping that into the last task of a plan
+  is how a plan ends red. Scheduled, not written — it deserves its own task and review.
+  **DQ4 = the runner lane goes to the WHOLE-BRANCH REVIEW, not Task 15.** Task 15 changes
+  zero Go files, and re-running it here would only produce another attestation from the
+  class of author the ledger already distrusts.
+Task 15: IMPLEMENTER DISPATCHED (session 53, Opus 5, agent `impl-task-15`, un-suffixed).
+  BASE `f8a59a8`, three absolute paths, overrides BINDING, `task-15-report.md` as the
+  authoritative channel, and an explicit standing instruction: **cite `file:line` for
+  every behavioural sentence, or do not ship the sentence.**
+Task 15: implementer DONE — 5 commits `f8a59a8`..`5c69d52`, tree clean, **ZERO Go files
+  changed**. All eleven of the pre-flight's false statements dispositioned individually.
+Task 15: **GATE PASS at `5c69d52`** — controller-run, 9 lanes, `Commit=5c69d52` stamped,
+  contracts clean. Gitleaks via the parent-repo absolute mount: exit 0, **238 commits
+  scanned**, no leaks, zero "partial scan" lines (`git rev-list --count --all --no-merges`
+  = 238, so every non-merge commit across all refs was covered).
+Task 15: >>> **THE IMPLEMENTER OVERRODE ONE OF MY OVERRIDES, CORRECTLY.** <<< My §D1 and
+  the pre-flight's B5 both said decision 14 should read publish failures "split FOUR ways,
+  three of them halting." The measured count is **FIVE** — `push_rejected` +
+  `forge_unavailable` (transient) + `publish_conflict` + `auth_expired` +
+  `repo_unavailable` (halting). Writing "four" would have shipped a self-contradicting
+  sentence (a list of five introduced as four) into the permanent record. **I verified
+  this myself before accepting it**: `runsports.go:336-350` is the mapping site,
+  `publish.go:1003-1009` is `haltsPublication`, `outcome.go:50-67` defines the codes.
+  The standing rule — a prescribed remedy is a hypothesis — worked in the direction it is
+  least comfortable, against the controller.
+Task 15: the implementer **refused to assert two things it could not verify** and said so:
+  forge token SCOPE names (it describes the capabilities instead), and that a revoked
+  token yields `auth_expired` AT THE PUBLISH STEP (step 6 asks the operator to record
+  where the run dies and with which code, noting both conditions are visible at intake so
+  a run may never reach publish). Asserting either would have been exactly the
+  invented-mapping error the smoke checklist exists to catch.
+Task 15: self-review caught a false sentence it had written itself — the checklist's
+  revision step originally claimed "this is the only place a real forge is asked to
+  resolve the same base twice"; a revision does NOT re-resolve, `base_sha` is pinned once
+  at intake (`tasks.go:178`). Deleted before commit.
+Task 15: the smoke checklist is ~50 lines, not the ruling's estimated ~25 — the extra is
+  step 6 (the two halting answers) and step 7 (fix the mapping, then row 08 closes).
+  Without them it verifies the happy path only, and the halting mappings are the part
+  with NO live evidence at all. Accepted: the ruling made it load-bearing.
+Task 15: ⚠️ **an edit landed in Plan 05's document, which is already `done` on the
+  roadmap** (`phase.materialized` gained a `generation` key — `orchestrator.go:312`). That
+  is what override §D2 asked for and the footnote is self-dating ("gained `generation` in
+  Plan 08"), but it is an edit to a CLOSED plan and is recorded here for that reason.
+Task 15: REVIEWER DISPATCHED (Opus 5, agent `review-task-15`, un-suffixed) framed for a
+  DOCS task: the review is fact-checking prose against code, the implementer's `file:line`
+  citations are the lever, a false statement in the permanent record is IMPORTANT not
+  minor, and the four-vs-five question is to be adjudicated INDEPENDENTLY rather than
+  inherited from me.
+Task 15: REVIEW = spec ✅ / quality **NEEDS FIXES** (`task-15-review.md`). 0 Critical,
+  2 Important, 4 Minor. **It opened ~55 citations at their cited lines: 1 false,
+  1 procedurally unusable, 2 mild overstatements, the rest supported.** Tree left clean.
+Task 15: **THE FOUR-VS-FIVE OVERRIDE WAS ADJUDICATED INDEPENDENTLY AND UPHELD.** The
+  reviewer counted from source without inheriting my confirmation and got five, three
+  halting, with a per-code production table. It noted my §D1 sentence enumerates the three
+  halting codes and then says "four", which is only reachable by dropping one of the two
+  transients — and that the pre-flight carried the same slip forward. Flagging it loudly
+  was called the correct handling.
+Task 15: **Important 1 — a FALSE AUTHORIZATION REQUIREMENT reached the README.**
+  `:106-108` said `/api/v1/approvals` needs `approve`. It does not: `handleListApprovals`
+  (`api.go:372-392`) scopes to every grant the caller holds at ANY level
+  (`identity/service.go:285-293`), admins bypass entirely (`api.go:377`), and the inbox is
+  not run-scoped at all. The handler's own comment states the rule the line inverted. It
+  is STRICTER than reality — the direction that misleads an operator into exposing the
+  inbox to approvers only — and **it contradicted the same document's own Plan 08 section
+  at `:728-733`, which gets it right.**
+Task 15: >>> **Important 2 — the smoke checklist could not reach the mapping it exists to
+  measure, and step 7 closed row 08 anyway.** <<< This is load-bearing because of sofo's
+  DQ1 ruling: row 08 CLOSES on this checklist. Step 6 named the PUBLISH mapping
+  (`publishError`, `runsports.go:325-350`) but instructed "then run a task" — and both
+  conditions are hit at INTAKE, a DIFFERENT mapping (`intakeError`, `:270-292`), which
+  resolves the head before writing anything (`tasks.go:174-181`), so no run exists.
+  Followed literally, an operator records two intake behaviours and closes the row while
+  the publish-time mappings stay as invented as before — including the exact failure mode
+  the roadmap note describes. **The fix invents no mapping: it is an ORDERING.** Reach the
+  gate with a working token, THEN revoke, THEN approve; the intent pins `credential_id`
+  (`schema.sql:419`), so the revoked credential is the one the publication presents.
+  Generalizable: **an artefact that CLOSES a risk must be checked against the risk, not
+  just against the code it cites.** The checklist's every sentence was true; the
+  PROCEDURE still could not reach what the row is open for.
+Task 15: minor (deferred, routed to the whole-branch review): `unchargedWhileUnfinished`
+  downgrades TRANSIENTS only (`publish.go:180-189`), so a permanent that neither halts nor
+  precedes the intent — e.g. `invalid_output` from the commit step,
+  `gitops/publish.go:289` — would leave the path with the intent still `pending`. The
+  README faithfully transcribes the code's own stated invariant (`publish.go:261-262`), so
+  this is NOT a Task 15 defect; if the edge is real it belongs in the code's comment
+  first and the README second.
+Task 15: fix round 1/5 — 4 commits `5c69d52`..`e77bd6e`, **GATE PASS at `e77bd6e`**
+  (9 lanes, stamped). Important 1 + minors 4/5/6 ADDRESSED. Gitleaks 243/243 non-merge
+  commits, no leaks.
+Task 15: **RE-REVIEW = FINDINGS REMAIN OPEN. Important 2 NOT ADDRESSED — the fix's
+  premise was false, and disproving it uncovered a PRODUCTION DEFECT.**
+  The implementer's link 2 ("first contact with the outside world is `PushPatch`") is
+  wrong: `pushPublication`'s FIRST act is the recovery probe (`publish.go:674-675`,
+  "Recovery first"), which calls `forge.BranchHead` at `:787` presenting the pinned
+  credential. And `recoverBranch` (`publish.go:788-793`) **unconditionally re-wraps ANY
+  probe error as transient `forge_unavailable`, with no `errors.As` passthrough.**
+  So: dead credential → 401 → adapter maps it through `publishError` to permanent
+  `auth_expired` (`runsports.go:209-217`) → **`recoverBranch` throws that verdict away**
+  → the attempt parks transient and re-probes to the wall deadline. No halt, no
+  `halt_reason`, no `publish.halted` event. `publishError`'s contract ("only what this
+  adapter can PROVE permanent is permanent") is honored by the adapter and undone by its
+  caller. **This is the exact disaster the README's own teeth paragraph names — an
+  `auth_expired` presenting as transient — live in the tree.**
+  Repo-gone is a different shape: the 404 folds to `ok=false` deliberately
+  (`runsports.go:206-208`, "absence is an ANSWER") and the clone failure is typed by
+  **gitops** (`gitops/publish.go:205-207`), never by `publishError`.
+  `publishError`'s halting arms can only fire on `OpenPullRequest`/`FindPullRequests`
+  (`runsports.go:221-245`) — i.e. after an intent is already `pushed`.
+Task 15: **I VERIFIED THE DEFECT MYSELF** before acting (`publish.go:668-700` for
+  "Recovery first", `:780-800` for the unconditional re-wrap). Confirmed. The re-reviewer
+  was right and the fix round's own premise was wrong.
+Task 15: >>> **USER RULING (sofo, 2026-08-09): FIX IT NOW, as TASK 16.** <<< Options put
+  were: fix now / route to the whole-branch review's fix wave / defer to Plan 09.
+  Rationale accepted: it is the plan's headline invariant ("three codes halt") being false
+  on the FIRST forge call of the publish path, the README now documents halting that
+  cannot happen, and a behaviour change wants its own tests and mutation — which a
+  review fix-wave (one dispatch, no second round) is a poor home for.
+Task 15: CONTROLLER RULING — **the defect splits in two and only the credential half is
+  code.** Task 16 fixes `recoverBranch`'s passthrough. The repo-gone half is
+  DOCUMENTATION (Task 15 fix round 2): a failed clone genuinely cannot distinguish
+  "repository deleted" from a network fault, so typing it permanent would be wrong, and
+  `repo_unavailable` IS reachable — just only in the push→PR-open window.
+Task 15: **STAYS OPEN pending Task 16.** Its checklist prose must describe the FIXED
+  tree, so round 2 waits on Task 16 landing. Also open in round 2: the new false sentence
+  at `README.md:1004` ("the first thing to present the token afterwards is the push
+  itself") — the probe presents it first.
+Task 15: minor (deferred): `GET /api/v1/approvals`'s OpenAPI summary (`api.go:97`) still
+  says "scoped to the caller's grants (view)" while the handler scopes to ANY grant.
+  Pre-existing, untouched, and the README no longer repeats it. Whole-branch review's.
+
+## Task 16 — recoverBranch discards a typed permanent outcome (BASE `e77bd6e`, session 53)
+
+Task 16: **NOT IN THE PLAN.** Created by sofo's ruling above, after Task 15's re-review
+  surfaced the defect. Scope is deliberately narrow: the credential half only.
+Task 16: IMPLEMENTER DISPATCHED (Opus 5, agent `impl-task-16`, un-suffixed) with the
+  trace, the out-of-scope list (repo-gone; the OpenAPI summary), three things to work out
+  rather than assume (every call site of `recoverBranch`; whether the class change is
+  actually SUFFICIENT to reach a `publish.halted` event; whether a sibling discard exists
+  elsewhere on the publish path), and falsification as the acceptance criterion — RED at
+  `e77bd6e` first, then mutate its own fix. **Told explicitly that a well-argued
+  refutation is a better outcome than a fix papering over a wrong diagnosis.**
+Task 16: implementer DONE — one commit `c2fe779`. **GATE PASS at `c2fe779`** (9 lanes,
+  stamped, contracts clean) **AND `task backend:test:runner` exit 0**, which it ran
+  unprompted and correctly: `internal/runs/runner`'s testutil and `gitops/stage_test.go`
+  both import `internal/runs/fake`, so its fake-forge change compiles into that lane.
+Task 16: >>> **THE CONTROLLER'S PRESCRIBED FIX WAS INSUFFICIENT, and the implementer
+  proved it by mutation.** <<< I prescribed the `errors.As` passthrough. **M2 — keep the
+  passthrough but restore `return intent, err` at the probe call site — shows the run
+  fails with `auth_expired` while the intent stays `pending`: no halt row, no reason, no
+  event.** The second half (routing the probe error through `maybeHalt`) is what actually
+  delivers the documented behaviour. A fix that changed only the class would have shipped
+  a run that dies with the right code and strands its intent. This came directly from the
+  dispatch instruction to PROVE the halt rather than assume the class change sufficed —
+  the second time this session a prescribed remedy was wrong in the controller's own hand.
+Task 16: **A SIBLING DEFECT WAS FOUND AND FIXED** — `openPublication`'s
+  `FindPullRequests` (`publish.go:856-862` at base) did the same unconditional re-wrap,
+  typed by the same `publishError`. One step later and **strictly worse**: the intent is
+  already `pushed`, so a dead credential retried to the wall deadline with the branch
+  live on the forge and no pull request. `grep CodeForgeUnavailable` over `internal/runs`
+  + `internal/app` returns exactly two unconditional re-wraps; both are now fixed.
+Task 16: four sites deliberately UNCHANGED, each with a reason:
+  `adoptConflictingPublication:1051`'s post-conflict re-query (documented "ask again,
+  uncharged" — folding a permanent in would halt on the forge's own read-after-write lag)
+  and the two settlement probes (settlement never re-types; `publishSettleUnverifiableAfter`
+  bounds it), plus the two call sites already routed through `maybeHalt`.
+Task 16: RED was EMPIRICAL, not read — at `e77bd6e` with only the test and fake added,
+  both legs TIMED OUT at 45s each (93.73s total, "run never reached failed"); after the
+  fix, 1.98s. **The 93.7s → 2.0s collapse is itself the property**: the machine stopped
+  retrying. M1 (delete the passthrough) reproduces the timeout failure mode exactly;
+  M3 falsifies the sibling site independently. Each leg falsifies its own call site.
+Task 16: side benefit recorded — `RetryAt` from a rate limit that named its own reset now
+  SURVIVES the probe path; the old unconditional re-wrap discarded it.
+Task 16: concern for Task 15 round 2 — `README.md:1000-1005` is now stale in one clause
+  ("the first thing to present the token afterwards is the push itself"); it is the PROBE
+  that presents it first, so the smoke run observes the halt one call earlier than the
+  checklist predicts. **The checklist's stated expected result — halt, `halt_reason`,
+  `publish.halted`, no retry to the wall deadline — is unchanged and NOW ACTUALLY HOLDS.**
+Task 16: ~~minor (deferred): `publishError`'s `ErrUnauthorized → auth_expired` mapping has
+  no direct unit test~~ **RETRACTED — THE GAP DOES NOT EXIST.** I recorded the
+  implementer's §8.2 claim without checking it; the reviewer found the coverage:
+  `internal/app/forgeadapter_integration_test.go:214-241`
+  (`TestForgeAdapter_RunPathFailuresAreTypedOutcomes`) drives a local `httptest` server and
+  asserts `401 → permanent/auth_expired`, `404 → permanent/repo_unavailable`,
+  `422 → permanent/publish_conflict`, `503`/`418 → transient/forge_unavailable`. The grep
+  missed it because the test drives STATUS CODES, not the sentinel name. **Both halves of
+  the contract are covered** — the adapter proves permanence there, the state machine
+  honours it in Task 16's test. Method note: *a grep for a symbol is not a search for a
+  behaviour*, and a self-reported coverage gap deserves the same scepticism as a
+  self-reported kill.
+Task 16: minor (deferred, whole-branch review): `pushPublication:694-698` returns a
+  permanent `invalid_output` while the intent is `pending` and does NOT halt. Defensible
+  (nothing has reached the forge, so nothing is stranded) but it is a literal exception to
+  the invariant `runPublish`'s comment states without qualification.
+Task 16: REVIEWER DISPATCHED (Opus 5, agent `review-task-16`, un-suffixed) told to verify
+  five load-bearing claims rather than accept them — above all M2 — to judge the sibling
+  fix for scope creep, to VERDICT EACH of the four unchanged sites (where a fix of this
+  shape goes wrong), and to try a mutation the implementer did not: whether an UNTYPED
+  probe failure still resumes rather than halts, which is the regression this change could
+  plausibly introduce.
+Task 16: REVIEW = **NEEDS FIXES** — 0 Critical, **1 Important**, 3 Minor
+  (`task-16-review.md`). It reproduced M2 exactly, confirmed the sibling is the same defect
+  rather than scope creep, and **upheld all four "unchanged site" decisions**.
+Task 16: >>> **Important 1 — the passthrough lets `publish_not_started` through, turning a
+  15s backoff into a ZERO-DELAY HOT LOOP.** <<< The regression I asked about, from a
+  direction I did not anticipate. `probeFailure`'s `errors.As` passes ANY typed
+  `OutcomeError`, and **`publishError` is not the only typer behind those ports**: both
+  adapter methods also fail BEFORE the forge call (`runsports.go:210-213`, `:236-239`)
+  via `notStarted` (`:430-439`), which emits a typed transient `publish_not_started`.
+  That code is not chargeable (`outcome.go:93`), so `unchargedWhileUnfinished` leaves it
+  alone, and its schedule is `{0,0,0}` (`retry.go:27`) — immediate requeue, no delay.
+  Pre-change the unconditional re-wrap made it `forge_unavailable` → downgraded to
+  `publish_resumable` → 5s floor / 15s base. `retry.go:20-23` states the bypassed intent
+  in its own words: *"a curve beats hot-looping until the wall deadline."*
+  It bites on a PERSISTENTLY dead credential RECORD — `UseCredentialVersioned`
+  (`assets/credentials.go:354-383`) fails permanently when the row is gone (`:362`) or the
+  DEK cannot be unwrapped (`:379`). The loop never charges the node's failure budget, is
+  exempt from the budget pre-check and the park-past-deadline refusal, and burns
+  `execution_used_ms` at maximum rate; the decrypt variant writes a `credential.used`
+  audit row per iteration. **Same operator-facing cause Task 16 exists for, taking a WORSE
+  path than before whenever the credential is dead at the record/key level.**
+Task 16: **the reviewer found it by building a FOUR-ROW NEW-vs-OLD table over input
+  classes**, not by mutating a call site — untyped / adapter-`notStarted` / `publishError`
+  permanent / `publishError` transient-with-`RetryAt`. Rows 1 and 4 CONFIRMED the
+  implementer's claims 4 and 5; row 3 is the fix working; row 2 is the regression.
+  Generalizes the plan's standing lesson to a new axis: **"one mutation does not cover a
+  table" applies to the space of INPUTS a changed predicate accepts, not just to call
+  sites.** Ask what else can reach a widened branch.
+Task 16: minor (deferred → Task 15 round 2): `README.md:1004` is now a wrong INSTRUCTION
+  for a human — the probe presents the token first, so the halt lands one call earlier
+  than the checklist predicts. The checklist's stated expected RESULT is unchanged and now
+  actually holds. The implementer deliberately did not edit it (Task 15 owns that file
+  this session) — correct under the parallel-work constraint, but a hand-off that must not
+  be dropped: this is the checklist a human follows during the still-open smoke run.
+Task 16: minor: the implementer's stated reason for leaving `adoptConflictingPublication`
+  alone is NOT the reason it is safe. Read-after-write lag does not apply to the branch it
+  justifies; the site is safe because it is self-limiting through `openPublication`'s
+  now-halting find on the next attempt. The DECISION is correct and upheld; the ARGUMENT
+  is one a later reader would reuse where it does not hold. Being corrected in the report.
+Task 16: FIX ROUND 1/5 DISPATCHED — resumed `impl-task-16` with the Important, the
+  reviewer's proposed remedy explicitly labelled a HYPOTHESIS (four lines in the function
+  it just wrote, and two prescribed remedies have already been wrong this session — one of
+  them mine, on this task), three questions to settle first (is `publish_not_started` the
+  only "nothing began" code that can reach these sites; does preserving `RetryAt` make
+  sense there; does anything RELY on it surviving from a probe), and both report
+  corrections. A unit test on the `probeFailure` → `unchargedWhileUnfinished` → `retryDelay`
+  chain is explicitly acceptable falsification here.
+Task 16: fix round 1/5 — one commit `09638c4`, **GATE PASS at `09638c4`** (9 lanes,
+  stamped, contracts clean) plus `backend:test:runner` exit 0 and the full `internal/runs`
+  integration lane green.
+Task 16: **THE IMPLEMENTER DID NOT TAKE THE PROPOSED PATCH, and found a PRE-EXISTING
+  instance of the same defect by asking where the fix belonged.** The reviewer proposed a
+  `CodePublishNotStarted` special-case inside `probeFailure`. It put the fix one level
+  down, in `unchargedWhileUnfinished` (`publish.go:200-208`), because
+  `gitPublisher.PushPatch` types its scratch and `prepare` failures with the SAME
+  `notStarted` (`runsports.go:446-452`) and `prepare` opens the SAME credential (`:385`) —
+  **so the identical zero-delay hot loop already existed on the PUSH path at `e77bd6e`,
+  before Task 16 and untouched by it.** A fix inside `probeFailure` would have closed two
+  of the three routes and left the oldest open. `unchargedWhileUnfinished` is where all
+  three meet, and its documented precondition is exactly what makes the code false:
+  *"Both callers stand inside a live intent"* — an intent exists ⇒ "never began" is not
+  true ⇒ the `{0,0,0}` schedule is not earned.
+Task 16: >>> **M5 — AN OVER-BROAD FIX SURVIVED THE IMPLEMENTER'S OWN FIRST TEST.** <<<
+  With only four rows, a version that relabels EVERY transient (`_ = out.Chargeable()`)
+  passed the whole unit lane. It added a fifth row — `resumable()`'s own output, which
+  really does flow through that function from the reads and writes around the probes —
+  plus a `wantRelabelled` column asserting the relabel marker appears EXACTLY when a code
+  was replaced. **And it refused to add `credential_busy` / `rate_limited` rows to kill
+  the mutant**, on the grounds that neither is reachable on the publish path
+  (`credential_busy` is minted only by the runner's lease; `rate_limited` only by the
+  agentic path; `publishError` types a forge rate limit as `forge_unavailable` with a
+  `RetryAt`) — *"a row that cannot occur would have been decoration."* That is the
+  distinction between a table that discriminates and one that merely looks thorough.
+Task 16: RED isolated ONE of the four rows — which is itself the evidence for the
+  reviewer's rows 1 and 4: the untyped row and the `RetryAt` row passed at `c2fe779` and
+  still pass. The second RED leg is the PRE-EXISTING push-path instance.
+Task 16: the one behaviour change it admits: the fake publisher's `HangBeforePush`
+  (`fake/publisher.go:106-112`) answers `publish_not_started` on ctx-cancel WITH a live
+  intent, so it now becomes `publish_resumable`. Argued harmless — the outcome is dropped
+  by the heartbeat's fencing CAS anyway — and all eight `HangBeforePush` call sites pass
+  unchanged (58.4s lane). Named to the re-reviewer as the thing to check hardest.
+Task 16: both report corrections made — §8.2 withdrawn (the coverage exists), and the
+  `adoptConflictingPublication` reason restated: read-after-write lag justifies that
+  site's THIRD answer, not its handling of a failed re-query; the site is safe because it
+  is self-limiting through `openPublication`'s now-halting find on the next attempt.
+Task 16: SCOPED RE-REVIEW DISPATCHED (Opus 5 — a classification change on the publish
+  path, last code change on a 60+ commit branch; agent `rereview-task-16`, un-suffixed).
+  Told the level question is the whole question (enumerate every caller of
+  `unchargedWhileUnfinished` and every code that can reach it), to check the
+  `HangBeforePush` change hardest, and — the gating instruction — **to RE-RUN M5 against
+  the committed tree: if the over-broad mutant still survives, the test is decoration and
+  the finding is not closed regardless of how the fix looks.**
+Task 16: ⚠️ CONTROLLER SLIP, recorded because it nearly read as a broken tree: I ran
+  `go build ./...` from the WORKTREE ROOT, which has no Go module, and got exit 1
+  (`pattern ./...: directory prefix . does not contain main module`). The gate passed at
+  the same commit. **Run `go` from `backend/`, `task` from the worktree root** — the
+  standing rule, and I broke it. An exit code from the wrong directory looks exactly like
+  a failure from the right one.
+Task 16: RE-REVIEW = **PASS**, finding ADDRESSED at `publish.go:200-208`, no new breakage.
+  **M5 now DIES** against the committed tree, as do M4, M-A, M-B and M-D (M-E is an
+  equivalent mutant). The re-reviewer enumerated every caller of
+  `unchargedWhileUnfinished` and every code that can reach the two sites, and confirmed
+  the blast radius is exactly one code, every reachable producer of which is a pre-flight
+  failure with a live intent — **nothing wrongly downgraded, nothing wrongly preserved.**
+  It independently verified the push-leg claim (`runsports.go:441-457` + `:385`): the
+  identical hot loop is real and pre-existing, and a `probeFailure` special-case would
+  have left it open. The level choice is **better than the patch the review proposed.**
+Task 16: minor (deferred, whole-branch review) — **the fix's own premise is UNPINNED.**
+  M-C (routing `authorizePublish`'s exit through the downgrade,
+  `unchargedWhileUnfinished(notStartedUnlessTyped(err))`) **SURVIVES** the unit lane AND
+  survives `TestGoldenSet_CrashBeforeTheIntentCommitsPublishesNothing` — the one test
+  whose comment explicitly narrates its dependence on the `{0,0,0}` requeue. So a future
+  refactor routing that exit through the downgrade would silently turn every HONEST
+  non-start into a 15s park with the suite green. Correctly calibrated Minor: nothing is
+  misclassified at `09638c4` and both halves' OUTPUTS are pinned (M-A and M-B die) — only
+  the wiring between them is not. A note for whoever next touches `runPublish`'s prologue.
+Task 16: minor (deferred): `publish_integration_test.go:786-788`'s comment says
+  "HangBeforePush yields `publish_not_started`" — still literally true of the fake, but
+  that code no longer survives to the run level from that injection. One word of drift.
+Task 16: >>> **COMPLETE** (commits `e77bd6e`..`09638c4`, 2 commits, review clean after one
+  fix round). <<< Gated by the controller at BOTH heads (`c2fe779`, `09638c4`), plus
+  `backend:test:runner` at each. **A production defect found by fact-checking a paragraph.**
+
+Task 15: FIX ROUND 2/5 DISPATCHED — unblocked by Task 16 landing. Important 2 only, plus
+  the stale `README.md:1004` clause. Told: the credential-dead case NOW works as its
+  ordering describes (halt at the PROBE, one call earlier than the checklist predicts, and
+  the expected result the checklist already states now actually holds); the repo-gone case
+  still cannot reach `publishError` and must SAY what is actually reachable — a transient
+  `forge_unavailable` from the clone, which is itself worth recording on row 08 — while
+  noting `repo_unavailable` IS reachable in the push→PR-open window, so decision 14 is not
+  false but narrower in reach than a reader would assume. **And: if step 7's "row 08
+  closes" cannot be made true of what the row is open for, say so plainly rather than
+  writing around it.**
+Task 15: fix round 2/5 — 3 commits `09638c4`..`eb91334`, **GATE PASS at `eb91334`**
+  (9 lanes, stamped, contracts clean). Gitleaks 248/248 non-merge commits, no leaks.
+Task 15: the implementer **re-measured every fact I handed it** before writing — 12 claims,
+  all held — and re-read the whole Plan 08 README section against the tree rather than
+  against its memory of writing it. Only `:1004` was stale.
+Task 15: it wrote a NEW paragraph the review had not asked for and that the section needed:
+  **"Where a halting answer arrives bounds which ones you will ever see"** (`README:868-882`).
+  The halting table said WHAT halts and the runbook said where to look, but nothing said
+  WHERE IN THE SEQUENCE an answer lands — which is exactly what makes one of the two smoke
+  cases unreachable. Also added the caveat an operator must not assume: **only a 401-shaped
+  answer reaches `auth_expired`**; a 404 to a probe folds to "no branch" and walks into the
+  transient case, "which is itself the finding".
+Task 15: RE-REVIEW 2 = **ADDRESSED**. 16/16 claims verified true against the tree,
+  including an exhaustive proof that `repo_unavailable`'s only producer is `publishError`'s
+  `ErrNotFound` arm and its only reachable call sites are the two PR calls, gated on
+  `status == pushed`. No newly false sentence; no round-1 sentence left stale.
+Task 15: >>> **CONTROLLER RULING on the row-08 judgement call (upheld by the re-review).**
+  <<< Row 08 **still closes on the checklist**, but the checklist no longer claims to close
+  everything the row was opened for. The unreachable `repo_unavailable` arm becomes a named
+  PLAN RESIDUAL with a concrete closing action — **a fault-injected integration case at the
+  PR-open step, NOT another operator run.** Reasoning: sofo's DQ1 ruling (no flip to done on
+  green CI; close on the operator checklist) is preserved exactly; what changed is
+  information discovered AFTER that ruling — no manual procedure can reach that arm, since
+  the pre-push probe folds 404 by design and the push→PR-open window is not
+  operator-controllable. "Row cannot close" would make it permanently unclosable by the very
+  mechanism sofo chose. Roadmap note, plan residual and README closing paragraph all state
+  it in the same words; verified non-contradictory. **One edit each if sofo prefers
+  otherwise.**
+Task 15: nuance recorded by the re-reviewer: the fault-injected case closes the PLUMBING
+  half of that residual; **the forge's real 404 shape on the PR endpoints stays invented
+  forever.** The residual's own text already concedes this.
+Task 15: >>> **COMPLETE** (commits `f8a59a8`..`eb91334`, 12 commits across the task and two
+  fix rounds, review clean, ZERO Go files changed). <<< Gated by the controller at all
+  three heads it passed through (`5c69d52`, `e77bd6e`, `eb91334`).
+
+Task 15: FIX ROUND 1/5 DISPATCHED — resumed `impl-task-15`. Both Importants plus minors
+  4, 5 (folds into Important 2) and 6 (align decision 14's wider "publish failures split
+  five ways" to the README's narrower "Five outcome codes classify a forge answer").
+  Minor 3 explicitly marked do-not-touch. Told to VERIFY the ordering claim itself —
+  particularly that a revoked credential is presented at publish rather than re-checked
+  earlier — and to say so if the source disagrees.
 
 ## Task 11 — The HTTP surface (BASE `e892288` — COMPLETE, session 51)
 
