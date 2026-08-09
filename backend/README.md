@@ -979,20 +979,43 @@ and opens a real pull request.
    - a pull request exists whose **base is the repo's default branch**
      (not merely "some open PR on that head") and whose number and URL
      match `pr_number` / `pr_url` on the run's publication projection.
-6. **The two halting answers.** `internal/app/runsports.go` turns
-   `forge.ErrUnauthorized` into `auth_expired` and `forge.ErrNotFound`
-   into `repo_unavailable`; which HTTP answer each forge actually gives
-   is the invented half.
-   - **Credential dead.** Revoke or expire the token, then run a task.
-   - **Repository gone.** Rename or delete the repo without updating its
-     caesar registration, then run a task.
+6. **The two halting answers, at the publish step.** `publishError`
+   (`internal/app/runsports.go`) turns `forge.ErrUnauthorized` into
+   `auth_expired` and `forge.ErrNotFound` into `repo_unavailable`; which
+   HTTP answer each forge actually gives is the invented half, and this
+   is the risk row 08 is open for.
 
-   For each: record *where* the run dies and with *which* code. Neither
-   may retry to the wall deadline, and a failure reached after an intent
-   exists must leave `halt_reason` on the run's publication projection
-   and a `publish.halted` event. Note that both conditions are visible at
-   intake (step 2), so a run may legitimately never reach publish — say
-   so in the record rather than forcing the run further.
+   **The ordering is what makes the step work, so follow it exactly.**
+   Both conditions are also visible at *intake*, which resolves the head
+   before it writes anything — and intake runs a **different** mapping,
+   `intakeError` in the same file, which answers 404 / 400 / 429 as
+   problem+json rather than producing an outcome code. Break either
+   condition before creating the task and the task-creation call fails,
+   no run exists, and the publish-step mapping is never reached. So
+   break it *after* the gate instead:
+
+   - **Credential dead.** Take a fresh task to the gate with a
+     **working** token (step 2, stopping short of the approve in step 4),
+     then revoke or expire the token on the forge, then approve. The publication is what meets the
+     dead credential: the decision and the intent's creation are both
+     database-only transactions, and the intent pins `credential_id`, so
+     the first thing to present the token afterwards is the push itself,
+     presenting the revoked one.
+   - **Repository gone.** Same ordering, another fresh task — reach the
+     gate, then rename or delete the repo without updating its caesar
+     registration, then approve. The intent pins `repo_slug`, so the publication addresses
+     the name the approval used.
+
+   For each, record where it fails — task creation, or the run — and with
+   which code. Neither may retry to the wall deadline, and a failure
+   reached after an intent exists must leave `halt_reason` on the run's
+   publication projection and a `publish.halted` event.
+
+   Optionally record the **intake** behaviour of the same two conditions
+   as a separate case (break the condition first, then create the task).
+   It is worth writing down, but it does not stand in for the above:
+   `intakeError` and `publishError` are two different tables, and only
+   the second one leaves a branch on the forge when it is wrong.
 7. **Record what the forges actually said.** If either forge's status
    codes or error bodies map differently than `runsports.go` assumes,
    fix the mapping and its `httptest` fixtures and commit that as its own
