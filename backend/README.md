@@ -255,10 +255,12 @@ The production posture stays honest: `runner.enabled` defaults false
 default deploy refuses to fake a phase result rather than pretending to
 run one. Since Plan 08 wired the real forge, that flag is the only thing
 left in the way — intake accepts gates and publishes, so flipping one
-boolean gives the runner real work and the deploy stack needs no other
-change. In prod, network isolation must not rest on Docker alone: the
-host firewall must deny the agent subnets everything except the gateway
-(baseline in the Plan 14 deployment runbook).
+boolean gives the runner real work, on a host that already has the
+Docker daemon, the built images and the writable data root the flag has
+always needed — `buildRunner` failing any of those is a boot error, not
+a degraded start. In prod, network isolation must not rest on Docker
+alone: the host firewall must deny the agent subnets everything except
+the gateway (baseline in the Plan 14 deployment runbook).
 
 ## Harness filesystem contract (Plan 07)
 
