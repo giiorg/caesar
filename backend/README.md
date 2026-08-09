@@ -956,9 +956,15 @@ The `forge` block is documented under [Config](#config) above — both
 endpoints per forge, the self-hosted trap, `publish_work_dir` and its
 default, and the base-URL validation rules. Two operational notes belong
 here rather than there: `publish_work_dir` must be **writable by the
-caesar process**, and `serve` creates it at boot rather than lazily,
-because discovering an unwritable work dir at the first publication is
-discovering it at the worst possible moment.
+caesar process**, and `serve` both creates it at boot and **writes a
+probe file into it and removes it again**, because discovering an
+unwritable work dir at the first publication is discovering it at the
+worst possible moment. Creating it is not enough on its own to know
+that: `os.MkdirAll` returns nil on a directory that already exists
+whatever its owner or mode, and the packaged default
+`/var/lib/caesar/publish` is precisely a path a deployment pre-creates —
+often as root, for a caesar process that is not. Either failure is a
+boot error naming `publish work dir`, not a degraded start.
 
 ### Manual forge smoke checklist (operator-run, real GitHub/GitLab)
 

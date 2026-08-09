@@ -59,6 +59,32 @@ func runServeCmd(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// probeWritable answers the only question a boot check can honestly ask about
+// a directory: can THIS process create a file in it? Nothing else is
+// equivalent — a stat tells you the mode bits and not whose uid they apply to,
+// and a mode that looks right still loses to a read-only mount, a full
+// filesystem, or a label the kernel enforces above the bits. So it creates a
+// file and removes it.
+//
+// The dot prefix keeps the probe out of the way of the per-publication
+// subdirectory listing, and it is removed on every path, including the one
+// where the close fails.
+func probeWritable(dir string) error {
+	f, err := os.CreateTemp(dir, ".caesar-writable-")
+	if err != nil {
+		return fmt.Errorf("%s exists but this process cannot write in it: %w", dir, err)
+	}
+	name := f.Name()
+	closeErr := f.Close()
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("%s: could not remove the write probe %s: %w", dir, name, err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("%s: write probe failed to close: %w", dir, closeErr)
+	}
+	return nil
+}
+
 // runServe boots the control plane: connect, migrate (advisory-locked),
 // serve HTTP until ctx is cancelled, then drain within the shutdown timeout.
 func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
@@ -120,6 +146,15 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		workDir = os.TempDir()
 	}
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		return fmt.Errorf("serve: publish work dir: %w", err)
+	}
+	// And MkdirAll is not the question. It returns nil on a directory that
+	// already exists, whatever its owner or mode, so on the deployment shape
+	// this check exists for — the packaged default /var/lib/caesar/publish,
+	// pre-created by a package or a mount, for a caesar process that is not
+	// root — creation always succeeds and answers nothing. Only writing
+	// answers it, so write.
+	if err := probeWritable(workDir); err != nil {
 		return fmt.Errorf("serve: publish work dir: %w", err)
 	}
 	publisher := gitPublisher{assets: assetsSvc, workDir: workDir, endpoints: endpoints}

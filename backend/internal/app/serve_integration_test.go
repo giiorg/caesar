@@ -129,6 +129,65 @@ func TestRunServe_RefusesToBootOnAnUnusablePublishWorkDir(t *testing.T) {
 	}
 }
 
+// The shape the sibling above cannot reach, and the one a real deployment
+// actually presents. os.MkdirAll returns nil on a directory that ALREADY
+// exists, whatever its owner or mode — and the packaged default
+// /var/lib/caesar/publish is exactly the path a deploy pre-creates, under
+// root, for a caesar process that is not root. Creation therefore answers
+// nothing; only writing does.
+func TestRunServe_RefusesToBootOnAPreExistingUnwritablePublishWorkDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the mode bits this test stages, so the refusal is unobservable as uid 0")
+	}
+	workDir := filepath.Join(t.TempDir(), "publish")
+	// r-x: it exists, MkdirAll will succeed on it, and nothing may create a
+	// file inside it. This is the whole point of the case.
+	if err := os.Mkdir(workDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(workDir, 0o700) })
+	// Guard the staging itself: if the platform ignored the mode, the boot
+	// would succeed and this test would read as a passing guard rather than
+	// an unstaged one.
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll on the pre-existing dir = %v; this test only means something if it succeeds", err)
+	}
+	if f, err := os.CreateTemp(workDir, "staging-*"); err == nil {
+		f.Close()
+		t.Fatalf("%s is writable after chmod 0500: the unwritable case was never staged", workDir)
+	}
+
+	cfg := config.Config{}
+	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.ShutdownTimeout = config.Duration(5 * time.Second)
+	cfg.Database.URL = testdb.NewURL(t)
+	cfg.Security.MasterKey = "dev:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	cfg.Forge.PublishWorkDir = workDir
+	cfg.Orchestrator = config.Orchestrator{
+		Workers:           2,
+		PollInterval:      config.Duration(50 * time.Millisecond),
+		LeaseTTL:          config.Duration(30 * time.Second),
+		HeartbeatInterval: config.Duration(10 * time.Second),
+		OutboxRetention:   config.Duration(168 * time.Hour),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runServe(ctx, cfg, discard()) }()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "publish work dir") {
+			t.Fatalf("runServe = %v, want a boot refusal naming the publish work dir", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("runServe went on serving with a work dir that exists and cannot be written: " +
+			"every publication will die at its checkout, and the first one is the worst " +
+			"possible moment to learn it")
+	}
+}
+
 func TestRunServe_RefusesToBootWithoutMasterKey(t *testing.T) {
 	cfg := config.Config{}
 	cfg.Server.Addr = "127.0.0.1:0"
