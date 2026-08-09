@@ -224,12 +224,19 @@ grep -qF "buildinfo.Commit=$HEAD_SHORT" "$CI_LOG" \
 # read from the IMAGE, not from the build command: `docker build` is happy to
 # print a COMMIT build-arg it then serves from cache. caesar-git:dev's
 # entrypoint is caesar itself, so the image can be asked what it contains.
-grep -qF "--build-arg COMMIT=$HEAD_SHORT" "$IMAGE_LOG" \
+# -e, not a bare pattern: it starts with a dash, and grep reads that as flags.
+grep -qF -e "--build-arg COMMIT=$HEAD_SHORT" "$IMAGE_LOG" \
 	|| fail "image:build did not pass COMMIT=$HEAD_SHORT (images may describe another tree)"
 IMAGE_STAMP=$(docker run --rm caesar-git:dev version 2>&1)
 case "$IMAGE_STAMP" in
 	*"commit $HEAD_SHORT"*) ;;
 	*) fail "caesar-git:dev reports '$IMAGE_STAMP', not commit $HEAD_SHORT — the runner lane ran against another commit's image" ;;
+esac
+# Same reading as the build lane's -dirty check, from the other artifact: the
+# image's VERSION comes from `git describe --dirty`, so this fires when the
+# tree was written to after the clean check above.
+case "$IMAGE_STAMP" in
+	*-dirty*) fail "caesar-git:dev stamped a -dirty version ($IMAGE_STAMP): the tree was modified during the gate" ;;
 esac
 
 # `git describe --dirty` appends -dirty. If this fires, the tree changed BETWEEN
