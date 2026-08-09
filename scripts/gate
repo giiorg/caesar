@@ -118,14 +118,25 @@ if grep -qE 'buildinfo\.Version=[^ ]*-dirty' "$CI_LOG"; then
 fi
 
 # Content checks. Exit status has been wrong before; these read the output.
-for pat in 'FAIL' 'panic:' 'DATA RACE' 'Cannot connect to the Docker daemon'; do
+for pat in 'FAIL' 'panic:' 'DATA RACE'; do
 	if grep -qF "$pat" "$CI_LOG"; then
 		fail "found '$pat' in backend:ci output"
 	fi
 done
-if grep -qF 'Cannot connect to the Docker daemon' "$CONTRACTS_LOG"; then
-	fail "found 'Cannot connect to the Docker daemon' in contracts:check output"
-fi
+
+# Docker-unavailable is called out separately because it means the gate is red
+# through NO FAULT OF THE CODE, and this project has lost time twice to reading
+# it as a real failure. Both phrasings are needed and that was established by
+# mutation, not by reading: with Docker Desktop actually stopped, testcontainers
+# says "rootless Docker not found, failed to create Docker provider" and never
+# the Docker CLI's "Cannot connect to the Docker daemon" — so the CLI phrasing
+# alone was an assertion that could not fire on the failure it was written for.
+DOCKER_DOWN='Cannot connect to the Docker daemon|failed to create Docker provider|rootless Docker not found'
+for log in "$CI_LOG" "$CONTRACTS_LOG"; do
+	if grep -qE "$DOCKER_DOWN" "$log"; then
+		fail "Docker is unavailable — this gate is red through no fault of the code (see $log). Start Docker, wait for \`docker info\`, re-gate."
+	fi
+done
 
 if [ "$FAILED" -ne 0 ]; then
 	printf 'GATE FAIL  %s @ %s\n' "$BRANCH" "$HEAD_SHORT" >&2
