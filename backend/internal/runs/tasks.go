@@ -172,6 +172,21 @@ func (s *Service) resolveIntake(ctx context.Context, in NewTask) (RepoRef, Pinne
 	if err != nil {
 		return RepoRef{}, PinnedDefinition{}, "", err
 	}
+	if err := s.checkHarnesses(ctx, plan); err != nil {
+		return RepoRef{}, PinnedDefinition{}, "", err
+	}
+	baseSHA, err := s.forge.ResolveHead(ctx, repo)
+	if err != nil {
+		return RepoRef{}, PinnedDefinition{}, "", fmt.Errorf("runs: resolve head: %w", err)
+	}
+	return repo, def, baseSHA, nil
+}
+
+// checkHarnesses resolves every agentic node's harness against the registry.
+// Both intake paths run it: a run whose harness no longer exists can never
+// execute, and minting it anyway trades a clear 400 at the door for a typed
+// harness_error three phases later.
+func (s *Service) checkHarnesses(ctx context.Context, plan ExecPlan) error {
 	for _, id := range plan.Order {
 		n := plan.Nodes[id]
 		if n.Harness == "" {
@@ -179,17 +194,13 @@ func (s *Service) resolveIntake(ctx context.Context, in NewTask) (RepoRef, Pinne
 		}
 		if _, err := s.harnesses.HarnessByName(ctx, n.Harness); err != nil {
 			if xerrors.ClassOf(err) == xerrors.ClassNotFound {
-				return RepoRef{}, PinnedDefinition{}, "", xerrors.E(xerrors.ClassInvalid, "validation failed").
+				return xerrors.E(xerrors.ClassInvalid, "validation failed").
 					WithFields(xerrors.FieldError{Field: "harness", Message: fmt.Sprintf("node %q references unknown harness %q", id, n.Harness)})
 			}
-			return RepoRef{}, PinnedDefinition{}, "", err
+			return err
 		}
 	}
-	baseSHA, err := s.forge.ResolveHead(ctx, repo)
-	if err != nil {
-		return RepoRef{}, PinnedDefinition{}, "", fmt.Errorf("runs: resolve head: %w", err)
-	}
-	return repo, def, baseSHA, nil
+	return nil
 }
 
 // insertRun mints one pending run for a task inside tx: snapshot pinned
@@ -310,8 +321,11 @@ func (s *Service) Rerun(ctx context.Context, actor authn.Principal, taskID uuid.
 	if err != nil {
 		return Run{}, err
 	}
-	def, err := s.definitionByVersionID(ctx, taskRow.WorkflowVersionID)
+	def, plan, err := s.definitionByVersionID(ctx, taskRow.WorkflowVersionID)
 	if err != nil {
+		return Run{}, err
+	}
+	if err := s.checkHarnesses(ctx, plan); err != nil {
 		return Run{}, err
 	}
 	baseSHA, err := s.forge.ResolveHead(ctx, repo)
@@ -360,6 +374,13 @@ func (s *Service) Rerun(ctx context.Context, actor authn.Principal, taskID uuid.
 		}
 
 		run, err = s.insertRun(ctx, tx, taskID, taskRow.ProjectID, def, baseSHA, correlationID)
+		if isUniqueViolation(err) {
+			// runs_task_live_key: another rerun committed its pending run
+			// between our LatestRunForUpdate and this insert. That is a
+			// conflict, not an internal failure — the caller should retry or
+			// look at the run that won.
+			return xerrors.E(xerrors.ClassConflict, "another re-run of this task is already pending")
+		}
 		if err != nil {
 			return err
 		}
@@ -384,16 +405,19 @@ func (s *Service) Rerun(ctx context.Context, actor authn.Principal, taskID uuid.
 
 // definitionByVersionID re-resolves a task's pinned version through the
 // port's second method; the compile pass rejects stored corruption
-// before any row is minted against it.
-func (s *Service) definitionByVersionID(ctx context.Context, versionID uuid.UUID) (PinnedDefinition, error) {
+// before any row is minted against it. The compiled plan comes back with
+// the definition so the re-run intake's harness check does not compile it
+// a second time.
+func (s *Service) definitionByVersionID(ctx context.Context, versionID uuid.UUID) (PinnedDefinition, ExecPlan, error) {
 	def, err := s.defs.DefinitionByVersionID(ctx, versionID)
 	if err != nil {
-		return PinnedDefinition{}, err
+		return PinnedDefinition{}, ExecPlan{}, err
 	}
-	if _, err := compilePinned(def); err != nil {
-		return PinnedDefinition{}, err
+	plan, err := compilePinned(def)
+	if err != nil {
+		return PinnedDefinition{}, ExecPlan{}, err
 	}
-	return def, nil
+	return def, plan, nil
 }
 
 func runFromRow(r store.Run) (Run, error) {
