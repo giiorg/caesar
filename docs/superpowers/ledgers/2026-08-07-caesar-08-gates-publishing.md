@@ -1,87 +1,273 @@
 # SDD ledger — plan: docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md
 
 
-## >>> RESUME HERE (fresh session, 2026-08-09 — written by session 53) <<<
+## >>> RESUME HERE (session 54 — the whole-branch review AND its fix round have run) <<<
 
-# >>> ALL 16 TASKS ARE COMPLETE. THE NEXT ACTION IS THE WHOLE-BRANCH REVIEW. <<<
+# >>> ALL 16 TASKS COMPLETE. THE REVIEW IS DONE. THE FIX ROUND IS DONE. <<<
 
-**Tasks 1-16 COMPLETE, every one gated by the controller and reviewed clean.**
-**HEAD = `eb91334`, tree clean, 88 commits ahead of `main`.** No task is mid-flight;
-no fix round is open. Session 53 executed Tasks 13, 14, 15 and 16 end to end.
+**Tasks 1-16 COMPLETE.** Session 53 executed Tasks 13-16 end to end at `eb91334`.
+
+Session 54 ran the whole-branch review (three reviewers on Opus 5, disjoint charters,
+base `38b4f75`) and adjudicated it into
+`.superpowers/sdd/2026-08-07-caesar-08-gates-publishing/whole-branch-review-adjudicated.md`.
+The fix round ran as **three fixers with disjoint ownership**, in series, each gated by
+the controller:
+
+- **Fixer A** — production code under `internal/runs/**` and `internal/app/**`:
+  C1, C2/I4, I2, I3, I7, I8, I9 and four minors. 8 commits, `1c628c1..9fb3522`.
+- **Fixer B** — forge, the gate script, the message batch: I1, I10, I5, I6 and the
+  bytes-for-characters batch. 5 commits, `a6bb5ff..26ad7a0`.
+- **Fixer C** — documentation truth, contracts and this record: I11, I12, I13, I14, the
+  README reconciliation against A's and B's behaviour changes, and the record
+  corrections below.
+
+Reports: `fix-round-{a,b,c}-report.md` in the same directory.
 
 **There is no Task 17.** Task 16 was created mid-session by a user ruling (see below)
 and is not in the plan document. The plan's own task list ends at 15.
 
-**BASE for the whole-branch review = `git merge-base main HEAD` = `38b4f75`.**
+### The next action
 
-### The one action
+**The controller gates Fixer C's head, then `superpowers:finishing-a-development-branch`.**
+The merge/PR decision is sofo's — do not pre-commit it. Two loose ends to reconcile
+then: a stale `caesar-07-harness-drivers` worktree on disk though plan 07 merged, and
+**roadmap row 07's smoke run still open**. Roadmap row 08's own smoke run is also still
+open, and what it can now close CHANGED — see record correction 8.
 
-```
-<skill>/scripts/review-package docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md 38b4f75 <HEAD>
-```
-where `<skill>` = `/Users/sofo/.claude/plugins/cache/claude-plugins-official/superpowers/6.2.0/skills/subagent-driven-development`
+### >>> WHAT THE WHOLE-BRANCH REVIEW WAS TOLD — CONSUMED, WITH DISPOSITIONS <<<
 
-Then dispatch `../requesting-code-review/code-reviewer.md` **on the most capable model**
-(this is an architecture-and-judgement job, not a diff scan). One fix dispatch with the
-COMPLETE findings list — not one fixer per finding — then exactly ONE scoped re-review,
-then adjudicate residuals. There is no second fix wave.
-
-### >>> WHAT THE WHOLE-BRANCH REVIEW MUST BE TOLD EXPLICITLY <<<
-
-Point it at every `minor (deferred)` and `parked` line in this ledger (~28 across
-Tasks 1-6, plus everything Tasks 7-16 added) and at `19bd487`, whose new test never got
-a quality review. Beyond that, these are the items no diff scan will surface:
+**This list has been consumed by the review; it is kept for its dispositions, not as an
+instruction.** Every item below carries what the review actually did with it. The review
+was also pointed at every `minor (deferred)` and `parked` line in this ledger (~28 across
+Tasks 1-6, plus everything Tasks 7-16 added) and at `19bd487`.
 
 1. **W1 — A PRE-EXISTING TEST IS A SURVIVOR.**
    `TestPublish_CrashAfterPRCreateAdoptsTheExistingPullRequest`
    (`publish_integration_test.go:626`, Task 9's file) **PASSES with `CrashAfterPR`
    turned into a no-op.** Its sibling push test kills the same mutation. **Mutate BOTH.**
+   → **FIXED**, review I7, Fixer A `f6ef0cf`. Both reviewer mechanisms confirmed and both
+   mutants verified to survive the OLD test first. The fix needed a third assertion nobody
+   prescribed — `CreateAttemptCount() == 1` — because deleting the unconditional
+   `FindPullRequests` still adopts and still emits exactly one `publish.adopted`.
 2. **`task backend:test:runner` is attested by IMPLEMENTERS, never by a reviewer**, and
    `scripts/gate` does not cover it. Last green at `09638c4`. **Run it.**
+   → **PARTLY FALSE AS WRITTEN; see record correction 7.** The review escalated this to
+   "enforced by nothing", which is wrong: `.github/workflows/ci.yml:26` runs it as its own
+   `runner` job and `ci-ok` (`:85`) requires it. The gap was LOCAL-only. Fixer B closed it
+   in the gate (`3d0cc6b`) and correctly declined to fold it into `backend:ci`.
 3. **`orchestrator.go:653`'s `run.finished` audit has NO coverage** — two agents
    independently destroyed its subject and nothing failed. The golden set finishes
    through `orchestrator.go:1419` instead.
+   → **NOT RAISED by any of the three reviewers, and NOT fixed.** It survives as an open
+   coverage gap. Carry it.
 4. **Task 16's fix has an UNPINNED PREMISE.** Mutation M-C — routing
    `authorizePublish`'s exit through `unchargedWhileUnfinished` — **SURVIVES** the unit
    lane AND survives `TestGoldenSet_CrashBeforeTheIntentCommitsPublishesNothing`, the one
    test whose comment narrates its dependence on the `{0,0,0}` requeue. A future refactor
    would silently turn every honest non-start into a 15s park, suite green.
+   → **FIXED**, review I8, Fixer A `f2e86c3`. The pin went on the existing
+   `TestPublish_AFailedAuthorizationTransactionDoesNotKillTheRun` rather than a new test.
+   Confirmed: a unit test on `retryDelay` cannot work — M-C mutates the call site.
 5. **PARKED BY USER RULING:** `newGoldenEnv` duplicates ~55 lines of the seed test's
    world-staging. Deferred because Task 13 was acceptance evidence and
    `TestGoldenSet_MonthOneLoopThroughRealRoutes` is the ONLY cover for the synthetic patch
    shape (`fake/executor.go:150-163`), which it gets by NOT wiring a remote. Remedy is in
    `task-13-review.md` finding 2. **Triage, do not silently adopt or discard.**
+   → **TRIAGED: the park STANDS, but its stated reason above is FALSE.** See record
+   correction 1. `.Remote(` appears in three places tree-wide and five other test files
+   already take the synthetic branch, so the seed test is not the only COVER; it is only
+   the one that ASSERTS on the synthetic payload. Cheap insurance taken instead of the
+   dedupe: `fake/executor_test.go`'s
+   `TestRegisteringARemoteChangesTheImplementPatchShape` (Fixer C `06ee81e`).
 6. **The double `gate.decided` emission** (`gates.go:265`) is RECORDED, not fixed — the
    golden set pins 3 events against 2 audit rows with a comment saying Task 13 records
    rather than endorses it. Whether a distinct kind (`gate.authorized`?) is more honest
    is this review's call.
+   → **RULED AND FIXED**, review I3, Fixer A `99d5bc9`. **No `gate.authorized` kind was
+   invented.** One decision now emits ONE `gate.decided` carrying `authorization_id` and
+   `authorizes`; "this approval released something" is a rendering question Plan 10 can
+   ask of those fields. The golden set's count moves 3 → 2 and its comment now ENDORSES
+   the shape rather than recording the asymmetry, which is what makes it a pin.
 7. **`unchargedWhileUnfinished` downgrades TRANSIENTS only** (`publish.go:180-189`), so a
    permanent that neither halts nor precedes the intent — e.g. `invalid_output` from the
    commit step, `gitops/publish.go:289` — leaves the path with the intent still `pending`.
    `runPublish`'s comment states the invariant without that qualification. If the edge is
    real it belongs in the code's comment first and the README second.
+   → **FIXED, and it was worse than stated**, review C2/I4, Fixer A `ea14950`. Not one
+   edge: `gitops` types NINE permanent exits and none was in the halt set, plus a tenth in
+   `publish.go` returned raw. `maybeHalt` now halts on `Class == OutcomePermanent` and
+   `haltsPublication` is DELETED — an allow-list is fail-open by construction. Comment
+   fixed by A, README by C (`c4c5d52`).
 8. `pushPublication:694-698` returns a permanent `invalid_output` while the intent is
    `pending` and does not halt — defensible (nothing reached the forge) but a literal
    exception to the same invariant.
+   → **SUBSUMED by C2** and fixed with it. It halts now, like every other permanent with a
+   live intent.
 9. `GET /api/v1/approvals`'s OpenAPI summary (`api.go:97`) says "scoped to the caller's
    grants (view)" while the handler scopes to ANY grant. Pre-existing; the README no
    longer repeats it.
+   → **FIXED**, review I13, Fixer C `099362b`. The doc, not the handler — the any-grant
+   inbox is intended. Regenerated through `task contracts:gen`; `openapi.json` and
+   `schema.d.ts` carry only that summary as their delta.
 10. `publish_integration_test.go:786-788`'s comment says "HangBeforePush yields
     `publish_not_started`" — still true of the fake, but that code no longer survives to
     the run level from that injection.
+    → **FIXED** as a review minor, Fixer A `9fb3522`. Comment-only.
 11. **`characters`-for-bytes survives in five messages** (`workflows.go:67`,
     `identity/service.go:76`, `assets/assets.go:138` and `:147`, `assets/harnesses.go:68`,
     `assets/repos.go:56`) — all count with `len()`. Deliberately not widened in Task 14.
+    → **FIXED**, Fixer B `dd0cf2e`. **Six** messages, not five — `8eecf98` had fixed
+    `validateWorkflowName` and walked past `validateWorkflowDescription` eleven lines
+    below it in the same file. Decision: BYTES. `len()` stays and the messages now say
+    "bytes", because nothing pins these limits externally (no `maxLength` in
+    `openapi.json`, every backing column unconstrained `text`) and rune-counting
+    `MaxPasswordLen` would let a multi-byte password past the bound argon2id enforces.
 12. **The `schema.sql` equality gap is SCHEDULED, NOT WRITTEN** — a named plan residual.
     Nothing asserts the migrated schema equals `schema.sql`. ~140 test-only lines with a
     known false-positive tail; it deserves its own task.
+    → **STILL DEFERRED, with a corrected and sharper reason.** See record correction 9;
+    the residual is narrower than recorded AND carries a new gap nobody had noticed.
 13. **`repo_unavailable`'s unreachable arm** is a named plan residual with a concrete
     closing action: a fault-injected integration case at the PR-open step, NOT another
     operator run. Note the residual's own concession: that closes the PLUMBING half; the
     forge's real 404 shape on the PR endpoints stays invented.
+    → **THE PREMISE IS WRONG. See record correction 2.** The arm is unreachable only
+    because of a CHOICE in `github.go:94-97`, not because of a law.
+
+### >>> RECORD CORRECTIONS (session 54) — things this ledger asserted that are NOT true <<<
+
+**Read this before trusting any older line in this file.** These are corrections to the
+record, not new findings. Numbers 7 and 8 are corrections to the SESSION CONTROLLER's own
+earlier prescriptions; they are recorded here as corrections, not as discoveries.
+
+1. **The `newGoldenEnv` park's stated reason was FALSE — the park itself still stands.**
+   The record said `TestGoldenSet_MonthOneLoopThroughRealRoutes` is "the ONLY cover for
+   the synthetic patch shape". It is not: `.Remote(` appears in **3 places tree-wide**, so
+   five other test files already take the synthetic branch. What is actually unique is
+   that the seed test is the only one **asserting on** the synthetic payload
+   (`goldenset_integration_test.go:285`). The park stands for a better reason: the
+   proposed `(document, wire-remote flag, members)` signature turns "which patch shape"
+   into a call-site boolean, and **the flag argument is the trap**. Cheap insurance taken
+   instead of the dedupe — `TestRegisteringARemoteChangesTheImplementPatchShape` in
+   `fake/executor_test.go` (`06ee81e`), verified red by forcing the selector to the
+   synthetic branch: it fails on four assertions while every other test in the package
+   stays green.
+
+2. **The `repo_unavailable` residual's PREMISE is wrong — stop calling the arm
+   impossible.** "No manual procedure can reach that arm" rests entirely on
+   `github.go:94-97` folding a repo-gone 404 on the recovery probe into "no branch". That
+   is a **choice**, disambiguable with one `GET /repos/{slug}` on the 404 path — after
+   which a deleted repository lands on `repo_unavailable` **at the first probe**, before
+   any branch is pushed, which is trivially stageable by an operator. **Not implemented —
+   it is a follow-up** (see 10 below). What changed here is the reasoning, and it changes
+   what roadmap row 08 can close: see 8. The README's two paragraphs that leaned on the
+   fold now label it a choice (`c4c5d52`).
+
+3. **Three deferred lines are STALE — CLOSED, not carried.** Verified in the tree, not
+   from the commit messages:
+   - `wantCreates`/`wantPRs` "constants pretending to be data" — **gone**; replaced by
+     `wantAdopted` = 1,1,1,1,0 in `d02ce46`. `grep` finds neither name in `backend/`.
+   - the `schema_integration_test.go` split — **done** in `06c9afe`; the store package now
+     holds `testutil_integration_test.go`, `constraints_integration_test.go` and
+     `queries_integration_test.go`.
+   - `GetNodeArtifact`'s provenance-first ORDER BY has no test — **covered** by `1aff70a`
+     (`TestGetNodeArtifact_PrefersTheNewerGenerationOverTheNewerTimestamp`,
+     `queries_integration_test.go:115`).
+
+4. **The `phase.materialized` `generation` doc residual is ALREADY CLOSED** (`20025dc`).
+   Plan 05's docs table (`2026-08-03-caesar-05-execution-spine.md:92`) reads
+   `node_id, attempt, generation`, and `:99` explains why it gained the key.
+
+5. **Two findings CONSIDERED AND REJECTED — record them so they are not re-raised.**
+   - The `rerun_carryforward_integration_test.go` "names a process, not an outcome"
+     charge: **discarded.** Both names state outcomes and both tests fatal on vacuous
+     passes.
+   - The uniform `time.Sleep(1100ms)`: **discarded, and it is a STRENGTH, not a cost.** It
+     is what makes the RFC3339 second-resolution commit stamp observable. (Fixer A's I7
+     fix does not use one, deliberately — the fake reads the crash flag and increments
+     `openPRs` under a single lock acquisition, so `OpenPRCount() == 1` is an ordering
+     FACT and needs no sleep. That is a better instrument in that one place; it is not an
+     argument against the sleep where the stamp is the thing being observed.)
+
+6. **`19bd487`'s test is ACCEPTED** on proper review — falsifiable in the right direction,
+   with `len(phases) == 0` as the non-obvious assertion. Non-blocking gap: the intake
+   table has no negative definition case for Plan 08's *new* refusals; those live in
+   `compile_test.go`.
+
+7. **CORRECTION TO THE CONTROLLER'S OWN PRESCRIPTION — review I6 was OVERSTATED, and the
+   error was the controller's.** It claimed `backend:test:runner` "is enforced by
+   nothing". False: `.github/workflows/ci.yml:26` runs it as a dedicated `runner` job
+   (30-minute timeout) and `ci-ok` — the single required status check — lists it in
+   `needs` (`:85`). Verified directly. The real gap was **local-only**: `scripts/gate` did
+   not run it, and this project's workflow is gate-then-merge, so a branch could gate
+   green here and go red in the required check. Fixer B closed it in the gate (`3d0cc6b`)
+   and **correctly declined** to fold it into `backend:ci`, which would duplicate the CI
+   job and force the `backend` job to build images. Record the corrected finding, not the
+   original.
+
+8. **CORRECTION TO THE CONTROLLER'S OWN PRESCRIPTION — what roadmap row 08's smoke run can
+   close has CHANGED, in both directions.**
+   - **Better:** Fixer B's I1 fix makes a non-throttling **403** reach `auth_expired`, and
+     because `github.go:94` folds only 404, it halts at the **recovery probe, before the
+     push**. The checklist's credential-dead case previously warned that a forge answering
+     403 would walk into the transient case; it now lands on the halting arm. Both of the
+     two shapes a forge is likely to give a dead or de-scoped token reach the halt.
+   - **Worse, or at least different:** by correction 2, the repo-gone case's
+     unreachability is a consequence of one fold and not a law, so the row should not be
+     closed on language that calls that arm unreachable in principle. Both changes are in
+     the README's checklist (`c4c5d52`).
+
+9. **The `schema.sql` equality task — STILL DEFERRED, with a corrected, stronger reason
+   AND a new carry.** The recorded reason understated why it is safe to defer: sqlc
+   generates from `schema.sql` while testdb applies the **migrations**, so every
+   integration test already runs schema.sql-typed code against a migration-built database
+   — queried-column drift fails loudly and constraint drift is covered by
+   `store/constraints_integration_test.go`. The residual is narrow: non-queried indexes,
+   defaults, `ON DELETE`, column order. **The new and sharper half: no CI lane runs
+   `atlas migrate validate`, and `atlas.sum` was re-hashed BY HAND with nothing put in
+   place of the guard.** That is the part worth a task.
+
+10. **FOLLOW-UPS, recorded as named residuals** (none of these is this branch's work):
+   - **Disambiguate the repo-gone 404** on the recovery probe with one
+     `GET /repos/{slug}` (correction 2). This is what would let an operator close the
+     `repo_unavailable` arm on a checklist instead of a fault injection.
+   - **Split `publish.go`** at its existing line-1191 divider into `publishsettle.go`;
+     the test files already split that way. The deferred `materialize.go` cut is still
+     right, and C1 landing inside that cluster is the argument for it.
+   - **R2's M5/M6/M7:** `authorizePublish`'s own `{0,0,0}` exit still requeues at `now+0`,
+     uncharged and doubly exempt, until the wall deadline — whoever takes it must pin M-C
+     (I8) first; `publish_intents.halt_code` is a one-line migration, not the impossible
+     column this ledger implied; `generationOf` now has three spellings of one locked read
+     and its own stated inline-it condition has been met.
+   - **`orchestrator.go:653`'s `run.finished` audit still has no coverage** (item 3
+     above) — no reviewer raised it and no fixer touched it.
+   - **`runner/driver.go:276`** says "sanity clamping is `retryDelay`'s job (spec §4.1)"
+     for a provider-captured epoch. `retryDelay` explicitly does NOT clamp a stated reset;
+     it floor-clamps only. Survivable post-A (the run terminalizes rather than hanging),
+     but the comment points at a clamp that does not exist. Found by Fixer B, out of its
+     ownership.
+
+11. **TWO THINGS FIXER A SURFACED THAT NO REVIEWER FOUND — record them prominently.**
+   - **>>> Two gates over ONE patch collide on the publication branch marker. <<<**
+     `PublicationBranch` derives the marker from the **approved artifact id** (`ports.go`),
+     and a gate's examined artifact is its input patch. So a legal definition where two
+     gates consume the same `impl` patch and each authorizes its own publish produces two
+     intents on one branch name; the second loses `publish_intents_marker_key` and dies
+     `publish_conflict`. A hit this live while building the C1 fixture, which is why that
+     fixture forks at the implement nodes. **This became REACHABLE when A fixed C1** —
+     before that, the second gate could not be decided at all. It is a design question
+     (should the marker include the publish node id?), left recorded in `parallelGateDoc`'s
+     comment and now in the README rather than guessed at, because changing it renames
+     every publication's branch.
+   - **The INBOX fixture's `attempt` ≠ `generation` is FORCED, not modelled.** A gate is
+     materialized once per generation starting at generation 1, so in every run this
+     system can actually produce, a gate's attempt EQUALS its generation — which is why
+     the transposition was invisible. The row pins the **column mapping**, not a reachable
+     state. The "one-character fix" framing understated that.
 
 ### After the review
 
+Fixer C's head is gated by the controller, then
 `superpowers:finishing-a-development-branch`. **The merge/PR decision is sofo's** — do not
 pre-commit it. Two loose ends to reconcile then: a stale `caesar-07-harness-drivers`
 worktree on disk though plan 07 merged, and roadmap row 07's smoke run still open.
@@ -132,9 +318,9 @@ Do not hand-run `task backend:ci` any more. Run:
 
 It refuses BEFORE running anything unless the tree it lands in is the one named
 (toplevel, HEAD, branch, clean tree all asserted), redirects instead of piping,
-asserts all NINE lanes BY NAME, requires the build lane's stamped
-`buildinfo.Commit` to equal HEAD, fails on a `-dirty` stamp, and scans for
-`FAIL` / `panic:` / `DATA RACE` / Docker-unavailable. Exit 0 = gate passed.
+requires the build lane's stamped `buildinfo.Commit` to equal HEAD, fails on a
+`-dirty` stamp, and scans for `FAIL` / `panic:` / `DATA RACE` / Docker-unavailable
+across ALL FOUR logs. Exit 0 = gate passed.
 
 Why it exists: the old procedure was cwd-relative at every step, so a stale `cd`
 gated the WRONG TREE and still emitted a real, matching sha — self-consistent
@@ -143,6 +329,45 @@ when wrong. It has already misfired once here.
 **It was falsified with six red mutants before first use** (dirty tree, wrong sha,
 wrong branch, a path that is not the toplevel, an injected `t.Fatal`, and Docker
 genuinely stopped). Two of them earned their keep immediately — see below.
+
+>>> **THE GATE CHANGED AGAIN in session 54 (review I5/I6, Fixer B `3d0cc6b`,
+`26ad7a0`). It now runs FOUR commands, not two, and asserts something stronger
+than lane names.** <<<
+
+1. **It scrubs the environment first**, printing each variable it drops:
+   `unset PKG RAPID_SEED RAPID_CHECKS FUZZTIME GOFLAGS`. This is the I5 hole and it
+   is the reason the whole ledger's "gated" claims needed re-examining: go-task
+   reads `PKG` and friends **from the environment**, so an EXPORTED `PKG` narrowed
+   all nine lanes while every lane-name assertion and every content grep still
+   passed. The `PKG=… task …` workflow this plan introduced (`3313958`) trains
+   operators into exactly that. `GOFLAGS` is worse than the rest — it is not a
+   Taskfile variable at all, never appears in a resolved command line, and
+   `GOFLAGS=-run=NoSuchTest task backend:test` prints `ok … [no tests to run]` for
+   every package with **exit 0**.
+   >>> **PASS `PKG` INLINE, NEVER EXPORT IT.** `PKG=./internal/runs/ task backend:test`. <<<
+2. **It asserts each lane's RESOLVED COMMAND LINE**, not the lane name — the package
+   list lives at the TAIL of that line, which is precisely what narrowing rewrites.
+   `LANE_CMDS`/`RUNNER_CMDS` in the script hold the eleven expected lines
+   (`backend:build` by prefix, because its ldflags carry a build date; its sha is
+   pinned separately, which is stronger). **The cost is real and intended: a
+   deliberate `Taskfile.yml` change must now be mirrored in `scripts/gate`.**
+3. **It greps the SYMPTOM as well as the causes**: `no tests to run` is a content
+   failure, so a `-run` filter arriving by a route the scrub did not anticipate
+   still turns the gate red. Verified to have zero legitimate occurrences in a full
+   green run.
+4. **It runs `task image:build` then `task backend:test:runner`** — the CI lane
+   `backend:ci` does not include (see record correction 7) — and then **asks the
+   image what it contains** (`docker run --rm caesar-git:dev version` must name
+   HEAD), because a `--build-arg` in a build log proves nothing about a cached
+   layer. Honest limit, stated: since `image:build` runs first, that stamp check is
+   a cross-check on the build, not an independent detector of operator neglect.
+
+Falsified with three more mutants, one of which found a real bug in the fix itself
+(`grep -qF "--build-arg COMMIT=…"` read its own pattern as grep flags and exited 2,
+so the assertion was permanently red rather than merely wrong — fixed in `26ad7a0`).
+The decisive positive: the **unmodified committed** gate, run against a clean tree
+with `PKG=… RAPID_CHECKS=1 RAPID_SEED=9 FUZZTIME=1s GOFLAGS=-run=NoSuchTestAnywhere`
+all **exported**, overrode all five and ran every lane at full width.
 
 ### >>> TARGETED TEST RUNS NOW ACTUALLY WORK <<<
 
@@ -158,6 +383,13 @@ PKG=./internal/runs/api/ task backend:test:integration -- -run 'TestGateDecision
 `PKG` matters as much as the filter: `-run` alone still BUILDS and starts every
 package's test binary, so `PKG` is what stops a targeted run from spinning
 testcontainers it does not need (measured: 1.5s for one package).
+
+>>> **NEVER `export PKG` (or `RAPID_SEED`, `RAPID_CHECKS`, `FUZZTIME`, `GOFLAGS`).**
+Always the INLINE form above. go-task reads these from the environment, so an
+exported one silently narrows every lane in that shell for the rest of the session —
+which is review finding I5, and the reason `scripts/gate` now unsets them. This very
+paragraph is what trained the habit; it is corrected here rather than deleted so the
+next reader meets the hazard with the technique. <<<
 
 **This removes the reason reviewers on Tasks 4/5/6 were told not to run tests.**
 Reviewers on Task 11 onward SHOULD run and mutate. Give them the PKG form.
@@ -218,6 +450,14 @@ LOAD-BEARING rather than defensive:
   still reachable for `credential_busy` and `rate_limited`. Settlement should
   decide whether the terminal record keeps the attempt's class or gets a run-level
   permanent one. Left alone deliberately.
+  >>> **CLOSED (session 54): FIXED as review I2, Fixer A `63d6982`.** The
+  `parkedPastDeadline` arm now writes `Class: OutcomePermanent` keeping the typed
+  code and dropping the stale `RetryAt`. Note this was RE-ROUTED from Task 10's D5
+  to Task 14 (ledger line ~3274) and **Task 14 never touched it** — it was dropped,
+  not deferred, and only the whole-branch review caught that. The reachable set is
+  `rate_limited` and `credential_busy` ONLY: the arm is guarded by
+  `!out.Chargeable()`, and an unknown transient code IS chargeable, so R2's "and
+  every unknown code" was slightly wide. <<<
 - **Guards that stay unfalsifiable until settlement is a SECOND WRITER of the
   intent:** `reload`'s typed wrap (M3), `haltPublication`'s `n == 0` ->
   `errIntentAdvanced`, `recoverBranch`'s receipt branch (G2), and
@@ -443,6 +683,7 @@ gate-generation and `generationOf` carry-forwards. What follows is what is still
   that package's only bootstrap (`seedRun`, `seedRunWith`, `seedRunWithAuthorization`,
   `mustInsertPhase`, `mustInsertArtifactAt`) under a "schema" name while carrying behavioural
   tests. Task 6 added one more test there deliberately rather than rename mid-task.
+  >>> **DONE in `06c9afe`** (session 54 verification). <<<
 - **TASK 15 (docs), now four items:** the `phase.materialized` payload gained a `generation` key
   that Plan 05's docs table (that plan, line 92) still documents as `{node_id, attempt}`; add an
   assertion that the migrated schema equals `schema.sql` (nothing checks that today —
@@ -825,6 +1066,9 @@ Task 3: PARKED (the one Important) — hardcoded generation 1 at seven sites. It
   for Task 6's rematerialization.
 Task 3: minor (deferred): `GetNodeArtifact`'s provenance-first ORDER BY has no test —
   reverting it or writing `generation ASC` breaks nothing.
+  >>> **CLOSED (session 54, record correction 3):** covered by `1aff70a`,
+  `TestGetNodeArtifact_PrefersTheNewerGenerationOverTheNewerTimestamp` at
+  `store/queries_integration_test.go:115`. Do not carry this line again. <<<
 Task 3: minor (deferred): `TestApprovedPatches` asserts only SQLSTATE 23505, not the
   constraint name — same lens as D4 one test to the left; pin `approved_patches_live_key`.
 Task 3: minor (deferred): `artifacts_run_id_idx` is redundant with
@@ -832,6 +1076,9 @@ Task 3: minor (deferred): `artifacts_run_id_idx` is redundant with
 Task 3: minor (deferred): the 346-line `schema_integration_test.go` holds the package's only
   test bootstrap under a "schema" name. >>> SPLIT into `testutil_integration_test.go`
   BEFORE Tasks 5/6 add to it. <<<
+  >>> **CLOSED (session 54, record correction 3):** done in `06c9afe` — the store package
+  now holds `testutil_integration_test.go`, `constraints_integration_test.go` and
+  `queries_integration_test.go`. Do not carry this line again. <<<
 Task 3: minor (deferred): no index carries `phase_runs.status` for `ListWaitingGates`, and
   `publish_intents` has none for Task 10's settlement sweep. Fine at V1 scale — noted so
   Task 10 does not assume one exists.
@@ -2623,9 +2870,16 @@ Task 13: REVIEW = spec ✅ / quality **NEEDS FIXES** (`task-13-review.md`). 0 Cr
   and both routed it upward; the ruling went the implementer's way.
 Task 13: minor (deferred): `wantCreates`/`wantPRs` are `1,1` in all five rows — constants
   pretending to be data; folded into the fix dispatch as optional.
+  >>> **CLOSED (session 54, record correction 3):** both fields are GONE, replaced by
+  `wantAdopted` = 1,1,1,1,0 in `d02ce46`. Neither name appears in `backend/`. Do not carry
+  this line again. <<<
 Task 13: minor (deferred): the uniform `time.Sleep(1100ms)` is load-bearing only in
   `post-push` (M2 reproduces there alone) and costs ~4.4s across the other four. Kept
   deliberately as insurance if another case becomes sticky. Cost is now a known one.
+  >>> **CLOSED as CONSIDERED-AND-REJECTED (session 54, record correction 5):** the whole-
+  branch review raised it and it was discarded — the sleep is a STRENGTH, because it is
+  what makes the RFC3339 second-resolution commit stamp observable. Do not "optimize" it
+  away. <<<
 Task 13: >>> **W1 — ROUTED TO THE WHOLE-BRANCH REVIEW, NOT TASK 13's TO FIX.** <<<
   The pre-existing `TestPublish_CrashAfterPRCreateAdoptsTheExistingPullRequest`
   (`publish_integration_test.go:626`, **Task 9's file**) SURVIVES the same no-op mutation —
