@@ -865,6 +865,21 @@ half-done on the forge that no retry can finish, so the intent becomes
 or a permanent the run is entitled to die on because nothing of ours is
 left behind it. Recovery never guesses.
 
+**Where a halting answer arrives bounds which ones you will ever see.**
+A publication's *first* forge call is the recovery probe: `pushPublication`
+asks `BranchHead` before it pushes anything, and routes the answer through
+`maybeHalt`, so a credential the forge rejects halts there — one call
+before the push it guards, with a `halt_reason` for whoever must reissue
+the token. But the platform clients deliberately fold a 404 on that probe
+into "no branch" rather than an error, because absence is recovery's
+*answer* and not its failure. A repository that has vanished is therefore
+not distinguished at the probe: the publication proceeds to the clone,
+which cannot tell a deleted repository from a network fault and types
+itself transient `forge_unavailable`. `repo_unavailable` is reached on
+`OpenPullRequest` and `FindPullRequests` instead — once an intent is
+already `pushed`, which is the window where halting matters most and the
+one hardest to stage deliberately.
+
 ### Attribution
 
 Attribution is verbatim and pinned. **Author = the requester** —
