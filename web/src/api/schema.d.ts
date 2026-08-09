@@ -12,7 +12,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List gates awaiting a decision, scoped to the caller's grants (view). Unbounded by design at V1.
+         * List gates awaiting a decision on the projects the caller holds any grant on (an admin sees every one). Unbounded by design at V1.
          * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
          */
         get: operations["listApprovals"];

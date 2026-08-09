@@ -94,7 +94,11 @@ func Operations(a *API) []httpx.Operation {
 		},
 		{
 			Pattern: "GET /api/v1/approvals", ID: "listApprovals",
-			Summary:  "List gates awaiting a decision, scoped to the caller's grants (view). Unbounded by design at V1.",
+			// No grant level in the parenthetical, unlike every sibling above,
+			// because this endpoint enforces none: it scopes to the projects
+			// the caller holds ANY grant on. Seeing a gate is not being
+			// allowed to decide it — decideGate is where approve is enforced.
+			Summary:  "List gates awaiting a decision on the projects the caller holds any grant on (an admin sees every one). Unbounded by design at V1.",
 			Response: ApprovalListResponse{}, Status: http.StatusOK,
 			Handler: a.authenticated(a.handleListApprovals),
 		},
