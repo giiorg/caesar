@@ -207,6 +207,23 @@ func waitForPushCount(t *testing.T, p *fake.Publisher, want int, d time.Duration
 	t.Fatalf("the publisher saw %d pushes, want %d", p.PushCount(), want)
 }
 
+// waitForOpenPRCount waits on the forge's ACCEPTED creates rather than on any
+// database row. It is the only signal that fires strictly after the fake has
+// read its crash flag — openPRs is incremented and the flag is read under one
+// lock acquisition — so a test that disarms here cannot disarm into an
+// in-flight create the way a poll on the intent's status does.
+func waitForOpenPRCount(t *testing.T, fg *fake.Forge, want int, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if fg.OpenPRCount() >= want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the forge accepted %d creates, want %d", fg.OpenPRCount(), want)
+}
+
 func waitForRunWithin(t *testing.T, svc *runs.Service, runID uuid.UUID, want runs.RunStatus, d time.Duration) runs.Run {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -623,18 +640,53 @@ func TestPublish_AChangedRequesterAddressStillAdoptsTheBranch(t *testing.T) {
 	}
 }
 
+// A pull request opened and never received is FOUND by the next attempt, not
+// opened again.
+//
+// Both halves of this test used to be decorative and it passed for years of
+// commits without ever entering its own window. The disarm waited on the
+// INTENT reaching 'pushed', which is written before the first OpenPullRequest,
+// so it landed inside the in-flight create and the crash never fired — and the
+// two assertions it made (OpenPRCount()==1, a recorded PR number) are equally
+// true of a run that opened cleanly the first time. Both mutations survived:
+// CrashAfterPR as a no-op, and deleting the unconditional FindPullRequests at
+// the top of openPublication.
+//
+// Three things fix it, and each kills something specific:
+//
+//   - the disarm waits on OpenPRCount, not on the intent. The fake increments
+//     openPRs and reads the crash flag under ONE lock acquisition
+//     (fake/forge.go), so a count of 1 proves the flag was already read. No
+//     sleep: this is an ordering fact, not a timing hope.
+//   - publish.adopted == 1 kills the CrashAfterPR no-op. A clean first open
+//     emits publish.pr_opened instead, so this is the only assertion that
+//     separates "crashed, then adopted" from "opened once".
+//   - CreateAttemptCount() == 1 kills the deleted find. Without it the second
+//     attempt opens BLIND, the forge refuses the duplicate, and
+//     adoptConflictingPublication re-queries and adopts — so the run still
+//     succeeds with one request and one publish.adopted. Only the count of
+//     creates ATTEMPTED can see that the machine acted before it asked.
 func TestPublish_CrashAfterPRCreateAdoptsTheExistingPullRequest(t *testing.T) {
 	p := publicationAtItsGate(t, gatedConveyorDoc())
 	p.forge().CrashAfterPR(true)
 	startBackdater(t, p.f, p.run.ID)
 	p.approve(t, "gate")
-	waitForIntentStatus(t, p.f, p.run.ID, "publish", "pushed", 45*time.Second)
 
+	// The request now EXISTS on the forge and its caller was told nothing.
+	waitForOpenPRCount(t, p.forge(), 1, 45*time.Second)
 	p.forge().CrashAfterPR(false)
 	waitForRunWithin(t, p.svc, p.run.ID, runs.RunSucceeded, 90*time.Second)
 
 	if got := p.forge().OpenPRCount(); got != 1 {
 		t.Fatalf("the forge opened %d pull requests, want exactly 1: a lost receipt must be FOUND, not recreated", got)
+	}
+	if n := countEvents(t, p.svc, p.run.ID, runs.EventPublishAdopted); n != 1 {
+		t.Errorf("publish.adopted events = %d, want 1: the request must be FOUND, not opened cleanly — "+
+			"without this the crash injection can be a no-op and this test still passes", n)
+	}
+	if got := p.forge().CreateAttemptCount(); got != 1 {
+		t.Errorf("creates attempted = %d, want 1: the second attempt must FIND the request rather than "+
+			"open blind and be refused", got)
 	}
 	intent := intentRow(t, p.f, p.run.ID, "publish")
 	if intent.PRNumber == nil || *intent.PRNumber == 0 {
