@@ -49,7 +49,10 @@ against a vanished repository with a pushed branch orphaned behind it, or
 smoke checklist** in `backend/README.md` — one throwaway repo per forge, one
 task through a gate to an approve, then the branch, the four `caesar-*`
 trailers, the committer identity and the pull request's base verified by eye,
-plus the two halting answers observed. The row's *Milestone: month-one loop
+plus the credential-dead halt observed at the publication's recovery probe.
+One arm is out of a manual run's reach: `repo_unavailable` fires only once an
+intent is already `pushed`, so it stays a named residual on the plan rather
+than holding this row open. The row's *Milestone: month-one loop
 complete via API* claim rides on that same evidence: nothing here is verified
 until the checklist runs and its result is committed.
 
