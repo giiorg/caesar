@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# gate — run caesar's full gate against a NAMED worktree at a NAMED commit.
+#
+# WHY THIS EXISTS
+#
+# The procedure this replaces was: cd to the worktree, run `task backend:ci`,
+# confirm the build lane's stamped Version matches HEAD. Every step of that is
+# cwd-relative, so a stale `cd` gates the WRONG TREE and still emits a real,
+# matching sha — the check is self-consistent when it is wrong. That has already
+# happened once on this project (a round-1 gate ran in the main checkout because
+# the shell's cwd persists between tool calls). It was survivable with one
+# worktree. With two it is a defect with no detector.
+#
+# This script takes the worktree, the sha and the branch as ARGUMENTS and
+# refuses to run unless the tree it lands in is the one that was named.
+#
+# It also fixes the two other ways this gate has read green when it was not:
+#   - `task backend:ci | tail` reports TAIL's exit status. Never pipe. Redirect,
+#     then read $? directly.
+#   - An `ok` count decays into a rubber stamp. Assert LANE IDENTITY instead:
+#     all nine named lanes must appear in the log.
+#
+# Usage: scripts/gate <worktree-abs-path> <expected-sha> <expected-branch>
+# Exit:  0 = gate passed. 1 = gate failed or refused to run.
+
+set -uo pipefail
+
+die() { printf 'GATE REFUSED: %s\n' "$1" >&2; exit 1; }
+
+[ $# -eq 3 ] || die "usage: gate <worktree-abs-path> <expected-sha> <expected-branch>"
+
+WT="$1"
+WANT_SHA="$2"
+WANT_BRANCH="$3"
+
+command -v task >/dev/null 2>&1 || die "'task' is not on PATH"
+command -v git  >/dev/null 2>&1 || die "'git' is not on PATH"
+
+# ---------------------------------------------------------------------------
+# Pre-flight: prove we are in the tree we were told to gate, at the commit we
+# were told to gate, with nothing uncommitted. All four refusals happen BEFORE
+# a single test runs, so a misaimed gate costs a second rather than a session.
+# ---------------------------------------------------------------------------
+
+[ -d "$WT" ] || die "no such directory: $WT"
+cd "$WT" || die "cannot cd to: $WT"
+
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not a git worktree: $WT"
+[ "$TOP" = "$WT" ] || die "worktree mismatch: asked to gate '$WT', but git says the tree here is '$TOP'"
+
+HEAD_FULL=$(git rev-parse HEAD)
+HEAD_SHORT=$(git rev-parse --short HEAD)
+case "$HEAD_FULL" in
+	"$WANT_SHA"*) ;;
+	*) die "HEAD mismatch: expected '$WANT_SHA', tree is at '$HEAD_SHORT' ($HEAD_FULL)" ;;
+esac
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+[ "$BRANCH" = "$WANT_BRANCH" ] || die "branch mismatch: expected '$WANT_BRANCH', tree is on '$BRANCH'"
+
+DIRT=$(git status --porcelain)
+if [ -n "$DIRT" ]; then
+	printf 'GATE REFUSED: tree is dirty — a gate on uncommitted work proves nothing about the commit\n' >&2
+	printf '%s\n' "$DIRT" >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Run the gate. Redirected, never piped, exit status read directly.
+# ---------------------------------------------------------------------------
+
+LOGDIR=${GATE_LOG_DIR:-$(mktemp -d /tmp/caesar-gate.XXXXXX)}
+mkdir -p "$LOGDIR"
+CI_LOG="$LOGDIR/backend-ci.log"
+CONTRACTS_LOG="$LOGDIR/contracts-check.log"
+
+printf 'gate: %s @ %s (%s)\n' "$WT" "$HEAD_SHORT" "$BRANCH"
+printf 'gate: logs -> %s\n' "$LOGDIR"
+
+printf 'gate: running task backend:ci ...\n'
+task backend:ci >"$CI_LOG" 2>&1
+CI_STATUS=$?
+
+printf 'gate: running task contracts:check ...\n'
+task contracts:check >"$CONTRACTS_LOG" 2>&1
+CONTRACTS_STATUS=$?
+
+# ---------------------------------------------------------------------------
+# Verdict. Exit status alone is not the gate — collect every failure so one run
+# reports all of them.
+# ---------------------------------------------------------------------------
+
+FAILED=0
+fail() { printf '  - %s\n' "$1" >&2; FAILED=1; }
+
+[ "$CI_STATUS" -eq 0 ]        || fail "task backend:ci exited $CI_STATUS"
+[ "$CONTRACTS_STATUS" -eq 0 ] || fail "task contracts:check exited $CONTRACTS_STATUS"
+
+# Lane identity, not an ok count. A lane that silently stopped running is the
+# failure this catches; a count cannot tell you WHICH nine ran.
+LANES="backend:fmt:check backend:vet backend:lint backend:analyze backend:test backend:test:property backend:test:integration backend:vuln backend:build"
+LANE_COUNT=0
+for lane in $LANES; do
+	LANE_COUNT=$((LANE_COUNT + 1))
+	grep -qF "task: [$lane]" "$CI_LOG" || fail "lane did not run: $lane"
+done
+
+# The build lane stamps the sha it actually compiled. This is the only evidence
+# that couples the gate's OUTPUT to the commit rather than to the shell's cwd.
+grep -qF "buildinfo.Commit=$HEAD_SHORT" "$CI_LOG" \
+	|| fail "build lane did not stamp buildinfo.Commit=$HEAD_SHORT (gate may have run against another tree)"
+
+# `git describe --dirty` appends -dirty. If this fires, the tree changed BETWEEN
+# the clean check above and the build lane — i.e. something wrote during the gate.
+if grep -qE 'buildinfo\.Version=[^ ]*-dirty' "$CI_LOG"; then
+	fail "build lane stamped a -dirty version: the tree was modified during the gate"
+fi
+
+# Content checks. Exit status has been wrong before; these read the output.
+for pat in 'FAIL' 'panic:' 'DATA RACE' 'Cannot connect to the Docker daemon'; do
+	if grep -qF "$pat" "$CI_LOG"; then
+		fail "found '$pat' in backend:ci output"
+	fi
+done
+if grep -qF 'Cannot connect to the Docker daemon' "$CONTRACTS_LOG"; then
+	fail "found 'Cannot connect to the Docker daemon' in contracts:check output"
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+	printf 'GATE FAIL  %s @ %s\n' "$BRANCH" "$HEAD_SHORT" >&2
+	printf 'logs: %s\n' "$LOGDIR" >&2
+	exit 1
+fi
+
+printf 'GATE PASS  %s @ %s  (%d lanes, Commit=%s stamped, contracts clean)\n' \
+	"$BRANCH" "$HEAD_SHORT" "$LANE_COUNT" "$HEAD_SHORT"
+printf 'logs: %s\n' "$LOGDIR"
