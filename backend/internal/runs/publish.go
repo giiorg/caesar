@@ -182,9 +182,27 @@ var errIntentAdvanced = errors.New("runs: publish intent advanced concurrently")
 // converting it to a retry would spin until the wall deadline instead of
 // telling the truth now. The wall deadline remains the bound on this path,
 // and expired-run settlement (Task 10) is what finishes the record if it hits.
+//
+// publish_not_started is downgraded too, for the OPPOSITE reason to the
+// chargeable ones: it costs nothing already, but by the time it arrives HERE it
+// is false, and the falsehood is a schedule. Both forge ports and the publisher
+// type their own pre-flight failures with it (runsports.go notStarted: an
+// unsupported forge string, a credential row that is gone, a DEK that will not
+// unwrap, a full disk), and its schedule is {0, 0, 0} — an immediate requeue,
+// correct for the case the code was minted for, where no intent exists and the
+// successor authorizes from scratch. An intent DOES exist here, and every
+// production cause above is persistent, so the same answer becomes claim →
+// authorize → fail → requeue at now+0, uncharged and exempt from both
+// terminalization doors, until the wall deadline: the run's execution budget
+// spent at the maximum rate, and a credential.used audit row per lap. The
+// honest non-start keeps its code and its immediate requeue by NOT coming
+// through here — authorizePublish's exit types itself and returns directly.
 func unchargedWhileUnfinished(err error) error {
 	out := ClassifyOutcome(err)
-	if out.Class != OutcomeTransient || !out.Chargeable() {
+	if out.Class != OutcomeTransient {
+		return err
+	}
+	if !out.Chargeable() && out.Code != CodePublishNotStarted {
 		return err
 	}
 	return OutcomeError{Outcome: Outcome{
@@ -313,7 +331,9 @@ func probeFailure(subject string, err error) error {
 // transaction that commits an effect's receipt (the push's, the pull
 // request's, and the halt's), resumable types every other read or write that
 // happens with a live intent, and unchargedWhileUnfinished stops a forge
-// outage from spending the failure budget. Statuses 'published' and 'halted'
+// outage from spending the failure budget — and a pre-flight failure that says
+// "nothing began" from requeuing with no delay when something has.
+// Statuses 'published' and 'halted'
 // are outside the invariant by definition: both are settled, so a permanent
 // answer is honest.
 //

@@ -180,6 +180,153 @@ func TestPublish_AForgeAnswerWeCannotProvePermanentResumesUncharged(t *testing.T
 	}
 }
 
+// The DELAY half of the same contract, which the class assertions above cannot
+// see: what a failure is typed as also decides how long the publication waits
+// before asking again, and one of the four answers a probe can carry waits for
+// nothing at all.
+//
+// publish_not_started is scheduled {0, 0, 0} (retry.go) — an immediate requeue,
+// which is right for what that code was minted for: a worker that died before
+// an intent existed, where the successor authorizes from scratch. Both forge
+// ports also produce it from their OWN pre-flight (runsports.go: an unsupported
+// forge string, or assets.UseCredential failing because the credential row is
+// gone or its DEK will not unwrap), and by the time a probe runs, an intent
+// exists and every one of those causes is PERSISTENT. Uncharged and exempt from
+// both terminalization doors, it would then claim → authorize → probe → fail →
+// requeue at now+0 until the wall deadline, burning the run's execution budget
+// at the maximum rate and writing a credential.used audit row per lap.
+//
+// So all four rows must wait. The table is the whole point: three of them are
+// unchanged behaviour and only the second is the fix, and a version that
+// downgraded everything, or nothing, fails a different row.
+func TestPublish_AProbeFailureOnALivePublicationAlwaysWaitsBeforeAskingAgain(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	noJitter := func() float64 { return 0.5 } // multiplier 1.0
+	reset := now.Add(90 * time.Second)
+
+	for _, tc := range []struct {
+		name      string
+		in        error
+		wantClass OutcomeClass
+		wantCode  string
+		// wantDelay is what the successor parks for; zero means this answer is
+		// never retried at all, which only the halting permanent may be.
+		wantDelay time.Duration
+		// wantRelabelled says whether unchargedWhileUnfinished should have
+		// CHANGED this code — its message marker is the only evidence of that,
+		// and it must appear exactly when a code was replaced. It is what
+		// separates this fix from the over-broad version that relabels every
+		// transient it is handed, including ones already correct.
+		wantRelabelled bool
+	}{
+		{
+			name:      "a forge that failed in a way nobody has taught us to read",
+			in:        errors.New("connection reset by peer"),
+			wantClass: OutcomeTransient, wantCode: CodePublishResumable, wantDelay: 15 * time.Second,
+			wantRelabelled: true,
+		},
+		{
+			name: "the port's own non-start: a credential row that is gone, or a DEK that will not unwrap",
+			in: OutcomeError{Outcome: Outcome{
+				Class: OutcomeTransient, Code: CodePublishNotStarted,
+				Message: "the publication could not be prepared: no such credential",
+			}},
+			wantClass: OutcomeTransient, wantCode: CodePublishResumable, wantDelay: 15 * time.Second,
+			wantRelabelled: true,
+		},
+		{
+			name: "a credential the forge itself rejected",
+			in: OutcomeError{Outcome: Outcome{
+				Class: OutcomePermanent, Code: CodeAuthExpired,
+				Message: "probe branch caesar/x: the forge rejected the credential",
+			}},
+			wantClass: OutcomePermanent, wantCode: CodeAuthExpired,
+		},
+		{
+			name: "a rate limit that named its own reset",
+			in: OutcomeError{Outcome: Outcome{
+				Class: OutcomeTransient, Code: CodeForgeUnavailable,
+				Message: "probe branch caesar/x: 429", RetryAt: &reset,
+			}},
+			wantClass: OutcomeTransient, wantCode: CodePublishResumable, wantDelay: 90 * time.Second,
+			wantRelabelled: true,
+		},
+		{
+			// Not a probe answer but the same chain: resumable() and
+			// receiptFailure type the reads and writes AROUND the probes, and
+			// their output passes through the same downgrade. It is already the
+			// right code with the right schedule, so it must arrive untouched.
+			name:      "an answer that is already resumable",
+			in:        resumable("reload publication position: %v", errors.New("pool timeout")),
+			wantClass: OutcomeTransient, wantCode: CodePublishResumable, wantDelay: 15 * time.Second,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The real chain a probe failure travels: the port types it,
+			// probeFailure keeps or invents a class, and runPublish hands the
+			// result to unchargedWhileUnfinished before evaluate sees it.
+			out := ClassifyOutcome(unchargedWhileUnfinished(probeFailure("branch caesar/x", tc.in)))
+			if out.Class != tc.wantClass || out.Code != tc.wantCode {
+				t.Fatalf("outcome = %s/%s, want %s/%s", out.Class, out.Code, tc.wantClass, tc.wantCode)
+			}
+			if out.Chargeable() {
+				t.Errorf("%s must not spend the failure budget of a publication that is still unfinished", out.Code)
+			}
+			// "while a publication is unfinished" is the relabel's own marker.
+			if got := strings.Contains(out.Message, "while a publication is unfinished"); got != tc.wantRelabelled {
+				t.Errorf("relabelled = %v, want %v (message %q): a code that was already right must "+
+					"pass through untouched, and one that was replaced must say so", got, tc.wantRelabelled, out.Message)
+			}
+			if tc.wantDelay == 0 {
+				if out.Retryable() {
+					t.Fatalf("%s must not be retryable: it is the answer that halts", out.Code)
+				}
+				return
+			}
+			if d := retryDelay(out, now, 0, noJitter); d != tc.wantDelay {
+				t.Errorf("the successor parks %v out, want %v: a publication that re-asks with no "+
+					"delay hot-loops to the wall deadline on a cause no retry can fix", d, tc.wantDelay)
+			}
+		})
+	}
+}
+
+// The same lie arriving from the PUSH rather than a probe, which is where it
+// could always arrive: gitPublisher.PushPatch types its scratch and prepare
+// failures with the same notStarted (runsports.go), and prepare opens the same
+// credential. This leg is older than the probe pass-through and reaches
+// unchargedWhileUnfinished by a different route, so it is asserted separately —
+// a fix that lived in probeFailure alone would leave it at zero.
+func TestPublish_APublisherThatNeverStartedStillWaitsWhileAnIntentIsLive(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	noJitter := func() float64 { return 0.5 }
+	in := OutcomeError{Outcome: Outcome{
+		Class: OutcomeTransient, Code: CodePublishNotStarted,
+		Message: "the publication could not be prepared: open credential: cipher: message authentication failed",
+	}}
+	out := ClassifyOutcome(unchargedWhileUnfinished(in))
+	if out.Class != OutcomeTransient || out.Code != CodePublishResumable || out.Chargeable() {
+		t.Fatalf("outcome = %+v; want a transient, uncharged publish_resumable", out)
+	}
+	if d := retryDelay(out, now, 0, noJitter); d != 15*time.Second {
+		t.Errorf("the successor parks %v out, want 15s", d)
+	}
+	if !strings.Contains(out.Message, "authentication failed") || !strings.Contains(out.Message, CodePublishNotStarted) {
+		t.Errorf("message = %q; both the original code and the port's own words must survive, or an "+
+			"operator cannot tell which pre-flight failed", out.Message)
+	}
+	// The honest non-start is the one that reaches evaluate WITHOUT passing
+	// through here: authorizePublish's exit types itself with
+	// notStartedUnlessTyped and returns directly, so a publication that truly
+	// never began keeps its code and its immediate requeue.
+	if got := ClassifyOutcome(notStartedUnlessTyped(errors.New("dial timeout"))); got.Code != CodePublishNotStarted {
+		t.Fatalf("outcome = %+v; want publish_not_started to survive where nothing has begun", got)
+	}
+	if d := retryDelay(Outcome{Code: CodePublishNotStarted}, now, 0, noJitter); d != 0 {
+		t.Errorf("a publication that never began parks %v out, want an immediate requeue", d)
+	}
+}
+
 // notStartedUnlessTyped is the only thing standing between the nine untyped
 // statement errors inside authorizePublish — the COMMIT included — and a
 // permanent internal_error that terminalizes a run which has caused nothing.
