@@ -207,31 +207,36 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 			if got := errors.Is(err, forge.ErrForbidden); got != c.wantForbidden {
 				t.Errorf("forbidden = %v, want %v", got, c.wantForbidden)
 			}
-			// A stated reset must survive as an instant, not just as "retryable":
-			// it is the difference between backing off blind and waiting exactly
-			// as long as the forge asked.
-			if at, ok := forge.RetryAfter(err); c.wantRetry && len(c.headers) > 0 && !ok {
-				t.Errorf("rate-limited error must carry a retry instant (got %v)", at)
-			}
-			// And it must be the RIGHT instant. Presence alone would accept an
-			// epoch read as milliseconds — 1893456000 becomes the year 61989, and
-			// a run whose RetryAt is a geological age away parks until its wall
-			// deadline instead of retrying in minutes.
-			if !c.wantAt.IsZero() {
-				at, ok := forge.RetryAfter(err)
+			// Every row states the instant it expects, and the three arms below
+			// are exhaustive over the table — including the LAST one, which is
+			// the case that used to assert nothing. A retryable answer the forge
+			// did not date must carry NO instant: the run layer takes a stated
+			// RetryAt verbatim, so an invented one (say now+24h from a bare 429)
+			// parks the run past its wall deadline on the strength of a header
+			// the forge never sent.
+			at, ok := forge.RetryAfter(err)
+			switch {
+			// An ABSOLUTE reset must be the RIGHT instant. Presence alone would
+			// accept an epoch read as milliseconds — 1893456000 becomes the year
+			// 61989, and a run whose RetryAt is a geological age away parks until
+			// its wall deadline instead of retrying in minutes.
+			case !c.wantAt.IsZero():
 				if !ok || !at.Equal(c.wantAt) {
 					t.Errorf("retry instant = %v (present=%v), want %v", at, ok, c.wantAt)
 				}
-			}
 			// A stated DELAY has to be added to the clock, not swallowed. Coming
 			// back at `now` retries into a window the forge just said is shut,
 			// and on a secondary limit re-requesting immediately is what makes
 			// the limit worse — the argument the table's own comment opens with.
-			if c.wantDelta > 0 {
-				at, ok := forge.RetryAfter(err)
+			case c.wantDelta > 0:
 				if !ok || at.Before(before.Add(c.wantDelta)) || at.After(after.Add(c.wantDelta)) {
 					t.Errorf("retry instant = %v (present=%v), want now+%v, i.e. within [%v, %v]",
 						at, ok, c.wantDelta, before.Add(c.wantDelta), after.Add(c.wantDelta))
+				}
+			default:
+				if ok {
+					t.Errorf("retry instant = %v, want NONE: the forge stated no reset, "+
+						"and a manufactured one is taken verbatim by the run layer", at)
 				}
 			}
 		})
