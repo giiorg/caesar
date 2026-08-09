@@ -1098,6 +1098,56 @@ func TestPublish_AHaltedIntentRefusesEveryLaterAttempt(t *testing.T) {
 	}
 }
 
+// A forge answer no retry can change, arriving with the branch ALREADY on the
+// forge, halts for a human instead of failing the run.
+//
+// This is the hole a real forge adapter opens. Before it, every permanent
+// answer reaching this step was a publish_conflict, which halted. A revoked
+// token and a deleted repository are permanent too, and left alone they would
+// terminalize the run — which supersedes every phase, is revisited by no sweep,
+// and leaves the pushed marker branch with nobody looking for it. Halting is
+// the mechanism the design already has for "a person must look at this", and
+// this is exactly that.
+//
+// The refusal is unbounded rather than scripted-n-times, so the assertion that
+// the machine asked ONCE is a real property and not an artifact of the script.
+func TestPublish_APermanentForgeRefusalHaltsRatherThanStrandingThePushedBranch(t *testing.T) {
+	p := publicationAtItsGate(t, gatedConveyorDoc())
+	p.forge().FailPRPermanently(runs.CodeAuthExpired)
+	p.approve(t, "gate")
+
+	got := waitForRunWithin(t, p.svc, p.run.ID, runs.RunFailed, 60*time.Second)
+	// haltPublication's own verdict: the halt reason is what carries the cause.
+	if got.Outcome == nil || got.Outcome.Code != runs.CodePublishConflict {
+		t.Fatalf("outcome = %+v, want publish_conflict from the halt", got.Outcome)
+	}
+	intent := intentRow(t, p.f, p.run.ID, "publish")
+	if intent.Status != "halted" || intent.HaltReason == nil || *intent.HaltReason == "" {
+		t.Fatalf("the intent must halt with a reason a human can act on: %+v", intent)
+	}
+	if !strings.Contains(*intent.HaltReason, runs.CodeAuthExpired) &&
+		!strings.Contains(*intent.HaltReason, "permanent pull-request refusal") {
+		t.Errorf("halt reason = %q; it must name what the forge actually said", *intent.HaltReason)
+	}
+	// The branch IS pushed. That is the whole reason this must halt rather than
+	// fail: a failed run strands it.
+	if intent.HeadSHA == nil {
+		t.Fatal("the push receipt must survive a halt at the pull-request step")
+	}
+	if head := remoteBranchHead(t, p.f, intent.Branch); head != *intent.HeadSHA {
+		t.Errorf("the marker is at %q, want the pushed %q", head, *intent.HeadSHA)
+	}
+	// And the machine stops asking: an answer no retry can change is asked once.
+	if n := p.forge().CreateAttemptCount(); n != 1 {
+		t.Errorf("create attempts = %d, want 1", n)
+	}
+	// A halt is not a retry class, and nothing resumes it.
+	time.Sleep(500 * time.Millisecond)
+	if intentRow(t, p.f, p.run.ID, "publish").Status != "halted" {
+		t.Error("a halted intent must never be resumed automatically")
+	}
+}
+
 // adoptConflictingPublication's THIRD answer: the forge refused a second
 // request and then did not list the first. Read-after-write lag, or a replica
 // behind the write — guessing either way is wrong, so it resumes, uncharged,

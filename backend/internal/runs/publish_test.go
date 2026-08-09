@@ -125,6 +125,63 @@ func TestPublish_TheUnfinishedPublicationInvariantHolds(t *testing.T) {
 	})
 }
 
+// What caesar does when a REAL forge answers badly with the branch already
+// pushed. Both halves are load-bearing and they pull in opposite directions.
+//
+// maybeHalt is the fork. Halting is durable and terminal — a human reconciles
+// it, no later attempt resumes it — so it must fire on exactly the answers no
+// retry can change and on nothing else. Too narrow, and a revoked token
+// terminalizes the run with its branch orphaned on the forge. Too wide, and an
+// ordinary permanent failure (a malformed patch, a base SHA that vanished)
+// summons a human for something the run is entitled to die on.
+func TestMaybeHalt_HaltsOnlyOnAnswersAPersonMustReconcile(t *testing.T) {
+	for _, code := range []string{CodePublishConflict, CodeAuthExpired, CodeRepoUnavailable} {
+		if !haltsPublication(code) {
+			t.Errorf("%s must halt: no number of attempts fixes it, and a run that merely "+
+				"failed would leave its pushed branch with nobody looking for it", code)
+		}
+	}
+	// Every one of these really does reach maybeHalt — the gitops permanents
+	// through the push call site, the transients through both.
+	for _, code := range []string{
+		CodeForgeUnavailable, CodePushRejected, CodePublishResumable, CodePublishNotStarted,
+		CodeInvalidOutput, CodeBaseSHAUnavailable, CodeInternalError, CodeTimeout,
+	} {
+		if haltsPublication(code) {
+			t.Errorf("%s must not halt: halting is a human's inbox, and filling it with "+
+				"answers that retry or that honestly end the run empties it of meaning", code)
+		}
+	}
+}
+
+// The other half: what the forge adapter cannot PROVE permanent must come back
+// transient, so unchargedWhileUnfinished downgrades it to an uncharged,
+// resumable retry rather than terminalizing a run whose branch is on the forge.
+func TestPublish_AForgeAnswerWeCannotProvePermanentResumesUncharged(t *testing.T) {
+	// The exact outcome app's forgeAdapter produces for an answer it cannot
+	// classify: a 400 with a message nobody has taught us to read.
+	in := OutcomeError{Outcome: Outcome{
+		Class: OutcomeTransient, Code: CodeForgeUnavailable,
+		Message: "open pull request: forge returned 418: I'm a teapot",
+	}}
+	out := ClassifyOutcome(unchargedWhileUnfinished(in))
+	if out.Class != OutcomeTransient || out.Code != CodePublishResumable || out.Chargeable() {
+		t.Fatalf("outcome = %+v; want a transient, uncharged publish_resumable — an answer we "+
+			"could not read must be asked again, not terminalize a run with its branch pushed", out)
+	}
+	if !strings.Contains(out.Message, "teapot") {
+		t.Errorf("message = %q; the forge's own words must survive the downgrade", out.Message)
+	}
+	// And the proven-permanent ones are deliberately NOT downgraded: they have
+	// to arrive at maybeHalt still permanent, or the halt never happens.
+	for _, code := range []string{CodeAuthExpired, CodeRepoUnavailable} {
+		perm := OutcomeError{Outcome: Outcome{Class: OutcomePermanent, Code: code}}
+		if got := ClassifyOutcome(unchargedWhileUnfinished(perm)); got.Class != OutcomePermanent || got.Code != code {
+			t.Errorf("%s = %+v; a proven-permanent forge answer must reach maybeHalt intact", code, got)
+		}
+	}
+}
+
 // notStartedUnlessTyped is the only thing standing between the nine untyped
 // statement errors inside authorizePublish — the COMMIT included — and a
 // permanent internal_error that terminalizes a run which has caused nothing.

@@ -59,6 +59,12 @@ const (
 	CodeForgeUnavailable        = "forge_unavailable"         // the forge API could not be reached or refused transiently
 	CodePublishNotStarted       = "publish_not_started"       // transient, UNCHARGED: the worker died before authorizing
 	CodePublishResumable        = "publish_resumable"         // transient, UNCHARGED: an unfinished publication resumes from its intent
+	// CodeRepoUnavailable is the forge refusing to show the repository at all
+	// — deleted, renamed, or no longer visible to this token. Permanent, and
+	// one of the answers a publication HALTS on rather than retries: no number
+	// of attempts brings a deleted repository back, and a run that merely
+	// failed would leave its pushed branch with nobody looking for it.
+	CodeRepoUnavailable = "repo_unavailable"
 )
 
 // Outcome is a typed terminal result for an attempt or a run. RetryAt is

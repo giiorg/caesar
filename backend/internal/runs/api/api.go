@@ -39,6 +39,12 @@ func Operations(a *API) []httpx.Operation {
 		{
 			Pattern: "POST /api/v1/tasks", ID: "createTask", Summary: "Create a task and its first run (run grant)",
 			Request: CreateTaskRequest{}, Response: TaskResponse{}, Status: http.StatusCreated,
+			// Intake resolves the repository's head on the forge before it
+			// writes anything, so the forge's answer is part of this endpoint's
+			// answer set: 404 when the repository or its default branch is not
+			// there, 429 when the forge is throttling or unreachable. A client
+			// that cannot see those reads both as a bug in caesar.
+			Errors:  []int{http.StatusNotFound, http.StatusTooManyRequests},
 			Handler: a.authenticated(a.handleCreateTask),
 		},
 		{
@@ -54,6 +60,9 @@ func Operations(a *API) []httpx.Operation {
 		{
 			Pattern: "POST /api/v1/tasks/{id}/runs", ID: "rerunTask", Summary: "Re-run a task, superseding a pending run (run grant)",
 			Response: RunResponse{}, Status: http.StatusCreated,
+			// Same forge resolution as createTask, plus this endpoint's own 404
+			// for a task that does not exist.
+			Errors:  []int{http.StatusNotFound, http.StatusTooManyRequests},
 			Handler: a.authenticated(a.handleRerunTask),
 		},
 		{

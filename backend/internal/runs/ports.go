@@ -118,6 +118,23 @@ type HarnessSource interface {
 // Forge is the control plane's view of a code host. Plan 05 needed one
 // method; the publish state machine needs three more, and every one of them
 // is either an idempotency probe or an effect that records a receipt.
+//
+// EVERY implementation must return OutcomeError from BranchHead,
+// OpenPullRequest and FindPullRequests — the same rule gitops.AsOutcomeError
+// states for GitPublisher, and for the same reason. ClassifyOutcome matches
+// OutcomeError and nothing else, and is default-deny: an untyped error becomes
+// a PERMANENT internal_error. All three are called only from the publish state
+// machine, which stands inside an intent that is 'pending' or 'pushed', so a
+// permanent answer terminalizes the run — and no sweep revisits a failed run,
+// so a branch already on the forge becomes an orphan. Only what the
+// implementation can PROVE permanent may be permanent; everything else is
+// transient, which unchargedWhileUnfinished then downgrades to an uncharged,
+// resumable retry.
+//
+// ResolveHead is the exception and is deliberately NOT in that rule: its only
+// callers are task intake, and its error reaches the HTTP layer, which
+// classifies by xerrors and answers 500 for anything else. A repository the
+// operator mistyped must read as the requester's mistake, not as caesar's.
 type Forge interface {
 	// ResolveHead resolves a repo's default branch to the commit a run pins
 	// as its base SHA.

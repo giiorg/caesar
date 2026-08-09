@@ -972,7 +972,33 @@ func matchPublication(candidates []PullRequestRef, intent store.PublishIntent) (
 	return pr, found, false
 }
 
-// maybeHalt turns a permanent publish_conflict into a halted intent and
+// haltsPublication names the answers a person must reconcile, as opposed to
+// the ones another attempt might fix.
+//
+// The rule is "proven permanent", not "permanent": both callers of maybeHalt
+// stand inside an intent that is 'pending' or 'pushed', so failing the run
+// strands whatever is already on the forge. An answer only belongs here if no
+// number of retries could change it AND nothing automatic can put it right.
+//
+//   - publish_conflict: the marker is in a state we cannot prove is ours.
+//     Guessing records a stranger's branch or request as this run's output.
+//   - auth_expired: the forge rejected the repository's credential. Somebody
+//     has to issue a new token; retrying only spends the wall clock.
+//   - repo_unavailable: the forge will not show the repository — deleted,
+//     renamed, or no longer visible to this token. Same answer, same reason.
+//
+// Everything else stays out deliberately. A rejected push, a forge outage, a
+// gitops failure: those are ordinary transients, or permanents the run is
+// entitled to die on because nothing of ours is left half-done behind them.
+func haltsPublication(code string) bool {
+	switch code {
+	case CodePublishConflict, CodeAuthExpired, CodeRepoUnavailable:
+		return true
+	}
+	return false
+}
+
+// maybeHalt turns an answer a person must reconcile into a halted intent and
 // leaves every other error alone. Halting is durable and terminal: a human
 // reconciles it, and no later attempt resumes it (spec §3: "halts for manual
 // reconciliation on mismatch").
@@ -980,7 +1006,7 @@ func (o *Orchestrator) maybeHalt(ctx context.Context, cp cachedPlan, c claimed,
 	intent store.PublishIntent, err error,
 ) (store.PublishIntent, error) {
 	out := ClassifyOutcome(err)
-	if out.Code != CodePublishConflict {
+	if !haltsPublication(out.Code) {
 		return intent, err
 	}
 	return o.haltPublication(ctx, cp, c, intent, out.Message)

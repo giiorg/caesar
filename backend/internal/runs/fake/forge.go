@@ -38,6 +38,11 @@ type Forge struct {
 	crashAfterPR bool
 	failPRTimes  int
 	failPRCode   string
+	// permanentPRCode refuses EVERY create with a permanent typed outcome. It
+	// is how a revoked token or a deleted repository looks to the publish
+	// machine: an answer no retry can change, arriving when the branch is
+	// already on the forge.
+	permanentPRCode string
 	// hiddenListings makes the next N FindPullRequests answer empty even
 	// though a request exists. It models a forge that has accepted a create
 	// and not yet published it to its list endpoint, which is the ONLY way a
@@ -152,6 +157,14 @@ func (f *Forge) OpenPullRequest(ctx context.Context, repo runs.RepoRef, spec run
 
 	f.mu.Lock()
 	f.createAttempts++
+	if f.permanentPRCode != "" {
+		code := f.permanentPRCode
+		f.mu.Unlock()
+		return runs.PullRequestRef{}, runs.OutcomeError{Outcome: runs.Outcome{
+			Class: runs.OutcomePermanent, Code: code,
+			Message: "fake forge: scripted permanent pull-request refusal",
+		}}
+	}
 	if f.failPRTimes > 0 {
 		f.failPRTimes--
 		code := f.failPRCode
@@ -250,6 +263,16 @@ func (f *Forge) FailPRTimes(n int, code string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failPRTimes, f.failPRCode = n, code
+}
+
+// FailPRPermanently refuses every create with a PERMANENT typed outcome — the
+// shape a revoked token or a deleted repository has. It is unbounded on
+// purpose: the property under test is that the machine stops asking, so a
+// script that ran out of refusals would let a broken machine pass.
+func (f *Forge) FailPRPermanently(code string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.permanentPRCode = code
 }
 
 // HoldFirstPullRequest blocks the first create between the request existing on
