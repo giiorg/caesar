@@ -712,7 +712,10 @@ func (g *goldenEnv) count(t *testing.T, sql string, args ...any) int {
 }
 
 // countAudit counts audit entries for an action, narrowed to a subject kind
-// when one is given.
+// when one is given. The count is DATABASE-WIDE, not scoped to a run: every
+// goldenEnv gets its own isolated database and every test drives exactly one
+// task through it, so the two are the same number here. A fixture that ever
+// runs a second task must scope this before trusting it.
 func (g *goldenEnv) countAudit(t *testing.T, action, subjectKind string) int {
 	t.Helper()
 	if subjectKind == "" {
@@ -903,6 +906,9 @@ func TestGoldenSet_FullConveyorThroughTheAPI(t *testing.T) {
 	if got := g.remoteBranchCount(t, "caesar/"); got != 1 {
 		t.Errorf("caesar branches on the remote = %d, want 1", got)
 	}
+	if got := g.forge.OpenPRCount(); got != 1 {
+		t.Errorf("pull requests opened = %d, want 1", got)
+	}
 }
 
 func TestGoldenSet_CrashInjectionAroundEveryPublishStep(t *testing.T) {
@@ -921,43 +927,55 @@ func TestGoldenSet_CrashInjectionAroundEveryPublishStep(t *testing.T) {
 		// statement fault has already disarmed itself by firing. One
 		// zero-argument disarm cannot know which of the three was armed.
 		disarm func(*goldenEnv)
-		// fired reports that the injection actually triggered. Without it a
-		// case that never fired is a green run that looks exactly like a guard
-		// holding.
+		// fired reports that the injection triggered. For the two sticky
+		// switches it can only observe the EFFECT — both fakes increment their
+		// counter before they read the crash flag (fake/publisher.go:142-147,
+		// fake/forge.go:159) — so it is a proxy there, not a discriminator.
+		// wantAdopted is what discriminates; see below.
 		fired func(*goldenEnv) bool
-		// wantCreates is BRANCH CREATIONS, not pushes. PushCount is not the
-		// property and is not stable: CrashAfterPush is sticky, so it keeps
-		// pushing-and-crashing until disarmed (measured 8), and a receipt
-		// failure costs the push plus its recovery (measured 2). One branch
-		// CREATION is the invariant — the retry adopted rather than replaced.
-		wantCreates, wantPRs int
+		// wantAdopted is the publish.adopted count, and it is the ONLY thing in
+		// this table that separates "crashed, then recovered" from "never
+		// crashed at all". Everything else here — one push, one branch, one
+		// pull request, one intent, one consumed authorization, one pr_number
+		// event — is equally true of a run that had no crash injected, which is
+		// how two of these cases once passed with both fakes' crash switches
+		// turned into no-ops.
+		//
+		// publish.adopted is emitted only on the recovery path: by
+		// pushPublication when the push finds the branch already there
+		// (publish.go:724-726), and by openPublication when the pull request is
+		// already open (publish.go:915-917). Exactly one such event is the
+		// signature of one crash recovered. It is 0 for the intent case alone,
+		// where the transaction rolled back before anything reached the forge,
+		// so there is nothing to adopt.
+		wantAdopted int
 	}{
 		{
 			"post-push",
 			func(g *goldenEnv) { g.publisher.CrashAfterPush(true) },
 			func(g *goldenEnv) { g.publisher.CrashAfterPush(false) },
-			func(g *goldenEnv) bool { return g.publisher.PushCount() >= 1 }, 1, 1,
+			func(g *goldenEnv) bool { return g.publisher.PushCount() >= 1 }, 1,
 		},
 		{
 			"post-pr-create",
 			func(g *goldenEnv) { g.forge.CrashAfterPR(true) },
 			func(g *goldenEnv) { g.forge.CrashAfterPR(false) },
-			func(g *goldenEnv) bool { return g.forge.CreateAttemptCount() >= 1 }, 1, 1,
+			func(g *goldenEnv) bool { return g.forge.CreateAttemptCount() >= 1 }, 1,
 		},
 		{
 			"pre-db-commit-on-push-receipt",
 			func(g *goldenEnv) { g.faults.Fail("RecordPushReceipt", 0, 1) }, func(*goldenEnv) {},
-			func(g *goldenEnv) bool { return g.faults.Fired("RecordPushReceipt") > 0 }, 1, 1,
+			func(g *goldenEnv) bool { return g.faults.Fired("RecordPushReceipt") > 0 }, 1,
 		},
 		{
 			"pre-db-commit-on-pr-receipt",
 			func(g *goldenEnv) { g.faults.Fail("RecordPRReceipt", 0, 1) }, func(*goldenEnv) {},
-			func(g *goldenEnv) bool { return g.faults.Fired("RecordPRReceipt") > 0 }, 1, 1,
+			func(g *goldenEnv) bool { return g.faults.Fired("RecordPRReceipt") > 0 }, 1,
 		},
 		{
 			"pre-db-commit-on-intent",
 			func(g *goldenEnv) { g.faults.Fail("CreatePublishIntent", 0, 1) }, func(*goldenEnv) {},
-			func(g *goldenEnv) bool { return g.faults.Fired("CreatePublishIntent") > 0 }, 1, 1,
+			func(g *goldenEnv) bool { return g.faults.Fired("CreatePublishIntent") > 0 }, 0,
 		},
 	}
 	for _, c := range cases {
@@ -985,11 +1003,20 @@ func TestGoldenSet_CrashInjectionAroundEveryPublishStep(t *testing.T) {
 
 			run := g.waitForRun(t, approver, task.LatestRunID, "succeeded", 90*time.Second)
 
-			if got := g.publisher.CreatedCount(); got != c.wantCreates {
-				t.Errorf("branch creations = %d, want %d: the retry must ADOPT, not replace", got, c.wantCreates)
+			// Branch CREATIONS, not pushes. PushCount is not the property and is
+			// not stable: CrashAfterPush is sticky, so it keeps
+			// pushing-and-crashing until disarmed (measured 8), and a receipt
+			// failure costs the push plus its recovery (measured 2). One branch
+			// creation is the invariant — the retry adopted rather than replaced.
+			if got := g.publisher.CreatedCount(); got != 1 {
+				t.Errorf("branch creations = %d, want 1: the retry must ADOPT, not replace", got)
 			}
-			if got := g.forge.OpenPRCount(); got != c.wantPRs {
-				t.Errorf("pull requests opened = %d, want %d", got, c.wantPRs)
+			if got := g.forge.OpenPRCount(); got != 1 {
+				t.Errorf("pull requests opened = %d, want 1", got)
+			}
+			if n := g.countEventKind(t, approver, run.ID, "publish.adopted"); n != c.wantAdopted {
+				t.Errorf("publish.adopted events = %d, want %d: without this the case passes "+
+					"with its crash injection disabled — recovery is what it exists to prove", n, c.wantAdopted)
 			}
 			if got := g.remoteBranchCount(t, "caesar/"); got != 1 {
 				t.Errorf("caesar branches on the remote = %d, want 1", got)

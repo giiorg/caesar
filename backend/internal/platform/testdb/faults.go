@@ -63,6 +63,7 @@ func (q *QueryFaults) Fail(name string, skip, times int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.rules[name] = &queryFault{skip: skip, times: times}
+	delete(q.fired, name)
 }
 
 // FailUntilDisarmed arms the named query to fail every execution until Disarm.
@@ -73,6 +74,7 @@ func (q *QueryFaults) FailUntilDisarmed(name string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.rules[name] = &queryFault{unlimited: true}
+	delete(q.fired, name)
 }
 
 // Disarm removes the rule for name, letting the statement through again.
@@ -97,7 +99,9 @@ func (q *QueryFaults) Remaining(name string) int {
 
 // Fired reports how many times the named fault has actually failed a
 // statement. It survives Disarm, so a test can arm, wait, disarm and still
-// prove the injection happened.
+// prove the injection happened — but arming the same name again zeroes it, so
+// a test that arms one statement twice waits on the second arming's own count
+// rather than returning at once on the first's.
 func (q *QueryFaults) Fired(name string) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
