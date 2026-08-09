@@ -282,7 +282,36 @@ func TestDelayedRetry_WaitPastWallDeadlineTerminalizesNow(t *testing.T) {
 
 	final := waitForRun(t, svc, run.ID, runs.RunFailed)
 	if final.Outcome == nil || final.Outcome.Code != runs.CodeRateLimited {
-		t.Errorf("outcome = %+v, want the wait's own rate_limited code", final.Outcome)
+		t.Fatalf("outcome = %+v, want the wait's own rate_limited code", final.Outcome)
+	}
+	// The CODE is the wait's; the CLASS is the run's, and the run is dead.
+	//
+	// Keeping the transient class here was a real defect, not a nicety: the
+	// run is 'failed', nothing revisits a failed run (ListExpiredRunIDs matches
+	// pending/running/waiting only), and Outcome.Retryable() is the predicate
+	// every consumer asks. GET /runs/{id} and the run.finished audit detail
+	// both rendered {"class":"transient"} on a run that will never be retried
+	// by anything, which is an invitation to wait for a recovery that is not
+	// coming. The typed code still says which door was shut.
+	if final.Outcome.Class != runs.OutcomePermanent {
+		t.Errorf("outcome class = %q, want permanent: this run is terminalized and nothing revisits it",
+			final.Outcome.Class)
+	}
+	if final.Outcome.Retryable() {
+		t.Error("Outcome.Retryable() is true on a dead run: no sweep will ever pick it up again")
+	}
+	if final.Outcome.RetryAt != nil {
+		t.Errorf("outcome carries a retry instant %v on a dead run", final.Outcome.RetryAt)
+	}
+	// Read from the durable column too, not only the projection: this is what
+	// the audit detail and every later reader see.
+	var class string
+	if err := f.pool.QueryRow(ctx,
+		`SELECT outcome->>'class' FROM runs WHERE id = $1`, run.ID).Scan(&class); err != nil {
+		t.Fatal(err)
+	}
+	if class != string(runs.OutcomePermanent) {
+		t.Errorf("stored run outcome class = %q, want permanent", class)
 	}
 	if n := scalarCount(t, f,
 		`SELECT count(*) FROM phase_runs WHERE run_id = $1 AND not_before IS NOT NULL`, run.ID); n != 0 {

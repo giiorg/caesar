@@ -1579,7 +1579,17 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		// The wait would outlast the run, so the run dies of the wait
 		// itself — nothing was exhausted, and the typed code says which
 		// door was shut.
-		runOut = out
+		//
+		// PERMANENT, though the outcome that got here was transient. The code
+		// is a report of the cause and survives; the class is a statement
+		// about what happens next, and for a terminalized run the answer is
+		// nothing. ListExpiredRunIDs matches pending/running/waiting only, so
+		// no sweep revisits a failed run, while Outcome.Retryable() — which is
+		// exactly Class == transient — is what GET /runs/{id} and the
+		// run.finished audit detail publish. Carrying the wait's class through
+		// told every reader to expect a retry that cannot come. The RetryAt is
+		// dropped with it: a dead run has no next instant.
+		runOut = Outcome{Class: OutcomePermanent, Code: out.Code, Message: out.Message}
 	case out.Retryable(): // retryable but exhausted
 		runOut = Outcome{
 			Class: OutcomePermanent, Code: CodeAttemptsExhausted,
