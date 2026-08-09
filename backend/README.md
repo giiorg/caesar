@@ -150,15 +150,18 @@ prunes envelopes older than `orchestrator.outbox_retention`, 7 days by
 default. The rest of the queue loop is tuned under the same config key:
 `workers`, `poll_interval`, `lease_ttl`, `heartbeat_interval`.
 
-The production posture is honest, not simulated. `serve` wires
-`runs.NotImplementedExecutor` and a forge that refuses to resolve a
-head, so task intake fails with "forge adapters arrive in Plan 08" (no
-run can pin a base SHA), a definition containing gate or `git-publish`
-nodes is rejected at intake (`waiting` stays unreachable until Plan 08),
-and any phase claimed under production wiring dies `not_implemented`
-until Plan 06's Docker runner lands. Stubs never fake success. The
-deterministic fakes in `internal/runs/fake` are what drive the
-golden-set integration test, which takes a run end-to-end in CI.
+The production posture is honest, not simulated — and Plan 08 moved half
+of it from stub to real. `serve` now wires the real forge adapter and
+the real git publisher (`newForgeAdapter` and `gitPublisher` in
+`internal/app/serve.go`), so a run pins its base SHA from the forge and
+a definition carrying gate or `git-publish` nodes is accepted at intake;
+`unavailableForge` and `ExecPlan.HasUnsupportedNodes` are deleted, and
+`waiting` is reachable. What stays a stub is the executor:
+`runs.NotImplementedExecutor` is still the default, so any phase claimed
+with `runner.enabled` false dies `not_implemented` rather than reporting
+a result it never produced. Stubs never fake success. The deterministic
+fakes in `internal/runs/fake` are what drive the golden-set integration
+test, which takes a run end-to-end in CI.
 
 ## Docker runner and egress gateway (Plan 06)
 
@@ -244,13 +247,14 @@ bind-mounts `t.TempDir()`, so it expects a Linux daemon (or a Docker
 Desktop whose file sharing covers the OS temp dir).
 
 The production posture stays honest: `runner.enabled` defaults false
-(`NotImplementedExecutor` + `AlwaysAdmit`, exactly Plan 05), and task
-intake is refused until Plan 08's forge adapters land, so an enabled
-runner is unreachable today — the flag exists so config, wiring, and
-validation are real now and the deploy stack flips one boolean. In prod,
-network isolation must not rest on Docker alone: the host firewall must
-deny the agent subnets everything except the gateway (baseline in the
-Plan 14 deployment runbook).
+(`NotImplementedExecutor` + `AlwaysAdmit`, exactly Plan 05), so the
+default deploy refuses to fake a phase result rather than pretending to
+run one. Since Plan 08 wired the real forge, that flag is the only thing
+left in the way — intake accepts gates and publishes, so flipping one
+boolean gives the runner real work and the deploy stack needs no other
+change. In prod, network isolation must not rest on Docker alone: the
+host firewall must deny the agent subnets everything except the gateway
+(baseline in the Plan 14 deployment runbook).
 
 ## Harness filesystem contract (Plan 07)
 
