@@ -1,61 +1,63 @@
 # SDD ledger — plan: docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md
 
 
-## >>> RESUME HERE (fresh session, 2026-08-09 — written by session 52) <<<
+## >>> RESUME HERE (fresh session, 2026-08-09 — written by session 53) <<<
 
-**Tasks 1-12 COMPLETE, all gated and reviewed clean. THREE tasks remain (13-15).**
-**Task 12's last code commit is `00bbd94`, gate GREEN there; HEAD carries one
+**Tasks 1-13 COMPLETE, all gated and reviewed clean. TWO tasks remain (14-15).**
+**Task 13's last code commit is `d02ce46`, gate GREEN there. HEAD carries one
 docs-only commit on top (the tracked ledger snapshot). Tree clean.**
-**Run `git rev-parse HEAD` and use THAT as Task 13's BASE.**
+**Run `git rev-parse HEAD` and use THAT as Task 14's BASE** — not `d02ce46`. The
+docs-only commit on top is exactly the trap that made session 53 re-derive Task 13's
+base; the review package needs the true HEAD or it truncates the task.
 
-Session 52 executed Task 12 end to end (dispatch → gate → review → one fix round →
-re-review → complete) and took Task 13 to **ruled-and-ready**.
+Session 53 executed Task 13 end to end (dispatch → gate → review → one fix round →
+gate → re-review → complete). Zero production lines, as ruled.
 
-**NEXT ACTION: dispatch the Task 13 IMPLEMENTER. Its brief is already generated AND
-pre-flighted AND ruled on — do NOT redo any of that.** Everything it needs is on disk:
+**NEXT ACTION: generate the Task 14 brief, then PRE-FLIGHT it before dispatching.**
+Neither exists yet — Task 13's were done in advance, Task 14's are not.
 
-- `task-13-brief.md` (requirements) — 252 lines
-- `task-13-overrides.md` (**SUPERSEDES the brief**; carries sofo's ruling F and
-  every controller ruling)
-- `task-13-preflight.md` (the evidence: **5 BLOCKER, 14 CORRECTION, 3 DESIGN
-  QUESTION**; it BUILT the alternative seam and MEASURED the brief's numbers rather
-  than reasoning about them)
+```
+<skill>/scripts/task-brief docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md 14
+```
+where `<skill>` = `/Users/sofo/.claude/plugins/cache/claude-plugins-official/superpowers/6.2.0/skills/subagent-driven-development`
 
-Dispatch on Opus 5 with all three ABSOLUTE paths, the report file
-`task-13-report.md` named as the authoritative channel (**the return channel has
-dropped subagents' final messages repeatedly — the FILE is the record**), and
-**BASE = `00bbd94`**.
+**The pre-flight has paid for itself on every single task of this plan.** Do not skip
+it: every brief here has conflicted with the repo, and Task 13's pre-flight deleted an
+entire production-code step that rested on a factually false claim.
 
-### The three things Task 13 must not get wrong
+### >>> WHAT TASK 14 OWNS THAT NOTHING ELSE DOES <<<
 
-1. **>>> STEP 3 IS DELETED — TASK 13 ADDS ZERO PRODUCTION LINES. <<<** The brief
-   builds a production fault-injection seam (`Params.AllowFaultInjection`,
-   `faultBefore` in three statements) and justifies it with a claim that is
-   FACTUALLY FALSE ("the pool type is concrete throughout"). The seam is a
-   `pgx.QueryTracer`, it ALREADY EXISTS as `queryFaults`
-   (`internal/runs/testutil_integration_test.go:21-94`), six tests use it, and the
-   pre-flight drove all five crash cases with it. Move it to `platform/testdb` (one
-   copy, not two); the six existing tests staying green is the falsifier.
-2. **The brief's `wantPushes: 1` is MEASURABLY WRONG** — 8 in the post-push case,
-   2 in the push-receipt case, because `CrashAfterPush` is sticky and `p.pushes++`
-   fires before the flag is read. `CreatedCount()` is 1 in all five: assert the
-   property, not the traffic.
-3. **The intent-crash test's `countAuthorizations(valid) == 1` is UNOBSERVABLE**
-   (measured 0 — `publish_not_started`'s `{0,0,0}` schedule requeues faster than a
-   poller can read). Give the fault a stable window, then falsify the test by moving
-   the consume out of the intent's transaction and showing it go RED.
+1. **`task backend:test:runner` HAS NOT BEEN RUN FOR SEVERAL TASKS.** It is NOT part
+   of `backend:ci` and `scripts/gate` does not assert it. Task 14 must gate on it.
+   **Expect an unpleasant surprise there** — it is the least-exercised lane on the
+   branch, and the plan's Global Constraints say a regression in it is a real one.
+2. **The `gate_note` → `lineageInto` carry-forward** (sofo's ruling, session 52). The
+   one path nothing exercises end to end: a `gate_note` reaching the runner's real
+   staging as `1-gate_note.json`. It was moved OFF Task 13 because `lineageInto` is
+   runner-side and the golden set wires the fake executor. Task 14 owns it by name.
+3. Split `backend/internal/runs/store/schema_integration_test.go` — it still holds
+   that package's only bootstrap (`seedRun`, `seedRunWith`, `seedRunWithAuthorization`,
+   `mustInsertPhase`, `mustInsertArtifactAt`) under a "schema" name while carrying
+   behavioural tests.
 
-### Where the deferred work went — do not lose these
+### Task 13's two carry-forwards into the WHOLE-BRANCH REVIEW (not into Task 14)
 
-- **sofo ruled: the `gate_note` → `lineageInto` carry-forward MOVES TO TASK 14.**
-  The ledger claimed since Task 6 that the golden set was its natural home; the
-  pre-flight falsified that (`lineageInto` is runner-side, the golden set wires the
-  fake executor). **Task 13 does NOT touch the runner lane.** Task 14 owns it and
-  should gate on `task backend:test:runner`, which is NOT in `backend:ci` and has
-  not been run for several tasks.
-- **Task 11's cut run-projection tests (C13/C14) land in Task 13** — they were cut
-  on the promise that its fixture drives the identical arc, and the pre-flight
-  verified it does. The brief never mentions them.
+- **W1 — a pre-existing test is a SURVIVOR.**
+  `TestPublish_CrashAfterPRCreateAdoptsTheExistingPullRequest`
+  (`publish_integration_test.go:626`, **Task 9's file**) PASSES with `CrashAfterPR`
+  turned into a no-op. Its sibling push test kills the same mutation. As of `d02ce46`
+  the golden set's own table pins that window, but the service-level test does not.
+  **Mutate BOTH when reviewing, not just the one named here.**
+- **Important 2, PARKED BY sofo's RULING:** `newGoldenEnv` duplicates ~55 lines of
+  the seed test's world-staging. Deferred because Task 13's job is clean acceptance
+  evidence and `TestGoldenSet_MonthOneLoopThroughRealRoutes` is the ONLY cover for the
+  synthetic patch shape (`fake/executor.go:150-163`), which it gets precisely by NOT
+  wiring a remote. The reviewer's remedy — a helper taking (document, wire-remote
+  flag, members) — is in `task-13-review.md` finding 2. Triage it at merge.
+- The double `gate.decided` emission (`gates.go:265`) is RECORDED, not fixed: the
+  golden set pins 3 events against 2 audit rows with a comment saying Task 13 records
+  rather than endorses it. Whether a distinct kind (`gate.authorized`?) is more honest
+  is the whole-branch review's call.
 
 ### Method reminders that cost session 52 time
 
@@ -2524,6 +2526,113 @@ Task 13: pre-flight CONFIRMED CORRECT (do not second-guess): artifact counts
   `PKG=./internal/app/ task backend:test:integration -- -run 'TestGoldenSet' -v`
   (the brief's `-race` is doubled by the lane; the missing `PKG` spins a Postgres per
   package). Expect NINE `--- PASS` lines.
+Task 13: IMPLEMENTER DISPATCHED (session 53, Opus 5, agent `impl-task-13` — name came
+  back un-suffixed, no collision). **BASE = `f5dab73`** (real HEAD, not `00bbd94`: the
+  ledger-snapshot commit sits on top and the review package needs the true base).
+  Dispatched with all three absolute paths, overrides named as BINDING over the brief,
+  and `task-13-report.md` named as the authoritative channel.
+Task 13: implementer DONE — 4 commits `f5dab73`..`f400152`, tree clean.
+  `81c098d` moves `queryFaults` → `internal/platform/testdb/faults.go` (exported
+  `testdb.QueryFaults`, `//go:build integration || runnerintegration`), `c5a873d` the
+  golden set, `fd9a6b1` a gofumpt fix, `f400152` self-review additions.
+  **ZERO production Go lines** — the diff is `_test.go` files plus that one new platform
+  test-only file. 920 insertions / 107 deletions across 5 files.
+Task 13: **GATE PASS at `f400152`** — controller-run `./scripts/gate`, 9 lanes,
+  `buildinfo.Commit=f400152` stamped, contracts clean, tree clean. Not taken on the
+  implementer's report.
+Task 13: the implementer's own first `backend:ci` came back **exit 201 on
+  `backend:fmt:check`** (gofumpt wanted the crash case table exploded) — fixed in
+  `fd9a6b1`. Recording it: that is exactly the lane a hand-picked test list misses.
+Task 13: eight mutations reported (M1-M8), including **mutant S14 discharged** —
+  `orchestrator.go:1182` generation → 1 kills `FullConveyor` via the approval inbox never
+  showing a generation-2 gate. The S14 ledger line is `progress.md:2697`, NOT the `:2632`
+  the brief cites (that is a different Task 11 entry).
+Task 13: **the pre-flight's DESIGN QUESTION 3 remedy was itself a survivor** — the one
+  block in that document that was recommended rather than measured. Asserting
+  `publish.pr_opened == 1` measures **0** in the two PR-adjacent crash cases, because
+  `publish.go:915-917` emits `publish.adopted` on a recovered attempt. Replaced with a
+  count of events carrying `pr_number`. The standing lesson, landing again.
+Task 13: REVIEWER DISPATCHED (Opus 5, agent `review-task-13`, un-suffixed) with the
+  overrides named as binding, the `PKG=` targeted-run form, and an explicit mandate to
+  RUN and MUTATE rather than verify by reading.
+Task 13: REVIEW = spec ✅ / quality **NEEDS FIXES** (`task-13-review.md`). 0 Critical,
+  2 Important, 5 Minor. The reviewer independently reproduced M1, M2 and M3 from the
+  implementer's table (same failure text, same line numbers) and confirmed §4's
+  survivor finding. It left the tree clean at `f400152`.
+  **Important 1 — the one that matters. Two of the five crash cases pass with the crash
+  injection DISABLED**, measured: turning `fake/forge.go:230` and `fake/publisher.go:162`
+  into no-ops leaves `post-push` and `post-pr-create` GREEN. The `fired` predicate exists
+  by its own comment to prevent exactly this, and it does the job for the three
+  query-fault cases (`Fired()` is a true counter) but NOT for the two sticky-switch cases:
+  `PushCount() >= 1` / `CreateAttemptCount() >= 1` count the EFFECT, and both increment
+  before the crash flag is read. Nothing else in the case body separates the two worlds.
+  Remedy is MEASURED not prescribed: a per-case `wantAdopted` asserting `publish.adopted`
+  (>=1 in the four cases that reach the forge, 0 for `pre-db-commit-on-intent`).
+  **Important 2 — PARKED BY sofo's RULING (2026-08-09).** `newGoldenEnv` duplicates ~55
+  lines of the seed test's world-staging. Ruling: DEFER. Task 13's job is clean acceptance
+  evidence, and `TestGoldenSet_MonthOneLoopThroughRealRoutes` is the ONLY cover for the
+  synthetic patch shape (`fake/executor.go:150-163`), which it gets precisely by NOT
+  wiring a remote. The reviewer's remedy (a helper taking document + wire-remote flag +
+  members) is recorded for the whole-branch review to triage. Both agents split on this
+  and both routed it upward; the ruling went the implementer's way.
+Task 13: minor (deferred): `wantCreates`/`wantPRs` are `1,1` in all five rows — constants
+  pretending to be data; folded into the fix dispatch as optional.
+Task 13: minor (deferred): the uniform `time.Sleep(1100ms)` is load-bearing only in
+  `post-push` (M2 reproduces there alone) and costs ~4.4s across the other four. Kept
+  deliberately as insurance if another case becomes sticky. Cost is now a known one.
+Task 13: >>> **W1 — ROUTED TO THE WHOLE-BRANCH REVIEW, NOT TASK 13's TO FIX.** <<<
+  The pre-existing `TestPublish_CrashAfterPRCreateAdoptsTheExistingPullRequest`
+  (`publish_integration_test.go:626`, **Task 9's file**) SURVIVES the same no-op mutation —
+  it passes with `CrashAfterPR` doing nothing. Its sibling push test kills it. So the
+  post-PR-create window is currently pinned by **NOTHING IN THE REPOSITORY**: neither the
+  service-level test nor the golden set's case notices if the crash stops happening.
+  This is a live example of the plan's own lesson — a guard tested only green asserts
+  nothing. Whoever runs the final review: mutate BOTH, not just the one named here.
+Task 13: FIX ROUND 1/5 DISPATCHED — resumed `impl-task-13` (rounds 1-3 resume the
+  original implementer; its context is intact). Sent Important 1 + three one-line minors,
+  with the parked item and W1 explicitly marked do-not-touch. Acceptance criterion stated
+  as the mutation, not the green suite: all five cases must go RED when the injection is
+  disabled.
+Task 13: fix round 1/5 — 1 Important addressed + 4 minors, commit `d02ce46` (still ZERO
+  production lines). `wantCreates`/`wantPRs` dropped for literals; the struct's earning
+  field is now `wantAdopted int` = `1,1,1,1,0`. The `fired` comment now says out loud
+  that it is a PROXY for the two sticky switches and names `wantAdopted` as the real
+  discriminator. Minors 4/5/6 all fixed in code (`delete(q.fired, name)` on both arm
+  paths; `countAudit` documented as database-wide with what would break it;
+  `OpenPRCount() == 1` added to the full-conveyor test).
+Task 13: **the implementer improved on the prescribed remedy in two ways.** (a) It
+  strengthened the reviewer's `bool` (">= 1") to an exact `int`, measured stable over
+  three consecutive runs — an exact count is a strictly better falsifier. (b) **It noticed
+  the reviewer's mutation only exercises TWO of the five rows** and added M10 (disabling
+  the `QueryFaults` seam in `testdb/faults.go`) so the other three are shown to die on
+  `fired` too. M9 → `post-push` + `post-pr-create` FAIL on `publish.adopted = 0, want 1`;
+  M10 → the three query-fault cases FAIL on the firing guard. Every row now dies when its
+  OWN injection is disabled — which is the property the round was opened for, and it took
+  two mutations to cover, not one.
+Task 13: **GATE PASS at `d02ce46`** — controller-run, 9 lanes, `Commit=d02ce46` stamped,
+  contracts clean. Second gate of this task; both taken by the controller, neither on a
+  report.
+Task 13: SCOPED RE-REVIEW DISPATCHED (Fable 5 — one-commit 11.6KB fix diff, mid tier per
+  model selection; agent `rereview-task-13`, un-suffixed) over `f400152`..`d02ce46`, with
+  the parked finding explicitly OUT of scope, M9 named as the check to re-run, and the
+  bool→int strengthening flagged for an explicit soundness verdict.
+Task 13: RE-REVIEW = **all findings addressed, no new Critical/Important breakage**
+  (`task-13-rereview.md`). It re-ran M9 itself rather than reading the claim — 2 FAIL on
+  the new assertion, 3 PASS, matching the report line-for-line — verified both lines
+  matched before editing, reverted, tree clean. All three minors verdicted ADDRESSED.
+Task 13: the re-reviewer upgraded the exact-count justification from empirical to
+  **structural**: both adopted events are written in the same transaction as their
+  stage's receipt (`publish.go:728-755`, `:919-940`), so a crashed attempt rolls its
+  event back with the receipt; the receipt is fenced (`n == 0` → `errIntentAdvanced`), so
+  each stage records at most once; sticky retries error out before the receipt tx and
+  cannot inflate the count. The only path to a different number is a lease takeover, which
+  this fixture does not stage. So exact-1 has no flake surface AND catches a double-emit
+  regression that `>= 1` would not. Worth keeping as a method note: "measured stable three
+  times" is weaker evidence than an argument from the transaction boundary.
+Task 13: >>> **COMPLETE** (commits `f5dab73`..`d02ce46`, 5 commits, review clean after one
+  fix round, 1 Important PARKED BY USER RULING). <<< Gated by the controller at BOTH heads
+  it passed through (`f400152`, `d02ce46`), never on an implementer's report. ZERO
+  production lines. The parked item and W1 both carry forward to the whole-branch review.
 
 ## Task 11 — The HTTP surface (BASE `e892288` — COMPLETE, session 51)
 
