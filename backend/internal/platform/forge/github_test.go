@@ -301,6 +301,73 @@ func TestGitHub_FindPullRequestsFollowsEveryPage(t *testing.T) {
 	}
 }
 
+// RFC 8288 leaves the quotes optional around a rel value and lets one link
+// carry several relations. GitHub itself writes rel="next", but a GitHub
+// Enterprise install or a proxy in front of one may not, and matching the
+// quoted spelling literally fails SILENTLY: the loop stops at page one,
+// FindPullRequests reports no pull request on a branch that has one, and
+// openPublication opens a second against a single-use approval.
+func TestGitHub_FindPullRequestsFollowsEveryLegalSpellingOfRelNext(t *testing.T) {
+	spellings := map[string]string{
+		"unquoted":           `; rel=next`,
+		"a relation list":    `; rel="prev next"`,
+		"a trailing charset": `; rel="next"; type="application/json"`,
+		"unusual capitals":   `; REL=NEXT`,
+		"space after the ;":  `;  rel=next`,
+	}
+	for name, param := range spellings {
+		t.Run(name, func(t *testing.T) {
+			var srv *httptest.Server
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Query().Get("page") {
+				case "", "1":
+					w.Header().Set("Link", `<`+srv.URL+`/repos/acme/widgets/pulls?page=2>`+param)
+					_, _ = io.WriteString(w, `[{"number":1,"state":"closed","head":{"sha":"a"},"base":{"ref":"main"}}]`)
+				case "2":
+					_, _ = io.WriteString(w, `[{"number":2,"state":"open","head":{"sha":"b"},"base":{"ref":"main"}}]`)
+				default:
+					t.Errorf("page %q requested after the last one", r.URL.Query().Get("page"))
+					_, _ = io.WriteString(w, `[]`)
+				}
+			}))
+			defer srv.Close()
+
+			c := forge.NewGitHub(srv.URL, srv.Client())
+			got, err := c.FindPullRequests(context.Background(), forge.Repo{Slug: "acme/widgets"}, forge.Auth{Token: "t"}, "caesar/abc")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 2 {
+				t.Fatalf("candidates = %+v, want both pages: a truncated listing reads as "+
+					"'no pull request on this branch' and recovery opens a second one", got)
+			}
+		})
+	}
+}
+
+// The other direction: a link that is not a next relation must not be followed,
+// or the loop would chase the FIRST page forever.
+func TestGitHub_FindPullRequestsIgnoresRelationsThatAreNotNext(t *testing.T) {
+	var requests int
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Link", `<`+srv.URL+`/repos/acme/widgets/pulls?page=1>; rel=prev, `+
+			`<`+srv.URL+`/repos/acme/widgets/pulls?page=9>; rel="nextish"`)
+		_, _ = io.WriteString(w, `[{"number":1,"state":"open","head":{"sha":"a"},"base":{"ref":"main"}}]`)
+	}))
+	defer srv.Close()
+
+	c := forge.NewGitHub(srv.URL, srv.Client())
+	got, err := c.FindPullRequests(context.Background(), forge.Repo{Slug: "acme/widgets"}, forge.Auth{Token: "t"}, "caesar/abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 || len(got) != 1 {
+		t.Fatalf("issued %d requests for %d candidates, want 1 and 1: only rel=next ends a listing", requests, len(got))
+	}
+}
+
 func TestGitHub_FindPullRequestsRefusesRatherThanTruncateAtTheCap(t *testing.T) {
 	// A server that advertises a next page forever must not spin a worker — but
 	// stopping quietly at the cap would be worse than spinning. A partial

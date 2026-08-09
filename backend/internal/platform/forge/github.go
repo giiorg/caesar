@@ -162,6 +162,15 @@ func (g *GitHub) FindPullRequests(ctx context.Context, repo Repo, auth Auth, hea
 // GitHub paginates by this header rather than by a page count, and following
 // it is the only termination condition that does not depend on guessing how
 // the server treats an out-of-range page.
+//
+// The rel value is parsed rather than string-matched against `rel="next"`,
+// because RFC 8288 lets a server write it UNQUOTED (rel=next) and lets one
+// link carry several relations (rel="next prev"). Both are legal, GitHub
+// Enterprise and proxies in front of it do emit them, and missing one is not a
+// loud failure: the loop would stop early, FindPullRequests would report no
+// pull request on a branch that has one, and openPublication would then open a
+// second. Silent truncation is the worst shape this bug could take, so the
+// parse is permissive about form and strict about meaning.
 func nextLink(header string) string {
 	for _, link := range strings.Split(header, ",") {
 		parts := strings.Split(link, ";")
@@ -173,8 +182,16 @@ func nextLink(header string) string {
 			continue
 		}
 		for _, param := range parts[1:] {
-			if strings.EqualFold(strings.TrimSpace(param), `rel="next"`) {
-				return target[1 : len(target)-1]
+			name, value, ok := strings.Cut(param, "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(name), "rel") {
+				continue
+			}
+			// Quotes are optional around the value and the value may be a
+			// space-separated relation list.
+			for _, rel := range strings.Fields(strings.Trim(strings.TrimSpace(value), `"`)) {
+				if strings.EqualFold(rel, "next") {
+					return target[1 : len(target)-1]
+				}
 			}
 		}
 	}
