@@ -200,6 +200,55 @@ func TestOrchestrator_WallDeadlineStillKillsAWaitingRun(t *testing.T) {
 	if gate := phaseByNode(t, phases, "gate"); gate.Status != runs.PhaseSuperseded {
 		t.Errorf("the waiting gate must be superseded with the run, got %s", gate.Status)
 	}
+	// The sweep's own terminal event, and the audit row that goes with it.
+	//
+	// terminalizeRun writes a SECOND run.finished audit emission, distinct
+	// from the one finishRunTx writes on the ordinary evaluation path; the
+	// golden set only ever exercises the latter. Deleting the emission here
+	// left both this lane and the app lane green, so this is the assertion
+	// that makes the sweep's audit falsifiable: a run can die without a
+	// human touching it, and that death still has to be attributable.
+	if n := countEvents(t, svc, run.ID, runs.EventRunDead); n != 1 {
+		t.Errorf("run.dead events = %d, want 1", n)
+	}
+	// Scoped to THIS run's subject — an action-only count would pass on any
+	// run.finished row in the database.
+	if n := scalarCount(t, f,
+		`SELECT count(*) FROM audit_entries WHERE action = 'run.finished' AND subject_id = $1`,
+		run.ID.String()); n != 1 {
+		t.Fatalf("run.finished audit rows for the expired run = %d, want exactly 1", n)
+	}
+	var (
+		actor       uuid.NullUUID
+		subjectKind string
+		status      string
+		class, code string
+	)
+	// coalesce so a MISSING key fails the assertion below with its own
+	// message rather than a scan error that says nothing about the audit.
+	if err := f.pool.QueryRow(ctx, `
+		SELECT actor_user_id, subject_kind,
+		       coalesce(detail->>'status', ''),
+		       coalesce(detail->'outcome'->>'class', ''),
+		       coalesce(detail->'outcome'->>'code', '')
+		  FROM audit_entries WHERE action = 'run.finished' AND subject_id = $1`,
+		run.ID.String(),
+	).Scan(&actor, &subjectKind, &status, &class, &code); err != nil {
+		t.Fatalf("read the run.finished audit detail: %v", err)
+	}
+	if actor.Valid {
+		t.Errorf("run.finished actor = %s, want NULL: the wall-clock sweep is the system, not a user", actor.UUID)
+	}
+	if subjectKind != "run" {
+		t.Errorf("run.finished subject_kind = %q, want run", subjectKind)
+	}
+	if status != string(runs.RunDead) {
+		t.Errorf("run.finished detail status = %q, want %q", status, runs.RunDead)
+	}
+	if class != string(runs.OutcomePermanent) || code != runs.CodeWallDeadlineExceeded {
+		t.Errorf("run.finished detail outcome = %q/%q, want %q/%q — the audit has to say WHY the run died",
+			class, code, runs.OutcomePermanent, runs.CodeWallDeadlineExceeded)
+	}
 }
 
 // generationBumper moves the run to generation 2 from inside one attempt —
