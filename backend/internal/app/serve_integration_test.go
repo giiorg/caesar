@@ -102,10 +102,30 @@ func TestRunServe_RefusesToBootOnAnUnusablePublishWorkDir(t *testing.T) {
 	cfg.Database.URL = testdb.NewURL(t)
 	cfg.Security.MasterKey = "dev:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 	cfg.Forge.PublishWorkDir = filepath.Join(blocker, "publish")
+	// A bootable orchestrator block on purpose: without it a build that skipped
+	// the refusal would die on a zero poll interval, and this test would read as
+	// passing for a reason that has nothing to do with the work dir.
+	cfg.Orchestrator = config.Orchestrator{
+		Workers:           2,
+		PollInterval:      config.Duration(50 * time.Millisecond),
+		LeaseTTL:          config.Duration(30 * time.Second),
+		HeartbeatInterval: config.Duration(10 * time.Second),
+		OutboxRetention:   config.Duration(168 * time.Hour),
+	}
 
-	err := runServe(context.Background(), cfg, discard())
-	if err == nil || !strings.Contains(err.Error(), "publish work dir") {
-		t.Fatalf("runServe = %v, want a boot refusal naming the publish work dir", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runServe(ctx, cfg, discard()) }()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "publish work dir") {
+			t.Fatalf("runServe = %v, want a boot refusal naming the publish work dir", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("runServe went on serving with a work dir it cannot create: a misconfiguration " +
+			"has to be caught at boot, not at the first publication")
 	}
 }
 
