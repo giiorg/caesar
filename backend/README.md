@@ -996,11 +996,12 @@ and opens a real pull request.
    - a pull request exists whose **base is the repo's default branch**
      (not merely "some open PR on that head") and whose number and URL
      match `pr_number` / `pr_url` on the run's publication projection.
-6. **The two halting answers, at the publish step.** `publishError`
+6. **The two broken-world cases, at the publish step.** `publishError`
    (`internal/app/runsports.go`) turns `forge.ErrUnauthorized` into
    `auth_expired` and `forge.ErrNotFound` into `repo_unavailable`; which
    HTTP answer each forge actually gives is the invented half, and this
-   is the risk row 08 is open for.
+   is the risk row 08 is open for. One of these two reaches a halt and
+   one does not — knowing which is part of what the run records.
 
    **The ordering is what makes the step work, so follow it exactly.**
    Both conditions are also visible at *intake*, which resolves the head
@@ -1011,38 +1012,58 @@ and opens a real pull request.
    no run exists, and the publish-step mapping is never reached. So
    break it *after* the gate instead:
 
-   - **Credential dead.** Take a fresh task to the gate with a
-     **working** token (step 2, stopping short of the approve in step 4),
-     then revoke or expire the token on the forge, then approve. The publication is what meets the
-     dead credential: the decision and the intent's creation are both
+   - **Credential dead — reaches the halting arm.** Take a fresh task to
+     the gate with a **working** token (step 2, stopping short of the
+     approve in step 4), then revoke or expire the token on the forge,
+     then approve. The decision and the intent's creation are both
      database-only transactions, and the intent pins `credential_id`, so
-     the first thing to present the token afterwards is the push itself,
-     presenting the revoked one.
-   - **Repository gone.** Same ordering, another fresh task — reach the
-     gate, then rename or delete the repo without updating its caesar
-     registration, then approve. The intent pins `repo_slug`, so the publication addresses
-     the name the approval used.
+     the first thing to present the revoked token is the publication's
+     **recovery probe** — `BranchHead`, one call before the push it
+     guards. Expect a `halted` intent with a `halt_reason`, a
+     `publish.halted` event, and no retrying to the wall deadline.
+     **Record what the forge actually answered**, because that is the
+     invented part: only a 401-shaped answer reaches `auth_expired`. If
+     the forge answers 404 to a probe it will not authorize, the client
+     folds that into "no branch" and the run walks into the clone and
+     the transient case below instead — which is itself the finding.
+   - **Repository gone — does NOT reach the halting arm, and that is the
+     point of running it.** Same ordering, another fresh task: reach the
+     gate, then rename or delete the repo, then approve. The intent pins
+     `repo_slug` so the publication does address the vanished name — but
+     the probe's 404 is folded to "no branch", the clone then fails, and
+     `gitops` types a failed clone transient `forge_unavailable` because
+     it genuinely cannot tell a deleted repository from a network fault.
+     So expect a retrying `forge_unavailable`, not a halt. **Record that
+     observation on row 08**: it is a real gap between what decision 14
+     documents and what this route can reach.
 
    For each, record where it fails — task creation, or the run — and with
-   which code. Neither may retry to the wall deadline, and a failure
-   reached after an intent exists must leave `halt_reason` on the run's
-   publication projection and a `publish.halted` event.
+   which code, plus `halt_reason` and the `publish.halted` event where a
+   halt did occur.
 
    Optionally record the **intake** behaviour of the same two conditions
    as a separate case (break the condition first, then create the task).
    It is worth writing down, but it does not stand in for the above:
    `intakeError` and `publishError` are two different tables, and only
    the second one leaves a branch on the forge when it is wrong.
-7. **Record what the forges actually said.** If either forge's status
-   codes or error bodies map differently than `runsports.go` assumes,
-   fix the mapping and its `httptest` fixtures and commit that as its own
-   change — then row 08 closes.
+7. **Record what the forges actually said, then close the row.** If
+   either forge's status codes or error bodies map differently than
+   `runsports.go` assumes, fix the mapping and its `httptest` fixtures
+   and commit that as its own change. Row 08 closes on **what this
+   checklist can reach**: every response shape on the happy path, and
+   the halting arm the credential-dead case lands on.
 
-Step 6 is the one with teeth. A miss there is not cosmetic: a
-`repo_unavailable` that presents as `forge_unavailable` retries a
-vanished repository until the wall deadline with a pushed branch sitting
-orphaned behind it, and an `auth_expired` that presents as transient does
-the same.
+**One arm this checklist cannot reach, stated plainly rather than papered
+over.** `repo_unavailable` fires on `OpenPullRequest` and
+`FindPullRequests`, i.e. only once an intent is already `pushed` — so
+observing it means deleting the repository inside the push→PR-open
+window, which no manual procedure can hit reliably. Decision 14 is not
+false; it is narrower in *reach* than a reader would assume. That arm
+stays invented after the smoke run, and it carries the failure this
+checklist was written for: a `repo_unavailable` that presents as
+`forge_unavailable` retries a vanished repository until the wall deadline
+with a pushed branch sitting orphaned behind it. It is a named residual
+on this plan, not a reason to keep row 08 open forever.
 
 ## Contracts
 
