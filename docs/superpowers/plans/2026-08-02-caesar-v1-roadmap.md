@@ -50,9 +50,15 @@ smoke checklist** in `backend/README.md` — one throwaway repo per forge, one
 task through a gate to an approve, then the branch, the four `caesar-*`
 trailers, the committer identity and the pull request's base verified by eye,
 plus the credential-dead halt observed at the publication's recovery probe.
-One arm is out of a manual run's reach: `repo_unavailable` fires only once an
-intent is already `pushed`, so it stays a named residual on the plan rather
-than holding this row open. The row's *Milestone: month-one loop
+That halt is now reached by **both** shapes a forge is likely to give a dead
+or de-scoped token: a 401 and a 403 carrying no rate-limit signal both
+classify `auth_expired` at `BranchHead`, one call before the push.
+One arm is out of a manual run's reach **as the code stands**:
+`repo_unavailable` fires only once an intent is already `pushed`, so it stays
+a named residual on the plan rather than holding this row open. Read that
+narrowly — the arm is unreachable because `BranchHead`'s 404 is *folded* into
+"no branch", which is a choice, not a law; one `GET /repos/{slug}` on the 404
+path would put it at the first probe and back within a checklist's reach. The row's *Milestone: month-one loop
 complete via API* claim rides on that same evidence: nothing here is verified
 until the checklist runs and its result is committed.
 
