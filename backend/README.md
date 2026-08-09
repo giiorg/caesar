@@ -256,9 +256,30 @@ default deploy refuses to fake a phase result rather than pretending to
 run one. Since Plan 08 wired the real forge, that flag is the only thing
 left in the way — intake accepts gates and publishes, so flipping one
 boolean gives the runner real work, on a host that already has the
-Docker daemon, the built images and the writable data root the flag has
-always needed — `buildRunner` failing any of those is a boot error, not
-a degraded start. In prod, network isolation must not rest on Docker
+Docker daemon, the built images and a writable data root.
+
+**Boot verifies exactly one of those three, so check the host yourself
+before flipping the flag.** `buildRunner` creates the five `data_root`
+subdirectories at 0700 and fails the boot if it cannot, and `runner.New`
+refuses to start as root, without both image references configured, or
+with a log flood threshold below the per-stream cap. Nothing contacts
+the daemon: `dockerapi.New` only builds an `http.Client` over the socket
+path (`Client.Ping` exists and has no caller outside its own test), and
+the images are never looked for at boot — they are resolved per attempt.
+
+A wrong host therefore does not refuse to start. It fails the first
+attempt of every phase, typed and **transient**, which means the run
+retries it to `attempts_exhausted` instead of stopping at it:
+
+- **Daemon unreachable, or an image absent and unpullable** —
+  `resolveImage` (inspect, pull once, inspect again) yields transient
+  `image_unavailable`, naming the reference.
+- **`data_root` present but not writable by this process** — `Execute`'s
+  first `MkdirAll` yields transient `internal_error` beginning
+  `create attempt dir`. (`AdmitClaim`'s statfs does not catch this: an
+  unwritable directory still answers statfs.)
+
+In prod, network isolation must not rest on Docker
 alone: the host firewall must deny the agent subnets everything except
 the gateway (baseline in the Plan 14 deployment runbook).
 
