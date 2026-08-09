@@ -24,11 +24,24 @@ CI. Fix the code, never the rule.
     task backend:test:integration  # real postgres via testcontainers
     task backend:test:property     # rapid property tests (pinned seed; RAPID_SEED=0 randomizes)
     task backend:fuzz              # fuzz targets, FUZZTIME each (default 2m)
-    task ci                        # exactly what CI runs
+    task ci                        # backend:ci + contracts:check + secrets + lint:actions
+
+`task ci` is **not** the whole of CI. `.github/workflows/ci.yml` also runs a
+separate `runner` job (`task image:build` then `task backend:test:runner`,
+30-minute timeout because it is the expensive one), and `ci-ok` — the single
+required status check — needs it. Locally that lane is covered by
+`scripts/gate`, not by `task ci`, so a branch can be `task ci`-green and red
+in the required check.
 
 Nightly CI runs both the property and fuzz lanes for longer and with a
 randomized seed (`RAPID_SEED=0`, extended `RAPID_CHECKS`/`FUZZTIME`); PR CI
-runs them pinned and short.
+runs them pinned and short. Those knobs — plus `PKG` — are go-task variables,
+so pass them **inline** (`PKG=./internal/runs/ task backend:test`) and never
+export them: go-task reads them from the environment too, so an exported one
+silently narrows every lane that follows it in the same shell. `scripts/gate`
+unsets `PKG`, `RAPID_SEED`, `RAPID_CHECKS`, `FUZZTIME` and `GOFLAGS` for
+exactly that reason, prints each one it drops, and then asserts the resolved
+command of each lane rather than its name.
 
 ## Config
 
@@ -510,7 +523,12 @@ cap window does not wake every parked attempt at once, capped.
 
 The real ceiling is the run's wall deadline: eligibility that would land past it
 terminalizes the run immediately instead of parking a row that can never legally
-run.
+run. The run's published outcome for that death is **permanent**, carrying the
+waiting code that caused the park (`rate_limited`, `credential_busy`) and no
+`retry_at` — the wait's own transient class would have told every reader of
+`GET /runs/{id}` to expect a retry that cannot come, since no sweep revisits a
+failed run. The two publish codes are exempt from this refusal by design and do
+park past the deadline; `ListExpiredRunIDs` settles those.
 
 ### Redaction, and the withhold
 
@@ -749,6 +767,18 @@ a parallel graph leaves the run `running` while its sibling executes,
 and the run parks when the sibling finishes. `syncWaiting` moves the run
 in both directions so the two callers cannot drift.
 
+**Two gates may also be open at the same instant** — `validateConsumption`
+constrains a gate's inputs, never how many gates a run may hold open — and
+deciding one of them does not strand the other. A decision materializes
+nothing itself (all successor materialization lives in `materializeReady`),
+so what releases an approval's successors is the janitor's
+`ListRunsAwaitingMaterialization` pass. Its anti-join deliberately does
+**not** exclude runs holding a `waiting_decision` phase: a waiting gate is
+precisely what no worker can claim, and excluding it meant the sibling
+gate hid the run from the pass that would have materialized what the
+approval released — leaving the run idle to its wall deadline with the
+sibling gate undecidable forever.
+
 `GET /api/v1/approvals` is the inbox — unbounded by design at V1, since
 the waiting set is the size of a human's attention, not of the run
 history. `POST /api/v1/runs/{id}/gates/{node}/decision` is the door: it
@@ -842,14 +872,28 @@ counts are checked, and a driver that loses the CAS reloads and adopts
 the winner's row rather than failing the run.
 
 While an intent is `pending` or `pushed`, every error leaving the publish
-path is transient and **uncharged**. That is an invariant, not a
-tendency: no sweep revisits a failed run, so one charged failure here
-would make an orphaned branch permanent.
+path is transient and **uncharged**; a permanent answer only leaves after
+it has **settled** the intent, halting it with a reason on the row. Both
+halves are an invariant, not a tendency: no sweep revisits a failed run,
+so one charged failure here would make an orphaned branch permanent, and
+a permanent that left the intent `pending` would leave that branch with
+nothing on the record saying what happened to it.
 
 The marker is deterministic — `caesar/<approved-artifact-id>`, from a
 uuidv7 unique per node per generation, so recovery reconstructs it from
 the authorization row alone and a new generation necessarily gets a new
 branch. Human readability lives in the PR title, not the ref.
+
+**Known gap, reachable now that parallel gates are.** The marker is a
+function of the approved *artifact*, not of the publish node. A legal
+definition where two gates examine the **same** patch and each authorizes
+its own publish therefore produces two intents on one branch name, and
+the second loses `publish_intents_marker_key` as a permanent
+`publish_conflict`. Whether the marker should include the publish node id
+is an open design question — changing it would rename every publication's
+branch — so it is recorded rather than guessed at, at `parallelGateDoc`
+in `orchestrator_gates_integration_test.go`. That fixture forks at the
+implement nodes, which is why it does not hit this.
 
 **Ownership is proved by rebuilding the commit, never by observing a
 sha.** Recovery reconstructs the commit it would push and compares shas,
@@ -876,25 +920,37 @@ Five outcome codes classify a forge answer, and three of them **halt**:
 | `push_rejected` | transient | the expected-remote-SHA precondition failed — the remote moved, or the network blinked |
 | `forge_unavailable` | transient | the API could not be reached, or refused transiently (a 403 that carries rate-limit signals is throttling, not "forbidden") |
 | `publish_conflict` | permanent, **halts** | a marker exists in a state we cannot prove is ours |
-| `auth_expired` | permanent, **halts** | the forge rejected the repository's credential; somebody must issue a new token |
+| `auth_expired` | permanent, **halts** | the forge rejected the repository's credential (401), or refuses to let it do this (a 403 carrying no rate-limit signal — an under-scoped token, SAML enforcement, an archived repo); somebody must reissue or re-authorize it |
 | `repo_unavailable` | permanent, **halts** | the forge will not show the repository at all — deleted, renamed, or no longer visible to this token |
 
-`haltsPublication` in `internal/runs/publish.go` is the single authority
-on that set. The three halt for one reason: each leaves something of ours
-half-done on the forge that no retry can finish, so the intent becomes
-`halted` and a human reconciles. Everything else is an ordinary transient,
-or a permanent the run is entitled to die on because nothing of ours is
-left behind it. Recovery never guesses.
+`maybeHalt` in `internal/runs/publish.go` is the single authority, and it
+decides on the **class**, not on a list of codes: any permanent answer
+that reaches it with a live intent settles the row. It once held an
+allow-list of exactly those three codes, and that shape was fail-open by
+construction — `gitops` types nine permanent exits (eight
+`invalid_output`, one `base_sha_unavailable`) and not one of them was on
+the list, so each returned raw and left a `pending` intent with a NULL
+`halt_reason` behind a run nothing would revisit. The question this
+position forces is not "is this a person's problem?" but "must this
+publication's row be closed?", and with a live intent that answer is
+always yes. The three above are still the ones an operator meets most
+often and the ones worth knowing by sight — but they halt because they
+are permanent, not because they are listed. Everything else is an
+ordinary transient. Recovery never guesses.
 
 **Where a halting answer arrives bounds which ones you will ever see.**
 A publication's *first* forge call is the recovery probe: `pushPublication`
 asks `BranchHead` before it pushes anything, and routes the answer through
-`maybeHalt`, so a credential the forge rejects halts there — one call
-before the push it guards, with a `halt_reason` for whoever must reissue
-the token. But the platform clients deliberately fold a 404 on that probe
+`maybeHalt`, so a credential the forge rejects **or refuses** halts there
+— 401 and a non-throttling 403 alike, one call before the push it guards,
+with a `halt_reason` for whoever must reissue or re-authorize the token.
+But the platform clients fold a 404 on that probe
 into "no branch" rather than an error, because absence is recovery's
-*answer* and not its failure. A repository that has vanished is therefore
-not distinguished at the probe: the publication proceeds to the clone,
+*answer* and not its failure. That fold is a **choice**, not a constraint:
+`github.go` folds `ErrNotFound` alone, and one `GET /repos/{slug}` on the
+404 path would separate "the branch is not there" from "the repository is
+not there". Until something does, a repository that has vanished is not
+distinguished at the probe: the publication proceeds to the clone,
 which cannot tell a deleted repository from a network fault and types
 itself transient `forge_unavailable`. `repo_unavailable` is reached on
 `OpenPullRequest` and `FindPullRequests` instead — once an intent is
@@ -1056,10 +1112,12 @@ and opens a real pull request.
      guards. Expect a `halted` intent with a `halt_reason`, a
      `publish.halted` event, and no retrying to the wall deadline.
      **Record what the forge actually answered**, because that is the
-     invented part: only a 401-shaped answer reaches `auth_expired`. If
-     the forge answers 404 to a probe it will not authorize, the client
-     folds that into "no branch" and the run walks into the clone and
-     the transient case below instead — which is itself the finding.
+     invented part. A **401 and a 403 that carries no rate-limit signal
+     both reach `auth_expired`** at the probe, so the two shapes a forge
+     is most likely to give a dead or de-scoped token both land on the
+     halting arm. A **404** does not: the client folds it into "no
+     branch", and the run walks into the clone and the transient case
+     below instead — which is itself the finding.
    - **Repository gone — does NOT reach the halting arm, and that is the
      point of running it.** Same ordering, another fresh task: reach the
      gate, then rename or delete the repo, then approve. The intent pins
@@ -1087,17 +1145,26 @@ and opens a real pull request.
    checklist can reach**: every response shape on the happy path, and
    the halting arm the credential-dead case lands on.
 
-**One arm this checklist cannot reach, stated plainly rather than papered
-over.** `repo_unavailable` fires on `OpenPullRequest` and
-`FindPullRequests`, i.e. only once an intent is already `pushed` — so
-observing it means deleting the repository inside the push→PR-open
-window, which no manual procedure can hit reliably. Decision 14 is not
-false; it is narrower in *reach* than a reader would assume. That arm
-stays invented after the smoke run, and it carries the failure this
-checklist was written for: a `repo_unavailable` that presents as
-`forge_unavailable` retries a vanished repository until the wall deadline
-with a pushed branch sitting orphaned behind it. It is a named residual
-on this plan, not a reason to keep row 08 open forever.
+**One arm this checklist cannot reach as the code stands, stated plainly
+rather than papered over.** `repo_unavailable` fires on
+`OpenPullRequest` and `FindPullRequests`, i.e. only once an intent is
+already `pushed` — so observing it means deleting the repository inside
+the push→PR-open window, which no manual procedure can hit reliably.
+Decision 14 is not false; it is narrower in *reach* than a reader would
+assume.
+
+**That unreachability is a consequence of one choice, not a law.** The
+arm is out of reach only because `github.go` folds a repo-gone 404 on the
+recovery probe into "no branch". One `GET /repos/{slug}` on the 404 path
+separates the two, and then a deleted repository lands on
+`repo_unavailable` **at the first probe** — where an operator can stage it
+in a minute, before any branch is pushed. That is a follow-up, not part of
+this plan; what matters here is that the residual must not be read as
+"impossible to observe". Until it is taken, the arm stays invented, and it
+carries the failure this checklist was written for: a `repo_unavailable`
+that presents as `forge_unavailable` retries a vanished repository until
+the wall deadline with a pushed branch sitting orphaned behind it. It is a
+named residual on this plan, not a reason to keep row 08 open forever.
 
 ## Contracts
 
