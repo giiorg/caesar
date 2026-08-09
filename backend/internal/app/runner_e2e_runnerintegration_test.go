@@ -66,7 +66,7 @@ func (s scriptedResolver) HarnessSpec(ctx context.Context, id uuid.UUID) (runner
 // localBareGit stands in for the forge's clone URL: the remote is a bare repo
 // on this host, bind-mounted read-only into the stage container and cloned
 // over file://. Production appGitSource builds an HTTPS URL from the repo's
-// forge + slug (and self-hosted base URLs are Plan 08's); this local file://
+// forge + slug on the configured clone root; this local file://
 // path is the fake forge the runner suite also uses. The credential.used
 // audit row this test asserts is unaffected — it comes from the harness
 // credential the runner opens per attempt through the production adapter, not
