@@ -307,14 +307,29 @@ func intakeError(op string, repo runs.RepoRef, err error) error {
 // happened", which unchargedWhileUnfinished downgrades to an uncharged,
 // resumable retry bounded by the wall deadline.
 //
-// The three proven ones are each a human's problem rather than a retry:
+// The four proven ones are each a human's problem rather than a retry:
 //   - ErrConflict is the marker already carrying a request. publish_conflict is
 //     load-bearing beyond the halt — openPublication branches on that exact code
 //     to re-probe and adopt a request our own second driver opened.
 //   - ErrUnauthorized is a dead credential. auth_expired is the code an operator
 //     greps for; internal_error would bury a credential problem in a bug report.
+//   - ErrForbidden is a live credential the forge will not let act — an
+//     under-scoped token, an org enforcing SAML SSO, an archived repository.
+//     It shares auth_expired deliberately: no code in the vocabulary separates
+//     "the token is dead" from "the token is not allowed here", the operator's
+//     move is the same one in both cases (reissue or re-authorize the
+//     credential registered for this repository), and auth_expired is already
+//     the code the halt set, the README's table and the run detail view carry
+//     for it. What distinguishes them is the message, which quotes the forge's
+//     own words. The alternative — repo_unavailable — would be worse: it says
+//     the repository is gone, and here it demonstrably is not.
 //   - ErrNotFound is a repository the forge will not show us: deleted, renamed,
 //     or no longer visible to this token. Retrying cannot fix any of those.
+//
+// The thing to hold on to is that this arm is what keeps a permission failure
+// OUT of the default arm. A 403 returned as a plain error is transient
+// forge_unavailable, i.e. ~24 h of retries against a token that will never be
+// allowed, ending in a settlement that blames an expiry after the push.
 func publishError(op string, repo runs.RepoRef, err error) error {
 	permanent := func(code, msg string) error {
 		return runs.OutcomeError{Outcome: runs.Outcome{
@@ -342,6 +357,9 @@ func publishError(op string, repo runs.RepoRef, err error) error {
 	case errors.Is(err, forge.ErrUnauthorized):
 		return permanent(runs.CodeAuthExpired,
 			fmt.Sprintf("the forge rejected the credential registered for %q", repo.Slug))
+	case errors.Is(err, forge.ErrForbidden):
+		return permanent(runs.CodeAuthExpired,
+			fmt.Sprintf("the forge will not let the credential registered for %q do this", repo.Slug))
 	case errors.Is(err, forge.ErrNotFound):
 		return permanent(runs.CodeRepoUnavailable,
 			fmt.Sprintf("the forge will not show repository %q", repo.Slug))

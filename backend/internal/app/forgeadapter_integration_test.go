@@ -217,20 +217,46 @@ func TestForgeAdapter_RunPathFailuresAreTypedOutcomes(t *testing.T) {
 		code  int
 		class runs.OutcomeClass
 		want  string
+		// serve overrides the plain status handler where the ANSWER needs
+		// headers to mean what it means — which is the whole story for 403.
+		serve http.HandlerFunc
 	}{
-		{"a forge that is down", http.StatusServiceUnavailable, runs.OutcomeTransient, runs.CodeForgeUnavailable},
-		{"a request that already exists", http.StatusUnprocessableEntity, runs.OutcomePermanent, runs.CodePublishConflict},
-		{"a revoked credential", http.StatusUnauthorized, runs.OutcomePermanent, runs.CodeAuthExpired},
-		{"a repository the forge will not show", http.StatusNotFound, runs.OutcomePermanent, runs.CodeRepoUnavailable},
+		{name: "a forge that is down", code: http.StatusServiceUnavailable, class: runs.OutcomeTransient, want: runs.CodeForgeUnavailable},
+		{name: "a request that already exists", code: http.StatusUnprocessableEntity, class: runs.OutcomePermanent, want: runs.CodePublishConflict},
+		{name: "a revoked credential", code: http.StatusUnauthorized, class: runs.OutcomePermanent, want: runs.CodeAuthExpired},
+		{name: "a repository the forge will not show", code: http.StatusNotFound, class: runs.OutcomePermanent, want: runs.CodeRepoUnavailable},
+		// A 403 carrying no rate-limit signal is a permission answer: an
+		// under-scoped fine-grained PAT, an org enforcing SAML SSO, an archived
+		// repository. It has to be PERMANENT. Falling to the default arm below
+		// spends ~24 h of retries on a token that will never be allowed and then
+		// settles with an expiry story, on a branch that is already pushed.
+		{name: "a token the forge will not let act", code: http.StatusForbidden, class: runs.OutcomePermanent, want: runs.CodeAuthExpired},
+		// And the reason that arm cannot simply read the status code: GitHub
+		// signals both rate limits with 403 as well, and THAT one must stay a
+		// transient with a reset. The two rows together pin the ordering.
+		{
+			name: "a 403 that is throttling, not refusal", code: http.StatusForbidden,
+			class: runs.OutcomeTransient, want: runs.CodeForgeUnavailable,
+			serve: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-RateLimit-Remaining", "0")
+				w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(w, `{"message":"API rate limit exceeded"}`)
+			},
+		},
 		// The default arm, and the one that matters most: an answer nobody has
 		// taught this adapter to read must NOT be permanent. Permanent here
 		// terminalizes a run whose branch is already on the forge.
-		{"an answer we cannot classify", http.StatusTeapot, runs.OutcomeTransient, runs.CodeForgeUnavailable},
+		{name: "an answer we cannot classify", code: http.StatusTeapot, class: runs.OutcomeTransient, want: runs.CodeForgeUnavailable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			env := newForgeEnv(t)
-			fa := forgeServing(t, env, status(tt.code))
+			serve := tt.serve
+			if serve == nil {
+				serve = status(tt.code)
+			}
+			fa := forgeServing(t, env, serve)
 			_, err := fa.OpenPullRequest(env.ctx, env.repo, runs.PullRequestSpec{Head: "caesar/x", Base: "main"})
 			if err == nil {
 				t.Fatal("want an error")

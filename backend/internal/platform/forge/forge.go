@@ -35,6 +35,17 @@ var (
 	ErrConflict = errors.New("forge: conflict")
 	// ErrUnauthorized is a credential the forge will not accept.
 	ErrUnauthorized = errors.New("forge: unauthorized")
+	// ErrForbidden is a credential the forge accepts and then will not let
+	// act: an under-scoped fine-grained PAT, an org enforcing SAML SSO the
+	// token is not authorized for, an IP allow-list, or an archived
+	// repository. It is a SEPARATE sentinel from ErrUnauthorized because the
+	// two are separate answers, and it exists at all because a plain error
+	// here is read as "we could not see what happened" one layer up and
+	// retried to the wall deadline — which no permission failure survives.
+	//
+	// It is NOT throttling. classify runs the rate-limit probe first, because
+	// GitHub answers both a primary and a secondary rate limit with 403.
+	ErrForbidden = errors.New("forge: forbidden")
 )
 
 // retryable marks a transport or 5xx/429 failure. A caller asks with
@@ -255,8 +266,11 @@ func redact(s, token string) string {
 // with X-RateLimit-Remaining: 0, with Retry-After, or naming a secondary
 // limit is throttling, and falling through to the generic 4xx arm would turn
 // a few minutes of backoff into a failed run with a branch already pushed.
-// A 403 with none of those signals still lands permanent, which is what keeps
-// "the token cannot do this" from retrying to the wall deadline.
+// A 403 with none of those signals is ErrForbidden, and it is a sentinel for
+// the same reason ErrUnauthorized is: the composition root types anything it
+// does not recognise as a transient, so a permission failure returned as a
+// plain error retries to the wall deadline and then reports itself as an
+// expiry after the branch was already pushed.
 //
 // The body is read for its message but never echoed past a bounded prefix,
 // and the token is scrubbed from it: an error here lands in a run event and
@@ -271,6 +285,12 @@ func classify(op string, resp *http.Response, body []byte, token string, now tim
 		return fmt.Errorf("%s: %w", op, ErrNotFound)
 	case resp.StatusCode == http.StatusUnauthorized:
 		return fmt.Errorf("%s: %w", op, ErrUnauthorized)
+	// Reached only when rateLimited declined it above. The forge's own words
+	// travel with it — "Resource protected by organization SAML enforcement",
+	// "Repository was archived so is read-only" — because they are the whole
+	// diagnosis for whoever has to fix the token or the repository.
+	case resp.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("%s: %w: %s", op, ErrForbidden, msg)
 	case resp.StatusCode == http.StatusUnprocessableEntity, resp.StatusCode == http.StatusConflict:
 		return fmt.Errorf("%s: %w: %s", op, ErrConflict, msg)
 	case resp.StatusCode >= 500:

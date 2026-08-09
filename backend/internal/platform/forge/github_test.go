@@ -128,6 +128,12 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 		body         string
 		wantRetry    bool
 		wantConflict bool
+		// wantForbidden is the 403 that is NOT throttling. It has to be a
+		// sentinel rather than a plain error, because app/runsports.go's
+		// default arm types anything it cannot recognise as a TRANSIENT
+		// forge_unavailable — so an unscoped token would retry to the wall
+		// deadline and then report "expired after pushing".
+		wantForbidden bool
 		// wantAt is set where the forge states an ABSOLUTE reset, which can be
 		// compared to a constant.
 		wantAt time.Time
@@ -143,8 +149,12 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 		// primary and secondary rate limits are documented to answer 403 or
 		// 429. Treating every 403 as permanent turns a few minutes of
 		// throttling into a failed run with a branch already on the forge —
-		// and re-requesting immediately makes a secondary limit worse.
-		{name: "forbidden, no rate signal", status: http.StatusForbidden, wantRetry: false},
+		// and re-requesting immediately makes a secondary limit worse. The
+		// other half of that rule is this row: a 403 with none of those
+		// signals is a permission answer — an under-scoped fine-grained PAT,
+		// an org enforcing SAML SSO, an archived repository — and no number of
+		// retries turns any of those into a push.
+		{name: "forbidden, no rate signal", status: http.StatusForbidden, wantRetry: false, wantForbidden: true},
 		{
 			name: "primary limit as 403", status: http.StatusForbidden, wantRetry: true,
 			headers: map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1893456000"},
@@ -189,6 +199,13 @@ func TestGitHub_ErrorsAreClassifiedForRetry(t *testing.T) {
 			}
 			if got := errors.Is(err, forge.ErrConflict); got != c.wantConflict {
 				t.Errorf("conflict = %v, want %v", got, c.wantConflict)
+			}
+			// A 403 the rate-limit probe did not claim is a permission answer,
+			// and it must arrive as a sentinel. The two throttling 403s below
+			// assert the same field FALSE, which is what pins the ordering: the
+			// probe runs first, so a secondary limit never becomes "forbidden".
+			if got := errors.Is(err, forge.ErrForbidden); got != c.wantForbidden {
+				t.Errorf("forbidden = %v, want %v", got, c.wantForbidden)
 			}
 			// A stated reset must survive as an instant, not just as "retryable":
 			// it is the difference between backing off blind and waiting exactly
