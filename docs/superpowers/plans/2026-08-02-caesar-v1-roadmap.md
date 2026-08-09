@@ -22,7 +22,7 @@ The V1 spec covers one system but many subsystems. Per the writing-plans scope r
 | 05 | Execution spine | Tasks / runs / PhaseRun-as-queue (immutable attempt rows, claim CTE, leases, heartbeats, `reconciling`), commit-ordered RunEvents + counter row, outbox lifecycle, two clocks + transactional deadline predicates, minimal pinned PolicySnapshot, status enums + transition tables for spine entities. Deterministic fake harness + fake forge + local bare repos → **golden-set harness seed**. A run executes end-to-end against fakes. | **done** — 2026-08-03-caesar-05-execution-spine.md |
 | 06 | Docker runner & egress gateway | RunSpec, hardened per-attempt containers/networks/volumes, disk quotas + free-space watermark (mechanism pinned here), `caesar egress-proxy` (broker token format + per-provider operation allowlists pinned here; CONNECT allowlist), clone staging contract, hostile-`.git` extraction, validation containers, log caps, reconciliation against real Docker, runner integration suite incl. escape probes. | **done** — 2026-08-04-caesar-06-docker-runner.md |
 | 07 | Harness adapters & artifact flow | claude-code + codex adapters (harness image contents + per-harness FQDN allowlists pinned here), filesystem contract, typed outcome mapping, artifact lineage materialization. Subscription-first custody: materialized credentials, single-flight credential leases, delayed retry on cap hits, exact-value redaction with quarantined logs. Real agent produces a patch through the conveyor. | **implementation complete — smoke pending, provisional codex markers** — `2026-08-05-caesar-07-harness-drivers.md` |
-| 08 | Gates & publishing | Gate decisions (CAS + deadline predicate), single-use ApprovedPatch, `git-publish` effect state machine + deterministic markers + recovery, forge port + GitHub + GitLab adapters, commit/PR attribution format pinned here, publish status enums, golden-set crash injection around every publish step, **generations / revision rematerialization (moved from 07)**. **Milestone: month-one loop complete via API.** | pending |
+| 08 | Gates & publishing | Gate decisions (CAS + deadline predicate), single-use ApprovedPatch, `git-publish` effect state machine + deterministic markers + recovery, forge port + GitHub + GitLab adapters, commit/PR attribution format pinned here, publish status enums, golden-set crash injection around every publish step, **generations / revision rematerialization (moved from 07)**. **Milestone: month-one loop complete via API.** | **implementation complete — live-forge smoke pending** — `2026-08-07-caesar-08-gates-publishing.md` |
 | 09 | Policy engine & kill switch | Versioned baselines (exact policy JSON schema pinned here), tighten-only overrides, snapshot evaluation, durable kill switch with two-part fencing (control-plane lock sections + gateway-kill-first), autonomy-tier signals, budget/cost ceilings. | pending |
 | 10 | Realtime SSE | Single tailer (LISTEN/NOTIFY + slow-poll), in-memory fan-out, snapshot-then-deltas with watermark splice, `Last-Event-ID` resume, authorization-scoped streams, bounded per-subscriber queues. | pending |
 | 11 | Web foundation | Vite + React + TS strict scaffold, constitution enforced by Biome/CI, generated client + TanStack Query + SSE-into-cache wiring, typed form abstraction, OKLCH token theming (1 dark + 1 light), app shell + tabs. | pending |
@@ -36,6 +36,22 @@ Sequence is dependency-ordered but not rigid: 10 (SSE) can start any time after 
 **Two notes on row 07.** *Generations / revision rematerialization moved to Plan 08*: it needs gate decisions to exist before it can be built, and every other 07 deliverable landed without it. And 07 does **not** flip to done on green CI. Per its own gate, the plan's acceptance evidence is the manual smoke checklist in `backend/README.md` — run once by the operator against real subscriptions, because no CI lane may ever place a live subscription call. Until that runs and its evidence is committed, the codex exit-marker rows in `internal/runs/runner/driver.go` remain **invented** rather than recorded: the CI fixture speaks them, which proves the mapping engine and nothing about the CLI. If the real CLI speaks differently, cap hits charge as `harness_error` instead of parking and auth death stops failing fast. The row closes on that single item; it never closes silently.
 
 Those are the *miss* failures, and they are the mild ones. The two the smoke run structurally **cannot** close are the false-match failures, because it observes what a CLI prints and never what a model prints into the same stdout: an auth row that matches the agent's own prose is **permanent** and writes `last_auth_expired_at` onto a live, working credential, and an epoch the capture mis-reads (a millisecond timestamp read as seconds) yields a provider-stated reset that bypasses the retry cap by design and therefore **terminalizes a run that was owed a park**. Both rows were narrowed for precision *before* the run rather than after it.
+
+**One note on row 08.** It does not flip to done on green CI either, and for
+the same reason row 07 does not: its acceptance evidence is an operator event.
+Every forge assertion in the plan is against `httptest` servers and local bare
+repositories, and **no CI lane has ever made a live GitHub or GitLab call** —
+so the two adapters' response shapes and error mappings are invented in
+fixtures exactly as the codex exit markers were. If a forge answers
+differently, `repo_unavailable` can present as a `forge_unavailable` retry loop
+against a vanished repository with a pushed branch orphaned behind it, or
+`auth_expired` can stop failing fast. The row closes on the **manual forge
+smoke checklist** in `backend/README.md` — one throwaway repo per forge, one
+task through a gate to an approve, then the branch, the four `caesar-*`
+trailers, the committer identity and the pull request's base verified by eye,
+plus the two halting answers observed. The row's *Milestone: month-one loop
+complete via API* claim rides on that same evidence: nothing here is verified
+until the checklist runs and its result is committed.
 
 ## Where the spec's "left to the implementation plan" items land
 
