@@ -308,6 +308,74 @@ func TestConfig_RunnerDefaultsAndValidation(t *testing.T) {
 	})
 }
 
+func TestConfig_ForgeDefaultsAndValidation(t *testing.T) {
+	t.Run("defaults when block absent", func(t *testing.T) {
+		cfg, err := Load(writeFile(t, `{"database": {"url": "postgres://x"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The API host and the clone host are DIFFERENT for GitHub and the same
+		// for GitLab; getting that backwards is the silent self-hosted failure
+		// in miniature, so both pairs are pinned.
+		want := Forge{
+			GitHubBaseURL: "https://api.github.com", GitLabBaseURL: "https://gitlab.com",
+			GitHubCloneBaseURL: "https://github.com", GitLabCloneBaseURL: "https://gitlab.com",
+			PublishWorkDir: "/var/lib/caesar/publish", RequestTimeout: Duration(30 * time.Second),
+		}
+		if diff := cmp.Diff(want, cfg.Forge); diff != "" {
+			t.Errorf("forge defaults (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("a self-hosted base is honoured", func(t *testing.T) {
+		body := `{"database": {"url": "postgres://x"}, "forge": {` +
+			`"github_base_url": "https://ghe.example.com/api/v3", ` +
+			`"github_clone_base_url": "https://ghe.example.com"}}`
+		cfg, err := Load(writeFile(t, body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Forge.GitHubBaseURL != "https://ghe.example.com/api/v3" ||
+			cfg.Forge.GitHubCloneBaseURL != "https://ghe.example.com" {
+			t.Fatalf("forge = %+v, want the configured GHE pair", cfg.Forge)
+		}
+	})
+
+	t.Run("fails closed", func(t *testing.T) {
+		// Every one of these is silent without the check: a bad base URL is
+		// `retryable` to the forge client, so it becomes a transient
+		// forge_unavailable retried on the schedule until the run's wall
+		// deadline, with the cause buried in a run event.
+		tests := []struct{ name, block, wantErr string }{
+			{"no scheme", `{"github_base_url": "api.github.com"}`, "github_base_url"},
+			{"typo'd scheme", `{"github_base_url": "htps://api.github.com"}`, "github_base_url"},
+			{"no host", `{"gitlab_base_url": "https:///api"}`, "gitlab_base_url"},
+			{"empty base", `{"github_clone_base_url": ""}`, "github_clone_base_url"},
+			{"userinfo in a base", `{"gitlab_clone_base_url": "https://tok@gitlab.com"}`, "userinfo"},
+			{"relative work dir", `{"publish_work_dir": "publish"}`, "publish_work_dir"},
+			{"empty work dir", `{"publish_work_dir": ""}`, "publish_work_dir"},
+			{"zero timeout", `{"request_timeout": "0s"}`, "request_timeout"},
+			{"unknown key inside forge", `{"wat": 1}`, "unknown field"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				body := `{"database": {"url": "postgres://x"}, "forge": ` + tt.block + `}`
+				_, err := Load(writeFile(t, body))
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want mention of %q", err, tt.wantErr)
+				}
+			})
+		}
+	})
+
+	t.Run("http is allowed for a lab", func(t *testing.T) {
+		body := `{"database": {"url": "postgres://x"}, "forge": {"gitlab_base_url": "http://gitlab.lab"}}`
+		if _, err := Load(writeFile(t, body)); err != nil {
+			t.Fatalf("err = %v; an air-gapped forge over http is a real deployment", err)
+		}
+	})
+}
+
 func TestStageEnvFromProcess_ForwardsOnlyTheGitAuthKeysThatAreSet(t *testing.T) {
 	t.Setenv("GIT_CONFIG_COUNT", "1")
 	t.Setenv("GIT_CONFIG_KEY_0", "http.extraheader")

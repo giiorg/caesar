@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -77,6 +79,33 @@ func TestRunServe_BootsMigratesAndShutsDownOnCancel(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("runServe did not return after cancel")
+	}
+}
+
+// The publication work dir is materialized at BOOT, not lazily on the first
+// publication. Lazily is the tempting version and the wrong one: it hides a
+// misconfiguration until a run has already been approved and pushed, which is
+// the worst possible moment to discover it.
+//
+// A path whose parent is a regular file is a mkdir that cannot succeed, so this
+// asserts the boot-time refusal rather than a directory listing — the refusal is
+// the observable half, and it can only happen if the directory is made here.
+func TestRunServe_RefusesToBootOnAnUnusablePublishWorkDir(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{}
+	cfg.Server.Addr = "127.0.0.1:0"
+	cfg.Server.ShutdownTimeout = config.Duration(5 * time.Second)
+	cfg.Database.URL = testdb.NewURL(t)
+	cfg.Security.MasterKey = "dev:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	cfg.Forge.PublishWorkDir = filepath.Join(blocker, "publish")
+
+	err := runServe(context.Background(), cfg, discard())
+	if err == nil || !strings.Contains(err.Error(), "publish work dir") {
+		t.Fatalf("runServe = %v, want a boot refusal naming the publish work dir", err)
 	}
 }
 

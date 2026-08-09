@@ -96,27 +96,51 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, svc, svc, svc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, svc))...)
 
-	// The execution spine: real peer-context adapters, the honest
-	// not-implemented executor and forge until Plans 06/08. identity.Service
-	// serves as authenticator, authorizer, and grant source here too.
-	// Plan 12 replaces this with cfg.Forge.PublishWorkDir; until that config
-	// block exists, publications materialize under the system temp dir.
-	publisher := gitPublisher{assets: assetsSvc, workDir: os.TempDir()}
+	// The execution spine: real peer-context adapters and the real forge.
+	// identity.Service serves as authenticator, authorizer, and grant source
+	// here too.
+	//
+	// ONE endpoints value builds the forge adapter, the publisher and the
+	// runner's staging clone. Building it three times is how the API host and
+	// the clone host drift apart, which is the silent self-hosted failure: the
+	// run can read the repository and publishes nothing.
+	endpoints := forgeEndpoints{
+		GitHub: cfg.Forge.GitHubBaseURL, GitLab: cfg.Forge.GitLabBaseURL,
+		GitHubClone: cfg.Forge.GitHubCloneBaseURL, GitLabClone: cfg.Forge.GitLabCloneBaseURL,
+	}
+	forgeSvc := newForgeAdapter(assetsSvc, endpoints,
+		&http.Client{Timeout: cfg.Forge.RequestTimeout.Std()})
+
+	// config.Load validates publish_work_dir as a non-empty absolute path, so
+	// an empty one means this Config never went through Load — the shape the
+	// integration tests build by hand. Falling back keeps them booting without
+	// pinning a path they never asked for. The directory is made HERE, at boot,
+	// and not lazily on first publication: a work dir nobody can write is a
+	// misconfiguration, and discovering it at the first publication is
+	// discovering it at the worst possible moment.
+	workDir := cfg.Forge.PublishWorkDir
+	if workDir == "" {
+		workDir = os.TempDir()
+	}
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		return fmt.Errorf("serve: publish work dir: %w", err)
+	}
+	publisher := gitPublisher{assets: assetsSvc, workDir: workDir, endpoints: endpoints}
 
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		unavailableForge{}, publisher, principalSource{svc: svc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		forgeSvc, publisher, principalSource{svc: svc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc))...)
 
 	// Plan 06: the real Docker runner when configured. Disabled by default —
-	// production intake is refused until Plan 08's forge adapters, so the
+	// it needs a Docker daemon, built images and a writable data root, so the
 	// honest stub stays the default posture (stubs never fake success).
 	var executor runs.Executor = runs.NotImplementedExecutor{}
 	var admission runs.Admission = runs.AlwaysAdmit{}
 	runnerDone := make(chan struct{})
 	close(runnerDone) // no-op wait unless a runner replaces it below
 	if cfg.Runner.Enabled {
-		rnr, err := buildRunner(cfg.Runner, assetsSvc, runsSvc, log)
+		rnr, err := buildRunner(cfg.Runner, endpoints, assetsSvc, runsSvc, log)
 		if err != nil {
 			return fmt.Errorf("serve: runner: %w", err)
 		}

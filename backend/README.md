@@ -45,6 +45,22 @@ only:
   `caesar.dev.json`. `serve` and `admin rekey` require it; `migrate`
   and `admin bootstrap` do not.
 
+The `forge` block is how caesar reaches its code hosts, and it carries
+**two** endpoints per forge because they are genuinely different hosts:
+`github_base_url` (the API — `https://api.github.com`) and
+`github_clone_base_url` (where the repositories live —
+`https://github.com`), and the same pair for GitLab. Setting only the API
+base is the trap on a self-hosted install: every API call reaches the
+private instance while every clone and push still goes to the public
+site, which reads as "the run can see the repo but publishes nothing".
+`publish_work_dir` is where publication checkouts are materialized — one
+fresh subdirectory per publication, removed when it ends — and it
+defaults to `/var/lib/caesar/publish`, which a non-root developer cannot
+create, so `caesar.dev.json` points it at `/tmp/caesar-publish`.
+Every base is validated at load: it must parse, use `https` (or `http`
+for a lab), name a host, and carry no userinfo — a token belongs in a
+header, never in a URL.
+
 ## Migrations
 
 Desired state lives in `internal/platform/pg/schema.sql`. Author with

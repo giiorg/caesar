@@ -19,7 +19,7 @@ func TestBuildRunner_CreatesTheDataRootTree(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "data")
 	_, err := buildRunner(config.Runner{
 		DataRoot: root, CaesarImage: "caesar:dev", GitImage: "caesar-git:dev",
-	}, nil, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	}, forgeEndpoints{}, nil, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("buildRunner: %v", err)
 	}
@@ -37,21 +37,42 @@ func TestBuildRunner_CreatesTheDataRootTree(t *testing.T) {
 	}
 }
 
+// publicDefaults is what config ships, spelled out rather than read from
+// config.defaults(): a test that read the production defaults would keep
+// passing if somebody changed them.
+var publicDefaults = forgeEndpoints{
+	GitHub: "https://api.github.com", GitLab: "https://gitlab.com",
+	GitHubClone: "https://github.com", GitLabClone: "https://gitlab.com",
+}
+
 func TestCloneURL_BuildsHostedURLsAndRejectsUnknownForge(t *testing.T) {
 	tests := []struct {
 		name    string
+		eps     forgeEndpoints
 		forge   string
 		slug    string
 		want    string
 		wantErr bool
 	}{
-		{name: "github", forge: "github", slug: "acme/widgets", want: "https://github.com/acme/widgets.git"},
-		{name: "gitlab", forge: "gitlab", slug: "acme/widgets", want: "https://gitlab.com/acme/widgets.git"},
-		{name: "unknown forge errors", forge: "bitbucket", slug: "acme/widgets", wantErr: true},
+		{name: "github", eps: publicDefaults, forge: "github", slug: "acme/widgets", want: "https://github.com/acme/widgets.git"},
+		{name: "gitlab", eps: publicDefaults, forge: "gitlab", slug: "acme/widgets", want: "https://gitlab.com/acme/widgets.git"},
+		// A trailing slash on the configured base is an operator's honest
+		// spelling, and joining it naively would produce a double slash.
+		{
+			name:  "a trailing slash on the base is absorbed",
+			eps:   forgeEndpoints{GitHubClone: "https://github.com/"},
+			forge: "github", slug: "acme/widgets", want: "https://github.com/acme/widgets.git",
+		},
+		{name: "unknown forge errors", eps: publicDefaults, forge: "bitbucket", slug: "acme/widgets", wantErr: true},
+		// An unconfigured base must REFUSE, not emit "acme/widgets.git".
+		// gitops.checkCloneURL rejects only unparseable URLs and userinfo, so a
+		// relative path would sail through to `git clone` and fail far from
+		// the cause.
+		{name: "an unconfigured base errors", eps: forgeEndpoints{}, forge: "github", slug: "acme/widgets", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := cloneURL(tt.forge, tt.slug)
+			got, err := cloneURL(tt.eps, tt.forge, tt.slug)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("cloneURL(%q, %q) = %q, want error", tt.forge, tt.slug, got)
@@ -68,6 +89,25 @@ func TestCloneURL_BuildsHostedURLsAndRejectsUnknownForge(t *testing.T) {
 				t.Errorf("cloneURL(%q, %q) = %q, want %q", tt.forge, tt.slug, got, tt.want)
 			}
 		})
+	}
+}
+
+// The failure this guards is silent: API calls reach the self-hosted instance,
+// clone and push still reach github.com, and the run reads as "can see the
+// repo, publishes nothing".
+func TestCloneURL_FollowsTheConfiguredForgeAndNotThePublicHost(t *testing.T) {
+	got, err := cloneURL(forgeEndpoints{
+		GitHub:      "https://git.example.internal/api/v3",
+		GitHubClone: "https://git.example.internal",
+	}, "github", "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://git.example.internal/acme/widgets.git"; got != want {
+		t.Errorf("cloneURL = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "github.com") {
+		t.Error("a self-hosted run must not clone from the public host")
 	}
 }
 

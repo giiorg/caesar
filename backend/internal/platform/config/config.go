@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,6 +26,7 @@ type Config struct {
 	Security     Security     `json:"security"`
 	Orchestrator Orchestrator `json:"orchestrator"`
 	Runner       Runner       `json:"runner"`
+	Forge        Forge        `json:"forge"`
 }
 
 type Server struct {
@@ -64,8 +67,8 @@ type Orchestrator struct {
 }
 
 // Runner configures the Docker execution runner (Plan 06). It ships
-// disabled: production intake is refused until Plan 08's forge adapters, so
-// enabling it is an explicit operator act. Every byte/cpu/pids knob has a
+// disabled: it needs a Docker daemon, images and a writable data root on the
+// host, so enabling it is an explicit operator act. Every byte/cpu/pids knob has a
 // pinned default (plan Global Constraints); zero never means "unlimited".
 type Runner struct {
 	Enabled             bool     `json:"enabled"`
@@ -84,6 +87,34 @@ type Runner struct {
 	PidsLimit           int64    `json:"pids_limit"`
 	QuotaPollInterval   Duration `json:"quota_poll_interval"`
 	ConnectAllow        []string `json:"connect_allow"`
+}
+
+// Forge is how caesar reaches its code hosts. Base URLs are configurable so
+// self-hosted GitHub Enterprise and GitLab instances work without a code
+// change; the defaults are the public endpoints.
+//
+// There are TWO endpoints per forge and they are genuinely different hosts,
+// not one value used twice. GitHub's API lives at api.github.com while its
+// repositories live at github.com; a GitHub Enterprise install typically
+// serves both from one host under different paths. Configuring only the API
+// base is the trap: every API call would reach the self-hosted instance while
+// every clone and push still went to the public site, which reads as "the run
+// can see the repo but publishes nothing" and is miserable to diagnose.
+type Forge struct {
+	GitHubBaseURL string `json:"github_base_url"`
+	GitLabBaseURL string `json:"gitlab_base_url"`
+	// The HTTPS roots a clone URL is built on — what `cloneURL` in
+	// app/runnerports.go joins the repo slug onto, for both the staging clone
+	// and the publication checkout.
+	GitHubCloneBaseURL string `json:"github_clone_base_url"`
+	GitLabCloneBaseURL string `json:"gitlab_clone_base_url"`
+	// PublishWorkDir is where publication checkouts are materialized. Each
+	// publication gets a fresh subdirectory that is removed when it ends,
+	// so this only ever holds work in flight.
+	PublishWorkDir string `json:"publish_work_dir"`
+	// RequestTimeout bounds one forge API call. Unqualified: this struct
+	// lives in package config, so config.Duration would not compile.
+	RequestTimeout Duration `json:"request_timeout"`
 }
 
 // minRunnerPids floors pids_limit well above a shell + agent's needs so an
@@ -137,6 +168,14 @@ func defaults() Config {
 			FreeBytesWatermark:  Bytes(10 << 30),
 			PidsLimit:           512,
 			QuotaPollInterval:   Duration(2 * time.Second),
+		},
+		Forge: Forge{
+			GitHubBaseURL:      "https://api.github.com",
+			GitLabBaseURL:      "https://gitlab.com",
+			GitHubCloneBaseURL: "https://github.com",
+			GitLabCloneBaseURL: "https://gitlab.com",
+			PublishWorkDir:     "/var/lib/caesar/publish",
+			RequestTimeout:     Duration(30 * time.Second),
 		},
 	}
 }
@@ -208,6 +247,32 @@ func EgressProxyEnv() (string, error) {
 	return raw, nil
 }
 
+// forgeBaseProblems checks one forge base URL. `http` is allowed because a lab
+// or an air-gapped GitLab is a real deployment; userinfo is refused outright
+// because a credential in a base URL would ride into every request URL, and
+// from there into logs, reflogs and process listings — the exact leak the
+// token-as-header rule exists to prevent.
+func forgeBaseProblems(field, raw string) []string {
+	if raw == "" {
+		return []string{field + " must not be empty"}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return []string{fmt.Sprintf("%s %q is not a URL: %v", field, raw, err)}
+	}
+	var out []string
+	if u.Scheme != "https" && u.Scheme != "http" {
+		out = append(out, fmt.Sprintf("%s %q must use scheme https (or http for a lab)", field, raw))
+	}
+	if u.Host == "" {
+		out = append(out, fmt.Sprintf("%s %q has no host", field, raw))
+	}
+	if u.User != nil {
+		out = append(out, field+" must not carry userinfo: the forge token travels as a header, never in a URL")
+	}
+	return out
+}
+
 func (c Config) validate() error {
 	var problems []string
 	if c.Server.Addr == "" {
@@ -272,6 +337,24 @@ func (c Config) validate() error {
 	}
 	if c.Runner.PidsLimit > maxRunnerPids {
 		problems = append(problems, fmt.Sprintf("runner.pids_limit must be at most %d", maxRunnerPids))
+	}
+	// Forge: fail closed at boot, because the alternative is silent and slow.
+	// A base URL with a typo'd scheme is `retryable` to the forge client, so
+	// it becomes a transient forge_unavailable that is RETRIED on the schedule
+	// until the run's wall deadline, with the real cause buried in a run event.
+	problems = append(problems,
+		forgeBaseProblems("forge.github_base_url", c.Forge.GitHubBaseURL)...)
+	problems = append(problems,
+		forgeBaseProblems("forge.gitlab_base_url", c.Forge.GitLabBaseURL)...)
+	problems = append(problems,
+		forgeBaseProblems("forge.github_clone_base_url", c.Forge.GitHubCloneBaseURL)...)
+	problems = append(problems,
+		forgeBaseProblems("forge.gitlab_clone_base_url", c.Forge.GitLabCloneBaseURL)...)
+	if !filepath.IsAbs(c.Forge.PublishWorkDir) {
+		problems = append(problems, "forge.publish_work_dir must be a non-empty absolute path")
+	}
+	if c.Forge.RequestTimeout.Std() <= 0 {
+		problems = append(problems, "forge.request_timeout must be positive")
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
