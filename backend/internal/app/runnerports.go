@@ -253,6 +253,22 @@ type forgeEndpoints struct {
 	GitHubClone, GitLabClone string
 }
 
+// forgeEndpointsFrom is the whole config→wiring mapping, extracted so it can be
+// tested. Inline in runServe it was four assignments no test could observe, and
+// the mistake it invites is not a crash: putting an API base into a clone slot
+// compiles, boots, and sends every API call to the private instance while every
+// clone and push goes on reaching the public site. That is the failure the
+// config block, this type and the README all describe, and it has to be a
+// falsifiable claim rather than three paragraphs of prose.
+func forgeEndpointsFrom(f config.Forge) forgeEndpoints {
+	return forgeEndpoints{
+		GitHub:      f.GitHubBaseURL,
+		GitLab:      f.GitLabBaseURL,
+		GitHubClone: f.GitHubCloneBaseURL,
+		GitLabClone: f.GitLabCloneBaseURL,
+	}
+}
+
 // cloneURL builds the HTTPS clone URL for a forge/slug pair from the CONFIGURED
 // clone roots. Kept pure (no credential, no assets) so the github/gitlab switch
 // is unit-testable on its own.

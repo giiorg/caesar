@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/giiorg/caesar/backend/internal/platform/config"
 )
 
@@ -43,6 +45,83 @@ func TestBuildRunner_CreatesTheDataRootTree(t *testing.T) {
 var publicDefaults = forgeEndpoints{
 	GitHub: "https://api.github.com", GitLab: "https://gitlab.com",
 	GitHubClone: "https://github.com", GitLabClone: "https://gitlab.com",
+}
+
+// The config→wiring mapping, and the one assertion that matters is that the
+// API slot and the clone slot do NOT hold the same value for GitHub.
+//
+// Swapping the two compiles and boots. Every API call then reaches the
+// self-hosted instance while every clone and push still goes to the public
+// site, which reads as "the run can see the repository and publishes nothing" —
+// the failure the config doc, the forgeEndpoints doc and the README all
+// describe and which nothing observed until this test.
+func TestForgeEndpointsFrom_KeepsTheAPIHostAndTheCloneHostApart(t *testing.T) {
+	tests := []struct {
+		name string
+		in   config.Forge
+		want forgeEndpoints
+	}{
+		{
+			name: "the shipped defaults",
+			in: config.Forge{
+				GitHubBaseURL: "https://api.github.com", GitLabBaseURL: "https://gitlab.com",
+				GitHubCloneBaseURL: "https://github.com", GitLabCloneBaseURL: "https://gitlab.com",
+			},
+			want: forgeEndpoints{
+				GitHub: "https://api.github.com", GitLab: "https://gitlab.com",
+				GitHubClone: "https://github.com", GitLabClone: "https://gitlab.com",
+			},
+		},
+		{
+			// A GitHub Enterprise install: one host, two different paths. The
+			// slots still must not be crossed.
+			name: "a self-hosted pair",
+			in: config.Forge{
+				GitHubBaseURL: "https://ghe.example.com/api/v3", GitLabBaseURL: "https://gitlab.lab/api",
+				GitHubCloneBaseURL: "https://ghe.example.com", GitLabCloneBaseURL: "https://gitlab.lab",
+			},
+			want: forgeEndpoints{
+				GitHub: "https://ghe.example.com/api/v3", GitLab: "https://gitlab.lab/api",
+				GitHubClone: "https://ghe.example.com", GitLabClone: "https://gitlab.lab",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := forgeEndpointsFrom(tt.in)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("forgeEndpointsFrom (-want +got):\n%s", diff)
+			}
+			if got.GitHub == got.GitHubClone {
+				t.Error("the GitHub API base and the GitHub clone base are the same value: " +
+					"a crossed slot sends API calls to one server and pushes to another")
+			}
+		})
+	}
+}
+
+// And the mapping is fed by what config.Load actually produces, not by a
+// hand-built struct: the defaults are the values a deployment that configures
+// nothing runs on.
+func TestForgeEndpointsFrom_ReadsTheLoadedDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "caesar.json")
+	if err := os.WriteFile(path, []byte(`{"database": {"url": "postgres://x"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := forgeEndpointsFrom(cfg.Forge)
+	if got.GitHub != "https://api.github.com" {
+		t.Errorf("GitHub API base = %q, want https://api.github.com", got.GitHub)
+	}
+	if got.GitHubClone != "https://github.com" {
+		t.Errorf("GitHub clone base = %q, want https://github.com", got.GitHubClone)
+	}
+	if got.GitLab != "https://gitlab.com" || got.GitLabClone != "https://gitlab.com" {
+		t.Errorf("GitLab pair = (%q, %q), want both https://gitlab.com", got.GitLab, got.GitLabClone)
+	}
 }
 
 func TestCloneURL_BuildsHostedURLsAndRejectsUnknownForge(t *testing.T) {

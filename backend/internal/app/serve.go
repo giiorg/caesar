@@ -104,10 +104,7 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	// runner's staging clone. Building it three times is how the API host and
 	// the clone host drift apart, which is the silent self-hosted failure: the
 	// run can read the repository and publishes nothing.
-	endpoints := forgeEndpoints{
-		GitHub: cfg.Forge.GitHubBaseURL, GitLab: cfg.Forge.GitLabBaseURL,
-		GitHubClone: cfg.Forge.GitHubCloneBaseURL, GitLabClone: cfg.Forge.GitLabCloneBaseURL,
-	}
+	endpoints := forgeEndpointsFrom(cfg.Forge)
 	forgeSvc := newForgeAdapter(assetsSvc, endpoints,
 		&http.Client{Timeout: cfg.Forge.RequestTimeout.Std()})
 
