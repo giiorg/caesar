@@ -330,6 +330,9 @@ func (h *harness) createTaskInRepo(t *testing.T, token string, repoID uuid.UUID,
 const (
 	stagedTreeHash     = "1111111111111111111111111111111111111111"
 	supersededTreeHash = "2222222222222222222222222222222222222222"
+	// liveGateAttempt is the attempt ordinal stageGate gives the WAITING gate.
+	// It is deliberately not equal to that gate's generation — see stageGate.
+	liveGateAttempt = 3
 )
 
 // gateStamps is what stageGate wrote and what the projections have to carry
@@ -460,7 +463,19 @@ func (h *harness) stageGate(t *testing.T, task runsapi.TaskResponse) (uuid.UUID,
 	// continues rather than restarting — see MaxAttemptForNode.
 	st.livePatchID = patch(3, 2, 20, stagedTreeHash).String()
 	phase("impl", "succeeded", 3, 2, 20, at(15))
-	liveGate := phase("gate", "waiting_decision", 2, 2, 10, nil)
+	// The live gate is staged at attempt 3, generation 2, and the gap is
+	// deliberate.
+	//
+	// A gate is materialized once per generation from generation 1, so in every
+	// run this system can actually produce a gate's attempt EQUALS its
+	// generation — which means the inbox DTO could transpose the two columns
+	// and nothing would ever see it. The transposition is the whole risk this
+	// row exists to catch, so the fixture forces the divergence rather than
+	// modelling a run, exactly as the service-level guard does when it forces
+	// generation 3 against attempt 1 (gates_integration_test.go). This file
+	// stages rows directly for precisely this kind of question; the conveyor
+	// that produces them for real is the golden set.
+	liveGate := phase("gate", "waiting_decision", liveGateAttempt, 2, 10, nil)
 	if err := h.pool.QueryRow(ctx,
 		`SELECT created_at FROM phase_runs WHERE id = $1`, liveGate).Scan(&st.waitingSince); err != nil {
 		t.Fatal(err)
@@ -984,13 +999,15 @@ func TestAPI_ApprovalsInboxIsScopedToGrants(t *testing.T) {
 
 	t.Run("an entry carries everything a list view renders", func(t *testing.T) {
 		got := onlyRun(t, "approver-tok", runA)
-		// Attempt and generation are 2, and that is the point of staging a spent
-		// revision round: at 1 they are indistinguishable from a hardcoded 1,
+		// Attempt and generation are both past 1 and DIFFERENT from each other,
+		// which is the point of staging a spent revision round and of the gap
+		// stageGate forces. At 1 they are indistinguishable from a hardcoded 1,
 		// from the run's first generation, and from a column read off the wrong
-		// row. The waiting entry must be the SECOND gate attempt.
+		// row; equal to each other, they are indistinguishable from each other,
+		// and a DTO that transposed them would satisfy every assertion here.
 		want := runsapi.ApprovalResponse{
 			RunID: runA.String(), TaskID: taskA.ID, ProjectID: h.projectID.String(),
-			TaskTitle: "gate on A", NodeID: "gate", Attempt: 2, Generation: 2,
+			TaskTitle: "gate on A", NodeID: "gate", Attempt: 3, Generation: 2,
 			RequesterID: h.approver.UserID.String(), WaitingSince: got.WaitingSince,
 		}
 		if got != want {
@@ -1083,7 +1100,7 @@ func TestAPI_RunProjectionCarriesTheGateFields(t *testing.T) {
 		if run.Generation != 2 {
 			t.Errorf("run generation = %d, want 2", run.Generation)
 		}
-		if g := phaseAt(t, run, "gate", 2).Generation; g != 2 {
+		if g := phaseAt(t, run, "gate", liveGateAttempt).Generation; g != 2 {
 			t.Errorf("live gate phase generation = %d, want 2", g)
 		}
 		if g := phaseAt(t, run, "gate", 1).Generation; g != 1 {
@@ -1106,7 +1123,7 @@ func TestAPI_RunProjectionCarriesTheGateFields(t *testing.T) {
 	})
 
 	t.Run("the decided gate phase carries who decided and what they examined", func(t *testing.T) {
-		gate := phaseAt(t, run, "gate", 2)
+		gate := phaseAt(t, run, "gate", liveGateAttempt)
 		if gate.Decision == nil {
 			t.Fatal("the decided gate phase carries no decision")
 		}
@@ -1135,7 +1152,7 @@ func TestAPI_RunProjectionCarriesTheGateFields(t *testing.T) {
 	// and everything below still has a decision to find — it just has the wrong
 	// one. Asserting the two verdicts differ is what makes that observable.
 	t.Run("each gate attempt carries the verdict given on it and no other", func(t *testing.T) {
-		live, prior := phaseAt(t, run, "gate", 2), phaseAt(t, run, "gate", 1)
+		live, prior := phaseAt(t, run, "gate", liveGateAttempt), phaseAt(t, run, "gate", 1)
 		if live.Decision == nil || prior.Decision == nil {
 			t.Fatalf("both gate attempts must carry their own decision: live=%+v prior=%+v",
 				live.Decision, prior.Decision)
@@ -1239,7 +1256,7 @@ func TestAPI_RunProjectionCarriesTheGateFields(t *testing.T) {
 			runsapi.GateDecisionRequest{Decision: "approve"}); resp.StatusCode != http.StatusOK {
 			t.Fatalf("self-approval = %d, want 200", resp.StatusCode)
 		}
-		gate := phaseAt(t, getRun(t, ownRun), "gate", 2)
+		gate := phaseAt(t, getRun(t, ownRun), "gate", liveGateAttempt)
 		if gate.Decision == nil || !gate.Decision.SelfApproval {
 			t.Errorf("decision = %+v, want self_approval true", gate.Decision)
 		}

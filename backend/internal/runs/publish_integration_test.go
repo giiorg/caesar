@@ -619,6 +619,21 @@ func TestPublish_AChangedRequesterAddressStillAdoptsTheBranch(t *testing.T) {
 	p.approve(t, "gate")
 	waitForPushCount(t, p.publisher(), 1, 30*time.Second)
 
+	// Wait for the crash to be EVALUATED — a successor row — before stopping.
+	//
+	// Without this the injection does no work and the test passes for the
+	// wrong reason: waitForPushCount returns while the first attempt is still
+	// inside PushPatch, and p.stop() below cancels the context its receipt
+	// transaction runs on, which recreates the very window CrashAfterPush was
+	// armed to create. Verified: the whole test survived a no-op CrashAfterPush
+	// on that route. The successor row proves the attempt reached
+	// evaluateFailure with the branch pushed and no receipt.
+	waitForPhaseAttempt(t, p.f, p.run.ID, "publish", 2, 45*time.Second)
+	if got := intentRow(t, p.f, p.run.ID, "publish").Status; got != "pending" {
+		t.Fatalf("intent status = %q, want pending: the crash must leave the receipt unwritten, or "+
+			"the adopt path below is never entered", got)
+	}
+
 	// A restart with a cold plan cache AND a moved address: either alone
 	// leaves a cached value in place.
 	p.stop()
@@ -902,12 +917,19 @@ func TestPublish_TransientForgeFailureResumesWithoutRePushing(t *testing.T) {
 
 // The push leg of unchargedWhileUnfinished, which nothing else can reach.
 //
-// Every other publisher injection is already uncharged before it arrives —
-// HangBeforePush yields publish_not_started, CrashAfterPush yields
-// publish_resumable — so only a CHARGEABLE transient out of the push asks
-// whether the downgrade happens at that call site. push_rejected is that
-// outcome: max_attempts is 3, so charged, two rejections plus one more failure
-// exhaust the node and terminalize a run whose branch may already be pushed.
+// Every other publisher injection arrives UNCHARGEABLE, so none of them can
+// ask whether the downgrade happens at this call site: the fake answers
+// publish_not_started for a cancelled HangBeforePush and publish_resumable for
+// CrashAfterPush (fake/publisher.go), and Chargeable() is already false for
+// both. (What the RUN then records is publish_resumable either way —
+// unchargedWhileUnfinished rewrites the non-start too, deliberately, so a
+// pre-flight failure that says "nothing began" cannot requeue with no delay
+// when something has. That rewrite is not what this test is about.)
+//
+// Only a CHARGEABLE transient out of the push asks the question. push_rejected
+// is that outcome: max_attempts is 3, so charged, two rejections plus one more
+// failure exhaust the node and terminalize a run whose branch may already be
+// pushed.
 func TestPublish_ARejectedPushDoesNotExhaustTheNode(t *testing.T) {
 	p := publicationAtItsGate(t, gatedConveyorDoc())
 	p.publisher().FailPushTimes(2, runs.CodePushRejected)

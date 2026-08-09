@@ -35,9 +35,14 @@ func TestApprovedPatches_OneLiveAuthorizationPerPublishNode(t *testing.T) {
 	if err == nil {
 		t.Fatal("a second LIVE authorization for the same publish node must be refused: the token is single-use")
 	}
+	// The CONSTRAINT, not just the SQLSTATE — as the sibling below already
+	// does. There are three unique constraints reachable from this insert, so
+	// 23505 alone cannot tell "a second live authorization was refused" from a
+	// duplicate id or a repeated decision, and this test would keep passing
+	// after the partial index it is named for was dropped.
 	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
-		t.Fatalf("want unique violation, got %v", err)
+	if !errors.As(err, &pgErr) || pgErr.ConstraintName != "approved_patches_live_key" {
+		t.Fatalf("want a violation of approved_patches_live_key, got %v", err)
 	}
 
 	// Invalidating the first makes room for the next generation's.
