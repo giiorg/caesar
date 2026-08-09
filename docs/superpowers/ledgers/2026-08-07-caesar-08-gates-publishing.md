@@ -3,42 +3,67 @@
 
 ## >>> RESUME HERE (fresh session, 2026-08-09 — written by session 53) <<<
 
-**Tasks 1-13 COMPLETE, all gated and reviewed clean. TWO tasks remain (14-15).**
-**Task 13's last code commit is `d02ce46`, gate GREEN there. HEAD carries one
-docs-only commit on top (the tracked ledger snapshot). Tree clean.**
-**Run `git rev-parse HEAD` and use THAT as Task 14's BASE** — not `d02ce46`. The
+**Tasks 1-14 COMPLETE, all gated and reviewed clean. ONE task remains (15), then the
+WHOLE-BRANCH REVIEW.**
+**Task 14's last code commit is `06c9afe`, gate GREEN there AND the runner lane green.
+HEAD carries one docs-only commit on top (the tracked ledger snapshot). Tree clean.**
+**Run `git rev-parse HEAD` and use THAT as Task 15's BASE** — not `06c9afe`. The
 docs-only commit on top is exactly the trap that made session 53 re-derive Task 13's
 base; the review package needs the true HEAD or it truncates the task.
 
-Session 53 executed Task 13 end to end (dispatch → gate → review → one fix round →
-gate → re-review → complete). Zero production lines, as ruled.
+Session 53 executed Tasks 13 AND 14 end to end. Task 13: zero production lines, one
+fix round. Task 14: seven commits, three production files, **no fix round** — the
+first task on this plan to pass its review clean on the first pass.
 
-**NEXT ACTION: generate the Task 14 brief, then PRE-FLIGHT it before dispatching.**
-Neither exists yet — Task 13's were done in advance, Task 14's are not.
+**NEXT ACTION: generate the Task 15 brief, then PRE-FLIGHT it before dispatching.**
 
 ```
-<skill>/scripts/task-brief docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md 14
+<skill>/scripts/task-brief docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md 15
 ```
 where `<skill>` = `/Users/sofo/.claude/plugins/cache/claude-plugins-official/superpowers/6.2.0/skills/subagent-driven-development`
 
-**The pre-flight has paid for itself on every single task of this plan.** Do not skip
-it: every brief here has conflicted with the repo, and Task 13's pre-flight deleted an
-entire production-code step that rested on a factually false claim.
+**The pre-flight has paid for itself on every single task of this plan** — 9 BLOCKER
+on Task 14's brief, including a central assertion that was UNSATISFIABLE both before
+and after the brief's own prescribed fix. Do not skip it for Task 15 on the grounds
+that it is "only docs": Task 15 is where the plan's own text gets corrected, so a
+wrong premise there is a wrong premise in the permanent record.
 
-### >>> WHAT TASK 14 OWNS THAT NOTHING ELSE DOES <<<
+### >>> WHAT TASK 15 OWNS <<<
 
-1. **`task backend:test:runner` HAS NOT BEEN RUN FOR SEVERAL TASKS.** It is NOT part
-   of `backend:ci` and `scripts/gate` does not assert it. Task 14 must gate on it.
-   **Expect an unpleasant surprise there** — it is the least-exercised lane on the
-   branch, and the plan's Global Constraints say a regression in it is a real one.
-2. **The `gate_note` → `lineageInto` carry-forward** (sofo's ruling, session 52). The
-   one path nothing exercises end to end: a `gate_note` reaching the runner's real
-   staging as `1-gate_note.json`. It was moved OFF Task 13 because `lineageInto` is
-   runner-side and the golden set wires the fake executor. Task 14 owns it by name.
-3. Split `backend/internal/runs/store/schema_integration_test.go` — it still holds
-   that package's only bootstrap (`seedRun`, `seedRunWith`, `seedRunWithAuthorization`,
-   `mustInsertPhase`, `mustInsertArtifactAt`) under a "schema" name while carrying
-   behavioural tests.
+**Task 15 VERIFIES rather than creates** — the plan was already committed (`5cb627b`),
+a deliberate deviation, because 8,993 lines of corrected text should not sit
+untracked. Known doc items, accumulated across the plan:
+
+1. **Plan line 45 (decision 14) is now WRONG.** It says publish failures split THREE
+   ways with `publish_conflict` the only halting code. It is now FOUR, with
+   `repo_unavailable` and `auth_expired` also halting.
+2. Plan 05's docs table (that plan, line 92) documents the `phase.materialized`
+   payload as `{node_id, attempt}`; it gained a `generation` key.
+3. Add an assertion that the migrated schema equals `schema.sql` — **nothing checks
+   that today**; `migrate_updown_integration_test.go` only walks down-then-up and
+   checks two table names.
+4. Record that `CountSettledPublications` counts EVERY intent including `pending`,
+   the name being deliberately wrong.
+5. Record that `CodeRevisionRoundsExhausted` is deliberately unused (the max-rounds
+   refusal terminalizes nothing, so it carries no outcome code).
+6. `backend/README.md` + roadmap row 08.
+
+### >>> THEN: THE WHOLE-BRANCH REVIEW <<<
+
+Point it at every `minor (deferred)` and `parked` line in this ledger — there are
+~28 across Tasks 1-6 plus everything Tasks 7-14 added — and at `19bd487`, whose new
+test never got a quality review. Dispatch it on the most capable model.
+
+**Three things it must be told explicitly:**
+
+- **W1 — a pre-existing test is a SURVIVOR.**
+  `TestPublish_CrashAfterPRCreateAdoptsTheExistingPullRequest`
+  (`publish_integration_test.go:626`, Task 9's file) PASSES with `CrashAfterPR`
+  turned into a no-op; its sibling push test kills the same mutation. **Mutate BOTH.**
+- **`task backend:test:runner` is attested by an IMPLEMENTER, not a reviewer, and
+  `scripts/gate` does not cover it.** Run it.
+- **`orchestrator.go:653`'s `run.finished` audit has NO coverage** — two agents
+  independently destroyed its subject and nothing failed.
 
 ### Task 13's two carry-forwards into the WHOLE-BRANCH REVIEW (not into Task 14)
 
@@ -2633,6 +2658,144 @@ Task 13: >>> **COMPLETE** (commits `f5dab73`..`d02ce46`, 5 commits, review clean
   fix round, 1 Important PARKED BY USER RULING). <<< Gated by the controller at BOTH heads
   it passed through (`f400152`, `d02ce46`), never on an implementer's report. ZERO
   production lines. The parked item and W1 both carry forward to the whole-branch review.
+
+## Task 14 — Carry-forwards from Plans 04 and 05 (BASE `1a3da79` — session 53)
+
+Task 14: brief generated (`task-14-brief.md`, 211 lines; plan lines 8529-8739).
+Task 14: PRE-FLIGHT NOT CLEAN — **9 BLOCKER, 8 CORRECTION, 3 DESIGN QUESTION**
+  (`task-14-preflight.md`, 976 lines). It reproduced ALL FOUR defects and FIXED all four
+  in a scratch copy OUTSIDE the worktree, red-then-green, with the `runs`+`workflows`+`app`
+  integration lanes green and `golangci-lint` clean after. Worktree verified clean at
+  `1a3da79` before and after. **All four of the brief's diagnoses are sound; its Step 1
+  test code and its Step 6 are what do not survive contact with the source.**
+Task 14: >>> **`task backend:test:runner` IS GREEN AT `1a3da79`** <<< — measured, all four
+  packages `ok`, exit 0, ~100s after `task image:build`. The lane that had not been run
+  for several tasks and that `scripts/gate` does not assert has **no pre-existing red**.
+  Task 14 inherits a green lane and adds a test to it.
+  1. **`if won != 1` is UNSATISFIABLE — the brief's premise is wrong.** Measured `won=2`
+     ten runs of ten at HEAD, and `2,2,3,2,2` WITH the brief's own Step 3+4 fix applied.
+     Under READ COMMITTED a blocked `FOR UPDATE` re-evaluates the quals of the row it
+     LOCKED (EPQ); it does NOT re-run `ORDER BY … LIMIT 1`. So a caller whose SELECT begins
+     after the winner commits legitimately locks the winner's NEW pending run and supersedes
+     it — a second winner, and correct. "Exactly one rerun wins" is not an invariant of this
+     design. RULED: assert (a) no loser is an internal fault, (b) `runs_task_live_key` leaves
+     exactly one live run. The Step 3 classification fix itself is right and stays.
+  2. **Step 1's harness does not exist — ten identifiers, ZERO hits.** The real harness is
+     `tasks_integration_test.go` + `testutil_integration_test.go`. No orchestrator is wired
+     by `newService`, so waiting for `RunSucceeded` is unreachable — and unnecessary: both
+     carry-forwards reproduce with a PENDING latest run (measured).
+  3. **`TestValidate_DuplicateEdgeIsReportedOnceNotTwice` PASSES at HEAD** — twice over:
+     `validateShape` already `continue`s after one duplicate violation, AND the second
+     assertion greps `"at most 1 patch"`, which is the IMPLEMENT message; the fixture's
+     review node emits `"review consumes exactly 1 patch"`. The loop matches nothing and
+     the test is vacuous.
+  4. `interface{ Fields() []xerrors.FieldError }` NEVER matches — `Fields` is a struct
+     field, not a method, so `TestWorkflowName_LengthErrorSaysBytes` `t.Fatal`s
+     unconditionally, before AND after the fix.
+  5. `%s` on `xerrors.ClassOf(...)` is a BUILD failure (`type Class int`, no `String()`);
+     `go test` runs a vet subset by default. Use `%d`.
+  6. **`fake.Forge.Heads` does not exist** — the field is unexported, ALREADY mutex-guarded,
+     and the setter already exists as `Head`. Every clause of that brief sentence is wrong.
+  7. **`countAuditBySubject` duplicates Task 13's `countAudit` AND does not scope to a run**
+     — `subject_kind` is a TYPE, not an identity. The brief's own comment claims the
+     opposite of what its SQL does. Real fix: scope by `subject_id`.
+  8. Replacing `countAudit`'s two call sites makes it dead → `unused` fires → **measured
+     `task backend:lint` failure**, and lint is in `backend:ci`. Delete it in the same edit.
+  9. The workflows tests are written for the wrong package (`package workflows` is an
+     INTERNAL test package; qualified `workflows.X` references do not compile there).
+Task 14: RULINGS — **D1 (a)** bare `isUniqueViolation`, consistent with four existing call
+  sites; a constraint-name check would be the only one in the codebase. **D2 (b)** the
+  `gate_note` test is the runner-lane end-to-end ALONE — the carry-forward's point is REAL
+  staging, which a unit test cannot show, and a unit test would be a third assertion of a
+  format string two tests already pin. **D3 (a)** scope AND tighten `n == 0` → `n == 1`; a
+  scoped count that only asks "more than zero" throws away the precision scoping just bought.
+Task 14: both ledger carry-forwards RULED IN SCOPE — the `gate_note`/`lineageInto` real-
+  staging test (~45 lines, `//go:build runnerintegration`, near-clone of
+  `lineage_runner_test.go:19-96`; **the ONE item the pre-flight sized but did NOT build**,
+  so its shape is a proposal, not a measurement) and the `schema_integration_test.go` split
+  (555 lines; boundary EXACT at line 228, the first `func Test`).
+Task 14: IMPLEMENTER DISPATCHED (session 53, Opus 5, agent `impl-task-14`, un-suffixed).
+  BASE `1a3da79`, all three absolute paths, overrides named BINDING, `task-14-report.md`
+  named as the authoritative channel, and the runner lane named as the implementer's own
+  gate since `scripts/gate` will not catch a regression there.
+Task 14: implementer DONE — 7 commits `1a3da79`..`06c9afe`, tree clean, 12 files,
+  930 insertions / 594 deletions. Production touched in only THREE files
+  (`runs/tasks.go`, `workflows/validate.go`, `workflows/workflows.go`).
+Task 14: **GATE PASS at `06c9afe`** — controller-run, 9 lanes, `Commit=06c9afe` stamped,
+  contracts clean. **AND `task backend:test:runner` exit 0** with the new gate_note test
+  inside the lane (all four packages `ok`) — the lane `scripts/gate` does not assert.
+Task 14: 18 MUTATIONS, per call site. The two that matter most for method:
+  **M3/M4 kill exactly ONE call site's test each** (`checkHarnesses` in `Rerun` vs in
+  `resolveIntake`), proving the extraction did not collapse two guards into one covered
+  path; M5 then shows the shared body is reached from both. And **G3 is Task 13's lesson
+  landing on the implementer**: duplicating `run.finished`'s audit at
+  `orchestrator.go:652` changed NOTHING, because the golden set finishes through
+  `orchestrator.go:1419` — the mutation looked like it should kill the row and could not
+  reach it. G4 at the other site is what actually falsified the assertion.
+Task 14: **A1b found a real coverage gap the review had not asked about.** With
+  `wellFormed` admitting malformed edges the ENTIRE existing suite stayed green — nothing
+  pinned that an edge already rejected for an unknown endpoint must not also inflate its
+  target's consumption count. The implementer added
+  `TestValidate_AMalformedEdgeIsNotCountedTowardsConsumption` (`0c54a27`) and re-ran A1b
+  to show it now dies. An unfalsifiable predicate found by mutating a refactor.
+Task 14: **M6 is a FIXTURE-level falsification, recorded as such.** The `liveRuns`
+  assertion cannot be killed by any application-level mutation because it asserts what the
+  INDEX promises; it was falsified by `DROP INDEX runs_task_live_key`. Not vacuous, but
+  not code-level either — the distinction is the honest one.
+Task 14: minor (deferred): **`characters`-for-bytes survives in five other messages**
+  (`workflows.go:67`, `identity/service.go:76`, `assets/assets.go:138` and `:147`,
+  `assets/harnesses.go:68`, `assets/repos.go:56`) — all count with `len()`, all say
+  "characters", none pinned by `openapi.json`. CONTROLLER RULING: **not widened here.**
+  The carry-forward names the workflow *name* message only, and widening scope mid-task
+  is how a bounded task stops being reviewable. Routed to the whole-branch review as a
+  one-line-each consistency sweep.
+Task 14: minor (deferred): `orchestrator.go:652`'s `run.finished` audit is exercised by
+  NOTHING in the golden set (discovered by G3). Not this task's defect; real coverage gap.
+Task 14: minor (deferred): `isUniqueViolation` in `Rerun` is a bare 23505 check per ruling
+  D1(a). `insertRun` also runs `appendEvents`, so a future unique index on `run_events`
+  would report as "another re-run is already pending". Exposure is real, matches four
+  existing call sites, worth a line wherever error classification is revisited next.
+Task 14: REVIEWER DISPATCHED (Opus 5, agent `review-task-14`, un-suffixed) with the three
+  requirement files in precedence order, the extraction/signature-change/file-split named
+  as the risks that justify looking outside the diff, and a mandate to run and mutate.
+Task 14: REVIEW = spec ✅ / quality **APPROVED** (`task-14-review.md`). 0 Critical,
+  0 Important, 5 Minor — **no fix round**. The reviewer ran 12 mutations of its own, four
+  of which the implementer never ran, and left the tree clean at `06c9afe`.
+Task 14: the reviewer's **G5 is the most valuable mutation of the round and nobody had run
+  it**: `gates.go:294` `SubjectID: decision.ID.String()` → a fresh uuid →
+  `gate.decided audit entries for this run = 1, want 2`. That pins
+  `countAuditGateDecisions`'s join (`d.id::text = a.subject_id`) to the production
+  convention that a `gate.decided` entry's subject IS the decision row — the single most
+  novel thing in the new helper, and the implementer's own G-series never tested it.
+Task 14: the reviewer **independently reproduced the negative result** (its Ga = the
+  report's G3): destroying `orchestrator.go:653`'s audit subject moves NOTHING. Two agents
+  now agree the golden set never reaches the terminalization path's `run.finished` audit.
+Task 14: the reviewer closed the one thing that could have made the `gate_note` test
+  vacuous, and the report had not stated it: if the staged `.caesar/in/` files landed in
+  the produced diff, every content assertion would pass without the agent reading
+  anything. They cannot — `gitops/extract.go:26` (`:(exclude).caesar`) plus the index drop
+  at `:110-118` remove `.caesar` from the patch, so the evidence can only reach the diff
+  through the agent's own `cp`.
+Task 14: ⚠️ **the reviewer did NOT run `task backend:test:runner`** (~100s + image build,
+  no specific doubt to justify it). It verified the new file builds and vets under the
+  lane's tag and that `internal/app` still vets there. **The runner lane is attested by
+  the IMPLEMENTER's pasted `RUNNER_EXIT=0`, not by the reviewer** — and `scripts/gate`
+  does not cover it either. Whoever runs the whole-branch review should run that lane.
+Task 14: minor (deferred): `gatenote_runner_test.go:318-329` — two assertion messages
+  describe something other than what they check (`note-seen.json` / `inputs-seen.json` are
+  the SCRIPT's copy targets, so a failure reading "inputs.json did not name the gate note"
+  sends a debugger to `lineageInto` when the cause is the container). Same class of defect
+  as Task 13's override C. Hoist into their own "the agent did not run" check.
+Task 14: minor (deferred): `rerun_carryforward_integration_test.go` names a process, not a
+  subject; every neighbour is named for what it tests. `rerun_intake_integration_test.go`
+  would age better — "carryforward" is a fact about this ledger, meaningless in six months.
+Task 14: minor (deferred): the split put ~2 files of distance between two near-identical
+  14-column `approved_patches` INSERTs (`constraints_integration_test.go:358-364` and
+  `testutil_integration_test.go`'s `seedRunWithAuthorization`). PRE-EXISTING duplication,
+  explicitly not counted against this task, but the next column added has two homes.
+Task 14: >>> **COMPLETE** (commits `1a3da79`..`06c9afe`, 7 commits, review clean, NO fix
+  round, 5 minors deferred). <<< Gated by the controller at `06c9afe` (9 lanes, stamped),
+  plus the runner lane green by the implementer's attestation.
 
 ## Task 11 — The HTTP surface (BASE `e892288` — COMPLETE, session 51)
 
