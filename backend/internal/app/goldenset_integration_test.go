@@ -413,7 +413,6 @@ type goldenEnv struct {
 	// seed commit, which is also the run's pinned base.
 	bare       string
 	baseSHA    string
-	projectID  string
 	repoID     string
 	workflowID string
 }
@@ -531,7 +530,7 @@ func newGoldenEnv(t *testing.T) *goldenEnv {
 	return &goldenEnv{
 		pool: pool, faults: faults, srv: srv, forge: forge, publisher: publisher,
 		bare: bare, baseSHA: baseSHA,
-		projectID: project.ID, repoID: repo.ID, workflowID: wf.ID,
+		repoID: repo.ID, workflowID: wf.ID,
 	}
 }
 
@@ -784,13 +783,29 @@ func TestGoldenSet_FullConveyorThroughTheAPI(t *testing.T) {
 
 	task := g.createTask(t, requester, "Add a CHANGELOG")
 
-	// One request-changes round, then approve.
+	// One request-changes round, then approve. The generation in a decision
+	// response means different things by decision — the NEW one a revision
+	// opened, the one an approve decided — and both are read here because that
+	// asymmetry is the endpoint's documented contract.
 	g.waitForApproval(t, approver, task.LatestRunID, 1)
-	approver.decide(t, task.LatestRunID, "gate", "request_changes", "add a header")
+	if got := approver.decide(t, task.LatestRunID, "gate", "request_changes", "add a header"); got.Generation != 2 {
+		t.Errorf("request_changes reported generation %d, want 2: the revision it opened", got.Generation)
+	}
 	g.waitForApproval(t, approver, task.LatestRunID, 2)
-	approver.decide(t, task.LatestRunID, "gate", "approve", "")
+	approved := approver.decide(t, task.LatestRunID, "gate", "approve", "")
+	if approved.Generation != 2 {
+		t.Errorf("approve reported generation %d, want 2: the generation it decided", approved.Generation)
+	}
+	if approved.AuthorizationID == "" {
+		t.Error("an approve that unblocks a publish node must report the authorization it minted")
+	}
 
 	run := g.waitForRun(t, approver, task.LatestRunID, "succeeded", 90*time.Second)
+
+	// The run pinned the real repository's head, and published on top of it.
+	if run.BaseSHA != g.baseSHA {
+		t.Errorf("run base_sha = %s, want the bare repository's head %s", run.BaseSHA, g.baseSHA)
+	}
 
 	// Artifacts: two generations of patch/verdict, one publication.
 	byType := map[string]int{}
