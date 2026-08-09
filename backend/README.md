@@ -598,6 +598,16 @@ advances. The second signal is the runs themselves: any run failing
 `auth_expired` names the credential in its typed outcome, visible in run detail
 and the event stream.
 
+**`auth_expired` has two producers and only one of them writes that column.**
+`markAuthExpired` (`runner/collect.go`, `runner/execute.go`) is the *harness*
+side, and it is what sets `last_auth_expired_at` on the credential row. The
+forge side — `publishError` in `internal/app/runsports.go`, for a 401 or a
+non-throttling 403 against the repository's `forge_token` — produces the same
+code with **no** credential-row write. So a publish node that halts
+`auth_expired` names its repository in the message and leaves
+`last_auth_expired_at` untouched; look at the run's `halt_reason`, not at the
+credentials view.
+
 Secrets are size-bounded per kind at the door: 4 KiB for single tokens, 64 KiB
 for `agent_auth_file`, which must also parse as JSON and yield a refresh-token
 fingerprint — a file that cannot is unusable, and refusing it at creation beats
