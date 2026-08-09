@@ -906,8 +906,15 @@ The commit message carries four trailers, in this order:
 
 `caesar-approved-by` is the **approver**; the author is the requester,
 and the message is where the approver is recorded. These are provenance,
-not attribution. **No `Co-authored-by` machine trailer is emitted**,
-deliberately — `gitops/publish_test.go` asserts none appears. The attempt
+not attribution. **No `Co-authored-by` machine trailer is emitted**, and
+no tool advertisement of any kind. That is enforced on the renderer
+itself, by `TestCommitMessageForEmitsNoAttributionTrailer`
+(`internal/runs/publish_test.go`): the trailer block must be exactly
+those four `caesar-*` keys, and the whole message is scanned for
+attribution wording. `gitops/publish_test.go`'s own `Co-authored-by`
+grep does **not** enforce this and never could — `gitops` composes no
+message, it commits `PublishInput.Message` verbatim, so that grep only
+re-reads a literal the test itself supplied. The attempt
 ordinal is deliberately absent: it differs between attempts of one
 publication, and every input here must not.
 

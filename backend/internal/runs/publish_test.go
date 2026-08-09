@@ -511,3 +511,68 @@ func TestCommitMessageForIsAPureFunctionOfDurableInputs(t *testing.T) {
 		t.Error("the attempt ordinal must not reach the message: it differs between attempts of one publication")
 	}
 }
+
+// attributionTokens are the substrings that would mean caesar credited itself,
+// or a model, for work a human approved. Lower-cased before the comparison, so
+// "Co-Authored-By" and "co-authored-by" are the same finding.
+var attributionTokens = []string{
+	"co-authored-by", "signed-off-by", "assisted-by", "generated with",
+	"claude", "anthropic", "copilot", "gpt", "🤖",
+}
+
+func TestCommitMessageForEmitsNoAttributionTrailer(t *testing.T) {
+	// Baked decision 7: caesar's commits carry PROVENANCE (which run, which
+	// node, which artifact, who approved it) and never ATTRIBUTION. No
+	// machine co-author, no tool advertisement — the human approver is the
+	// only person the message names, and the requester is the author.
+	//
+	// This is the only test that enforces it. gitops/publish_test.go's
+	// Co-authored-by check greps a message the test itself supplied as a
+	// literal, and gitops never composes a message — it commits `in.Message`
+	// verbatim — so nothing there can see a trailer this renderer adds.
+	//
+	// Both halves below are load-bearing and neither carries the other: the
+	// trailer-key check sees an appended trailer, the token scan sees an
+	// advertisement folded into the subject or the body.
+	auth := authorization{ApproverEmail: "ada@example.com"}
+	auth.ArtifactID = uuid.MustParse("019fe7b7-6e37-7d9c-97db-d48907ccaff2")
+	ref := AttemptRef{
+		RunID:   uuid.MustParse("019fe7b7-fc23-7557-9448-f0bbe13c514d"),
+		NodeID:  "publish",
+		Attempt: 2,
+	}
+	got := commitMessageFor("ship it", ref, auth)
+
+	// Everything after the subject's blank line is the trailer block, and the
+	// four caesar-* keys are the whole of it. An appended attribution trailer
+	// shows up here as a key that is not one of them.
+	_, block, ok := strings.Cut(got, "\n\n")
+	if !ok {
+		t.Fatalf("commit message %q has no blank line: it is not a subject plus a trailer block", got)
+	}
+	want := map[string]bool{
+		"caesar-run": true, "caesar-node": true,
+		"caesar-artifact": true, "caesar-approved-by": true,
+	}
+	for _, line := range strings.Split(block, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		key, _, _ := strings.Cut(line, ":")
+		if !want[key] {
+			t.Errorf("commit message carries the trailer %q; the trailer block is exactly the four "+
+				"caesar-* provenance keys, and caesar attributes its commits to nobody but the "+
+				"requester and the approver (baked decision 7)", line)
+		}
+	}
+
+	// And the advertisement half, which no trailer-key check can see because
+	// it does not have to be a trailer.
+	lower := strings.ToLower(got)
+	for _, tok := range attributionTokens {
+		if strings.Contains(lower, tok) {
+			t.Errorf("commit message %q contains %q: caesar's commits carry provenance, never "+
+				"attribution to a machine or a tool (baked decision 7)", got, tok)
+		}
+	}
+}
