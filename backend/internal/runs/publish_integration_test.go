@@ -1195,6 +1195,31 @@ func TestPublish_AFailedAuthorizationTransactionDoesNotKillTheRun(t *testing.T) 
 			if got := chargeableFailures(t, p.f, p.run.ID, "publish"); got != 0 {
 				t.Errorf("chargeable failures = %d, want 0: nothing had begun, so nothing was spent", got)
 			}
+			// The first attempt's TYPE, not merely its survival.
+			//
+			// This is what pins runPublish's authorize exit to
+			// notStartedUnlessTyped ALONE. Wrapping it in
+			// unchargedWhileUnfinished — which is what a future reader
+			// tidying five typing helpers into one would naturally do —
+			// rewrites publish_not_started's {0,0,0} immediate requeue into
+			// publish_resumable's 15-second park, so every honest non-start
+			// burns wall clock instead of retrying at once. That mutation
+			// survives the unit lane, the golden set and this entire
+			// integration lane: the run still succeeds, just later. Nothing
+			// but reading the recorded code can see it, and a unit test on
+			// retryDelay cannot — the mutation is at the call site, not in the
+			// schedule table.
+			var code string
+			if err := p.f.pool.QueryRow(context.Background(),
+				`SELECT outcome->>'code' FROM phase_runs
+				 WHERE run_id = $1 AND node_id = 'publish' AND outcome IS NOT NULL
+				 ORDER BY attempt ASC LIMIT 1`, p.run.ID).Scan(&code); err != nil {
+				t.Fatal(err)
+			}
+			if code != runs.CodePublishNotStarted {
+				t.Errorf("first publish attempt outcome = %q, want %q: nothing had begun, so the "+
+					"requeue must be immediate", code, runs.CodePublishNotStarted)
+			}
 			// The rollback is what makes the retry honest: one intent from one
 			// approval, and one publication on the remote.
 			if got := countIntents(t, p.f, p.run.ID); got != 1 {
