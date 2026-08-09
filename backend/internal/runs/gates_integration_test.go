@@ -228,8 +228,27 @@ func TestDecideGate_ApproveMintsASingleUseAuthorizationBoundToTheExaminedArtifac
 	if pub := phaseByNode(t, phases, "publish"); pub.Status != runs.PhaseSucceeded {
 		t.Errorf("publish status = %s, want succeeded", pub.Status)
 	}
-	if n := countEvents(t, svc, run.ID, runs.EventGateDecided); n != 2 {
-		t.Errorf("gate.decided events = %d, want 2 (the decision and the authorization it minted)", n)
+	// ONE decision, ONE event — carrying the authorization it minted.
+	//
+	// An approve that dominates a publish used to emit gate.decided twice: once
+	// with the decision and once with authorization_id/authorizes and no
+	// decision field at all. One kind meaning two things makes every consumer
+	// count wrong on exactly the approvals that authorize a publish and on no
+	// others, and the audit row count (one per decision) was already the honest
+	// one. The authorization is an attribute of the decision, so it travels on
+	// the decision's own event.
+	if n := countEvents(t, svc, run.ID, runs.EventGateDecided); n != 1 {
+		t.Errorf("gate.decided events = %d, want 1: one decision is one event", n)
+	}
+	decided := lastEventOfKind(t, svc, run.ID, runs.EventGateDecided)
+	for k, want := range map[string]any{
+		"decision":         string(runs.DecisionApprove),
+		"authorization_id": res.AuthorizationID.String(),
+		"authorizes":       "publish",
+	} {
+		if got := decided.Payload[k]; got != want {
+			t.Errorf("gate.decided payload[%q] = %v, want %v", k, got, want)
+		}
 	}
 }
 

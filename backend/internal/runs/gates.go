@@ -264,14 +264,24 @@ func (s *Service) DecideGate(ctx context.Context, actor authn.Principal, in Gate
 					return err
 				}
 				res.AuthorizationID = &auth.ID
-				evs = append(evs, Event{
-					RunID: in.RunID, ProjectID: taskRow.ProjectID, Kind: EventGateDecided,
-					CorrelationID: correlationID,
-					Payload: map[string]any{
-						"node_id": in.NodeID, "authorization_id": auth.ID.String(),
-						"authorizes": publishNode, "artifact_id": art.ID.String(),
-					},
-				})
+				// ONE decision, ONE event. The authorization is an ATTRIBUTE
+				// of this approval, so it rides the approval's own event
+				// rather than a second gate.decided of its own.
+				//
+				// A second emission was the shape here, and it carried
+				// authorization_id/authorizes and no `decision` field at all —
+				// so the kind meant two different things and any consumer
+				// counting gate.decided double-counted exactly the approvals
+				// that authorize a publish and no others. The audit's one row
+				// per decision was already the honest count. No new kind was
+				// invented for the same reason: "this approval released
+				// something" is a rendering question, and Plan 10 can ask it
+				// of these fields.
+				//
+				// artifact_id is not repeated: examined_artifact_id below is
+				// the same value, set from the same art.ID.
+				evs[0].Payload["authorization_id"] = auth.ID.String()
+				evs[0].Payload["authorizes"] = publishNode
 			}
 			// The run resumes; the janitor's next tick materializes what the
 			// gate unblocked. Resuming here rather than materializing inline

@@ -871,14 +871,19 @@ func TestGoldenSet_FullConveyorThroughTheAPI(t *testing.T) {
 		"publish.intent_created", "publish.pushed", "publish.pr_opened",
 		"run.succeeded",
 	})
-	// Two decisions, but THREE gate.decided events: an approve that authorizes
-	// a publish emits it twice, once for the decision and once carrying the
-	// authorization (gates.go:265). The audit records 2, one per decision. This
-	// count RECORDS that asymmetry rather than endorsing it — whether the
-	// second emission should exist is a question for the whole-branch review,
-	// and an exact count is what stops it changing silently either way.
-	if n := g.countEventKind(t, approver, run.ID, "gate.decided"); n != 3 {
-		t.Errorf("gate.decided events = %d, want 3 (one per decision, plus the approve's authorization event)", n)
+	// Two decisions, TWO gate.decided events, two audit rows. One decision is
+	// one event, and an approve that authorizes a publish says so on that same
+	// event through authorization_id/authorizes.
+	//
+	// It used to be three: the approve emitted a second gate.decided carrying
+	// the authorization and no decision field. The whole-branch review settled
+	// it — a kind that means two things makes every consumer double-count
+	// exactly the approvals that authorize a publish, and the audit's one row
+	// per decision was already the honest shape. This count is now an
+	// endorsement rather than a record, and it is the assertion that stops the
+	// second emission coming back.
+	if n := g.countEventKind(t, approver, run.ID, "gate.decided"); n != 2 {
+		t.Errorf("gate.decided events = %d, want 2 (one per decision)", n)
 	}
 
 	// Audit, scoped to THIS run's own subjects. An action-only count passes on

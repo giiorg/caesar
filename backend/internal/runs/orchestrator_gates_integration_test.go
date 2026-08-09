@@ -44,6 +44,23 @@ func tryPhaseByNode(phases []runs.Phase, nodeID string) (runs.Phase, bool) {
 	return found, ok
 }
 
+// lastEventOfKind returns the newest event of a kind, and fatals when there is
+// none: a test reaching for a payload has already asserted the count.
+func lastEventOfKind(t *testing.T, svc *runs.Service, runID uuid.UUID, kind string) runs.RunEventRecord {
+	t.Helper()
+	evs, err := svc.ListRunEvents(context.Background(), runID, 0, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := len(evs) - 1; i >= 0; i-- {
+		if evs[i].Kind == kind {
+			return evs[i]
+		}
+	}
+	t.Fatalf("no %s event on run %s", kind, runID)
+	return runs.RunEventRecord{}
+}
+
 func countEvents(t *testing.T, svc *runs.Service, runID uuid.UUID, kind string) int {
 	t.Helper()
 	evs, err := svc.ListRunEvents(context.Background(), runID, 0, 500)
