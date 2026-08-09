@@ -103,9 +103,10 @@ harnesses), and workflows (`/api/v1/workflows` + `/versions`) — writes
 are admin-only, and the single write door validates every document. The
 execution spine adds `/api/v1/tasks` and `/api/v1/runs`: reads need the
 `view` grant on the project, creating and re-running a task needs `run`.
-Gates add `/api/v1/approvals` and `POST
-/api/v1/runs/{id}/gates/{node}/decision`, which need `approve` on the
-project the run belongs to.
+Gates add `GET /api/v1/approvals` — the inbox, scoped to the projects
+the caller holds *any* grant on (an admin sees every one) — and `POST
+/api/v1/runs/{id}/gates/{node}/decision`, which needs `approve` on the
+run's project. Seeing a gate is not being allowed to decide it.
 
 ## Execution spine (Plan 05)
 
