@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/giiorg/caesar/backend/internal/runs/store"
@@ -431,12 +432,36 @@ func TestMatchPublication(t *testing.T) {
 	}
 }
 
+// The marker is derived from the approved artifact id, and it must actually
+// VARY with it.
+//
+// This used to feed store.PublishIntent{}.ID — the ZERO uuid — and assert
+// "caesar/00000000-...-000000000000", which is the one input a constant
+// implementation reproduces exactly. Every integration comparison derives both
+// sides by calling this function, and every test stages one publication per
+// database, so `return "caesar/000…0"` left ~2,900 lines of publish tests and
+// the whole golden set green. In production every publication in the
+// deployment would collide on one marker, and publish_intents_marker_key would
+// turn the ordinary case into a permanent publish_conflict.
+//
+// So: a real id, its text asserted to appear, and two distinct ids asserted to
+// produce distinct branches. The last one is what a constant cannot survive.
 func TestPublicationBranchIsDerivedFromTheApprovedArtifact(t *testing.T) {
-	// Recovery reconstructs the marker from the authorization row alone, so
-	// it may depend on nothing else.
-	art := store.PublishIntent{}.ID // the zero uuid is enough to pin the shape
-	if got, want := PublicationBranch(art), "caesar/00000000-0000-0000-0000-000000000000"; got != want {
+	art := uuid.MustParse("019fe7b7-6e37-7d9c-97db-d48907ccaff2")
+	if got, want := PublicationBranch(art), "caesar/019fe7b7-6e37-7d9c-97db-d48907ccaff2"; got != want {
 		t.Fatalf("PublicationBranch = %q, want %q", got, want)
+	}
+	// Recovery reconstructs the marker from the authorization row alone, so it
+	// may depend on nothing but the artifact id — and two artifacts may never
+	// share a branch.
+	other := uuid.MustParse("019fe7b7-fc23-7557-9448-f0bbe13c514d")
+	if a, b := PublicationBranch(art), PublicationBranch(other); a == b {
+		t.Errorf("two different approved artifacts share the marker %q: every publication in the "+
+			"deployment would collide on one branch", a)
+	}
+	// And it is a function of its argument, not of when it is called.
+	if a, b := PublicationBranch(art), PublicationBranch(art); a != b {
+		t.Errorf("PublicationBranch is not stable: %q then %q", a, b)
 	}
 }
 
