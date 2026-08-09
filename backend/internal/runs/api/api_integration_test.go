@@ -952,15 +952,15 @@ func TestAPI_RunProjectionCarriesTheGateFields(t *testing.T) {
 	}
 	h.stagePublication(t, runID, authID)
 
-	getRun := func(t *testing.T) runsapi.RunResponse {
+	getRun := func(t *testing.T, id uuid.UUID) runsapi.RunResponse {
 		t.Helper()
-		resp := h.do(t, http.MethodGet, "/api/v1/runs/"+runID.String(), "viewer-tok", nil)
+		resp := h.do(t, http.MethodGet, "/api/v1/runs/"+id.String(), "viewer-tok", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("get run = %d, want 200", resp.StatusCode)
 		}
 		return decodeInto[runsapi.RunResponse](t, resp)
 	}
-	run := getRun(t)
+	run := getRun(t, runID)
 
 	t.Run("the run and its rows carry their generation", func(t *testing.T) {
 		if run.Generation != 1 {
@@ -1031,10 +1031,45 @@ func TestAPI_RunProjectionCarriesTheGateFields(t *testing.T) {
 			runID, "abc123", 42, "https://forge.test/pr/42"); err != nil {
 			t.Fatal(err)
 		}
-		pub := getRun(t).Publications[0]
+		pub := getRun(t, runID).Publications[0]
 		if pub.Status != "published" || pub.HeadSHA != "abc123" || pub.PRNumber != 42 ||
 			pub.PRURL != "https://forge.test/pr/42" {
 			t.Errorf("publication = %+v, want the receipts", pub)
+		}
+	})
+
+	t.Run("a halted publication carries its reason", func(t *testing.T) {
+		// Rewound to 'pushed' first: halted is a one-way exit from an
+		// unfinished state, so this exercises the projection on a shape the
+		// state machine can actually produce.
+		if _, err := h.pool.Exec(context.Background(),
+			`UPDATE publish_intents SET status = 'pushed', pr_number = NULL, pr_url = NULL WHERE run_id = $1`,
+			runID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(context.Background(),
+			`UPDATE publish_intents SET status = 'halted', halt_reason = $2 WHERE run_id = $1`,
+			runID, "the branch vanished from the forge"); err != nil {
+			t.Fatal(err)
+		}
+		pub := getRun(t, runID).Publications[0]
+		if pub.Status != "halted" || pub.HaltReason != "the branch vanished from the forge" {
+			t.Errorf("publication = %+v, want the halt and its reason", pub)
+		}
+	})
+
+	t.Run("a self-approval is projected as one", func(t *testing.T) {
+		// The requester decides their own gate. The shipped policy permits it
+		// and marks the row distinctly (spec §6); the marker is worth nothing
+		// if it stops at the database.
+		_, ownRun := h.gatedRun(t, "approver-tok", h.repoID, "my own gate")
+		if resp := h.do(t, http.MethodPost, decisionPath(ownRun, "gate"), "approver-tok",
+			runsapi.GateDecisionRequest{Decision: "approve"}); resp.StatusCode != http.StatusOK {
+			t.Fatalf("self-approval = %d, want 200", resp.StatusCode)
+		}
+		gate := phaseByNodeID(t, getRun(t, ownRun), "gate")
+		if gate.Decision == nil || !gate.Decision.SelfApproval {
+			t.Errorf("decision = %+v, want self_approval true", gate.Decision)
 		}
 	})
 
