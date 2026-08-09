@@ -711,17 +711,20 @@ func (g *goldenEnv) count(t *testing.T, sql string, args ...any) int {
 	return n
 }
 
-// countAudit counts audit entries for an action, narrowed to a subject kind
-// when one is given. The count is DATABASE-WIDE, not scoped to a run: every
-// goldenEnv gets its own isolated database and every test drives exactly one
-// task through it, so the two are the same number here. A fixture that ever
-// runs a second task must scope this before trusting it.
-func (g *goldenEnv) countAudit(t *testing.T, action, subjectKind string) int {
+// countAuditSubject scopes by action AND subject id, which is what makes the
+// assertion about THIS run rather than about any run in the database.
+func (g *goldenEnv) countAuditSubject(t *testing.T, action, subjectID string) int {
 	t.Helper()
-	if subjectKind == "" {
-		return g.count(t, `SELECT count(*) FROM audit_entries WHERE action = $1`, action)
-	}
-	return g.count(t, `SELECT count(*) FROM audit_entries WHERE action = $1 AND subject_kind = $2`, action, subjectKind)
+	return g.count(t, `SELECT count(*) FROM audit_entries WHERE action = $1 AND subject_id = $2`, action, subjectID)
+}
+
+// countAuditGateDecisions scopes gate.decided to a run. Its audit subject is
+// the decision row, so the run only reaches it through gate_decisions.
+func (g *goldenEnv) countAuditGateDecisions(t *testing.T, runID string) int {
+	t.Helper()
+	return g.count(t, `SELECT count(*) FROM audit_entries a
+		 JOIN gate_decisions d ON d.id::text = a.subject_id
+		 WHERE a.action = 'gate.decided' AND d.run_id = $1::uuid`, runID)
 }
 
 func (g *goldenEnv) countIntents(t *testing.T, runID string) int {
@@ -878,15 +881,23 @@ func TestGoldenSet_FullConveyorThroughTheAPI(t *testing.T) {
 		t.Errorf("gate.decided events = %d, want 3 (one per decision, plus the approve's authorization event)", n)
 	}
 
-	// Audit, by action.
-	for _, action := range []string{"task.created", "run.created", "gate.decided", "run.finished"} {
-		if n := g.countAudit(t, action, ""); n == 0 {
-			t.Errorf("no %s audit entry", action)
+	// Audit, scoped to THIS run's own subjects. An action-only count passes on
+	// any entry of that action in the database, which is what the Plan 05
+	// carry-forward is about — the isolation that makes it true today is a
+	// property of the fixture, not of the assertion.
+	for _, sub := range []struct{ action, id string }{
+		{"task.created", task.ID},
+		{"run.created", run.ID},
+		{"run.finished", run.ID},
+	} {
+		if n := g.countAuditSubject(t, sub.action, sub.id); n != 1 {
+			t.Errorf("%s audit entries for subject %s = %d, want 1", sub.action, sub.id, n)
 		}
 	}
-	// Two decisions, one per generation, both attributed to the approver.
-	if n := g.countAudit(t, "gate.decided", "gate_decision"); n != 2 {
-		t.Errorf("gate.decided audit entries = %d, want 2", n)
+	// gate.decided's subject is the DECISION, not the run, so scoping to this
+	// run goes through gate_decisions.run_id. Two decisions, one per generation.
+	if n := g.countAuditGateDecisions(t, run.ID); n != 2 {
+		t.Errorf("gate.decided audit entries for this run = %d, want 2", n)
 	}
 
 	// The remote really carries the publication.
