@@ -32,15 +32,22 @@ type Service struct {
 	repos     RepoSource
 	harnesses HarnessSource
 	forge     Forge
-	params    Params
+	// publisher performs the git half of a publication. There is no
+	// not-implemented stub for it (baked decision 8): this plan wires a real
+	// one everywhere, and a stub would be dead code with no call site.
+	publisher  GitPublisher
+	principals PrincipalSource
+	params     Params
 }
 
 func NewService(pool *pgxpool.Pool, c clock.Clock, rec *audit.Recorder,
-	defs DefinitionSource, repos RepoSource, harnesses HarnessSource, forge Forge, p Params,
+	defs DefinitionSource, repos RepoSource, harnesses HarnessSource, forge Forge,
+	publisher GitPublisher, principals PrincipalSource, p Params,
 ) *Service {
 	return &Service{
 		pool: pool, clock: c, audit: rec, defs: defs, repos: repos,
-		harnesses: harnesses, forge: forge, params: p,
+		harnesses: harnesses, forge: forge, publisher: publisher,
+		principals: principals, params: p,
 	}
 }
 
@@ -87,10 +94,21 @@ func unmarshalMap(raw []byte) (map[string]any, error) {
 }
 
 // snapshotFromRow re-parses the pinned snapshot; corruption is internal.
+// A stored schema-1 document (Plan 05..07) is upgraded in place: it predates
+// AllowSelfApproval, and the shipped baseline value is what those runs were
+// created under, so defaulting to true changes nothing for them.
 func snapshotFromRow(raw []byte) (PolicySnapshot, error) {
 	var s PolicySnapshot
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return PolicySnapshot{}, fmt.Errorf("runs: pinned snapshot corrupt: %w", err)
+	}
+	switch s.SchemaVersion {
+	case 1:
+		s.SchemaVersion = snapshotSchemaVersion
+		s.AllowSelfApproval = true
+	case snapshotSchemaVersion:
+	default:
+		return PolicySnapshot{}, fmt.Errorf("runs: pinned snapshot schema %d is not readable by this binary", s.SchemaVersion)
 	}
 	return s, nil
 }

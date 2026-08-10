@@ -149,10 +149,11 @@ func TestCredentialContention_RunsWaitFreeThenRunSerially(t *testing.T) {
 
 	assetsSvc := assets.NewService(pool, clk, rec, keys)
 	workflowsSvc := workflows.NewService(pool, clk, rec)
-	heads := map[uuid.UUID]string{}
+	forge := fake.NewForge(map[uuid.UUID]string{})
 	runsSvc := runs.NewService(pool, clk, rec,
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		fake.Forge{Heads: heads}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		forge, fake.NewPublisher(nil), principalSource{svc: identitySvc},
+		runs.Params{Snapshot: runs.DefaultSnapshot()})
 
 	project, err := assetsSvc.CreateProject(ctx, admin, "contention", "")
 	if err != nil {
@@ -179,7 +180,7 @@ func TestCredentialContention_RunsWaitFreeThenRunSerially(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	heads[repo.ID] = "0123456789012345678901234567890123456789"
+	forge.Head(repo.ID, "0123456789012345678901234567890123456789")
 
 	wf, err := workflowsSvc.CreateWorkflow(ctx, admin, "contention", "")
 	if err != nil {

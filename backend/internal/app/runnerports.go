@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -39,7 +40,11 @@ var _ runner.EventSink = (*runs.Service)(nil)
 // three composition-root adapters over assets (the runs context never imports
 // assets), and runsSvc as the event sink. It is called from runServe only
 // when cfg.Runner.Enabled.
-func buildRunner(cfg config.Runner, assetsSvc *assets.Service, runsSvc *runs.Service, log *slog.Logger) (*runner.Runner, error) {
+//
+// eps is passed in rather than rebuilt from config here: runServe builds one
+// forgeEndpoints for the forge adapter, the publisher and this, so the staging
+// clone cannot end up pointed at a different host from the publication push.
+func buildRunner(cfg config.Runner, eps forgeEndpoints, assetsSvc *assets.Service, runsSvc *runs.Service, log *slog.Logger) (*runner.Runner, error) {
 	// Nothing else creates DataRoot, and AdmitClaim statfs's it on every
 	// claim to check the free-space watermark — so a fresh install refuses
 	// every claim until the directory exists. Create the local tree here
@@ -79,7 +84,7 @@ func buildRunner(cfg config.Runner, assetsSvc *assets.Service, runsSvc *runs.Ser
 		ConnectAllow:        cfg.ConnectAllow,
 	}
 	return runner.New(engine, appHarnessResolver{svc: assetsSvc}, appCredentialOpener{svc: assetsSvc},
-		appCredentialLeaser{svc: assetsSvc}, appGitSource{svc: assetsSvc}, runsSvc, opts, log)
+		appCredentialLeaser{svc: assetsSvc}, appGitSource{svc: assetsSvc, endpoints: eps}, runsSvc, opts, log)
 }
 
 // appHarnessResolver resolves a phase's harness from the assets context. The
@@ -207,14 +212,21 @@ func syncStatus(s assets.SyncStatus) (runner.SyncStatus, error) {
 
 // appGitSource turns a repo reference into the stage container's clone. The
 // forge token travels as a header, never inside the URL (a token-in-URL lands
-// in reflogs and process listings). Self-hosted forge base URLs are Plan 08's
-// forge port; until then only github/gitlab hosted URLs are constructed here.
-type appGitSource struct{ svc *assets.Service }
+// in reflogs and process listings).
+//
+// It carries the configured clone roots for the same reason gitPublisher does:
+// staging and publication must reach the SAME server. A staging clone left on
+// the public host while the API talks to a self-hosted instance is the silent
+// half of that failure — the run stages somebody else's code, or none at all.
+type appGitSource struct {
+	svc       *assets.Service
+	endpoints forgeEndpoints
+}
 
 func (a appGitSource) CloneSpec(ctx context.Context, repo runs.RepoRef) (runner.CloneSpec, error) {
 	// Resolve (and validate) the forge before opening the credential: an
 	// unsupported forge must fail without an audited secret use.
-	url, err := cloneURL(repo.Forge, repo.Slug)
+	url, err := cloneURL(a.endpoints, repo.Forge, repo.Slug)
 	if err != nil {
 		return runner.CloneSpec{}, err
 	}
@@ -228,20 +240,57 @@ func (a appGitSource) CloneSpec(ctx context.Context, repo runs.RepoRef) (runner.
 	}, nil
 }
 
-// cloneURL builds the hosted HTTPS clone URL for a forge/slug pair, rejecting
-// any forge whose base URL is not yet pinned. Kept pure (no credential, no
-// assets) so the github/gitlab switch is unit-testable on its own.
-func cloneURL(forge, slug string) (string, error) {
+// forgeEndpoints is the resolved base URLs per forge kind: the API host the
+// clients talk to, and the HTTPS root clone and push use. They are separate
+// because they genuinely are — api.github.com versus github.com — and because
+// configuring one without the other is the silent self-hosted failure: every
+// API call reaches the private instance while every clone and push still goes
+// to the public site.
+//
+// One value builds both adapters, so the two can never drift apart.
+type forgeEndpoints struct {
+	GitHub, GitLab           string
+	GitHubClone, GitLabClone string
+}
+
+// forgeEndpointsFrom is the whole config→wiring mapping, extracted so it can be
+// tested. Inline in runServe it was four assignments no test could observe, and
+// the mistake it invites is not a crash: putting an API base into a clone slot
+// compiles, boots, and sends every API call to the private instance while every
+// clone and push goes on reaching the public site. That is the failure the
+// config block, this type and the README all describe, and it has to be a
+// falsifiable claim rather than three paragraphs of prose.
+func forgeEndpointsFrom(f config.Forge) forgeEndpoints {
+	return forgeEndpoints{
+		GitHub:      f.GitHubBaseURL,
+		GitLab:      f.GitLabBaseURL,
+		GitHubClone: f.GitHubCloneBaseURL,
+		GitLabClone: f.GitLabCloneBaseURL,
+	}
+}
+
+// cloneURL builds the HTTPS clone URL for a forge/slug pair from the CONFIGURED
+// clone roots. Kept pure (no credential, no assets) so the github/gitlab switch
+// is unit-testable on its own.
+//
+// An empty base is refused rather than joined. The result would be the relative
+// "acme/widgets.git", and nothing downstream catches it: gitops.checkCloneURL
+// rejects only unparseable URLs and userinfo, so a misconfigured deployment
+// would reach `git clone` with a path and fail there, far from the cause.
+func cloneURL(eps forgeEndpoints, forge, slug string) (string, error) {
 	var base string
 	switch forge {
 	case "github":
-		base = "https://github.com/"
+		base = eps.GitHubClone
 	case "gitlab":
-		base = "https://gitlab.com/"
+		base = eps.GitLabClone
 	default:
-		return "", fmt.Errorf("app: git source: unsupported forge %q (self-hosted base URLs arrive in Plan 08)", forge)
+		return "", fmt.Errorf("app: git source: unsupported forge %q", forge)
 	}
-	return base + slug + ".git", nil
+	if base == "" {
+		return "", fmt.Errorf("app: git source: no clone base URL configured for forge %q", forge)
+	}
+	return strings.TrimRight(base, "/") + "/" + slug + ".git", nil
 }
 
 // cloneAuthHeader renders the forge token as a Basic auth header. The token

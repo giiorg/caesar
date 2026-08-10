@@ -48,6 +48,23 @@ func (q *Queries) AdvanceEventCounter(ctx context.Context, n int64) error {
 	return err
 }
 
+const bumpRunGeneration = `-- name: BumpRunGeneration :one
+UPDATE runs SET generation = generation + 1
+WHERE id = $1 AND status = 'waiting' AND wall_deadline > now()
+RETURNING generation
+`
+
+// Opening a generation is a deciding mutation, so it carries the same
+// predicate the gate's own CAS does. A run that expired between the decision
+// arriving and this statement running returns no row, and openRevision turns
+// that into the same conflict a late decision gets.
+func (q *Queries) BumpRunGeneration(ctx context.Context, id uuid.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, bumpRunGeneration, id)
+	var generation int32
+	err := row.Scan(&generation)
+	return generation, err
+}
+
 const cASRunStatus = `-- name: CASRunStatus :execrows
 UPDATE runs SET status = $2
 WHERE id = $1 AND status = $3
@@ -88,7 +105,7 @@ SET status = 'running', worker_id = $1,
     claimed_at = $2
 FROM candidate
 WHERE phase_runs.id = candidate.id
-RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at, candidate.wall_deadline AS run_wall_deadline,
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.generation, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at, candidate.wall_deadline AS run_wall_deadline,
           candidate.execution_budget_ms, candidate.execution_used_ms
 `
 
@@ -107,6 +124,7 @@ type ClaimPhaseRow struct {
 	ChargeableFailures int32
 	NotBefore          *time.Time
 	Status             string
+	Generation         int32
 	WorkerID           pgtype.Text
 	LeasedUntil        *time.Time
 	ClaimedAt          *time.Time
@@ -135,6 +153,7 @@ func (q *Queries) ClaimPhase(ctx context.Context, arg ClaimPhaseParams) (ClaimPh
 		&i.ChargeableFailures,
 		&i.NotBefore,
 		&i.Status,
+		&i.Generation,
 		&i.WorkerID,
 		&i.LeasedUntil,
 		&i.ClaimedAt,
@@ -157,7 +176,7 @@ WHERE id IN (
     ORDER BY leased_until
     LIMIT $3 FOR UPDATE SKIP LOCKED
 )
-RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.generation, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
           (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline
 `
 
@@ -176,6 +195,7 @@ type ClaimStuckReconcilingRow struct {
 	ChargeableFailures int32
 	NotBefore          *time.Time
 	Status             string
+	Generation         int32
 	WorkerID           pgtype.Text
 	LeasedUntil        *time.Time
 	ClaimedAt          *time.Time
@@ -207,6 +227,7 @@ func (q *Queries) ClaimStuckReconciling(ctx context.Context, arg ClaimStuckRecon
 			&i.ChargeableFailures,
 			&i.NotBefore,
 			&i.Status,
+			&i.Generation,
 			&i.WorkerID,
 			&i.LeasedUntil,
 			&i.ClaimedAt,
@@ -225,6 +246,43 @@ func (q *Queries) ClaimStuckReconciling(ctx context.Context, arg ClaimStuckRecon
 	return items, nil
 }
 
+const clearPublicationAbsent = `-- name: ClearPublicationAbsent :execrows
+UPDATE publish_intents SET absent_since = NULL, updated_at = now()
+WHERE id = $1 AND absent_since IS NOT NULL
+`
+
+// The marker turned up. Whatever we thought was missing is not, and the next
+// absence starts its grace from scratch.
+func (q *Queries) ClearPublicationAbsent(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, clearPublicationAbsent, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const consumeAuthorization = `-- name: ConsumeAuthorization :execrows
+UPDATE approved_patches SET status = 'consumed', settled_at = $2
+WHERE approved_patches.id = $1 AND approved_patches.status = 'valid'
+  AND EXISTS (SELECT 1 FROM runs r WHERE r.id = approved_patches.run_id AND r.wall_deadline > now())
+`
+
+type ConsumeAuthorizationParams struct {
+	ID        uuid.UUID
+	SettledAt *time.Time
+}
+
+// Carries the run's wall-deadline predicate: an expired run may not authorize
+// a forge effect, and evaluating it here means the sweeper cannot lose the
+// race (spec §3 Budgets).
+func (q *Queries) ConsumeAuthorization(ctx context.Context, arg ConsumeAuthorizationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, consumeAuthorization, arg.ID, arg.SettledAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const countOutbox = `-- name: CountOutbox :one
 SELECT count(*) FROM outbox
 `
@@ -234,6 +292,128 @@ func (q *Queries) CountOutbox(ctx context.Context) (int64, error) {
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const countRequestChanges = `-- name: CountRequestChanges :one
+SELECT count(*) FROM gate_decisions
+WHERE run_id = $1 AND node_id = $2 AND decision = 'request_changes'
+`
+
+type CountRequestChangesParams struct {
+	RunID  uuid.UUID
+	NodeID string
+}
+
+// Rounds spent on THIS gate in THIS run — max_rounds is per gate, not per
+// run, and generations are global, so the count cannot be read off either.
+func (q *Queries) CountRequestChanges(ctx context.Context, arg CountRequestChangesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countRequestChanges, arg.RunID, arg.NodeID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countSettledPublications = `-- name: CountSettledPublications :one
+SELECT count(*) FROM publish_intents WHERE run_id = $1
+`
+
+// Publications this run has begun. EVERY status counts, 'pending' included.
+//
+// The tempting reading is that a pending intent has pushed nothing yet, so a
+// revision could still take it back. It cannot: the intent row commits BEFORE
+// the first forge call, so 'pending' is precisely the window in which a push
+// may be in flight — and the intent's authorization is already consumed, which
+// InvalidateAuthorizations deliberately will not touch. A revision opened
+// against a pending intent races a push it has no way to cancel.
+//
+// It lives in this task, not beside the publish state machine that owns the
+// rest of these rows, because Task 6's revision path is its only caller and
+// Task 6 must compile on its own.
+func (q *Queries) CountSettledPublications(ctx context.Context, runID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countSettledPublications, runID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const createPublishIntent = `-- name: CreatePublishIntent :one
+INSERT INTO publish_intents (run_id, node_id, attempt, authorization_id, repo_id,
+                             forge_kind, repo_slug, credential_id, branch, target_branch,
+                             base_sha, tree_hash, title, body, author_email,
+                             commit_message, status, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', $17, $17)
+RETURNING id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, commit_message, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at
+`
+
+type CreatePublishIntentParams struct {
+	RunID           uuid.UUID
+	NodeID          string
+	Attempt         int32
+	AuthorizationID uuid.UUID
+	RepoID          uuid.UUID
+	ForgeKind       string
+	RepoSlug        string
+	CredentialID    uuid.UUID
+	Branch          string
+	TargetBranch    string
+	BaseSha         string
+	TreeHash        string
+	Title           string
+	Body            string
+	AuthorEmail     string
+	CommitMessage   string
+	CreatedAt       time.Time
+}
+
+func (q *Queries) CreatePublishIntent(ctx context.Context, arg CreatePublishIntentParams) (PublishIntent, error) {
+	row := q.db.QueryRow(ctx, createPublishIntent,
+		arg.RunID,
+		arg.NodeID,
+		arg.Attempt,
+		arg.AuthorizationID,
+		arg.RepoID,
+		arg.ForgeKind,
+		arg.RepoSlug,
+		arg.CredentialID,
+		arg.Branch,
+		arg.TargetBranch,
+		arg.BaseSha,
+		arg.TreeHash,
+		arg.Title,
+		arg.Body,
+		arg.AuthorEmail,
+		arg.CommitMessage,
+		arg.CreatedAt,
+	)
+	var i PublishIntent
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Attempt,
+		&i.AuthorizationID,
+		&i.RepoID,
+		&i.ForgeKind,
+		&i.RepoSlug,
+		&i.CredentialID,
+		&i.Branch,
+		&i.TargetBranch,
+		&i.BaseSha,
+		&i.TreeHash,
+		&i.Title,
+		&i.Body,
+		&i.AuthorEmail,
+		&i.CommitMessage,
+		&i.Status,
+		&i.HeadSha,
+		&i.PrNumber,
+		&i.PrUrl,
+		&i.HaltReason,
+		&i.AbsentSince,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const dBNow = `-- name: DBNow :one
@@ -249,6 +429,46 @@ func (q *Queries) DBNow(ctx context.Context) (time.Time, error) {
 	var column_1 time.Time
 	err := row.Scan(&column_1)
 	return column_1, err
+}
+
+const finishGatePhase = `-- name: FinishGatePhase :execrows
+UPDATE phase_runs SET status = $4, outcome = $2, finished_at = $3
+WHERE phase_runs.id = $1 AND phase_runs.status = 'waiting_decision'
+  AND EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.id = phase_runs.run_id
+        AND r.status = 'waiting'
+        AND r.wall_deadline > now()
+  )
+`
+
+type FinishGatePhaseParams struct {
+	ID         uuid.UUID
+	Outcome    []byte
+	FinishedAt *time.Time
+	ToStatus   string
+}
+
+// The gate's own CAS. Unlike FinishPhase there is no worker identity to
+// match — a gate has no worker — and the from-status is fixed, so the only
+// way to win is to be the transaction that found the row still waiting.
+//
+// The run's wall-deadline predicate rides IN this statement, evaluated against
+// the database clock (global constraint: every deciding predicate reads now(),
+// and it reads it in the statement that mutates). An earlier SELECT now() in
+// the same transaction is not a substitute: it would let a decision that read
+// the clock before the sweeper's commit still land its own mutation.
+func (q *Queries) FinishGatePhase(ctx context.Context, arg FinishGatePhaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishGatePhase,
+		arg.ID,
+		arg.Outcome,
+		arg.FinishedAt,
+		arg.ToStatus,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const finishPhase = `-- name: FinishPhase :execrows
@@ -305,10 +525,161 @@ func (q *Queries) FinishRun(ctx context.Context, arg FinishRunParams) (int64, er
 	return result.RowsAffected(), nil
 }
 
+const getArtifactByID = `-- name: GetArtifactByID :one
+SELECT id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at FROM artifacts WHERE id = $1
+`
+
+// The publish path's read: an authorization names ONE artifact id and the
+// publication must carry that artifact's diff, not whatever is newest for the
+// node now. Addressing it by id is what makes the approved thing and the
+// published thing the same thing.
+func (q *Queries) GetArtifactByID(ctx context.Context, id uuid.UUID) (Artifact, error) {
+	row := q.db.QueryRow(ctx, getArtifactByID, id)
+	var i Artifact
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Attempt,
+		&i.Generation,
+		&i.Type,
+		&i.Payload,
+		&i.ParentIds,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getAuthorizationByID = `-- name: GetAuthorizationByID :one
+SELECT ap.id, ap.run_id, ap.gate_node_id, ap.publish_node_id, ap.gate_decision_id, ap.artifact_id, ap.base_sha, ap.tree_hash, ap.repo_id, ap.forge_kind, ap.repo_slug, ap.target_branch, ap.generation, ap.status, ap.created_at, ap.settled_at, u.email AS approver_email
+FROM approved_patches ap
+JOIN gate_decisions gd ON gd.id = ap.gate_decision_id
+JOIN users u ON u.id = gd.acted_by
+WHERE ap.id = $1
+`
+
+type GetAuthorizationByIDRow struct {
+	ID             uuid.UUID
+	RunID          uuid.UUID
+	GateNodeID     string
+	PublishNodeID  string
+	GateDecisionID uuid.UUID
+	ArtifactID     uuid.UUID
+	BaseSha        string
+	TreeHash       string
+	RepoID         uuid.UUID
+	ForgeKind      string
+	RepoSlug       string
+	TargetBranch   string
+	Generation     int32
+	Status         string
+	CreatedAt      time.Time
+	SettledAt      *time.Time
+	ApproverEmail  string
+}
+
+// The resume read: an intent that already exists names its authorization, and
+// the publish path needs the same joined shape the fresh read returns.
+func (q *Queries) GetAuthorizationByID(ctx context.Context, id uuid.UUID) (GetAuthorizationByIDRow, error) {
+	row := q.db.QueryRow(ctx, getAuthorizationByID, id)
+	var i GetAuthorizationByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.GateNodeID,
+		&i.PublishNodeID,
+		&i.GateDecisionID,
+		&i.ArtifactID,
+		&i.BaseSha,
+		&i.TreeHash,
+		&i.RepoID,
+		&i.ForgeKind,
+		&i.RepoSlug,
+		&i.TargetBranch,
+		&i.Generation,
+		&i.Status,
+		&i.CreatedAt,
+		&i.SettledAt,
+		&i.ApproverEmail,
+	)
+	return i, err
+}
+
+const getLiveGateForUpdate = `-- name: GetLiveGateForUpdate :one
+SELECT pr.id, pr.run_id, pr.node_id, pr.attempt, pr.max_attempts, pr.chargeable_failures, pr.not_before, pr.status, pr.generation, pr.worker_id, pr.leased_until, pr.claimed_at, pr.finished_at, pr.outcome, pr.created_at, r.wall_deadline AS run_wall_deadline, r.status AS run_status,
+       r.generation AS run_generation, r.policy_snapshot, t.requester_id, t.project_id
+FROM phase_runs pr
+JOIN runs r ON r.id = pr.run_id
+JOIN tasks t ON t.id = r.task_id
+WHERE pr.run_id = $1 AND pr.node_id = $2 AND pr.status = 'waiting_decision'
+FOR UPDATE OF pr
+`
+
+type GetLiveGateForUpdateParams struct {
+	RunID  uuid.UUID
+	NodeID string
+}
+
+type GetLiveGateForUpdateRow struct {
+	ID                 uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Attempt            int32
+	MaxAttempts        int32
+	ChargeableFailures int32
+	NotBefore          *time.Time
+	Status             string
+	Generation         int32
+	WorkerID           pgtype.Text
+	LeasedUntil        *time.Time
+	ClaimedAt          *time.Time
+	FinishedAt         *time.Time
+	Outcome            []byte
+	CreatedAt          time.Time
+	RunWallDeadline    time.Time
+	RunStatus          string
+	RunGeneration      int32
+	PolicySnapshot     []byte
+	RequesterID        uuid.UUID
+	ProjectID          uuid.UUID
+}
+
+// The decision's CAS target, locked for the whole decision transaction so a
+// second decider blocks rather than racing. The run columns ride along:
+// every deciding statement carries the wall-deadline predicate (spec §3).
+func (q *Queries) GetLiveGateForUpdate(ctx context.Context, arg GetLiveGateForUpdateParams) (GetLiveGateForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, getLiveGateForUpdate, arg.RunID, arg.NodeID)
+	var i GetLiveGateForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ChargeableFailures,
+		&i.NotBefore,
+		&i.Status,
+		&i.Generation,
+		&i.WorkerID,
+		&i.LeasedUntil,
+		&i.ClaimedAt,
+		&i.FinishedAt,
+		&i.Outcome,
+		&i.CreatedAt,
+		&i.RunWallDeadline,
+		&i.RunStatus,
+		&i.RunGeneration,
+		&i.PolicySnapshot,
+		&i.RequesterID,
+		&i.ProjectID,
+	)
+	return i, err
+}
+
 const getNodeArtifact = `-- name: GetNodeArtifact :one
-SELECT id, run_id, node_id, attempt, type, payload, parent_ids, created_at FROM artifacts
+SELECT id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at FROM artifacts
 WHERE run_id = $1 AND node_id = $2 AND type = $3
-ORDER BY attempt DESC, created_at DESC
+ORDER BY generation DESC, attempt DESC, created_at DESC, id DESC
 LIMIT 1
 `
 
@@ -318,6 +689,23 @@ type GetNodeArtifactParams struct {
 	Type   string
 }
 
+// The CURRENT artifact of this type for this node. After a revision the node
+// has one per generation, and the successor must read the newest.
+//
+// Ordering is by PROVENANCE first, not by time. The rows this has to separate
+// are stamped from two different clocks: a revision seed carries the database
+// clock (it is written inside the decision transaction), while a produced
+// artifact carries the injected application clock, which is time.Now() in
+// production. Those clocks are independent, so ordering on created_at means a
+// host clock even slightly behind the database silently sorts a generation-2
+// patch BEHIND its own generation-1 seed — and the gate then approves, and the
+// publisher then publishes, the stale content. uuidv7 does not save this: the
+// ids are minted from the same skewed clock.
+//
+// generation and attempt are integers this plan already maintains and neither
+// can go backwards, so they decide. created_at and id stay only as tiebreaks
+// within one (generation, attempt) — where a single clock produced both rows
+// and comparing them is meaningful.
 func (q *Queries) GetNodeArtifact(ctx context.Context, arg GetNodeArtifactParams) (Artifact, error) {
 	row := q.db.QueryRow(ctx, getNodeArtifact, arg.RunID, arg.NodeID, arg.Type)
 	var i Artifact
@@ -326,6 +714,7 @@ func (q *Queries) GetNodeArtifact(ctx context.Context, arg GetNodeArtifactParams
 		&i.RunID,
 		&i.NodeID,
 		&i.Attempt,
+		&i.Generation,
 		&i.Type,
 		&i.Payload,
 		&i.ParentIds,
@@ -335,7 +724,7 @@ func (q *Queries) GetNodeArtifact(ctx context.Context, arg GetNodeArtifactParams
 }
 
 const getPhase = `-- name: GetPhase :one
-SELECT id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE id = $1
+SELECT id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, generation, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE id = $1
 `
 
 func (q *Queries) GetPhase(ctx context.Context, id uuid.UUID) (PhaseRun, error) {
@@ -350,6 +739,7 @@ func (q *Queries) GetPhase(ctx context.Context, id uuid.UUID) (PhaseRun, error) 
 		&i.ChargeableFailures,
 		&i.NotBefore,
 		&i.Status,
+		&i.Generation,
 		&i.WorkerID,
 		&i.LeasedUntil,
 		&i.ClaimedAt,
@@ -361,7 +751,7 @@ func (q *Queries) GetPhase(ctx context.Context, id uuid.UUID) (PhaseRun, error) 
 }
 
 const getPhaseByRef = `-- name: GetPhaseByRef :one
-SELECT id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE run_id = $1 AND node_id = $2 AND attempt = $3
+SELECT id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, generation, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE run_id = $1 AND node_id = $2 AND attempt = $3
 `
 
 type GetPhaseByRefParams struct {
@@ -385,6 +775,7 @@ func (q *Queries) GetPhaseByRef(ctx context.Context, arg GetPhaseByRefParams) (P
 		&i.ChargeableFailures,
 		&i.NotBefore,
 		&i.Status,
+		&i.Generation,
 		&i.WorkerID,
 		&i.LeasedUntil,
 		&i.ClaimedAt,
@@ -395,8 +786,50 @@ func (q *Queries) GetPhaseByRef(ctx context.Context, arg GetPhaseByRefParams) (P
 	return i, err
 }
 
+const getPublishIntent = `-- name: GetPublishIntent :one
+SELECT id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, commit_message, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at FROM publish_intents WHERE run_id = $1 AND node_id = $2
+`
+
+type GetPublishIntentParams struct {
+	RunID  uuid.UUID
+	NodeID string
+}
+
+func (q *Queries) GetPublishIntent(ctx context.Context, arg GetPublishIntentParams) (PublishIntent, error) {
+	row := q.db.QueryRow(ctx, getPublishIntent, arg.RunID, arg.NodeID)
+	var i PublishIntent
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Attempt,
+		&i.AuthorizationID,
+		&i.RepoID,
+		&i.ForgeKind,
+		&i.RepoSlug,
+		&i.CredentialID,
+		&i.Branch,
+		&i.TargetBranch,
+		&i.BaseSha,
+		&i.TreeHash,
+		&i.Title,
+		&i.Body,
+		&i.AuthorEmail,
+		&i.CommitMessage,
+		&i.Status,
+		&i.HeadSha,
+		&i.PrNumber,
+		&i.PrUrl,
+		&i.HaltReason,
+		&i.AbsentSince,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getRun = `-- name: GetRun :one
-SELECT id, task_id, status, definition_hash, base_sha, policy_snapshot, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at FROM runs WHERE id = $1
+SELECT id, task_id, status, definition_hash, base_sha, policy_snapshot, generation, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at FROM runs WHERE id = $1
 `
 
 func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -409,6 +842,7 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.DefinitionHash,
 		&i.BaseSha,
 		&i.PolicySnapshot,
+		&i.Generation,
 		&i.ExecutionBudgetMs,
 		&i.ExecutionUsedMs,
 		&i.WallDeadline,
@@ -421,7 +855,7 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
 }
 
 const getRunForUpdate = `-- name: GetRunForUpdate :one
-SELECT id, task_id, status, definition_hash, base_sha, policy_snapshot, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at FROM runs WHERE id = $1 FOR UPDATE
+SELECT id, task_id, status, definition_hash, base_sha, policy_snapshot, generation, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at FROM runs WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) GetRunForUpdate(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -434,6 +868,7 @@ func (q *Queries) GetRunForUpdate(ctx context.Context, id uuid.UUID) (Run, error
 		&i.DefinitionHash,
 		&i.BaseSha,
 		&i.PolicySnapshot,
+		&i.Generation,
 		&i.ExecutionBudgetMs,
 		&i.ExecutionUsedMs,
 		&i.WallDeadline,
@@ -476,6 +911,180 @@ func (q *Queries) GetTask(ctx context.Context, id uuid.UUID) (Task, error) {
 	return i, err
 }
 
+const getValidAuthorizationForUpdate = `-- name: GetValidAuthorizationForUpdate :one
+SELECT ap.id, ap.run_id, ap.gate_node_id, ap.publish_node_id, ap.gate_decision_id, ap.artifact_id, ap.base_sha, ap.tree_hash, ap.repo_id, ap.forge_kind, ap.repo_slug, ap.target_branch, ap.generation, ap.status, ap.created_at, ap.settled_at, u.email AS approver_email
+FROM approved_patches ap
+JOIN gate_decisions gd ON gd.id = ap.gate_decision_id
+JOIN users u ON u.id = gd.acted_by
+WHERE ap.run_id = $1 AND ap.publish_node_id = $2 AND ap.status = 'valid'
+FOR UPDATE OF ap
+`
+
+type GetValidAuthorizationForUpdateParams struct {
+	RunID         uuid.UUID
+	PublishNodeID string
+}
+
+type GetValidAuthorizationForUpdateRow struct {
+	ID             uuid.UUID
+	RunID          uuid.UUID
+	GateNodeID     string
+	PublishNodeID  string
+	GateDecisionID uuid.UUID
+	ArtifactID     uuid.UUID
+	BaseSha        string
+	TreeHash       string
+	RepoID         uuid.UUID
+	ForgeKind      string
+	RepoSlug       string
+	TargetBranch   string
+	Generation     int32
+	Status         string
+	CreatedAt      time.Time
+	SettledAt      *time.Time
+	ApproverEmail  string
+}
+
+// The approver's email rides along because a publication renders it into the
+// commit trailers and the PR body, and joining here saves the publish path a
+// second round trip on its hottest transaction.
+//
+// FOR UPDATE OF ap: the decision and user rows are read-only here, and locking
+// them would serialize unrelated decisions by the same approver.
+func (q *Queries) GetValidAuthorizationForUpdate(ctx context.Context, arg GetValidAuthorizationForUpdateParams) (GetValidAuthorizationForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, getValidAuthorizationForUpdate, arg.RunID, arg.PublishNodeID)
+	var i GetValidAuthorizationForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.GateNodeID,
+		&i.PublishNodeID,
+		&i.GateDecisionID,
+		&i.ArtifactID,
+		&i.BaseSha,
+		&i.TreeHash,
+		&i.RepoID,
+		&i.ForgeKind,
+		&i.RepoSlug,
+		&i.TargetBranch,
+		&i.Generation,
+		&i.Status,
+		&i.CreatedAt,
+		&i.SettledAt,
+		&i.ApproverEmail,
+	)
+	return i, err
+}
+
+const haltPublishIntent = `-- name: HaltPublishIntent :execrows
+UPDATE publish_intents SET status = 'halted', halt_reason = $2, updated_at = $3
+WHERE id = $1 AND status IN ('pending', 'pushed')
+`
+
+type HaltPublishIntentParams struct {
+	ID         uuid.UUID
+	HaltReason pgtype.Text
+	UpdatedAt  time.Time
+}
+
+// Terminal by design: a halted publication is reconciled by a human, never
+// by another attempt.
+//
+// 'published' is NOT haltable, and that exclusion is load-bearing rather than
+// tidy: a publication that reached 'published' has both its receipts and is
+// done, so no late arrival may overwrite it with a call for human help.
+//
+// It is NOT, however, sufficient on its own, and reading it as the fence
+// against the create-PR race would be a mistake. The dangerous window is the
+// one BEFORE the receipt commits: the winner has opened the request, the
+// intent still says 'pushed', and this statement would happily halt it. What
+// closes that window is in the code, not here — adoptConflictingPublication
+// re-queries on conflict and only halts on a request provably not ours, so a
+// loser of the race never reaches this statement at all.
+func (q *Queries) HaltPublishIntent(ctx context.Context, arg HaltPublishIntentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, haltPublishIntent, arg.ID, arg.HaltReason, arg.UpdatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const haltStablyAbsentPublication = `-- name: HaltStablyAbsentPublication :execrows
+UPDATE publish_intents SET status = 'halted', halt_reason = $1, updated_at = now()
+WHERE id = $2 AND status = $3
+  AND absent_since IS NOT NULL
+  AND absent_since <= now() - make_interval(secs => $4::int)
+`
+
+type HaltStablyAbsentPublicationParams struct {
+	HaltReason   pgtype.Text
+	ID           uuid.UUID
+	Status       string
+	GraceSeconds int32
+}
+
+// Halt only if the marker has been absent, continuously, for the whole grace.
+// The comparison is in SQL against the DATABASE clock, like every other
+// deadline predicate in this system: an app-side comparison would let clock
+// skew shorten the one window protecting an in-flight request.
+//
+// The grace arrives as SECONDS and is widened by make_interval rather than
+// being cast from an interval literal: sqlc maps `interval` to pgtype.Interval,
+// so an interval parameter would put a pgtype value in the call signature
+// where a time.Duration belongs.
+func (q *Queries) HaltStablyAbsentPublication(ctx context.Context, arg HaltStablyAbsentPublicationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, haltStablyAbsentPublication,
+		arg.HaltReason,
+		arg.ID,
+		arg.Status,
+		arg.GraceSeconds,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const haltUnverifiablePublication = `-- name: HaltUnverifiablePublication :execrows
+UPDATE publish_intents SET status = 'halted', halt_reason = $1, updated_at = now()
+WHERE publish_intents.id = $2 AND publish_intents.status = $3
+  AND EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.id = publish_intents.run_id
+        AND r.wall_deadline <= now() - make_interval(secs => $4::int)
+  )
+`
+
+type HaltUnverifiablePublicationParams struct {
+	HaltReason          pgtype.Text
+	ID                  uuid.UUID
+	Status              string
+	UnverifiableSeconds int32
+}
+
+// The give-up bound on a publication nobody can verify. Settlement never
+// guesses — an unreachable forge defers to the next tick — but "defer" with no
+// bound is its own durable answer: an outage, or a credential revoked after the
+// intent was created, would leave the run alive past its deadline forever,
+// holding a phase slot and re-probing on every tick.
+//
+// The age is measured against the RUN's wall_deadline, not against this row.
+// updated_at is bumped by both absence statements and created_at would halt on
+// the first blip for any run with a long wall deadline; the deadline is the one
+// timestamp that says how long this run has been owed an answer.
+func (q *Queries) HaltUnverifiablePublication(ctx context.Context, arg HaltUnverifiablePublicationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, haltUnverifiablePublication,
+		arg.HaltReason,
+		arg.ID,
+		arg.Status,
+		arg.UnverifiableSeconds,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const heartbeatPhase = `-- name: HeartbeatPhase :execrows
 UPDATE phase_runs SET leased_until = now() + make_interval(secs => $3::float8)
 WHERE id = $1 AND status = 'running' AND worker_id = $2
@@ -495,21 +1104,84 @@ func (q *Queries) HeartbeatPhase(ctx context.Context, arg HeartbeatPhaseParams) 
 	return result.RowsAffected(), nil
 }
 
+const insertApprovedPatch = `-- name: InsertApprovedPatch :one
+INSERT INTO approved_patches (run_id, gate_node_id, publish_node_id, gate_decision_id,
+                              artifact_id, base_sha, tree_hash, repo_id, forge_kind,
+                              repo_slug, target_branch, generation, status, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'valid', $13)
+RETURNING id, run_id, gate_node_id, publish_node_id, gate_decision_id, artifact_id, base_sha, tree_hash, repo_id, forge_kind, repo_slug, target_branch, generation, status, created_at, settled_at
+`
+
+type InsertApprovedPatchParams struct {
+	RunID          uuid.UUID
+	GateNodeID     string
+	PublishNodeID  string
+	GateDecisionID uuid.UUID
+	ArtifactID     uuid.UUID
+	BaseSha        string
+	TreeHash       string
+	RepoID         uuid.UUID
+	ForgeKind      string
+	RepoSlug       string
+	TargetBranch   string
+	Generation     int32
+	CreatedAt      time.Time
+}
+
+func (q *Queries) InsertApprovedPatch(ctx context.Context, arg InsertApprovedPatchParams) (ApprovedPatch, error) {
+	row := q.db.QueryRow(ctx, insertApprovedPatch,
+		arg.RunID,
+		arg.GateNodeID,
+		arg.PublishNodeID,
+		arg.GateDecisionID,
+		arg.ArtifactID,
+		arg.BaseSha,
+		arg.TreeHash,
+		arg.RepoID,
+		arg.ForgeKind,
+		arg.RepoSlug,
+		arg.TargetBranch,
+		arg.Generation,
+		arg.CreatedAt,
+	)
+	var i ApprovedPatch
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.GateNodeID,
+		&i.PublishNodeID,
+		&i.GateDecisionID,
+		&i.ArtifactID,
+		&i.BaseSha,
+		&i.TreeHash,
+		&i.RepoID,
+		&i.ForgeKind,
+		&i.RepoSlug,
+		&i.TargetBranch,
+		&i.Generation,
+		&i.Status,
+		&i.CreatedAt,
+		&i.SettledAt,
+	)
+	return i, err
+}
+
 const insertArtifact = `-- name: InsertArtifact :one
-INSERT INTO artifacts (id, run_id, node_id, attempt, type, payload, parent_ids, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, run_id, node_id, attempt, type, payload, parent_ids, created_at
+INSERT INTO artifacts (id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at
 `
 
 type InsertArtifactParams struct {
-	ID        uuid.UUID
-	RunID     uuid.UUID
-	NodeID    string
-	Attempt   int32
-	Type      string
-	Payload   []byte
-	ParentIds []byte
-	CreatedAt time.Time
+	ID         uuid.UUID
+	RunID      uuid.UUID
+	NodeID     string
+	Attempt    int32
+	Generation int32
+	Type       string
+	Payload    []byte
+	ParentIds  []byte
+	CreatedAt  time.Time
 }
 
 func (q *Queries) InsertArtifact(ctx context.Context, arg InsertArtifactParams) (Artifact, error) {
@@ -518,6 +1190,7 @@ func (q *Queries) InsertArtifact(ctx context.Context, arg InsertArtifactParams) 
 		arg.RunID,
 		arg.NodeID,
 		arg.Attempt,
+		arg.Generation,
 		arg.Type,
 		arg.Payload,
 		arg.ParentIds,
@@ -529,9 +1202,109 @@ func (q *Queries) InsertArtifact(ctx context.Context, arg InsertArtifactParams) 
 		&i.RunID,
 		&i.NodeID,
 		&i.Attempt,
+		&i.Generation,
 		&i.Type,
 		&i.Payload,
 		&i.ParentIds,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertGateDecision = `-- name: InsertGateDecision :one
+INSERT INTO gate_decisions (phase_run_id, run_id, node_id, generation, decision,
+                            examined_artifact_id, note, acted_by, self_approval, acted_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING id, phase_run_id, run_id, node_id, generation, decision, examined_artifact_id, note, acted_by, self_approval, acted_at
+`
+
+type InsertGateDecisionParams struct {
+	PhaseRunID         uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Generation         int32
+	Decision           string
+	ExaminedArtifactID uuid.UUID
+	Note               string
+	ActedBy            uuid.UUID
+	SelfApproval       bool
+	ActedAt            time.Time
+}
+
+func (q *Queries) InsertGateDecision(ctx context.Context, arg InsertGateDecisionParams) (GateDecision, error) {
+	row := q.db.QueryRow(ctx, insertGateDecision,
+		arg.PhaseRunID,
+		arg.RunID,
+		arg.NodeID,
+		arg.Generation,
+		arg.Decision,
+		arg.ExaminedArtifactID,
+		arg.Note,
+		arg.ActedBy,
+		arg.SelfApproval,
+		arg.ActedAt,
+	)
+	var i GateDecision
+	err := row.Scan(
+		&i.ID,
+		&i.PhaseRunID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Generation,
+		&i.Decision,
+		&i.ExaminedArtifactID,
+		&i.Note,
+		&i.ActedBy,
+		&i.SelfApproval,
+		&i.ActedAt,
+	)
+	return i, err
+}
+
+const insertGatePhase = `-- name: InsertGatePhase :one
+INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, chargeable_failures,
+                        generation, status, created_at)
+VALUES ($1, $2, $3, $4, 0, $5, 'waiting_decision', $6)
+RETURNING id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, generation, worker_id, leased_until, claimed_at, finished_at, outcome, created_at
+`
+
+type InsertGatePhaseParams struct {
+	RunID       uuid.UUID
+	NodeID      string
+	Attempt     int32
+	MaxAttempts int32
+	Generation  int32
+	CreatedAt   time.Time
+}
+
+// A gate row is INSERTED waiting: the claim CTE predicates on 'pending', so
+// no worker can ever lease it and the execution budget never accrues against
+// a human's thinking time (spec §3 Budgets).
+func (q *Queries) InsertGatePhase(ctx context.Context, arg InsertGatePhaseParams) (PhaseRun, error) {
+	row := q.db.QueryRow(ctx, insertGatePhase,
+		arg.RunID,
+		arg.NodeID,
+		arg.Attempt,
+		arg.MaxAttempts,
+		arg.Generation,
+		arg.CreatedAt,
+	)
+	var i PhaseRun
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.NodeID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ChargeableFailures,
+		&i.NotBefore,
+		&i.Status,
+		&i.Generation,
+		&i.WorkerID,
+		&i.LeasedUntil,
+		&i.ClaimedAt,
+		&i.FinishedAt,
+		&i.Outcome,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -560,9 +1333,10 @@ func (q *Queries) InsertOutbox(ctx context.Context, arg InsertOutboxParams) erro
 }
 
 const insertPhase = `-- name: InsertPhase :one
-INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
-RETURNING id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at
+INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, chargeable_failures,
+                        not_before, generation, status, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+RETURNING id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, generation, worker_id, leased_until, claimed_at, finished_at, outcome, created_at
 `
 
 type InsertPhaseParams struct {
@@ -572,6 +1346,7 @@ type InsertPhaseParams struct {
 	MaxAttempts        int32
 	ChargeableFailures int32
 	NotBefore          *time.Time
+	Generation         int32
 	CreatedAt          time.Time
 }
 
@@ -583,6 +1358,7 @@ func (q *Queries) InsertPhase(ctx context.Context, arg InsertPhaseParams) (Phase
 		arg.MaxAttempts,
 		arg.ChargeableFailures,
 		arg.NotBefore,
+		arg.Generation,
 		arg.CreatedAt,
 	)
 	var i PhaseRun
@@ -595,6 +1371,7 @@ func (q *Queries) InsertPhase(ctx context.Context, arg InsertPhaseParams) (Phase
 		&i.ChargeableFailures,
 		&i.NotBefore,
 		&i.Status,
+		&i.Generation,
 		&i.WorkerID,
 		&i.LeasedUntil,
 		&i.ClaimedAt,
@@ -609,7 +1386,7 @@ const insertRun = `-- name: InsertRun :one
 INSERT INTO runs (task_id, status, definition_hash, base_sha, policy_snapshot,
                   execution_budget_ms, wall_deadline, created_at)
 VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7)
-RETURNING id, task_id, status, definition_hash, base_sha, policy_snapshot, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at
+RETURNING id, task_id, status, definition_hash, base_sha, policy_snapshot, generation, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at
 `
 
 type InsertRunParams struct {
@@ -640,6 +1417,7 @@ func (q *Queries) InsertRun(ctx context.Context, arg InsertRunParams) (Run, erro
 		&i.DefinitionHash,
 		&i.BaseSha,
 		&i.PolicySnapshot,
+		&i.Generation,
 		&i.ExecutionBudgetMs,
 		&i.ExecutionUsedMs,
 		&i.WallDeadline,
@@ -719,8 +1497,47 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, e
 	return i, err
 }
 
+const invalidateAuthorizations = `-- name: InvalidateAuthorizations :many
+UPDATE approved_patches SET status = 'invalidated', settled_at = $2
+WHERE run_id = $1 AND status = 'valid'
+RETURNING id, publish_node_id
+`
+
+type InvalidateAuthorizationsParams struct {
+	RunID     uuid.UUID
+	SettledAt *time.Time
+}
+
+type InvalidateAuthorizationsRow struct {
+	ID            uuid.UUID
+	PublishNodeID string
+}
+
+// A newer patch generation invalidates prior authorizations (spec §2). Only
+// 'valid' rows are touched: a consumed one already funded a publication and
+// rewriting its status would erase that fact.
+func (q *Queries) InvalidateAuthorizations(ctx context.Context, arg InvalidateAuthorizationsParams) ([]InvalidateAuthorizationsRow, error) {
+	rows, err := q.db.Query(ctx, invalidateAuthorizations, arg.RunID, arg.SettledAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []InvalidateAuthorizationsRow
+	for rows.Next() {
+		var i InvalidateAuthorizationsRow
+		if err := rows.Scan(&i.ID, &i.PublishNodeID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const latestRunForUpdate = `-- name: LatestRunForUpdate :one
-SELECT id, task_id, status, definition_hash, base_sha, policy_snapshot, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at FROM runs WHERE task_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE
+SELECT id, task_id, status, definition_hash, base_sha, policy_snapshot, generation, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at FROM runs WHERE task_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE
 `
 
 func (q *Queries) LatestRunForUpdate(ctx context.Context, taskID uuid.UUID) (Run, error) {
@@ -733,6 +1550,7 @@ func (q *Queries) LatestRunForUpdate(ctx context.Context, taskID uuid.UUID) (Run
 		&i.DefinitionHash,
 		&i.BaseSha,
 		&i.PolicySnapshot,
+		&i.Generation,
 		&i.ExecutionBudgetMs,
 		&i.ExecutionUsedMs,
 		&i.WallDeadline,
@@ -745,20 +1563,24 @@ func (q *Queries) LatestRunForUpdate(ctx context.Context, taskID uuid.UUID) (Run
 }
 
 const listArtifactsForRun = `-- name: ListArtifactsForRun :many
-SELECT id, run_id, node_id, attempt, type, parent_ids, created_at
+SELECT id, run_id, node_id, attempt, generation, type, parent_ids, created_at
 FROM artifacts WHERE run_id = $1 ORDER BY created_at, id
 `
 
 type ListArtifactsForRunRow struct {
-	ID        uuid.UUID
-	RunID     uuid.UUID
-	NodeID    string
-	Attempt   int32
-	Type      string
-	ParentIds []byte
-	CreatedAt time.Time
+	ID         uuid.UUID
+	RunID      uuid.UUID
+	NodeID     string
+	Attempt    int32
+	Generation int32
+	Type       string
+	ParentIds  []byte
+	CreatedAt  time.Time
 }
 
+// Metadata only: payload is deliberately absent, and generation is present
+// because after a revision a node has one artifact per round and a reader
+// cannot tell them apart without it.
 func (q *Queries) ListArtifactsForRun(ctx context.Context, runID uuid.UUID) ([]ListArtifactsForRunRow, error) {
 	rows, err := q.db.Query(ctx, listArtifactsForRun, runID)
 	if err != nil {
@@ -773,6 +1595,7 @@ func (q *Queries) ListArtifactsForRun(ctx context.Context, runID uuid.UUID) ([]L
 			&i.RunID,
 			&i.NodeID,
 			&i.Attempt,
+			&i.Generation,
 			&i.Type,
 			&i.ParentIds,
 			&i.CreatedAt,
@@ -837,6 +1660,70 @@ func (q *Queries) ListExpiredRunIDs(ctx context.Context, limit int32) ([]uuid.UU
 	return items, nil
 }
 
+const listGateDecisionsForRun = `-- name: ListGateDecisionsForRun :many
+SELECT gd.id, gd.phase_run_id, gd.run_id, gd.node_id, gd.generation, gd.decision, gd.examined_artifact_id, gd.note, gd.acted_by, gd.self_approval, gd.acted_at, u.email AS acted_by_email
+FROM gate_decisions gd
+JOIN users u ON u.id = gd.acted_by
+WHERE gd.run_id = $1
+ORDER BY gd.acted_at
+`
+
+type ListGateDecisionsForRunRow struct {
+	ID                 uuid.UUID
+	PhaseRunID         uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Generation         int32
+	Decision           string
+	ExaminedArtifactID uuid.UUID
+	Note               string
+	ActedBy            uuid.UUID
+	SelfApproval       bool
+	ActedAt            time.Time
+	ActedByEmail       string
+}
+
+// The run projection's decided gates, keyed by phase_run_id so a decision
+// lands on the attempt row that was actually decided. Keying on node_id would
+// attach every round's decision to every round's row: after a revision both
+// gate attempts carry the same node id.
+//
+// The approver's address is joined because a run page renders "approved by"
+// and the uuid is not readable; the id rides along for the audit trail. Both
+// are projected under names that say which is which.
+func (q *Queries) ListGateDecisionsForRun(ctx context.Context, runID uuid.UUID) ([]ListGateDecisionsForRunRow, error) {
+	rows, err := q.db.Query(ctx, listGateDecisionsForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListGateDecisionsForRunRow
+	for rows.Next() {
+		var i ListGateDecisionsForRunRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.PhaseRunID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Generation,
+			&i.Decision,
+			&i.ExaminedArtifactID,
+			&i.Note,
+			&i.ActedBy,
+			&i.SelfApproval,
+			&i.ActedAt,
+			&i.ActedByEmail,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingRunIDs = `-- name: ListPendingRunIDs :many
 SELECT id FROM runs WHERE status = 'pending' ORDER BY created_at LIMIT $1
 `
@@ -862,7 +1749,7 @@ func (q *Queries) ListPendingRunIDs(ctx context.Context, limit int32) ([]uuid.UU
 }
 
 const listPhasesForRun = `-- name: ListPhasesForRun :many
-SELECT id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE run_id = $1 ORDER BY created_at, node_id, attempt
+SELECT id, run_id, node_id, attempt, max_attempts, chargeable_failures, not_before, status, generation, worker_id, leased_until, claimed_at, finished_at, outcome, created_at FROM phase_runs WHERE run_id = $1 ORDER BY created_at, node_id, attempt
 `
 
 func (q *Queries) ListPhasesForRun(ctx context.Context, runID uuid.UUID) ([]PhaseRun, error) {
@@ -883,12 +1770,63 @@ func (q *Queries) ListPhasesForRun(ctx context.Context, runID uuid.UUID) ([]Phas
 			&i.ChargeableFailures,
 			&i.NotBefore,
 			&i.Status,
+			&i.Generation,
 			&i.WorkerID,
 			&i.LeasedUntil,
 			&i.ClaimedAt,
 			&i.FinishedAt,
 			&i.Outcome,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPublishIntentsForRun = `-- name: ListPublishIntentsForRun :many
+SELECT id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, commit_message, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at FROM publish_intents WHERE run_id = $1 ORDER BY created_at
+`
+
+func (q *Queries) ListPublishIntentsForRun(ctx context.Context, runID uuid.UUID) ([]PublishIntent, error) {
+	rows, err := q.db.Query(ctx, listPublishIntentsForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PublishIntent
+	for rows.Next() {
+		var i PublishIntent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Attempt,
+			&i.AuthorizationID,
+			&i.RepoID,
+			&i.ForgeKind,
+			&i.RepoSlug,
+			&i.CredentialID,
+			&i.Branch,
+			&i.TargetBranch,
+			&i.BaseSha,
+			&i.TreeHash,
+			&i.Title,
+			&i.Body,
+			&i.AuthorEmail,
+			&i.CommitMessage,
+			&i.Status,
+			&i.HeadSha,
+			&i.PrNumber,
+			&i.PrUrl,
+			&i.HaltReason,
+			&i.AbsentSince,
+			&i.CreatedAt,
+			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -938,8 +1876,66 @@ func (q *Queries) ListRunEventsAfter(ctx context.Context, arg ListRunEventsAfter
 	return items, nil
 }
 
+const listRunsAwaitingMaterialization = `-- name: ListRunsAwaitingMaterialization :many
+SELECT r.id FROM runs r
+WHERE r.status = 'running'
+  AND r.wall_deadline > now()
+  AND NOT EXISTS (
+      SELECT 1 FROM phase_runs pr
+      WHERE pr.run_id = r.id
+        AND pr.status IN ('pending', 'running', 'reconciling')
+  )
+ORDER BY r.created_at
+LIMIT $1
+`
+
+// Running runs that have nothing a worker could pick up. Such a run is either
+// finished (every node succeeded) or blocked behind a gate decision that just
+// landed — a decision is not a phase evaluation, so nothing else would ever
+// pick those up.
+//
+// Written as an anti-join rather than recomputing readiness in SQL: the graph
+// lives in Go, so this only has to be a cheap over-approximation that
+// materializeReady then decides precisely. Both answers are idempotent, so a
+// run matched spuriously costs one no-op transaction.
+//
+// 'waiting_decision' is DELIBERATELY NOT in the anti-join, and it used to be.
+// A waiting gate is precisely not something a worker could pick up — ClaimPhase
+// predicates on 'pending' — so excluding it contradicted this query's own first
+// sentence, and the cost was a permanent strand: with two gates open at once,
+// approving one CASes the run 'waiting' → 'running' while the sibling gate goes
+// on hiding the run from the pass that would materialize what the approval
+// released. Nothing then called syncWaiting, the run never returned to
+// 'waiting', and FinishGatePhase refused the sibling forever.
+//
+// The over-approximation this widens by is bounded, and by the same argument
+// the paragraph above already makes: the newly matched runs are exactly the
+// 'running' ones whose only live phases are waiting gates, and the first pass
+// over such a run parks it back to 'waiting' (syncWaiting, via
+// RunIsWaitingOnAGate), which the outer r.status predicate then excludes. One
+// no-op transaction, once — not a loop.
+func (q *Queries) ListRunsAwaitingMaterialization(ctx context.Context, limit int32) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listRunsAwaitingMaterialization, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunsForTask = `-- name: ListRunsForTask :many
-SELECT id, task_id, status, definition_hash, base_sha, policy_snapshot, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at FROM runs WHERE task_id = $1 ORDER BY created_at DESC, id DESC
+SELECT id, task_id, status, definition_hash, base_sha, policy_snapshot, generation, execution_budget_ms, execution_used_ms, wall_deadline, outcome, created_at, started_at, finished_at FROM runs WHERE task_id = $1 ORDER BY created_at DESC, id DESC
 `
 
 func (q *Queries) ListRunsForTask(ctx context.Context, taskID uuid.UUID) ([]Run, error) {
@@ -958,6 +1954,7 @@ func (q *Queries) ListRunsForTask(ctx context.Context, taskID uuid.UUID) ([]Run,
 			&i.DefinitionHash,
 			&i.BaseSha,
 			&i.PolicySnapshot,
+			&i.Generation,
 			&i.ExecutionBudgetMs,
 			&i.ExecutionUsedMs,
 			&i.WallDeadline,
@@ -976,10 +1973,68 @@ func (q *Queries) ListRunsForTask(ctx context.Context, taskID uuid.UUID) ([]Run,
 	return items, nil
 }
 
-const listSucceededNodes = `-- name: ListSucceededNodes :many
-SELECT node_id FROM phase_runs WHERE run_id = $1 AND status = 'succeeded'
+const listSeedArtifacts = `-- name: ListSeedArtifacts :many
+SELECT id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at FROM artifacts
+WHERE run_id = $1 AND node_id = $2 AND attempt = 0
+  AND generation = (SELECT generation FROM runs WHERE id = $1)
+ORDER BY type, id
 `
 
+type ListSeedArtifactsParams struct {
+	RunID  uuid.UUID
+	NodeID string
+}
+
+// What a revision handed this node. attempt = 0 is unreachable for a
+// produced artifact (phase attempts start at 1), so the ordinal alone
+// distinguishes a control-plane seed from a harness output. Only the newest
+// generation's seeds are returned: an older round's note is spent.
+func (q *Queries) ListSeedArtifacts(ctx context.Context, arg ListSeedArtifactsParams) ([]Artifact, error) {
+	rows, err := q.db.Query(ctx, listSeedArtifacts, arg.RunID, arg.NodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Artifact
+	for rows.Next() {
+		var i Artifact
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Attempt,
+			&i.Generation,
+			&i.Type,
+			&i.Payload,
+			&i.ParentIds,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSucceededNodes = `-- name: ListSucceededNodes :many
+SELECT node_id FROM (
+    SELECT DISTINCT ON (node_id) node_id, status
+    FROM phase_runs
+    WHERE run_id = $1
+    ORDER BY node_id, attempt DESC
+) latest
+WHERE status = 'succeeded'
+`
+
+// Readiness is decided by each node's NEWEST attempt row, not by whether the
+// node ever succeeded. A revision rematerializes nodes that already succeeded
+// in the prior generation; with an any-attempt predicate those nodes would
+// read as done forever and their successors would run on stale artifacts.
+// With no revisions in play the newest row is the only terminal row, so this
+// is a strict generalization of the Plan 05 behaviour.
 func (q *Queries) ListSucceededNodes(ctx context.Context, runID uuid.UUID) ([]string, error) {
 	rows, err := q.db.Query(ctx, listSucceededNodes, runID)
 	if err != nil {
@@ -1123,6 +2178,167 @@ func (q *Queries) ListTerminalRunIDsAmong(ctx context.Context, ids []uuid.UUID) 
 	return items, nil
 }
 
+const listUnsettledPublishIntents = `-- name: ListUnsettledPublishIntents :many
+SELECT id, run_id, node_id, attempt, authorization_id, repo_id, forge_kind, repo_slug, credential_id, branch, target_branch, base_sha, tree_hash, title, body, author_email, commit_message, status, head_sha, pr_number, pr_url, halt_reason, absent_since, created_at, updated_at FROM publish_intents
+WHERE run_id = $1 AND status IN ('pending', 'pushed')
+`
+
+// Intents that may correspond to an effect on the forge nobody has written
+// down. 'published' and 'halted' are settled by definition.
+func (q *Queries) ListUnsettledPublishIntents(ctx context.Context, runID uuid.UUID) ([]PublishIntent, error) {
+	rows, err := q.db.Query(ctx, listUnsettledPublishIntents, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PublishIntent
+	for rows.Next() {
+		var i PublishIntent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Attempt,
+			&i.AuthorizationID,
+			&i.RepoID,
+			&i.ForgeKind,
+			&i.RepoSlug,
+			&i.CredentialID,
+			&i.Branch,
+			&i.TargetBranch,
+			&i.BaseSha,
+			&i.TreeHash,
+			&i.Title,
+			&i.Body,
+			&i.AuthorEmail,
+			&i.CommitMessage,
+			&i.Status,
+			&i.HeadSha,
+			&i.PrNumber,
+			&i.PrUrl,
+			&i.HaltReason,
+			&i.AbsentSince,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWaitingGates = `-- name: ListWaitingGates :many
+SELECT pr.id, pr.run_id, pr.node_id, pr.attempt, pr.generation, pr.created_at,
+       t.id AS task_id, t.project_id, t.title, t.requester_id
+FROM phase_runs pr
+JOIN runs r ON r.id = pr.run_id
+JOIN tasks t ON t.id = r.task_id
+WHERE pr.status = 'waiting_decision'
+ORDER BY pr.created_at
+`
+
+type ListWaitingGatesRow struct {
+	ID          uuid.UUID
+	RunID       uuid.UUID
+	NodeID      string
+	Attempt     int32
+	Generation  int32
+	CreatedAt   time.Time
+	TaskID      uuid.UUID
+	ProjectID   uuid.UUID
+	Title       string
+	RequesterID uuid.UUID
+}
+
+func (q *Queries) ListWaitingGates(ctx context.Context) ([]ListWaitingGatesRow, error) {
+	rows, err := q.db.Query(ctx, listWaitingGates)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListWaitingGatesRow
+	for rows.Next() {
+		var i ListWaitingGatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Attempt,
+			&i.Generation,
+			&i.CreatedAt,
+			&i.TaskID,
+			&i.ProjectID,
+			&i.Title,
+			&i.RequesterID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWaitingGatesByProjects = `-- name: ListWaitingGatesByProjects :many
+SELECT pr.id, pr.run_id, pr.node_id, pr.attempt, pr.generation, pr.created_at,
+       t.id AS task_id, t.project_id, t.title, t.requester_id
+FROM phase_runs pr
+JOIN runs r ON r.id = pr.run_id
+JOIN tasks t ON t.id = r.task_id
+WHERE pr.status = 'waiting_decision' AND t.project_id = ANY($1::uuid[])
+ORDER BY pr.created_at
+`
+
+type ListWaitingGatesByProjectsRow struct {
+	ID          uuid.UUID
+	RunID       uuid.UUID
+	NodeID      string
+	Attempt     int32
+	Generation  int32
+	CreatedAt   time.Time
+	TaskID      uuid.UUID
+	ProjectID   uuid.UUID
+	Title       string
+	RequesterID uuid.UUID
+}
+
+func (q *Queries) ListWaitingGatesByProjects(ctx context.Context, projectIds []uuid.UUID) ([]ListWaitingGatesByProjectsRow, error) {
+	rows, err := q.db.Query(ctx, listWaitingGatesByProjects, projectIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListWaitingGatesByProjectsRow
+	for rows.Next() {
+		var i ListWaitingGatesByProjectsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Attempt,
+			&i.Generation,
+			&i.CreatedAt,
+			&i.TaskID,
+			&i.ProjectID,
+			&i.Title,
+			&i.RequesterID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockEventCounter = `-- name: LockEventCounter :one
 SELECT next_id FROM run_event_counter WHERE onerow FOR UPDATE
 `
@@ -1137,7 +2353,7 @@ func (q *Queries) LockEventCounter(ctx context.Context) (int64, error) {
 const markPhaseReconciling = `-- name: MarkPhaseReconciling :one
 UPDATE phase_runs SET status = 'reconciling'
 WHERE phase_runs.id = $1 AND phase_runs.status = 'running' AND phase_runs.leased_until <= now()
-RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.generation, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
           (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline
 `
 
@@ -1150,6 +2366,7 @@ type MarkPhaseReconcilingRow struct {
 	ChargeableFailures int32
 	NotBefore          *time.Time
 	Status             string
+	Generation         int32
 	WorkerID           pgtype.Text
 	LeasedUntil        *time.Time
 	ClaimedAt          *time.Time
@@ -1175,6 +2392,7 @@ func (q *Queries) MarkPhaseReconciling(ctx context.Context, id uuid.UUID) (MarkP
 		&i.ChargeableFailures,
 		&i.NotBefore,
 		&i.Status,
+		&i.Generation,
 		&i.WorkerID,
 		&i.LeasedUntil,
 		&i.ClaimedAt,
@@ -1190,7 +2408,7 @@ const markPhaseReconcilingPastDeadline = `-- name: MarkPhaseReconcilingPastDeadl
 UPDATE phase_runs SET status = 'reconciling'
 WHERE phase_runs.id = $1 AND phase_runs.status = 'running'
   AND EXISTS (SELECT 1 FROM runs r WHERE r.id = phase_runs.run_id AND r.wall_deadline <= now())
-RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
+RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.generation, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at,
           (SELECT r.wall_deadline FROM runs r WHERE r.id = phase_runs.run_id) AS run_wall_deadline
 `
 
@@ -1203,6 +2421,7 @@ type MarkPhaseReconcilingPastDeadlineRow struct {
 	ChargeableFailures int32
 	NotBefore          *time.Time
 	Status             string
+	Generation         int32
 	WorkerID           pgtype.Text
 	LeasedUntil        *time.Time
 	ClaimedAt          *time.Time
@@ -1229,6 +2448,7 @@ func (q *Queries) MarkPhaseReconcilingPastDeadline(ctx context.Context, id uuid.
 		&i.ChargeableFailures,
 		&i.NotBefore,
 		&i.Status,
+		&i.Generation,
 		&i.WorkerID,
 		&i.LeasedUntil,
 		&i.ClaimedAt,
@@ -1238,6 +2458,51 @@ func (q *Queries) MarkPhaseReconcilingPastDeadline(ctx context.Context, id uuid.
 		&i.RunWallDeadline,
 	)
 	return i, err
+}
+
+const markPublicationAbsent = `-- name: MarkPublicationAbsent :execrows
+
+UPDATE publish_intents SET absent_since = now(), updated_at = now()
+WHERE id = $1 AND status = $2 AND absent_since IS NULL
+`
+
+type MarkPublicationAbsentParams struct {
+	ID     uuid.UUID
+	Status string
+}
+
+// The three statements below carry the NEGATIVE answer for an expired run's
+// settlement: a marker that is not there. All three are :execrows and CAS on
+// status, so a settlement racing a live driver's receipt loses instead of
+// overwriting it.
+// First sighting of an absent marker. Set once and never refreshed: the grace
+// measures from when absence was FIRST seen, so re-stamping it on every tick
+// would push the deadline away forever and the intent would never settle.
+func (q *Queries) MarkPublicationAbsent(ctx context.Context, arg MarkPublicationAbsentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markPublicationAbsent, arg.ID, arg.Status)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const maxAttemptForNode = `-- name: MaxAttemptForNode :one
+SELECT COALESCE(max(attempt), 0)::integer FROM phase_runs WHERE run_id = $1 AND node_id = $2
+`
+
+type MaxAttemptForNodeParams struct {
+	RunID  uuid.UUID
+	NodeID string
+}
+
+// A rematerialized node continues the attempt ordinal rather than restarting
+// it: (run_id, node_id, attempt) is unique, and the ordinal stays what it has
+// always been — the execution ordinal (Plan 07 decision 5).
+func (q *Queries) MaxAttemptForNode(ctx context.Context, arg MaxAttemptForNodeParams) (int32, error) {
+	row := q.db.QueryRow(ctx, maxAttemptForNode, arg.RunID, arg.NodeID)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const pruneOutbox = `-- name: PruneOutbox :execrows
@@ -1250,6 +2515,117 @@ func (q *Queries) PruneOutbox(ctx context.Context, createdAt time.Time) (int64, 
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const recordPRReceipt = `-- name: RecordPRReceipt :execrows
+UPDATE publish_intents SET status = 'published', pr_number = $2, pr_url = $3,
+                           absent_since = NULL, updated_at = $4
+WHERE id = $1 AND status = 'pushed'
+`
+
+type RecordPRReceiptParams struct {
+	ID        uuid.UUID
+	PrNumber  pgtype.Int8
+	PrUrl     pgtype.Text
+	UpdatedAt time.Time
+}
+
+// absent_since is cleared for the same reason RecordPushReceipt clears it: a
+// settled intent carries no open question about a missing marker.
+func (q *Queries) RecordPRReceipt(ctx context.Context, arg RecordPRReceiptParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordPRReceipt,
+		arg.ID,
+		arg.PrNumber,
+		arg.PrUrl,
+		arg.UpdatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordPushReceipt = `-- name: RecordPushReceipt :execrows
+
+UPDATE publish_intents SET status = 'pushed', head_sha = $2, absent_since = NULL, updated_at = $3
+WHERE id = $1 AND status = 'pending'
+`
+
+type RecordPushReceiptParams struct {
+	ID        uuid.UUID
+	HeadSha   pgtype.Text
+	UpdatedAt time.Time
+}
+
+// The three receipt writes are MONOTONIC. status only ever moves forward
+// along pending -> pushed -> published, plus a one-way exit to halted from
+// the two unfinished states. That matters because a worker whose lease was
+// taken over can still be mid-flight inside a forge call: its request may be
+// accepted remotely long after the run stopped listening, and its late write
+// must not be able to undo the successor's. Each returns :execrows and every
+// caller checks the count — a zero means "somebody else already moved this
+// further", which is reloaded and adopted, never treated as failure.
+// The push landed. Recording head_sha before the PR call is what lets a
+// crash between the two resume instead of re-pushing blind. head_sha is
+// written once and never rewritten: a second push receipt for a different
+// commit would mean two commits on one marker, which cannot be true.
+//
+// absent_since is cleared in the SAME statement, and that is not tidiness.
+// Settlement stamps absent_since against the marker the intent's STATUS makes
+// uncertain — the branch while 'pending', the pull request once 'pushed'. A
+// stamp taken while pending and left behind would already be older than the
+// grace when the pull-request half first probes, so the very first PR-absence
+// sighting would halt an intent whose create call may still be on the wire.
+// The receipt is also the proof the stamp was wrong: the branch turned up.
+func (q *Queries) RecordPushReceipt(ctx context.Context, arg RecordPushReceiptParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordPushReceipt, arg.ID, arg.HeadSha, arg.UpdatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const runIsWaitingOnAGate = `-- name: RunIsWaitingOnAGate :one
+SELECT EXISTS (
+           SELECT 1 FROM phase_runs gate
+           WHERE gate.run_id = $1 AND gate.status = 'waiting_decision'
+       ) AND NOT EXISTS (
+           SELECT 1 FROM phase_runs live
+           WHERE live.run_id = $1
+             AND live.id <> $2
+             AND live.status IN ('pending', 'running', 'reconciling')
+       )
+`
+
+type RunIsWaitingOnAGateParams struct {
+	RunID        uuid.UUID
+	ExcludePhase uuid.UUID
+}
+
+// True when every live phase of the run is a gate awaiting a decision — at
+// least one waiting_decision row, and nothing pending, running or reconciling.
+//
+// This is what makes "run status is read back from the database, never inferred
+// from what a pass just did" (decision 20) implementable. It is read AFTER a
+// materialization pass's inserts, so it sees the successors that were just
+// created. Deciding from a pre-insertion snapshot gets a fan-out wrong in both
+// directions, and one of those directions strands the gate permanently: a
+// sibling finishing beside an already-waiting gate would leave the run
+// 'running', and FinishGatePhase refuses to decide a run that is not 'waiting'.
+//
+// exclude_phase is the phase whose own completion is being evaluated in the
+// calling transaction: its row may not have committed its terminal status yet,
+// and counting it as live would keep the run running forever. Pass uuid.Nil
+// when there is no such phase.
+//
+// It lives in this task, not beside the janitor pass that shares it, because
+// Task 4's evaluateSuccess is its first caller and Task 4 must compile on its
+// own.
+func (q *Queries) RunIsWaitingOnAGate(ctx context.Context, arg RunIsWaitingOnAGateParams) (pgtype.Bool, error) {
+	row := q.db.QueryRow(ctx, runIsWaitingOnAGate, arg.RunID, arg.ExcludePhase)
+	var column_1 pgtype.Bool
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const startRun = `-- name: StartRun :execrows
@@ -1272,7 +2648,7 @@ func (q *Queries) StartRun(ctx context.Context, arg StartRunParams) (int64, erro
 
 const supersedeLivePhases = `-- name: SupersedeLivePhases :many
 UPDATE phase_runs SET status = 'superseded', outcome = $2, finished_at = $3
-WHERE run_id = $1 AND status IN ('pending', 'running', 'reconciling')
+WHERE run_id = $1 AND status IN ('pending', 'running', 'waiting_decision', 'reconciling')
 RETURNING id, node_id, attempt
 `
 
@@ -1297,6 +2673,64 @@ func (q *Queries) SupersedeLivePhases(ctx context.Context, arg SupersedeLivePhas
 	var items []SupersedeLivePhasesRow
 	for rows.Next() {
 		var i SupersedeLivePhasesRow
+		if err := rows.Scan(&i.ID, &i.NodeID, &i.Attempt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const supersedePhasesInSlice = `-- name: SupersedePhasesInSlice :many
+UPDATE phase_runs SET status = 'superseded', outcome = $1, finished_at = $2
+WHERE run_id = $3 AND node_id = ANY($4::text[])
+  AND status IN ('pending', 'running', 'waiting_decision', 'reconciling', 'succeeded')
+RETURNING id, node_id, attempt
+`
+
+type SupersedePhasesInSliceParams struct {
+	Outcome    []byte
+	FinishedAt *time.Time
+	RunID      uuid.UUID
+	NodeIds    []string
+}
+
+type SupersedePhasesInSliceRow struct {
+	ID      uuid.UUID
+	NodeID  string
+	Attempt int32
+}
+
+// Revision rewind: every row for a node in the slice steps aside so a fresh
+// attempt can take its place.
+//
+// 'succeeded' is in this list and that is the load-bearing part. Readiness is
+// each node's NEWEST attempt row (decision 2), so a slice node that succeeded
+// in the prior generation would otherwise keep that row as its newest and stay
+// readable as done forever — the new generation would re-run only the revision
+// target, and the gate would then re-decide against the OLD review verdict.
+// Superseding the success is also the honest record: that attempt was retired
+// by a new generation, and its artifacts and decisions remain untouched.
+//
+// 'failed' and 'dead' are NOT in this list: a run holding either is already
+// terminal, so no revision can be opened against it.
+func (q *Queries) SupersedePhasesInSlice(ctx context.Context, arg SupersedePhasesInSliceParams) ([]SupersedePhasesInSliceRow, error) {
+	rows, err := q.db.Query(ctx, supersedePhasesInSlice,
+		arg.Outcome,
+		arg.FinishedAt,
+		arg.RunID,
+		arg.NodeIds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SupersedePhasesInSliceRow
+	for rows.Next() {
+		var i SupersedePhasesInSliceRow
 		if err := rows.Scan(&i.ID, &i.NodeID, &i.Attempt); err != nil {
 			return nil, err
 		}

@@ -66,7 +66,7 @@ func (s scriptedResolver) HarnessSpec(ctx context.Context, id uuid.UUID) (runner
 // localBareGit stands in for the forge's clone URL: the remote is a bare repo
 // on this host, bind-mounted read-only into the stage container and cloned
 // over file://. Production appGitSource builds an HTTPS URL from the repo's
-// forge + slug (and self-hosted base URLs are Plan 08's); this local file://
+// forge + slug on the configured clone root; this local file://
 // path is the fake forge the runner suite also uses. The credential.used
 // audit row this test asserts is unaffected — it comes from the harness
 // credential the runner opens per attempt through the production adapter, not
@@ -127,10 +127,11 @@ func TestRunnerE2E_TaskThroughRealContainerToPatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	heads := map[uuid.UUID]string{}
+	forge := fake.NewForge(map[uuid.UUID]string{})
 	runsSvc := runs.NewService(pool, clk, rec,
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		fake.Forge{Heads: heads}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		forge, fake.NewPublisher(nil), principalSource{svc: identitySvc},
+		runs.Params{Snapshot: runs.DefaultSnapshot()})
 
 	// The admin sets the stage through the real services.
 	project, err := assetsSvc.CreateProject(ctx, admin, "runner-e2e", "")
@@ -157,7 +158,7 @@ func TestRunnerE2E_TaskThroughRealContainerToPatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	heads[repo.ID] = headSHA
+	forge.Head(repo.ID, headSHA)
 
 	wf, err := workflowsSvc.CreateWorkflow(ctx, admin, "runner-e2e", "")
 	if err != nil {

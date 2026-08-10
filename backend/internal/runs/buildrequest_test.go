@@ -1,7 +1,8 @@
 // In-package: buildRequest is the orchestrator's own assembly step and has no
 // exported surface. What it must get right is the difference between a harness
-// that is GONE and a database that is briefly unreachable, and that difference
-// is only visible from inside.
+// that is GONE and a database that is briefly unreachable, and which of two
+// patch inputs a revised attempt actually runs — both only visible from
+// inside, and both reachable without a database.
 package runs
 
 import (
@@ -9,7 +10,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -32,7 +32,7 @@ func (s stubHarnessSource) HarnessByName(context.Context, string) (HarnessRef, e
 // registered" is permanent, kills the node with no retry, and tells the
 // operator to re-register something that never went anywhere. Only
 // ClassNotFound is that fact; everything else waits.
-func TestBuildRequest_HarnessResolutionSeparatesGoneFromUnreachable(t *testing.T) {
+func TestHarnessBinding_SeparatesGoneFromUnreachable(t *testing.T) {
 	cases := []struct {
 		name      string
 		err       error
@@ -65,10 +65,9 @@ func TestBuildRequest_HarnessResolutionSeparatesGoneFromUnreachable(t *testing.T
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			o := &Orchestrator{svc: &Service{harnesses: stubHarnessSource{err: tc.err}}}
-			ref := AttemptRef{RunID: uuid.New(), NodeID: "impl", Attempt: 1}
 
-			_, err := o.buildRequest(context.Background(), cachedPlan{},
-				PlanNode{ID: "impl", Kind: KindImplement, Harness: "claude"}, ref, time.Now().Add(time.Hour))
+			_, _, err := o.harnessBinding(context.Background(),
+				PlanNode{ID: "impl", Kind: KindImplement, Harness: "claude"})
 
 			var oe OutcomeError
 			if !errors.As(err, &oe) {
@@ -91,26 +90,93 @@ func TestBuildRequest_HarnessResolutionSeparatesGoneFromUnreachable(t *testing.T
 	}
 }
 
-// The successful resolution pins BOTH halves of the binding into the request:
-// the credential id and the kind, which is what lets the runner derive custody
-// without ever re-reading the mutable harness row.
-func TestBuildRequest_PinsTheResolvedCredentialBinding(t *testing.T) {
+// The successful resolution reports BOTH halves of the binding — the
+// credential id and the kind — which is what lets the runner derive custody
+// without ever re-reading the mutable harness row. That the two then reach the
+// request is pinned end to end by
+// TestOrchestrator_RequestPinsTheHarnessCredential.
+func TestHarnessBinding_ReportsBothHalvesOfTheResolvedCredential(t *testing.T) {
 	harnessID, credID := uuid.New(), uuid.New()
 	o := &Orchestrator{svc: &Service{harnesses: stubHarnessSource{ref: HarnessRef{
 		ID: harnessID, Kind: "codex", CredentialID: credID, CredentialKind: "agent_auth_file",
 	}}}}
-	ref := AttemptRef{RunID: uuid.New(), NodeID: "impl", Attempt: 1}
 
-	req, err := o.buildRequest(context.Background(), cachedPlan{},
-		PlanNode{ID: "impl", Kind: KindImplement, Harness: "codex-main"}, ref, time.Now().Add(time.Hour))
+	gotID, gotBinding, err := o.harnessBinding(context.Background(),
+		PlanNode{ID: "impl", Kind: KindImplement, Harness: "codex-main"})
 	if err != nil {
-		t.Fatalf("buildRequest: %v", err)
+		t.Fatalf("harnessBinding: %v", err)
 	}
-	if req.HarnessID != harnessID {
-		t.Errorf("harness id = %s, want %s", req.HarnessID, harnessID)
+	if gotID != harnessID {
+		t.Errorf("harness id = %s, want %s", gotID, harnessID)
 	}
 	want := CredentialBinding{ID: credID, Kind: "agent_auth_file"}
-	if req.Credential != want {
-		t.Errorf("binding = %+v, want %+v", req.Credential, want)
+	if gotBinding != want {
+		t.Errorf("binding = %+v, want %+v", gotBinding, want)
+	}
+}
+
+// A node that declares no harness resolves nothing and reports no error: gates
+// and git-publish nodes reach buildRequest too, and neither runs an agent.
+func TestHarnessBinding_ANodeWithNoHarnessBindsNothing(t *testing.T) {
+	o := &Orchestrator{svc: &Service{harnesses: stubHarnessSource{
+		err: xerrors.E(xerrors.ClassNotFound, "no such harness"),
+	}}}
+	gotID, gotBinding, err := o.harnessBinding(context.Background(),
+		PlanNode{ID: "publish", Kind: KindGitPublish})
+	if err != nil {
+		t.Fatalf("a harnessless node must not consult the registry at all: %v", err)
+	}
+	if gotID != uuid.Nil || gotBinding != (CredentialBinding{}) {
+		t.Errorf("bound %s / %+v, want nothing", gotID, gotBinding)
+	}
+}
+
+// One patch reaches a phase, ever (Plan 07's cumulative-patch contract): the
+// runner refuses a second one outright (runner/execute.go lineageInto), so
+// buildRequest has to resolve the collision rather than pass it on. A revision
+// seeds the target with the patch the gate examined, and that seed is strictly
+// newer than whatever an ancestor outside the slice still holds.
+func TestCollapsePatchInputs(t *testing.T) {
+	note := ArtifactInput{ID: uuid.New(), Type: ArtifactKindGateNote}
+	plan := ArtifactInput{ID: uuid.New(), Type: ArtifactKindPlan}
+	structural := ArtifactInput{ID: uuid.New(), Type: ArtifactKindPatch}
+	seed := ArtifactInput{ID: uuid.New(), Type: ArtifactKindPatch}
+
+	cases := []struct {
+		name string
+		in   []ArtifactInput
+		want []ArtifactInput
+	}{
+		{
+			name: "no patch at all passes through untouched",
+			in:   []ArtifactInput{plan, note},
+			want: []ArtifactInput{plan, note},
+		},
+		{
+			name: "the single structural patch survives",
+			in:   []ArtifactInput{plan, structural},
+			want: []ArtifactInput{plan, structural},
+		},
+		{
+			// The order buildRequest produces: structural inputs, then the
+			// revision's seeds. The seed is last and the seed is what runs.
+			name: "a seeded patch displaces the structural one",
+			in:   []ArtifactInput{plan, structural, note, seed},
+			want: []ArtifactInput{plan, note, seed},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := collapsePatchInputs(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d inputs, want %d: %+v", len(got), len(tc.want), got)
+			}
+			for i := range got {
+				if got[i].ID != tc.want[i].ID {
+					t.Errorf("input %d = %s (%s), want %s (%s)",
+						i, got[i].ID, got[i].Type, tc.want[i].ID, tc.want[i].Type)
+				}
+			}
+		})
 	}
 }

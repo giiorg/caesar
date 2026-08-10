@@ -53,7 +53,7 @@ func validateSlug(slug string) error {
 func validateBranch(branch string) error {
 	if branch == "" || len(branch) > maxBranchLen || strings.ContainsAny(branch, " \t\r\n") {
 		return xerrors.E(xerrors.ClassInvalid, "validation failed").WithFields(xerrors.FieldError{
-			Field: "default_branch", Message: fmt.Sprintf("must be 1-%d characters without whitespace", maxBranchLen),
+			Field: "default_branch", Message: fmt.Sprintf("must be 1-%d bytes without whitespace", maxBranchLen),
 		})
 	}
 	return nil

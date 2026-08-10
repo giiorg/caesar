@@ -55,7 +55,7 @@ func validateWorkflowName(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > maxWorkflowNameLen {
 		return "", xerrors.E(xerrors.ClassInvalid, "validation failed").WithFields(xerrors.FieldError{
-			Field: "name", Message: fmt.Sprintf("must be 1-%d characters", maxWorkflowNameLen),
+			Field: "name", Message: fmt.Sprintf("must be 1-%d bytes", maxWorkflowNameLen),
 		})
 	}
 	return name, nil
@@ -64,7 +64,7 @@ func validateWorkflowName(name string) (string, error) {
 func validateWorkflowDescription(desc string) error {
 	if len(desc) > maxWorkflowDescLen {
 		return xerrors.E(xerrors.ClassInvalid, "validation failed").WithFields(xerrors.FieldError{
-			Field: "description", Message: fmt.Sprintf("must be at most %d characters", maxWorkflowDescLen),
+			Field: "description", Message: fmt.Sprintf("must be at most %d bytes", maxWorkflowDescLen),
 		})
 	}
 	return nil

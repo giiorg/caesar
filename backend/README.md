@@ -24,11 +24,24 @@ CI. Fix the code, never the rule.
     task backend:test:integration  # real postgres via testcontainers
     task backend:test:property     # rapid property tests (pinned seed; RAPID_SEED=0 randomizes)
     task backend:fuzz              # fuzz targets, FUZZTIME each (default 2m)
-    task ci                        # exactly what CI runs
+    task ci                        # backend:ci + contracts:check + secrets + lint:actions
+
+`task ci` is **not** the whole of CI. `.github/workflows/ci.yml` also runs a
+separate `runner` job (`task image:build` then `task backend:test:runner`,
+30-minute timeout because it is the expensive one), and `ci-ok` — the single
+required status check — needs it. Locally that lane is covered by
+`scripts/gate`, not by `task ci`, so a branch can be `task ci`-green and red
+in the required check.
 
 Nightly CI runs both the property and fuzz lanes for longer and with a
 randomized seed (`RAPID_SEED=0`, extended `RAPID_CHECKS`/`FUZZTIME`); PR CI
-runs them pinned and short.
+runs them pinned and short. Those knobs — plus `PKG` — are go-task variables,
+so pass them **inline** (`PKG=./internal/runs/ task backend:test`) and never
+export them: go-task reads them from the environment too, so an exported one
+silently narrows every lane that follows it in the same shell. `scripts/gate`
+unsets `PKG`, `RAPID_SEED`, `RAPID_CHECKS`, `FUZZTIME` and `GOFLAGS` for
+exactly that reason, prints each one it drops, and then asserts the resolved
+command of each lane rather than its name.
 
 ## Config
 
@@ -44,6 +57,22 @@ only:
   `openssl rand -base64 32`; the dev keyset already lives in
   `caesar.dev.json`. `serve` and `admin rekey` require it; `migrate`
   and `admin bootstrap` do not.
+
+The `forge` block is how caesar reaches its code hosts, and it carries
+**two** endpoints per forge because they are genuinely different hosts:
+`github_base_url` (the API — `https://api.github.com`) and
+`github_clone_base_url` (where the repositories live —
+`https://github.com`), and the same pair for GitLab. Setting only the API
+base is the trap on a self-hosted install: every API call reaches the
+private instance while every clone and push still goes to the public
+site, which reads as "the run can see the repo but publishes nothing".
+`publish_work_dir` is where publication checkouts are materialized — one
+fresh subdirectory per publication, removed when it ends — and it
+defaults to `/var/lib/caesar/publish`, which a non-root developer cannot
+create, so `caesar.dev.json` points it at `/tmp/caesar-publish`.
+Every base is validated at load: it must parse, use `https` (or `http`
+for a lab), name a host, and carry no userinfo — a token belongs in a
+header, never in a URL.
 
 ## Migrations
 
@@ -87,6 +116,10 @@ harnesses), and workflows (`/api/v1/workflows` + `/versions`) — writes
 are admin-only, and the single write door validates every document. The
 execution spine adds `/api/v1/tasks` and `/api/v1/runs`: reads need the
 `view` grant on the project, creating and re-running a task needs `run`.
+Gates add `GET /api/v1/approvals` — the inbox, scoped to the projects
+the caller holds *any* grant on (an admin sees every one) — and `POST
+/api/v1/runs/{id}/gates/{node}/decision`, which needs `approve` on the
+run's project. Seeing a gate is not being allowed to decide it.
 
 ## Execution spine (Plan 05)
 
@@ -134,15 +167,18 @@ prunes envelopes older than `orchestrator.outbox_retention`, 7 days by
 default. The rest of the queue loop is tuned under the same config key:
 `workers`, `poll_interval`, `lease_ttl`, `heartbeat_interval`.
 
-The production posture is honest, not simulated. `serve` wires
-`runs.NotImplementedExecutor` and a forge that refuses to resolve a
-head, so task intake fails with "forge adapters arrive in Plan 08" (no
-run can pin a base SHA), a definition containing gate or `git-publish`
-nodes is rejected at intake (`waiting` stays unreachable until Plan 08),
-and any phase claimed under production wiring dies `not_implemented`
-until Plan 06's Docker runner lands. Stubs never fake success. The
-deterministic fakes in `internal/runs/fake` are what drive the
-golden-set integration test, which takes a run end-to-end in CI.
+The production posture is honest, not simulated — and Plan 08 moved half
+of it from stub to real. `serve` now wires the real forge adapter and
+the real git publisher (`newForgeAdapter` and `gitPublisher` in
+`internal/app/serve.go`), so a run pins its base SHA from the forge and
+a definition carrying gate or `git-publish` nodes is accepted at intake;
+`unavailableForge` and `ExecPlan.HasUnsupportedNodes` are deleted, and
+`waiting` is reachable. What stays a stub is the executor:
+`runs.NotImplementedExecutor` is still the default, so any phase claimed
+with `runner.enabled` false dies `not_implemented` rather than reporting
+a result it never produced. Stubs never fake success. The deterministic
+fakes in `internal/runs/fake` are what drive the golden-set integration
+test, which takes a run end-to-end in CI.
 
 ## Docker runner and egress gateway (Plan 06)
 
@@ -228,13 +264,37 @@ bind-mounts `t.TempDir()`, so it expects a Linux daemon (or a Docker
 Desktop whose file sharing covers the OS temp dir).
 
 The production posture stays honest: `runner.enabled` defaults false
-(`NotImplementedExecutor` + `AlwaysAdmit`, exactly Plan 05), and task
-intake is refused until Plan 08's forge adapters land, so an enabled
-runner is unreachable today — the flag exists so config, wiring, and
-validation are real now and the deploy stack flips one boolean. In prod,
-network isolation must not rest on Docker alone: the host firewall must
-deny the agent subnets everything except the gateway (baseline in the
-Plan 14 deployment runbook).
+(`NotImplementedExecutor` + `AlwaysAdmit`, exactly Plan 05), so the
+default deploy refuses to fake a phase result rather than pretending to
+run one. Since Plan 08 wired the real forge, that flag is the only thing
+left in the way — intake accepts gates and publishes, so flipping one
+boolean gives the runner real work, on a host that already has the
+Docker daemon, the built images and a writable data root.
+
+**Boot verifies exactly one of those three, so check the host yourself
+before flipping the flag.** `buildRunner` creates the five `data_root`
+subdirectories at 0700 and fails the boot if it cannot, and `runner.New`
+refuses to start as root, without both image references configured, or
+with a log flood threshold below the per-stream cap. Nothing contacts
+the daemon: `dockerapi.New` only builds an `http.Client` over the socket
+path (`Client.Ping` exists and has no caller outside its own test), and
+the images are never looked for at boot — they are resolved per attempt.
+
+A wrong host therefore does not refuse to start. It fails the first
+attempt of every phase, typed and **transient**, which means the run
+retries it to `attempts_exhausted` instead of stopping at it:
+
+- **Daemon unreachable, or an image absent and unpullable** —
+  `resolveImage` (inspect, pull once, inspect again) yields transient
+  `image_unavailable`, naming the reference.
+- **`data_root` present but not writable by this process** — `Execute`'s
+  first `MkdirAll` yields transient `internal_error` beginning
+  `create attempt dir`. (`AdmitClaim`'s statfs does not catch this: an
+  unwritable directory still answers statfs.)
+
+In prod, network isolation must not rest on Docker
+alone: the host firewall must deny the agent subnets everything except
+the gateway (baseline in the Plan 14 deployment runbook).
 
 ## Harness filesystem contract (Plan 07)
 
@@ -463,7 +523,12 @@ cap window does not wake every parked attempt at once, capped.
 
 The real ceiling is the run's wall deadline: eligibility that would land past it
 terminalizes the run immediately instead of parking a row that can never legally
-run.
+run. The run's published outcome for that death is **permanent**, carrying the
+waiting code that caused the park (`rate_limited`, `credential_busy`) and no
+`retry_at` — the wait's own transient class would have told every reader of
+`GET /runs/{id}` to expect a retry that cannot come, since no sweep revisits a
+failed run. The two publish codes are exempt from this refusal by design and do
+park past the deadline; `ListExpiredRunIDs` settles those.
 
 ### Redaction, and the withhold
 
@@ -532,6 +597,16 @@ credentials view carries passive freshness — `provided_at` (so a ~1-year
 advances. The second signal is the runs themselves: any run failing
 `auth_expired` names the credential in its typed outcome, visible in run detail
 and the event stream.
+
+**`auth_expired` has two producers and only one of them writes that column.**
+`markAuthExpired` (`runner/collect.go`, `runner/execute.go`) is the *harness*
+side, and it is what sets `last_auth_expired_at` on the credential row. The
+forge side — `publishError` in `internal/app/runsports.go`, for a 401 or a
+non-throttling 403 against the repository's `forge_token` — produces the same
+code with **no** credential-row write. So a publish node that halts
+`auth_expired` names its repository in the message and leaves
+`last_auth_expired_at` untouched; look at the run's `halt_reason`, not at the
+credentials view.
 
 Secrets are size-bounded per kind at the door: 4 KiB for single tokens, 64 KiB
 for `agent_auth_file`, which must also parse as JSON and yield a refresh-token
@@ -675,6 +750,442 @@ transcript: because the CLI prints the marker whenever it has no usable token,
 working auth — but it means a mis-pasted token and a dead one produce the same
 typed outcome, so check the credential before concluding the subscription
 expired.
+
+## Gates and publishing (Plan 08)
+
+A run reaches a human gate and stops. The human approves, requests
+changes, or rejects; an approval mints a single-use authorization that
+exactly one `git-publish` node consumes to push a branch and open a pull
+request on GitHub or GitLab, crash-safe at every step.
+
+### The gate lifecycle
+
+**A gate is a phase that is never claimed.** Gate rows are inserted
+directly as `waiting_decision`, and the claim CTE predicates on
+`pending` — that single branch is the whole reason a human's thinking
+time never burns a lease or the execution budget, which accrues only
+from `claimed_at` to evaluation. The wall clock does **not** stop: the
+run's deadline is a column compared against the database clock inside
+every deciding statement, so a gate nobody answers dies of the deadline
+like anything else.
+
+The run parks to `waiting` once nothing else on the graph is runnable.
+That is read back from the database (`RunIsWaitingOnAGate`), never
+inferred from what the pass just inserted, and `anyRunnablePhase` counts
+`pending`, `running` and `reconciling` rows — so a gate in one branch of
+a parallel graph leaves the run `running` while its sibling executes,
+and the run parks when the sibling finishes. `syncWaiting` moves the run
+in both directions so the two callers cannot drift.
+
+**Two gates may also be open at the same instant** — `validateConsumption`
+constrains a gate's inputs, never how many gates a run may hold open — and
+deciding one of them does not strand the other. A decision materializes
+nothing itself (all successor materialization lives in `materializeReady`),
+so what releases an approval's successors is the janitor's
+`ListRunsAwaitingMaterialization` pass. Its anti-join deliberately does
+**not** exclude runs holding a `waiting_decision` phase: a waiting gate is
+precisely what no worker can claim, and excluding it meant the sibling
+gate hid the run from the pass that would have materialized what the
+approval released — leaving the run idle to its wall deadline with the
+sibling gate undecidable forever.
+
+`GET /api/v1/approvals` is the inbox — unbounded by design at V1, since
+the waiting set is the size of a human's attention, not of the run
+history. `POST /api/v1/runs/{id}/gates/{node}/decision` is the door: it
+takes `{"decision": "approve" | "request_changes" | "reject", "note":
+"…"}` and needs the `approve` grant on the project resolved **from the
+run**. `request_changes` requires a note — it is the revision's only new
+input. A decision is recorded once per gate *attempt* row
+(`gate_decisions.phase_run_id UNIQUE`), so a rematerialized gate is
+decidable again while the same row is never decided twice. Self-approval
+is a policy-snapshot field (`allow_self_approval`, default true, snapshot
+schema 2 with a v1 upgrade branch); a run whose snapshot forbids it
+refuses the requester's own decision.
+
+### What an approval authorizes
+
+Approving mints one `approved_patches` row — the ApprovedPatch (spec
+§2), scoped to the single publish node its gate dominates. It pins the
+examined artifact id, the base SHA, the tree hash, **the repository as
+approved**, the target branch, and the generation.
+
+"The repository as approved" is three columns, not one: `repo_id` plus
+`forge_kind` and `repo_slug`. `UpdateRepo` can change a repo's slug,
+default branch and credential mid-run, so `repo_id` alone is not an
+identity — an id that still matches proves nothing about *where* the
+patch would land. Pinning the coordinates makes a rename a refusal
+instead of a patch delivered to a repository nobody approved. The target
+branch is the repo's default branch at approval time, and it is pinned
+for the same reason.
+
+Two indexes carry the single-use guarantee, and they do different jobs:
+
+- `publish_intents.authorization_id uuid NOT NULL UNIQUE` — single use in
+  its strongest form. A second consumption of the same authorization is a
+  constraint violation, not a lost CAS; Postgres is the authority.
+- `approved_patches_live_key ON approved_patches (run_id, publish_node_id)
+  WHERE status = 'valid'` — at most one *live* authorization per publish
+  node per run, which is what makes "invalidate the old one, mint the new
+  one" impossible to get half-done.
+
+Every pinned field is revalidated at consumption, before any forge call.
+A repo id, forge kind, slug, default branch, base SHA or authorizing gate
+that no longer agrees fails permanently as `authorization_stale`. A newer
+generation invalidates a live authorization outright.
+
+### Revisions
+
+`request_changes` opens a bounded revision generation. One transaction
+bumps the run's generation counter, invalidates every live authorization
+on the run, supersedes every phase row in the target→gate slice —
+`succeeded` rows included, because readiness is each node's newest
+attempt row, so a slice node whose previous-generation row succeeded
+would otherwise stay readable as done and the gate would re-decide
+against the previous generation's verdict — seeds the target with the
+note as a `gate_note` artifact plus a carry-forward copy of the examined
+artifact (payload copied, original as parent, history append-only), and
+rematerializes the target under the new generation.
+
+`max_rounds` is per **gate**, but the generation counter and the
+authorization invalidation are per **run**: a revision at one gate
+advances the whole run's generation and invalidates every live
+authorization on it.
+
+Two refusals answer `request_changes` with 409, and both leave approve
+and reject available:
+
+- **Rounds spent.** Exhausting `max_rounds` refuses the decision rather
+  than killing the run — ending a run on the Nth click would destroy
+  work, and a waiting gate is bounded by the wall deadline anyway. It is
+  a runtime conflict, not a validator rule.
+- **Already publishing.** A revision may not rewind a run that has begun
+  *any* publication — including one still `pending`, whose intent row
+  commits before the first forge call and whose authorization is already
+  consumed. Nothing in a transaction can un-push a commit, so refusing is
+  the honest answer.
+
+### The publish state machine
+
+`pending → pushed → published`, with `halted` as the terminal
+manual-reconciliation state. There is **one intent per `(run, publish
+node)`**, resumed across every later attempt and never re-minted — a
+second intent would mean a second branch — and the intent's `attempt`
+column is provenance, not identity.
+
+Each effect's receipt commits before the next call, so a retry always
+distinguishes "never happened" from "succeeded, receipt lost":
+`RecordPushReceipt` is `pending → pushed`, `RecordPRReceipt` is
+`pushed → published`, and `published` is deliberately **not** haltable —
+a publication with both receipts is done, and no late arrival may
+overwrite it with a call for human help. Status only moves forward, row
+counts are checked, and a driver that loses the CAS reloads and adopts
+the winner's row rather than failing the run.
+
+While an intent is `pending` or `pushed`, every error leaving the publish
+path is transient and **uncharged**; a permanent answer only leaves after
+it has **settled** the intent, halting it with a reason on the row. Both
+halves are an invariant, not a tendency: no sweep revisits a failed run,
+so one charged failure here would make an orphaned branch permanent, and
+a permanent that left the intent `pending` would leave that branch with
+nothing on the record saying what happened to it.
+
+The marker is deterministic — `caesar/<approved-artifact-id>`, from a
+uuidv7 unique per node per generation, so recovery reconstructs it from
+the authorization row alone and a new generation necessarily gets a new
+branch. Human readability lives in the PR title, not the ref.
+
+**Known gap, and it does not need parallel gates.** The marker is a
+function of the approved *artifact*, not of the publish node. A legal
+definition where two gates examine the **same** patch and each authorizes
+its own publish therefore produces two intents on one branch name, and
+the second loses `publish_intents_marker_key` as a permanent
+`publish_conflict`. `twoGateDoc` (`revisions_integration_test.go`) is
+exactly that shape with the gates **chained**, and `validate_test.go`
+blesses it by name — so this reproduces on a chained definition, and
+reproduces identically at `0a4383e`, before the parallel-gate fix. It is
+latent on the whole branch, not opened by that fix.
+
+The loss is bounded: the losing INSERT fails before any forge call, so
+there is no orphaned branch and nothing to reconcile — the run dies
+`publish_conflict` and a re-run is unaffected. The message is
+misdirecting, though: it names a marker conflict, which reads like
+recovery found somebody else's branch. Whether the marker should include
+the publish node id is an open design question — changing it would rename
+every publication's branch — so it is recorded rather than guessed at,
+here and at `parallelGateDoc` in `orchestrator_gates_integration_test.go`.
+That fixture forks at the implement nodes, which is why it does not hit
+this.
+
+**Ownership is proved by rebuilding the commit, never by observing a
+sha.** Recovery reconstructs the commit it would push and compares shas,
+which works only because both dates are pinned (below). An observed
+remote head is evidence, never a lease value: passing one to
+`--force-with-lease` would convert "somebody else's branch" into "a
+branch I may replace", so creating a marker uses an atomic *create-only*
+lease (`--force-with-lease=refs/heads/<branch>:`, empty expected value)
+— a plain push fast-forwards a branch that appeared between the probe
+and the push and reports success.
+
+A pull request on the marker is adopted only on an exact three-way
+match: it must carry both a base and a head, its base must equal the
+branch the approval named, and its head must equal the sha we recorded.
+A candidate missing either field, two candidates matching, or a
+candidate that can be neither confirmed nor ruled out all halt. Absent
+evidence is never permission, and a head branch alone is not a unique
+description of a publication.
+
+Five outcome codes classify a forge answer, and three of them **halt**:
+
+| code | class | why |
+|---|---|---|
+| `push_rejected` | transient | the expected-remote-SHA precondition failed — the remote moved, or the network blinked |
+| `forge_unavailable` | transient | the API could not be reached, or refused transiently (a 403 that carries rate-limit signals is throttling, not "forbidden") |
+| `publish_conflict` | permanent, **halts** | a marker exists in a state we cannot prove is ours |
+| `auth_expired` | permanent, **halts** | the forge rejected the repository's credential (401), or refuses to let it do this (a 403 carrying no rate-limit signal — an under-scoped token, SAML enforcement, an archived repo); somebody must reissue or re-authorize it |
+| `repo_unavailable` | permanent, **halts** | the forge will not show the repository at all — deleted, renamed, or no longer visible to this token |
+
+`maybeHalt` in `internal/runs/publish.go` is the single authority, and it
+decides on the **class**, not on a list of codes: any permanent answer
+that reaches it with a live intent settles the row. It once held an
+allow-list of exactly those three codes, and that shape was fail-open by
+construction — `gitops` types nine permanent exits (eight
+`invalid_output`, one `base_sha_unavailable`) and not one of them was on
+the list, so each returned raw and left a `pending` intent with a NULL
+`halt_reason` behind a run nothing would revisit. The question this
+position forces is not "is this a person's problem?" but "must this
+publication's row be closed?", and with a live intent that answer is
+always yes. The three above are still the ones an operator meets most
+often and the ones worth knowing by sight — but they halt because they
+are permanent, not because they are listed. Everything else is an
+ordinary transient. Recovery never guesses.
+
+**Where a halting answer arrives bounds which ones you will ever see.**
+A publication's *first* forge call is the recovery probe: `pushPublication`
+asks `BranchHead` before it pushes anything, and routes the answer through
+`maybeHalt`, so a credential the forge rejects **or refuses** halts there
+— 401 and a non-throttling 403 alike, one call before the push it guards,
+with a `halt_reason` for whoever must reissue or re-authorize the token.
+But the platform clients fold a 404 on that probe
+into "no branch" rather than an error, because absence is recovery's
+*answer* and not its failure. That fold is a **choice**, not a constraint:
+`github.go` folds `ErrNotFound` alone, and one `GET /repos/{slug}` on the
+404 path would separate "the branch is not there" from "the repository is
+not there". Until something does, a repository that has vanished is not
+distinguished at the probe: the publication proceeds to the clone,
+which cannot tell a deleted repository from a network fault and types
+itself transient `forge_unavailable`. `repo_unavailable` is reached on
+`OpenPullRequest` and `FindPullRequests` instead — once an intent is
+already `pushed`, which is the window where halting matters most and the
+one hardest to stage deliberately.
+
+### Attribution
+
+Attribution is verbatim and pinned. **Author = the requester** —
+`GIT_AUTHOR_NAME` is the email's local part, `GIT_AUTHOR_EMAIL` the
+address. **Committer = `caesar <caesar@invalid>`.** Git's own
+author/committer split says "this human's intent, executed by this
+machine" natively.
+
+`GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` are one pinned RFC3339 stamp
+— the intent's `created_at`, never the wall clock. That is a correctness
+requirement, not tidiness: a commit's sha hashes its identities
+*including their timestamps*, and rebuilding that sha is how recovery
+proves a receiptless branch is ours. An unpinned date makes every
+rebuild a different commit, the adopt comparison misses, and a
+crash-after-push force-pushes a duplicate over what is already on the
+remote.
+
+The commit message carries four trailers, in this order:
+
+    caesar-run: <run id>
+    caesar-node: <publish node id>
+    caesar-artifact: <approved artifact id>
+    caesar-approved-by: <approver's email address>
+
+`caesar-approved-by` is the **approver**; the author is the requester,
+and the message is where the approver is recorded. These are provenance,
+not attribution. **No `Co-authored-by` machine trailer is emitted**, and
+no tool advertisement of any kind. That is enforced on the renderer
+itself, by `TestCommitMessageForEmitsNoAttributionTrailer`
+(`internal/runs/publish_test.go`): the trailer block must be exactly
+those four `caesar-*` keys, and the whole message is scanned for
+attribution wording. `gitops/publish_test.go`'s own `Co-authored-by`
+grep does **not** enforce this and never could — `gitops` composes no
+message, it commits `PublishInput.Message` verbatim, so that grep only
+re-reads a literal the test itself supplied. The attempt
+ordinal is deliberately absent: it differs between attempts of one
+publication, and every input here must not.
+
+Both `author_email` and `commit_message` are **snapshotted on the intent
+and never re-rendered**. Both are hashed into the commit sha and both
+interpolate a mutable `users` row, so a re-render between two attempts
+would rebuild a different commit, miss the adopt comparison, and turn a
+crash-after-push into a permanent `publish_conflict` on a branch that is
+genuinely ours.
+
+### Operating a halted publication
+
+**caesar will never resolve this itself, and that is deliberate.** The
+run is already `failed` with the halting code (`publish_conflict`,
+`auth_expired` or `repo_unavailable`); `HaltPublishIntent` is terminal by
+design, and no later attempt reopens a halted intent — anything else
+would mean a machine guessing about a ref it could not prove was ours.
+
+1. Read `halt_reason` on the run's publication projection (`GET
+   /api/v1/runs/{id}`), and the `publish.halted` event in the run's
+   event stream. Between them they name the branch, the target branch,
+   and why the publication stopped.
+2. Inspect that branch on the forge, and any pull request opened from it.
+3. Choose one of two answers:
+   - **Re-run the task.** A new run mints a new patch artifact and
+     therefore a new `caesar/<artifact-id>` marker, so the abandoned ref
+     never blocks it (`publish_intents_marker_key` is per `(repo,
+     branch)`). Deleting the abandoned ref is hygiene, not a
+     precondition.
+   - **Accept what is already on the forge** and close the task by hand.
+
+There is **no endpoint that marks a halted publication resolved**. That
+is not an oversight: it belongs with Plan 09's operator surface, and
+until it exists the halt is reconciled outside caesar.
+
+### Configuring the forge
+
+The `forge` block is documented under [Config](#config) above — both
+endpoints per forge, the self-hosted trap, `publish_work_dir` and its
+default, and the base-URL validation rules. Two operational notes belong
+here rather than there: `publish_work_dir` must be **writable by the
+caesar process**, and `serve` both creates it at boot and **writes a
+probe file into it and removes it again**, because discovering an
+unwritable work dir at the first publication is discovering it at the
+worst possible moment. Creating it is not enough on its own to know
+that: `os.MkdirAll` returns nil on a directory that already exists
+whatever its owner or mode, and the packaged default
+`/var/lib/caesar/publish` is precisely a path a deployment pre-creates —
+often as root, for a caesar process that is not. Either failure is a
+boot error naming `publish work dir`, not a degraded start.
+
+### Manual forge smoke checklist (operator-run, real GitHub/GitLab)
+
+**This is row 08's acceptance evidence, not an appendix.** Every forge
+assertion in this plan is against `httptest` servers and local bare
+repositories, and no CI lane may make a live forge call — so the GitHub
+and GitLab response shapes and error mappings are *invented* until this
+runs. Until it does, roadmap row 08 stays annotated *implementation
+complete — live-forge smoke pending*.
+
+Use a throwaway repository on each forge; a publication pushes a branch
+and opens a real pull request.
+
+1. **Setup, per forge.** Create a throwaway repo with one commit on its
+   default branch. Mint a real token for it — caesar uses that one token
+   for everything the port does (read the default branch's head, read a
+   branch head, create a pull request / merge request, list the requests
+   on a head branch) **and** for the HTTPS clone and push, so it needs
+   both repository write and API access. Store it as a `forge_token`
+   credential (the only kind a repo accepts), register the repo on a
+   project with that credential, and register a workflow version whose
+   graph ends in a gate followed by the `git-publish` node it dominates.
+2. **Run to the gate.** Create a task and let it reach the gate. Intake
+   is the first live forge call — it resolves the default branch's head
+   to pin `base_sha` — so a token problem shows up here rather than at
+   publish time. Then `GET /api/v1/approvals` must list the gate, and
+   the run status must be `waiting` (the graph is linear, so nothing
+   else is runnable).
+3. **One revision round.** `request_changes` with a note, confirm the
+   response reports the **new** generation, and confirm the target node
+   rematerializes and re-runs.
+4. **Approve.** Confirm the response reports the decided generation and
+   that the run resumes.
+5. **Verify the publication on the forge**, which is the part only this
+   run can prove:
+   - a branch named `caesar/<approved-artifact-id>` exists, and its head
+     is the `head_sha` the run reports;
+   - the commit's **author** is the requester's address and its
+     **committer** is `caesar <caesar@invalid>`;
+   - the message carries all four `caesar-*` trailers and **no**
+     `Co-authored-by` line;
+   - a pull request exists whose **base is the repo's default branch**
+     (not merely "some open PR on that head") and whose number and URL
+     match `pr_number` / `pr_url` on the run's publication projection.
+6. **The two broken-world cases, at the publish step.** `publishError`
+   (`internal/app/runsports.go`) turns `forge.ErrUnauthorized` into
+   `auth_expired` and `forge.ErrNotFound` into `repo_unavailable`; which
+   HTTP answer each forge actually gives is the invented half, and this
+   is the risk row 08 is open for. One of these two reaches a halt and
+   one does not — knowing which is part of what the run records.
+
+   **The ordering is what makes the step work, so follow it exactly.**
+   Both conditions are also visible at *intake*, which resolves the head
+   before it writes anything — and intake runs a **different** mapping,
+   `intakeError` in the same file, which answers 404 / 400 / 429 as
+   problem+json rather than producing an outcome code. Break either
+   condition before creating the task and the task-creation call fails,
+   no run exists, and the publish-step mapping is never reached. So
+   break it *after* the gate instead:
+
+   - **Credential dead — reaches the halting arm.** Take a fresh task to
+     the gate with a **working** token (step 2, stopping short of the
+     approve in step 4), then revoke or expire the token on the forge,
+     then approve. The decision and the intent's creation are both
+     database-only transactions, and the intent pins `credential_id`, so
+     the first thing to present the revoked token is the publication's
+     **recovery probe** — `BranchHead`, one call before the push it
+     guards. Expect a `halted` intent with a `halt_reason`, a
+     `publish.halted` event, and no retrying to the wall deadline.
+     **Record what the forge actually answered**, because that is the
+     invented part. A **401 and a 403 that carries no rate-limit signal
+     both reach `auth_expired`** at the probe, so the two shapes a forge
+     is most likely to give a dead or de-scoped token both land on the
+     halting arm. A **404** does not: the client folds it into "no
+     branch", and the run walks into the clone and the transient case
+     below instead — which is itself the finding.
+   - **Repository gone — does NOT reach the halting arm, and that is the
+     point of running it.** Same ordering, another fresh task: reach the
+     gate, then rename or delete the repo, then approve. The intent pins
+     `repo_slug` so the publication does address the vanished name — but
+     the probe's 404 is folded to "no branch", the clone then fails, and
+     `gitops` types a failed clone transient `forge_unavailable` because
+     it genuinely cannot tell a deleted repository from a network fault.
+     So expect a retrying `forge_unavailable`, not a halt. **Record that
+     observation on row 08**: it is a real gap between what decision 14
+     documents and what this route can reach.
+
+   For each, record where it fails — task creation, or the run — and with
+   which code, plus `halt_reason` and the `publish.halted` event where a
+   halt did occur.
+
+   Optionally record the **intake** behaviour of the same two conditions
+   as a separate case (break the condition first, then create the task).
+   It is worth writing down, but it does not stand in for the above:
+   `intakeError` and `publishError` are two different tables, and only
+   the second one leaves a branch on the forge when it is wrong.
+7. **Record what the forges actually said, then close the row.** If
+   either forge's status codes or error bodies map differently than
+   `runsports.go` assumes, fix the mapping and its `httptest` fixtures
+   and commit that as its own change. Row 08 closes on **what this
+   checklist can reach**: every response shape on the happy path, and
+   the halting arm the credential-dead case lands on.
+
+**One arm this checklist cannot reach as the code stands, stated plainly
+rather than papered over.** `repo_unavailable` fires on
+`OpenPullRequest` and `FindPullRequests`, i.e. only once an intent is
+already `pushed` — so observing it means deleting the repository inside
+the push→PR-open window, which no manual procedure can hit reliably.
+Decision 14 is not false; it is narrower in *reach* than a reader would
+assume.
+
+**That unreachability is a consequence of one choice, not a law.** The
+arm is out of reach only because `github.go` folds a repo-gone 404 on the
+recovery probe into "no branch". One `GET /repos/{slug}` on the 404 path
+separates the two, and then a deleted repository lands on
+`repo_unavailable` **at the first probe** — where an operator can stage it
+in a minute, before any branch is pushed. That is a follow-up, not part of
+this plan; what matters here is that the residual must not be read as
+"impossible to observe". Until it is taken, the arm stays invented, and it
+carries the failure this checklist was written for: a `repo_unavailable`
+that presents as `forge_unavailable` retries a vanished repository until
+the wall deadline with a pushed branch sitting orphaned behind it. It is a
+named residual on this plan, not a reason to keep row 08 open forever.
 
 ## Contracts
 

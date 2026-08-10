@@ -65,6 +65,10 @@ func validateShape(d Document) []Violation {
 	}
 
 	seen := make(map[Edge]bool, len(d.Edges))
+	// wellFormed is the deduplicated edge list the multiplicity phase counts
+	// over. Counting d.Edges again would charge a duplicate edge twice, so one
+	// mistake read as two violations: the duplicate AND a multiplicity breach.
+	wellFormed := make([]Edge, 0, len(d.Edges))
 	for i, e := range d.Edges {
 		path := fmt.Sprintf("edges[%d]", i)
 		ok := true
@@ -92,6 +96,7 @@ func validateShape(d Document) []Violation {
 			continue
 		}
 		seen[e] = true
+		wellFormed = append(wellFormed, e)
 
 		switch from := d.Nodes[index[e.From]]; {
 		case from.Type == NodeGitPublish:
@@ -117,13 +122,7 @@ func validateShape(d Document) []Violation {
 
 	// Consumption multiplicities per node, counted over well-formed edges.
 	in := map[string]map[ArtifactType]int{}
-	for _, e := range d.Edges {
-		if _, ok := index[e.From]; !ok || e.From == e.To || !e.Artifact.Valid() {
-			continue
-		}
-		if _, ok := index[e.To]; !ok {
-			continue
-		}
+	for _, e := range wellFormed {
 		if in[e.To] == nil {
 			in[e.To] = map[ArtifactType]int{}
 		}

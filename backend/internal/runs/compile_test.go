@@ -16,7 +16,7 @@ func conveyor() runs.DefinitionDoc {
 			{ID: "plan", Kind: runs.KindPlan, Harness: "cc", Instructions: "Plan the change."},
 			{ID: "impl", Kind: runs.KindImplement, Harness: "cc", Instructions: "Implement the plan."},
 			{ID: "review", Kind: runs.KindReview, Harness: "cc", Instructions: "Review the patch."},
-			{ID: "gate", Kind: runs.KindGate},
+			{ID: "gate", Kind: runs.KindGate, Revision: &runs.DefRevision{Target: "impl", MaxRounds: 2}},
 			{ID: "publish", Kind: runs.KindGitPublish},
 		},
 		Edges: []runs.DefEdge{
@@ -49,8 +49,192 @@ func TestCompileOrdersAndBinds(t *testing.T) {
 	if diff := cmp.Diff(want, pub.Inputs); diff != "" {
 		t.Errorf("publish inputs (-want +got):\n%s", diff)
 	}
-	if got := plan.HasUnsupportedNodes(); !cmp.Equal(got, []string{"gate", "publish"}) {
-		t.Errorf("unsupported = %v, want [gate publish]", got)
+}
+
+func TestCompile_AssignsTheDominatingGateToItsPublish(t *testing.T) {
+	p, err := runs.Compile(conveyor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, ok := p.GateFor("publish")
+	if !ok || gate != "gate" {
+		t.Fatalf("GateFor(publish) = %q,%v; want gate,true", gate, ok)
+	}
+	pub, ok := p.PublishFor("gate")
+	if !ok || pub != "publish" {
+		t.Fatalf("PublishFor(gate) = %q,%v; want publish,true", pub, ok)
+	}
+	if _, ok := p.GateFor("review"); ok {
+		t.Error("only git-publish nodes have an authorizing gate")
+	}
+}
+
+func TestCompile_RevisionSliceIsTheTargetToGateSpan(t *testing.T) {
+	p, err := runs.Compile(conveyor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slice, ok := p.RevisionSlice("gate")
+	if !ok {
+		t.Fatal("the gate declares a revision transition")
+	}
+	want := []string{"gate", "impl", "review"}
+	if diff := cmp.Diff(want, slice); diff != "" {
+		t.Errorf("slice mismatch (-want +got):\n%s", diff)
+	}
+	// "plan" dominates the target and is NOT rewound: a revision re-does the
+	// work between the target and the gate, never the inputs that fed it.
+	for _, id := range slice {
+		if id == "plan" {
+			t.Error("the revision slice must stop at its target")
+		}
+	}
+}
+
+func TestCompile_GateWithoutARevisionHasNoSlice(t *testing.T) {
+	doc := conveyor()
+	doc.Nodes[3].Revision = nil
+	p, err := runs.Compile(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.RevisionSlice("gate"); ok {
+		t.Error("a gate with no on_request_changes has no slice")
+	}
+}
+
+func TestCompile_ExaminedInputIsThePatchTheGateSees(t *testing.T) {
+	p, err := runs.Compile(conveyor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, ok := p.ExaminedInput("gate")
+	if !ok {
+		t.Fatal("the gate examines exactly one plan or patch")
+	}
+	if in.Artifact != runs.ArtifactKindPatch || in.Origin != "impl" {
+		t.Fatalf("examined = %+v; want the implement patch", in)
+	}
+}
+
+func TestCompile_InputOrderBreaksTiesOnFromSoTwoSameTypeInputsAreDeterministic(t *testing.T) {
+	// Carried forward from Plan 05's final review: sorting on (Origin,
+	// Artifact) alone left two edges from DIFFERENT direct sources through
+	// the same origin in an order the map iteration decided.
+	doc := runs.DefinitionDoc{
+		Nodes: []runs.DefNode{
+			{ID: "implement", Kind: runs.KindImplement, Harness: "h", Instructions: "x"},
+			{ID: "gate_b", Kind: runs.KindGate},
+			{ID: "gate_a", Kind: runs.KindGate},
+			{ID: "sink", Kind: runs.KindReview, Harness: "h", Instructions: "x"},
+		},
+		Edges: []runs.DefEdge{
+			{From: "implement", To: "gate_b", Artifact: runs.ArtifactKindPatch},
+			{From: "implement", To: "gate_a", Artifact: runs.ArtifactKindPatch},
+			{From: "gate_b", To: "sink", Artifact: runs.ArtifactKindPatch},
+			{From: "gate_a", To: "sink", Artifact: runs.ArtifactKindPatch},
+		},
+	}
+	first, err := runs.Compile(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		again, err := runs.Compile(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diff := cmp.Diff(first.Nodes["sink"].Inputs, again.Nodes["sink"].Inputs); diff != "" {
+			t.Fatalf("compile %d produced a different input order (-first +again):\n%s", i, diff)
+		}
+	}
+	got := []string{first.Nodes["sink"].Inputs[0].From, first.Nodes["sink"].Inputs[1].From}
+	if diff := cmp.Diff([]string{"gate_a", "gate_b"}, got); diff != "" {
+		t.Errorf("From tiebreaker mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// assignGates runs on every Compile, so it is a new way for a stored
+// version to fail to compile. Each case is a document the definitions
+// validator already rejects; reaching one here is corruption, and the
+// compiler must say which invariant broke rather than hand the runtime a
+// plan with no authorizing gate.
+func TestCompile_RejectsAnUnassignableGraph(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  runs.DefinitionDoc
+		want string
+	}{
+		{
+			name: "publish with no gate above it",
+			doc: runs.DefinitionDoc{
+				Nodes: []runs.DefNode{
+					{ID: "impl", Kind: runs.KindImplement, Harness: "cc"},
+					{ID: "publish", Kind: runs.KindGitPublish},
+				},
+				Edges: []runs.DefEdge{{From: "impl", To: "publish", Artifact: runs.ArtifactKindPatch}},
+			},
+			want: `publish "publish" has no dominating gate examining its patch`,
+		},
+		{
+			name: "one gate over two publishes",
+			doc: runs.DefinitionDoc{
+				Nodes: []runs.DefNode{
+					{ID: "impl", Kind: runs.KindImplement, Harness: "cc"},
+					{ID: "gate", Kind: runs.KindGate},
+					{ID: "pub1", Kind: runs.KindGitPublish},
+					{ID: "pub2", Kind: runs.KindGitPublish},
+				},
+				Edges: []runs.DefEdge{
+					{From: "impl", To: "gate", Artifact: runs.ArtifactKindPatch},
+					{From: "gate", To: "pub1", Artifact: runs.ArtifactKindPatch},
+					{From: "gate", To: "pub2", Artifact: runs.ArtifactKindPatch},
+				},
+			},
+			want: `gate "gate" authorizes both "pub1" and "pub2"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := runs.Compile(tc.doc)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestCompile_RejectsARevisionTargetItCannotRewindTo(t *testing.T) {
+	cases := []struct {
+		name, target, want string
+	}{
+		{"unknown node", "ghost", `gate "gate" rewinds to unknown node "ghost"`},
+		// review is an ancestor of the gate but not a dominator: rewinding
+		// to it would leave the patch the gate examined untouched.
+		{"not a dominator", "review", `revision target "review" does not dominate gate "gate"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := conveyor()
+			doc.Nodes[3].Revision = &runs.DefRevision{Target: tc.target, MaxRounds: 2}
+			_, err := runs.Compile(doc)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestCompile_PassThroughPrefersTheTypedInputDeterministically(t *testing.T) {
+	// A gate examining a patch and consuming a review verdict passes the
+	// PATCH through, whatever order the edges arrive in.
+	p, err := runs.Compile(conveyor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := p.Nodes["publish"].Inputs
+	if len(in) != 1 || in[0].Origin != "impl" || in[0].Artifact != runs.ArtifactKindPatch {
+		t.Fatalf("publish inputs = %+v; want the implement patch through the gate", in)
 	}
 }
 

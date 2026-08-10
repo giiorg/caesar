@@ -11,7 +11,7 @@ import (
 )
 
 func TestDefaultSnapshotIsPinned(t *testing.T) {
-	want := runs.PolicySnapshot{SchemaVersion: 1, MaxAttempts: 3, ExecutionBudgetMS: 2 * 60 * 60 * 1000, WallClockMS: 24 * 60 * 60 * 1000}
+	want := runs.PolicySnapshot{SchemaVersion: 2, MaxAttempts: 3, ExecutionBudgetMS: 2 * 60 * 60 * 1000, WallClockMS: 24 * 60 * 60 * 1000, AllowSelfApproval: true}
 	if diff := cmp.Diff(want, runs.DefaultSnapshot()); diff != "" {
 		t.Errorf("default snapshot mismatch (-want +got):\n%s", diff)
 	}
@@ -25,7 +25,7 @@ func TestSnapshotJSONShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"schema":1,"max_attempts":3,"execution_budget_ms":7200000,"wall_clock_ms":86400000}`
+	want := `{"schema":2,"max_attempts":3,"execution_budget_ms":7200000,"wall_clock_ms":86400000,"allow_self_approval":true}`
 	if string(raw) != want {
 		t.Errorf("snapshot json = %s, want %s", raw, want)
 	}
@@ -40,7 +40,10 @@ func TestSnapshotValidation(t *testing.T) {
 		{"attempts over cap", func(s *runs.PolicySnapshot) { s.MaxAttempts = 11 }},
 		{"zero budget", func(s *runs.PolicySnapshot) { s.ExecutionBudgetMS = 0 }},
 		{"zero wall clock", func(s *runs.PolicySnapshot) { s.WallClockMS = 0 }},
-		{"wrong schema", func(s *runs.PolicySnapshot) { s.SchemaVersion = 2 }},
+		{"unknown schema", func(s *runs.PolicySnapshot) { s.SchemaVersion = 99 }},
+		// The read path upgrades a stored schema-1 document; Validate does not.
+		// What a caller pins must be the shape this binary writes.
+		{"superseded schema", func(s *runs.PolicySnapshot) { s.SchemaVersion = 1 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

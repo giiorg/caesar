@@ -65,7 +65,7 @@ func harnessFromRow(r store.Harness) (Harness, error) {
 func validateImageRef(ref string) error {
 	if ref == "" || len(ref) > maxImageRefLen {
 		return xerrors.E(xerrors.ClassInvalid, "validation failed").WithFields(xerrors.FieldError{
-			Field: "image_ref", Message: fmt.Sprintf("must be 1-%d characters", maxImageRefLen),
+			Field: "image_ref", Message: fmt.Sprintf("must be 1-%d bytes", maxImageRefLen),
 		})
 	}
 	return nil

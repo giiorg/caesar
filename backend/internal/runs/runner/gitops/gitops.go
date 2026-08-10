@@ -1,7 +1,14 @@
-// Package gitops drives the git binary for the trusted containers of the
-// runner pipeline. Every command runs with a constructed environment (spec
-// §3): git never sees the ambient env, so no user or system config, no
-// credential helper and no terminal prompt can reach it.
+// Package gitops drives the git binary for the trusted parts of the run
+// pipeline. Every command runs with a constructed environment (spec §3): git
+// never sees the ambient env, so no user or system config, no credential
+// helper and no terminal prompt can reach it.
+//
+// Two callers live here for one reason. Stage and Extract run INSIDE the
+// caesar-git container because they touch a workspace and a .git the agent
+// controlled. Publish does not — it reads the remote at a pinned commit and
+// applies a canonical patch — and runs in the control-plane process. It lives
+// in this package because this is where the git-driving primitives are, not
+// because it is a runner concern; the runner/ path is an accident of birth.
 package gitops
 
 import (
@@ -39,6 +46,25 @@ const (
 type TypedError struct{ Outcome runs.Outcome }
 
 func (e TypedError) Error() string { return e.Outcome.Code + ": " + e.Outcome.Message }
+
+// AsOutcomeError rewraps a TypedError as the runs.OutcomeError the spine
+// classifies, and returns anything else untouched.
+//
+// It exists because runs.ClassifyOutcome matches runs.OutcomeError and nothing
+// else, and is default-deny: a TypedError handed to it straight becomes a
+// PERMANENT internal_error. For the publish path that is not cosmetic — it is
+// the difference between halting a conflicted marker for a human and killing
+// the run, and between retrying a rejected push and terminalizing a run whose
+// branch may already be on the forge. Every adapter that returns a gitops
+// error across the runs.GitPublisher port must call this; the runner's
+// container entrypoints do the equivalent through their report files.
+func AsOutcomeError(err error) error {
+	var te TypedError
+	if !errors.As(err, &te) {
+		return err
+	}
+	return runs.OutcomeError{Outcome: te.Outcome}
+}
 
 func typed(class runs.OutcomeClass, code, format string, args ...any) TypedError {
 	return TypedError{Outcome: runs.Outcome{Class: class, Code: code, Message: fmt.Sprintf(format, args...)}}

@@ -69,8 +69,14 @@ tasks:
 
   backend:test:
     dir: backend
+    # Targeted runs: `task backend:test -- -run TestFoo -v` threads test flags
+    # through CLI_ARGS, and `PKG=./internal/runs/ task backend:test` narrows the
+    # packages. Both are needed. `-run` alone still BUILDS and starts every
+    # package's test binary, so it is PKG that keeps a targeted run from paying
+    # for packages it does not touch. These lanes silently discarded `--` args
+    # until 2026-08-09, which is why every "targeted" run was the whole suite.
     cmds:
-      - go test -race ./...
+      - go test -race {{.CLI_ARGS}} {{.PKG | default "./..."}}
 
   backend:analyze:
     dir: backend
@@ -94,8 +100,11 @@ tasks:
 
   backend:test:integration:
     dir: backend
+    # See backend:test for the CLI_ARGS/PKG contract. Narrowing matters most
+    # here: testdb spins a real Postgres per test process on first use, so
+    # PKG=./internal/runs/ is the difference between one container and many.
     cmds:
-      - go test -race -tags integration -count=1 ./...
+      - go test -race -tags integration -count=1 {{.CLI_ARGS}} {{.PKG | default "./..."}}
 
   backend:test:runner:
     desc: "Runner integration suite (needs Docker + task image:build)"
@@ -104,13 +113,13 @@ tasks:
       # -p 1: every package in this lane spins real containers, so their test
       # binaries run one at a time. Concurrent binaries storm the daemon and
       # make timing-sensitive tests (e.g. deadline kills) flake on small hosts.
-      - go test -race -tags runnerintegration -count=1 -timeout 20m -p 1 ./internal/runs/runner/... ./internal/runs/egress/... ./internal/app/
+      - go test -race -tags runnerintegration -count=1 -timeout 20m -p 1 {{.CLI_ARGS}} {{.PKG | default "./internal/runs/runner/... ./internal/runs/egress/... ./internal/app/"}}
 
   backend:test:property:
     desc: "Property tests (rapid): pinned seed by default; RAPID_SEED=0 randomizes (nightly)"
     dir: backend
     cmds:
-      - go test -race -tags property -count=1 ./internal/workflows/ ./internal/runs/ -rapid.seed={{.RAPID_SEED | default "1"}} -rapid.checks={{.RAPID_CHECKS | default "100"}}
+      - go test -race -tags property -count=1 {{.CLI_ARGS}} {{.PKG | default "./internal/workflows/ ./internal/runs/"}} -rapid.seed={{.RAPID_SEED | default "1"}} -rapid.checks={{.RAPID_CHECKS | default "100"}}
 
   backend:fuzz:
     desc: "Run the fuzz targets for FUZZTIME each (nightly; default 2m)"

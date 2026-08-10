@@ -115,10 +115,117 @@ type HarnessSource interface {
 	HarnessByName(ctx context.Context, name string) (HarnessRef, error)
 }
 
-// Forge resolves a repo's default branch to the commit a run pins as its
-// base SHA. Plan 08 grows this port into the publish state machine.
+// Forge is the control plane's view of a code host. Plan 05 needed one
+// method; the publish state machine needs three more, and every one of them
+// is either an idempotency probe or an effect that records a receipt.
+//
+// EVERY implementation must return OutcomeError from BranchHead,
+// OpenPullRequest and FindPullRequests — the same rule gitops.AsOutcomeError
+// states for GitPublisher, and for the same reason. ClassifyOutcome matches
+// OutcomeError and nothing else, and is default-deny: an untyped error becomes
+// a PERMANENT internal_error. All three are called only from the publish state
+// machine, which stands inside an intent that is 'pending' or 'pushed', so a
+// permanent answer terminalizes the run — and no sweep revisits a failed run,
+// so a branch already on the forge becomes an orphan. Only what the
+// implementation can PROVE permanent may be permanent; everything else is
+// transient, which unchargedWhileUnfinished then downgrades to an uncharged,
+// resumable retry.
+//
+// ResolveHead is the exception and is deliberately NOT in that rule: its only
+// callers are task intake, and its error reaches the HTTP layer, which
+// classifies by xerrors and answers 500 for anything else. A repository the
+// operator mistyped must read as the requester's mistake, not as caesar's.
 type Forge interface {
+	// ResolveHead resolves a repo's default branch to the commit a run pins
+	// as its base SHA.
 	ResolveHead(ctx context.Context, repo RepoRef) (string, error)
+	// BranchHead reports what a branch points at; ok is false when it does
+	// not exist. Recovery's first question.
+	BranchHead(ctx context.Context, repo RepoRef, branch string) (string, bool, error)
+	// OpenPullRequest creates the pull/merge request and returns its receipt.
+	OpenPullRequest(ctx context.Context, repo RepoRef, spec PullRequestSpec) (PullRequestRef, error)
+	// FindPullRequests lists every pull/merge request on a head branch. This
+	// is what turns "the receipt was lost" into "it already happened" — but
+	// only after the caller proves one of the candidates is the publication
+	// the approval authorized. A head branch alone does not prove it.
+	FindPullRequests(ctx context.Context, repo RepoRef, headBranch string) ([]PullRequestRef, error)
+}
+
+type PullRequestSpec struct{ Head, Base, Title, Body string }
+
+type PullRequestRef struct {
+	Number  int64
+	URL     string
+	HeadSHA string
+	// Base is the branch this pull request merges INTO. It is carried because
+	// recovery locates a pull request by HEAD branch alone, and a head branch
+	// is not a unique description of a publication: a human or a bot can open
+	// a second request from our marker to a different target. Without the
+	// base, recovery would adopt it and report a publication that merges
+	// somewhere nobody approved.
+	Base  string
+	State string
+}
+
+// GitPublisher performs the git half of a publication: a fresh trusted
+// checkout at BaseSHA, the approved patch applied, a commit with the pinned
+// attribution, and a push under an expected-remote-SHA precondition.
+//
+// It is a port rather than a direct call so the golden set can inject a
+// crash between the push and its receipt — the one window that makes a
+// publication non-idempotent if the machine gets it wrong.
+type GitPublisher interface {
+	PushPatch(ctx context.Context, req PushRequest) (PushResult, error)
+	// ExpectedHead reports the commit sha PushPatch WOULD produce, touching
+	// no ref. Task 10's expired-run settlement needs to identify a branch
+	// whose push receipt was lost while holding no authority to write
+	// anything; the pinned commit date is what makes the answer exact.
+	//
+	// Every field PushPatch would have used must be present, TreeHash
+	// included: an empty tree hash is a permanent invalid_output refused
+	// before the clone, not an opt-out.
+	ExpectedHead(ctx context.Context, req PushRequest) (string, error)
+}
+
+type PushRequest struct {
+	Ref                     AttemptRef
+	Repo                    RepoRef
+	Branch                  string
+	BaseSHA                 string
+	TreeHash                string
+	Patch                   string // base64(std) canonical diff, the artifact wire form
+	Message                 string
+	AuthorName, AuthorEmail string
+	// Date is the intent's created_at, pinned into both git identities so the
+	// commit sha is a pure function of this request. It is durable and stable
+	// across attempts, which is what lets a retry after a lost push receipt
+	// rebuild the SAME commit and adopt the branch instead of force-pushing a
+	// replacement over it. Never the wall clock.
+	Date time.Time
+	// ExpectHead is "" when the branch must not exist yet.
+	ExpectHead string
+	Deadline   time.Time
+}
+
+type PushResult struct {
+	HeadSHA  string
+	TreeHash string
+	Created  bool
+}
+
+// PublicationBranch is the deterministic marker (spec §3): derived from the
+// approved artifact id, which is a uuidv7 and therefore unique per node per
+// generation. Recovery reconstructs it from the authorization row alone.
+func PublicationBranch(artifactID uuid.UUID) string {
+	return "caesar/" + artifactID.String()
+}
+
+// PrincipalSource resolves a user id to the identity a publication is
+// attributed to (spec §6: "the requester's identity flows into audit, run
+// records, and published commits/PRs"). app implements it over identity;
+// the runs context never learns what a user row looks like.
+type PrincipalSource interface {
+	Email(ctx context.Context, userID uuid.UUID) (string, error)
 }
 
 // Executor runs one phase attempt to a typed result. Plan 06's Docker

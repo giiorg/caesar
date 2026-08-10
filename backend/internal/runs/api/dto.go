@@ -36,23 +36,31 @@ type TaskListResponse struct {
 	Tasks []TaskResponse `json:"tasks"`
 }
 
-// RunResponse carries phases and artifact metadata inline on the
-// single-run read; list entries leave both empty.
+// RunResponse carries phases, artifact metadata and publications inline on
+// the single-run read; list entries leave all three empty.
 type RunResponse struct {
-	ID              string              `json:"id"`
-	TaskID          string              `json:"task_id"`
-	Status          string              `json:"status"`
-	DefinitionHash  string              `json:"definition_hash"`
-	BaseSHA         string              `json:"base_sha"`
-	PolicySnapshot  runs.PolicySnapshot `json:"policy_snapshot"`
-	ExecutionUsedMS int64               `json:"execution_used_ms"`
-	WallDeadline    time.Time           `json:"wall_deadline"`
-	Outcome         *OutcomeResponse    `json:"outcome"`
-	CreatedAt       time.Time           `json:"created_at"`
-	StartedAt       *time.Time          `json:"started_at"`
-	FinishedAt      *time.Time          `json:"finished_at"`
-	Phases          []PhaseResponse     `json:"phases"`
-	Artifacts       []ArtifactResponse  `json:"artifacts"`
+	ID             string              `json:"id"`
+	TaskID         string              `json:"task_id"`
+	Status         string              `json:"status"`
+	DefinitionHash string              `json:"definition_hash"`
+	BaseSHA        string              `json:"base_sha"`
+	PolicySnapshot runs.PolicySnapshot `json:"policy_snapshot"`
+	// Generation is the revision round the run is on: 1 until a gate sends
+	// work back, one higher per round after that.
+	Generation      int32     `json:"generation"`
+	ExecutionUsedMS int64     `json:"execution_used_ms"`
+	WallDeadline    time.Time `json:"wall_deadline"`
+	// Outcome.Class on a terminal run can still read "transient" when the run
+	// died parked past its deadline over a settled publication. That is the
+	// orchestrator's classification, not this projection's — it predates the
+	// gate surface and is routed to Task 14; nothing here makes it worse.
+	Outcome      *OutcomeResponse      `json:"outcome"`
+	CreatedAt    time.Time             `json:"created_at"`
+	StartedAt    *time.Time            `json:"started_at"`
+	FinishedAt   *time.Time            `json:"finished_at"`
+	Phases       []PhaseResponse       `json:"phases"`
+	Artifacts    []ArtifactResponse    `json:"artifacts"`
+	Publications []PublicationResponse `json:"publications"`
 }
 
 type RunListResponse struct {
@@ -71,18 +79,89 @@ type PhaseResponse struct {
 	Attempt     int32            `json:"attempt"`
 	MaxAttempts int32            `json:"max_attempts"`
 	Status      string           `json:"status"`
+	Generation  int32            `json:"generation"`
 	Outcome     *OutcomeResponse `json:"outcome"`
 	CreatedAt   time.Time        `json:"created_at"`
 	FinishedAt  *time.Time       `json:"finished_at"`
+	// Decision is present only on a gate attempt somebody decided. A revision
+	// leaves two gate attempts on the same node id, each carrying its own.
+	Decision *GateDecisionSummary `json:"decision"`
 }
 
 type ArtifactResponse struct {
-	ID        string    `json:"id"`
-	NodeID    string    `json:"node_id"`
-	Attempt   int32     `json:"attempt"`
-	Type      string    `json:"type"`
-	ParentIDs []string  `json:"parent_ids"`
-	CreatedAt time.Time `json:"created_at"`
+	ID         string    `json:"id"`
+	NodeID     string    `json:"node_id"`
+	Attempt    int32     `json:"attempt"`
+	Generation int32     `json:"generation"`
+	Type       string    `json:"type"`
+	ParentIDs  []string  `json:"parent_ids"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+type GateDecisionRequest struct {
+	Decision string `json:"decision"` // approve | request_changes | reject
+	Note     string `json:"note,omitempty"`
+}
+
+type GateDecisionResponse struct {
+	DecisionID string `json:"decision_id"`
+	Decision   string `json:"decision"`
+	RunStatus  string `json:"run_status"`
+	// Generation is the generation this response is about, and which one that
+	// is depends on the decision: approve and reject report the generation you
+	// just DECIDED, request_changes reports the NEW generation your revision
+	// opened. One documented field beats two where one is always null.
+	Generation int32 `json:"generation"`
+	// AuthorizationID is empty when the gate authorizes no publish node.
+	AuthorizationID string `json:"authorization_id,omitempty"`
+}
+
+// ApprovalResponse is one attention item. It carries everything a list view
+// renders so the inbox is one request, not one plus N.
+type ApprovalResponse struct {
+	RunID        string    `json:"run_id"`
+	TaskID       string    `json:"task_id"`
+	ProjectID    string    `json:"project_id"`
+	TaskTitle    string    `json:"task_title"`
+	NodeID       string    `json:"node_id"`
+	Attempt      int32     `json:"attempt"`
+	Generation   int32     `json:"generation"`
+	RequesterID  string    `json:"requester_id"`
+	WaitingSince time.Time `json:"waiting_since"`
+}
+
+type ApprovalListResponse struct {
+	Approvals []ApprovalResponse `json:"approvals"`
+}
+
+// GateDecisionSummary projects a decided gate onto its phase. The approver's
+// id and address are separate fields: a run is readable with view, so the
+// address reaches every member of the project and that has to be visible in
+// the contract rather than hidden inside one ambiguous "acted_by".
+type GateDecisionSummary struct {
+	Decision           string    `json:"decision"`
+	Note               string    `json:"note"`
+	ActedByID          string    `json:"acted_by_id"`
+	ActedByEmail       string    `json:"acted_by_email"`
+	ActedAt            time.Time `json:"acted_at"`
+	SelfApproval       bool      `json:"self_approval"`
+	ExaminedArtifactID string    `json:"examined_artifact_id"`
+}
+
+// PublicationResponse projects one publish intent. absent_since is
+// deliberately absent: it is the settlement sweep's own bookkeeping, it moves
+// on every tick, and rendering it would invite a human to act on a probe that
+// is designed to be re-run.
+type PublicationResponse struct {
+	NodeID       string `json:"node_id"`
+	Status       string `json:"status"` // pending | pushed | published | halted
+	Branch       string `json:"branch"`
+	TargetBranch string `json:"target_branch"`
+	BaseSHA      string `json:"base_sha"`
+	HeadSHA      string `json:"head_sha,omitempty"`
+	PRNumber     int64  `json:"pr_number,omitempty"`
+	PRURL        string `json:"pr_url,omitempty"`
+	HaltReason   string `json:"halt_reason,omitempty"`
 }
 
 type RunEventsResponse struct {
@@ -105,32 +184,63 @@ func taskResponse(t runs.Task) TaskResponse {
 	}
 }
 
-func runResponse(r runs.Run, phases []runs.Phase, arts []runs.ArtifactMeta) RunResponse {
+func runResponse(d runs.RunDetail) RunResponse {
+	r := d.Run
 	out := RunResponse{
 		ID: r.ID.String(), TaskID: r.TaskID.String(), Status: string(r.Status),
 		DefinitionHash: r.DefinitionHash, BaseSHA: r.BaseSHA, PolicySnapshot: r.Snapshot,
+		Generation:      r.Generation,
 		ExecutionUsedMS: r.ExecutionUsedMS, WallDeadline: r.WallDeadline,
 		Outcome: outcomeResponse(r.Outcome), CreatedAt: r.CreatedAt,
 		StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
-		Phases: make([]PhaseResponse, 0, len(phases)), Artifacts: make([]ArtifactResponse, 0, len(arts)),
+		Phases:       make([]PhaseResponse, 0, len(d.Phases)),
+		Artifacts:    make([]ArtifactResponse, 0, len(d.Artifacts)),
+		Publications: make([]PublicationResponse, 0, len(d.Publications)),
 	}
-	for _, p := range phases {
+	for _, p := range d.Phases {
 		out.Phases = append(out.Phases, PhaseResponse{
 			NodeID: p.NodeID, Attempt: p.Attempt, MaxAttempts: p.MaxAttempts, Status: string(p.Status),
-			Outcome: outcomeResponse(p.Outcome), CreatedAt: p.CreatedAt, FinishedAt: p.FinishedAt,
+			Generation: p.Generation, Outcome: outcomeResponse(p.Outcome),
+			CreatedAt: p.CreatedAt, FinishedAt: p.FinishedAt, Decision: gateDecisionSummary(p.Decision),
 		})
 	}
-	for _, a := range arts {
+	for _, a := range d.Artifacts {
 		parents := make([]string, 0, len(a.ParentIDs))
 		for _, id := range a.ParentIDs {
 			parents = append(parents, id.String())
 		}
 		out.Artifacts = append(out.Artifacts, ArtifactResponse{
-			ID: a.ID.String(), NodeID: a.NodeID, Attempt: a.Attempt, Type: a.Type,
-			ParentIDs: parents, CreatedAt: a.CreatedAt,
+			ID: a.ID.String(), NodeID: a.NodeID, Attempt: a.Attempt, Generation: a.Generation,
+			Type: a.Type, ParentIDs: parents, CreatedAt: a.CreatedAt,
+		})
+	}
+	for _, p := range d.Publications {
+		out.Publications = append(out.Publications, PublicationResponse{
+			NodeID: p.NodeID, Status: p.Status, Branch: p.Branch, TargetBranch: p.TargetBranch,
+			BaseSHA: p.BaseSHA, HeadSHA: p.HeadSHA, PRNumber: p.PRNumber, PRURL: p.PRURL,
+			HaltReason: p.HaltReason,
 		})
 	}
 	return out
+}
+
+func gateDecisionSummary(d *runs.GateDecision) *GateDecisionSummary {
+	if d == nil {
+		return nil
+	}
+	return &GateDecisionSummary{
+		Decision: d.Decision, Note: d.Note, ActedByID: d.ActedByID.String(),
+		ActedByEmail: d.ActedByEmail, ActedAt: d.ActedAt, SelfApproval: d.SelfApproval,
+		ExaminedArtifactID: d.ExaminedArtifactID.String(),
+	}
+}
+
+func approvalResponse(g runs.WaitingGate) ApprovalResponse {
+	return ApprovalResponse{
+		RunID: g.RunID.String(), TaskID: g.TaskID.String(), ProjectID: g.ProjectID.String(),
+		TaskTitle: g.TaskTitle, NodeID: g.NodeID, Attempt: g.Attempt, Generation: g.Generation,
+		RequesterID: g.RequesterID.String(), WaitingSince: g.WaitingSince,
+	}
 }
 
 func outcomeResponse(o *runs.Outcome) *OutcomeResponse {

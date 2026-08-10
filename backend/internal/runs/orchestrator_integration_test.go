@@ -38,6 +38,21 @@ func startOrchestrator(t *testing.T, svc *runs.Service, ex runs.Executor, lease 
 	return o
 }
 
+// startStoppableOrchestrator is startOrchestrator with the cancel handed back
+// to the test body. A test that mutates a row the janitor also sweeps has to
+// be able to freeze the loop first, or it is racing its own subject; the stop
+// is idempotent and still runs at cleanup if the body never calls it.
+func startStoppableOrchestrator(t *testing.T, svc *runs.Service, ex runs.Executor, lease time.Duration) (*runs.Orchestrator, func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	o := newOrchestrator(svc, ex, lease)
+	go func() { defer close(done); _ = o.Run(ctx) }()
+	stop := sync.OnceFunc(func() { cancel(); <-done })
+	t.Cleanup(stop)
+	return o, stop
+}
+
 // waitForRun polls until the run reaches a terminal status.
 func waitForRun(t *testing.T, svc *runs.Service, runID uuid.UUID, want runs.RunStatus) runs.Run {
 	t.Helper()

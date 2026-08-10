@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -58,6 +59,32 @@ func runServeCmd(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// probeWritable answers the only question a boot check can honestly ask about
+// a directory: can THIS process create a file in it? Nothing else is
+// equivalent — a stat tells you the mode bits and not whose uid they apply to,
+// and a mode that looks right still loses to a read-only mount, a full
+// filesystem, or a label the kernel enforces above the bits. So it creates a
+// file and removes it.
+//
+// The dot prefix keeps the probe out of the way of the per-publication
+// subdirectory listing, and it is removed on every path, including the one
+// where the close fails.
+func probeWritable(dir string) error {
+	f, err := os.CreateTemp(dir, ".caesar-writable-")
+	if err != nil {
+		return fmt.Errorf("%s exists but this process cannot write in it: %w", dir, err)
+	}
+	name := f.Name()
+	closeErr := f.Close()
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("%s: could not remove the write probe %s: %w", dir, name, err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("%s: write probe failed to close: %w", dir, closeErr)
+	}
+	return nil
+}
+
 // runServe boots the control plane: connect, migrate (advisory-locked),
 // serve HTTP until ctx is cancelled, then drain within the shutdown timeout.
 func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
@@ -95,23 +122,57 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, svc, svc, svc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, svc))...)
 
-	// The execution spine: real peer-context adapters, the honest
-	// not-implemented executor and forge until Plans 06/08. identity.Service
-	// serves as authenticator, authorizer, and grant source here too.
+	// The execution spine: real peer-context adapters and the real forge.
+	// identity.Service serves as authenticator, authorizer, and grant source
+	// here too.
+	//
+	// ONE endpoints value builds the forge adapter, the publisher and the
+	// runner's staging clone. Building it three times is how the API host and
+	// the clone host drift apart, which is the silent self-hosted failure: the
+	// run can read the repository and publishes nothing.
+	endpoints := forgeEndpointsFrom(cfg.Forge)
+	forgeSvc := newForgeAdapter(assetsSvc, endpoints,
+		&http.Client{Timeout: cfg.Forge.RequestTimeout.Std()})
+
+	// config.Load validates publish_work_dir as a non-empty absolute path, so
+	// an empty one means this Config never went through Load — the shape the
+	// integration tests build by hand. Falling back keeps them booting without
+	// pinning a path they never asked for. The directory is made HERE, at boot,
+	// and not lazily on first publication: a work dir nobody can write is a
+	// misconfiguration, and discovering it at the first publication is
+	// discovering it at the worst possible moment.
+	workDir := cfg.Forge.PublishWorkDir
+	if workDir == "" {
+		workDir = os.TempDir()
+	}
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		return fmt.Errorf("serve: publish work dir: %w", err)
+	}
+	// And MkdirAll is not the question. It returns nil on a directory that
+	// already exists, whatever its owner or mode, so on the deployment shape
+	// this check exists for — the packaged default /var/lib/caesar/publish,
+	// pre-created by a package or a mount, for a caesar process that is not
+	// root — creation always succeeds and answers nothing. Only writing
+	// answers it, so write.
+	if err := probeWritable(workDir); err != nil {
+		return fmt.Errorf("serve: publish work dir: %w", err)
+	}
+	publisher := gitPublisher{assets: assetsSvc, workDir: workDir, endpoints: endpoints}
+
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		unavailableForge{}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		forgeSvc, publisher, principalSource{svc: svc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc))...)
 
 	// Plan 06: the real Docker runner when configured. Disabled by default —
-	// production intake is refused until Plan 08's forge adapters, so the
+	// it needs a Docker daemon, built images and a writable data root, so the
 	// honest stub stays the default posture (stubs never fake success).
 	var executor runs.Executor = runs.NotImplementedExecutor{}
 	var admission runs.Admission = runs.AlwaysAdmit{}
 	runnerDone := make(chan struct{})
 	close(runnerDone) // no-op wait unless a runner replaces it below
 	if cfg.Runner.Enabled {
-		rnr, err := buildRunner(cfg.Runner, assetsSvc, runsSvc, log)
+		rnr, err := buildRunner(cfg.Runner, endpoints, assetsSvc, runsSvc, log)
 		if err != nil {
 			return fmt.Errorf("serve: runner: %w", err)
 		}

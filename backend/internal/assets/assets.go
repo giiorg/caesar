@@ -117,7 +117,10 @@ type Harness struct {
 	UpdatedAt        time.Time
 }
 
-// Validation pins (plan header).
+// Validation pins (plan header). BYTE counts, the house convention — every
+// check below is a `len()`, the columns behind them are unconstrained `text`,
+// and the field errors say "bytes" so a caller counting graphemes is not
+// surprised by a name it thinks is 60 characters long.
 const (
 	maxNameLen        = 100
 	maxDescriptionLen = 500
@@ -135,7 +138,7 @@ func validateName(field, name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > maxNameLen {
 		return "", xerrors.E(xerrors.ClassInvalid, "validation failed").WithFields(xerrors.FieldError{
-			Field: field, Message: fmt.Sprintf("must be 1-%d characters", maxNameLen),
+			Field: field, Message: fmt.Sprintf("must be 1-%d bytes", maxNameLen),
 		})
 	}
 	return name, nil
@@ -144,7 +147,7 @@ func validateName(field, name string) (string, error) {
 func validateDescription(desc string) error {
 	if len(desc) > maxDescriptionLen {
 		return xerrors.E(xerrors.ClassInvalid, "validation failed").WithFields(xerrors.FieldError{
-			Field: "description", Message: fmt.Sprintf("must be at most %d characters", maxDescriptionLen),
+			Field: "description", Message: fmt.Sprintf("must be at most %d bytes", maxDescriptionLen),
 		})
 	}
 	return nil

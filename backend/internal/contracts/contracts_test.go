@@ -2,6 +2,7 @@ package contracts_test
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 	"testing"
 
@@ -66,4 +67,56 @@ func TestBuild_IsDeterministic(t *testing.T) {
 	if string(a) != string(b) {
 		t.Fatal("Build must be deterministic — the regen-diff gate depends on it")
 	}
+}
+
+// Operation.Errors is the only way an endpoint can declare a non-2xx answer
+// beyond the 400 every operation documents. Without a test the mechanism is
+// guarded only by the committed document, which says nothing about WHY the
+// status is there — and a client that cannot see 409 in the contract reads a
+// legitimate conflict as a bug.
+func TestBuild_DocumentsTheErrorStatusesAnOperationDeclares(t *testing.T) {
+	raw, err := contracts.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Paths map[string]map[string]struct {
+			OperationID string `json:"operationId"`
+			Responses   map[string]struct {
+				Content map[string]any `json:"content"`
+			} `json:"responses"`
+		} `json:"paths"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	decide := doc.Paths["/api/v1/runs/{id}/gates/{node}/decision"]["post"]
+	if decide.OperationID != "decideGate" {
+		t.Fatalf("operationId = %q, want decideGate", decide.OperationID)
+	}
+	conflict, ok := decide.Responses["409"]
+	if !ok {
+		t.Fatalf("decideGate responses = %v, want a documented 409", sortedKeys(decide.Responses))
+	}
+	if _, ok := conflict.Content["application/problem+json"]; !ok {
+		t.Errorf("409 content = %v, want the problem+json envelope", conflict.Content)
+	}
+
+	// And only where it is declared: an operation that lists no extra statuses
+	// keeps the two it always had, so the loop cannot be documenting 409
+	// everywhere.
+	listed := doc.Paths["/api/v1/approvals"]["get"]
+	if got := sortedKeys(listed.Responses); len(got) != 2 || got[0] != "200" || got[1] != "400" {
+		t.Errorf("listApprovals responses = %v, want only 200 and 400", got)
+	}
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

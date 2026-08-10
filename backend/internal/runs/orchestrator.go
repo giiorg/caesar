@@ -64,6 +64,46 @@ type cachedPlan struct {
 	taskInputs map[string]any
 	baseSHA    string
 	repo       RepoRef
+	// The three a publication renders into its pull request. All immutable
+	// for a run's lifetime — a task's title and requester and the run's
+	// pinned definition hash cannot change — so caching them is honest.
+	//
+	// The requester's EMAIL is deliberately not among them: it lives on a
+	// mutable users row, and it is hashed into the publication's commit sha.
+	// A cached copy re-resolved after a restart could differ between two
+	// attempts of the same publication and break the rebuild that recovery
+	// adopts by. authorizePublish resolves it once and writes it to
+	// publish_intents.author_email, which is the durable authority thereafter.
+	taskTitle      string
+	definitionHash string
+	requesterID    uuid.UUID
+	// generation is NOT cached: it changes when a gate opens a revision, and
+	// a stale value would stamp the wrong marker on an artifact. It is read
+	// per use through generationOf.
+}
+
+// generationOf reads the run's current generation under a row lock, and both
+// halves of that are load-bearing.
+//
+// Not cached: a revision bumps the counter under a different transaction than
+// the one that compiled the plan, so a value carried on cachedPlan would be
+// stale exactly when it matters.
+//
+// Locked: an unlocked SELECT returns the READ COMMITTED snapshot taken at
+// statement start, so a revision committing between the read and the writes it
+// feeds would stamp generation N-1 on a generation-N run — and
+// GetNodeArtifact's provenance-first ordering would then serve the stale
+// artifact to the node downstream. FOR UPDATE holds the row for the rest of
+// the transaction, which is what makes the value the caller stamps the value
+// the caller commits against. The lock is not a new one: every caller updates
+// this same run row later in the same transaction anyway (AddRunUsage,
+// FinishRun); it is only taken before the first stamp instead of after.
+func (o *Orchestrator) generationOf(ctx context.Context, q *store.Queries, runID uuid.UUID) (int32, error) {
+	row, err := q.GetRunForUpdate(ctx, runID)
+	if err != nil {
+		return 0, fmt.Errorf("runs: read generation: %w", err)
+	}
+	return row.Generation, nil
 }
 
 // NewOrchestrator wires the queue driver. leases may be nil: a deployment
@@ -117,6 +157,9 @@ func (o *Orchestrator) janitorLoop(ctx context.Context) {
 		}
 		if err := o.startPendingRuns(ctx); err != nil {
 			o.log.Error("orchestrator: start pending runs", "error", err)
+		}
+		if err := o.materializeResumedRuns(ctx); err != nil {
+			o.log.Error("orchestrator: materialize resumed runs", "error", err)
 		}
 		if err := o.sweepExpiredRuns(ctx); err != nil {
 			o.log.Error("orchestrator: wall-deadline sweep", "error", err)
@@ -249,11 +292,53 @@ func (o *Orchestrator) loadPlan(ctx context.Context, runID uuid.UUID) (cachedPla
 	cp := cachedPlan{
 		plan: plan, projectID: taskRow.ProjectID, taskInputs: inputs,
 		baseSHA: runRow.BaseSha, repo: repo,
+		taskTitle: taskRow.Title, definitionHash: runRow.DefinitionHash,
+		requesterID: taskRow.RequesterID,
 	}
 	o.planMu.Lock()
 	o.plans[runID] = cp
 	o.planMu.Unlock()
 	return cp, nil
+}
+
+// materializeNode inserts one node's next attempt row inside the caller's tx
+// and returns the event announcing it. Gates are inserted 'waiting_decision'
+// — the claim CTE predicates on 'pending', so this single branch is the whole
+// reason a human's thinking time never burns a lease or the execution budget.
+func (o *Orchestrator) materializeNode(ctx context.Context, tx pgx.Tx, cp cachedPlan,
+	runID uuid.UUID, nodeID string, attempt, maxAttempts, generation int32,
+) (Event, error) {
+	ref := AttemptRef{RunID: runID, NodeID: nodeID, Attempt: attempt}
+	payload := map[string]any{"node_id": nodeID, "attempt": attempt, "generation": generation}
+	if cp.plan.Nodes[nodeID].Kind != KindGate {
+		if _, err := o.svc.insertPhaseTx(ctx, tx, runID, nodeID, attempt, maxAttempts, 0, generation, nil); err != nil {
+			return Event{}, err
+		}
+		return Event{
+			RunID: runID, ProjectID: cp.projectID, Kind: EventPhaseMaterialized,
+			CorrelationID: ref.String(), Payload: payload,
+		}, nil
+	}
+	if _, err := store.New(tx).InsertGatePhase(ctx, store.InsertGatePhaseParams{
+		RunID: runID, NodeID: nodeID, Attempt: attempt, MaxAttempts: maxAttempts,
+		Generation: generation, CreatedAt: o.svc.clock.Now(),
+	}); err != nil {
+		return Event{}, fmt.Errorf("runs: insert gate %s/%s#%d: %w", runID, nodeID, attempt, err)
+	}
+	if rev := cp.plan.Nodes[nodeID].Revision; rev != nil {
+		payload["revision_target"] = rev.Target
+		payload["max_rounds"] = rev.MaxRounds
+	}
+	if pub, ok := cp.plan.PublishFor(nodeID); ok {
+		// The attention item says what an approval will authorize. A gate
+		// that authorizes nothing is a checkpoint; one that authorizes a
+		// publish is a release decision, and the UI must not conflate them.
+		payload["authorizes"] = pub
+	}
+	return Event{
+		RunID: runID, ProjectID: cp.projectID, Kind: EventGateWaiting,
+		CorrelationID: ref.String(), Payload: payload,
+	}, nil
 }
 
 // startPendingRuns flips pending runs to running and materializes their
@@ -293,14 +378,13 @@ func (o *Orchestrator) startPendingRuns(ctx context.Context) error {
 			}
 			maxAttempts := snap.MaxAttempts
 			for _, root := range cp.plan.Roots() {
-				if _, err := o.svc.insertPhaseTx(ctx, tx, runID, root, 1, maxAttempts, 0, nil); err != nil {
+				// The generation is literally 1: a run that has not started
+				// cannot have revised.
+				ev, err := o.materializeNode(ctx, tx, cp, runID, root, 1, maxAttempts, 1)
+				if err != nil {
 					return err
 				}
-				evs = append(evs, Event{
-					RunID: runID, ProjectID: cp.projectID, Kind: EventPhaseMaterialized,
-					CorrelationID: AttemptRef{RunID: runID, NodeID: root, Attempt: 1}.String(),
-					Payload:       map[string]any{"node_id": root, "attempt": 1},
-				})
+				evs = append(evs, ev)
 			}
 			return appendEvents(ctx, tx, now, evs)
 		})
@@ -328,7 +412,15 @@ func (o *Orchestrator) sweepExpiredRuns(ctx context.Context) error {
 		return err
 	}
 	for _, runID := range ids {
-		if !o.settleRunCredentials(ctx, runID) {
+		if !o.settleExpiredPhases(ctx, runID) {
+			continue
+		}
+		// A publication that may have landed is an obligation, not a detail.
+		// Terminalizing over one makes the orphan durable — the run is dead,
+		// its phases superseded, and nothing reconciles a dead run — so an
+		// unsettled intent leaves the run for the next tick exactly as an
+		// unsettled lease does.
+		if !o.settleRunPublications(ctx, runID) {
 			continue
 		}
 		out := Outcome{Class: OutcomePermanent, Code: CodeWallDeadlineExceeded, Message: "wall clock expired"}
@@ -339,24 +431,37 @@ func (o *Orchestrator) sweepExpiredRuns(ctx context.Context) error {
 	return nil
 }
 
-// settleRunCredentials fences and settles the credential obligation of every
-// phase of an expired run that could still be holding one, and reports whether
-// the run may now be terminalized.
+// settleExpiredPhases fences every still-running phase of an expired run and
+// settles the credential obligation of each phase it now owns, reporting
+// whether the run may be terminalized.
+//
+// FENCING IS UNCONDITIONAL, and that is the load-bearing part. It used to sit
+// behind this function's `o.credentials == nil` short-circuit, which meant
+// production — whose executor is not a CredentialReconciler, and whose publish
+// nodes bypass the executor entirely — fenced nothing at all. Nothing else
+// fences a past-deadline phase, so an expired run stayed 'running' forever:
+// publication settlement's quiescence could never become true, and the run
+// could never die. A run that cannot die is worse than the orphan settlement
+// exists to prevent. Only the credential half is skipped now.
+//
+// Fencing and settling stay in ONE pass, phase by phase, rather than a fencing
+// sweep followed by a settling sweep. The order is what makes a lost fencing
+// CAS mean something: losing it to another process means that process is
+// mid-reconciliation on that phase right now, and terminalizing on top of it
+// makes the ordering violation durable. A pass that fenced everything up front
+// would take custody of phases a concurrent sweeper was already settling.
 //
 // The cleanup-only entry is deliberate. Full reconciliation ADOPTS a completed
 // attempt and can evaluate it as a success — and FinishRun carries no deadline
 // predicate, so an exit-0 attempt reconciled after the wall deadline would mark
 // the run succeeded and this sweep's terminalization would silently lose its
 // CAS. Past the deadline the run's outcome is already decided; only the
-// credential obligation is still owed.
+// obligations it leaves behind are still owed.
 //
 // Rows this sweep already moved to 'reconciling' on an earlier tick are picked
 // up again: without that, a reconciliation that failed once would leave a phase
 // whose credential is never settled and a run that terminalizes over it.
-func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID) bool {
-	if o.credentials == nil {
-		return true // no executor-held credentials in this deployment
-	}
+func (o *Orchestrator) settleExpiredPhases(ctx context.Context, runID uuid.UUID) bool {
 	q := store.New(o.svc.pool)
 	phases, err := q.ListPhasesForRun(ctx, runID)
 	if err != nil {
@@ -367,26 +472,24 @@ func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID
 	for _, p := range phases {
 		switch PhaseStatus(p.Status) {
 		case PhaseRunning:
-			// Fence first: the phase lease may still be future-dated (the
-			// worker's own deadline exit races this sweep), so the plain
-			// MarkPhaseReconciling cannot serve here.
-			if _, err := q.MarkPhaseReconcilingPastDeadline(ctx, p.ID); err != nil {
-				if errorsIsNoRows(err) {
-					if o.phaseSettledElsewhere(ctx, q, p.ID) {
-						continue
-					}
-					settled = false
-					continue
-				}
-				o.log.Error("orchestrator: fence past-deadline phase", "phase", p.ID, "error", err)
+			owned, ok := o.fencePhase(ctx, q, p.ID)
+			if !ok {
 				settled = false
+			}
+			if !owned {
 				continue
 			}
 		case PhaseReconciling:
 			// Already fenced — by this sweep on an earlier tick, or by the
 			// lease sweep. Either way the obligation may still be owed.
 		default:
+			// Terminal, never claimed, or waiting on a human. A gate in
+			// particular ran no container and therefore holds no credential;
+			// there is nothing here to settle.
 			continue
+		}
+		if o.credentials == nil {
+			continue // no executor-held credentials in this deployment
 		}
 		ref := AttemptRef{RunID: runID, NodeID: p.NodeID, Attempt: p.Attempt}
 		if err := o.credentials.ReconcileCredential(ctx, ref); err != nil {
@@ -395,6 +498,37 @@ func (o *Orchestrator) settleRunCredentials(ctx context.Context, runID uuid.UUID
 		}
 	}
 	return settled
+}
+
+// fencePhase takes ONE still-running phase away from its worker: the worker
+// loses the CAS it would need to commit anything, so no new effect can be
+// issued and a settling sweep is not racing one.
+//
+// owned says this sweep fenced the phase and therefore owes its settlement; ok
+// says the run may still be terminalized this tick. The three answers are
+// distinct and the middle one is easy to lose: a phase that moved because it is
+// OVER owes nothing (owned false, ok true), while a phase another sweeper moved
+// to 'reconciling' is one it is settling right now, and terminalizing on top of
+// it makes the ordering violation durable (owned false, ok false).
+//
+// A fenced row is left 'reconciling', which is deliberately NOT terminal — the
+// obligation is still owed, it just has no owner that can act on it. Every
+// settlement in this file therefore reads quiescence as "nothing still
+// running", never as "no live row".
+func (o *Orchestrator) fencePhase(ctx context.Context, q *store.Queries, phaseID uuid.UUID) (owned, ok bool) {
+	// The phase lease may still be future-dated (the worker's own deadline exit
+	// races this sweep), so the plain MarkPhaseReconciling cannot serve here:
+	// this variant fences on the RUN's expired deadline.
+	_, err := q.MarkPhaseReconcilingPastDeadline(ctx, phaseID)
+	switch {
+	case err == nil:
+		return true, true
+	case errorsIsNoRows(err):
+		return false, o.phaseSettledElsewhere(ctx, q, phaseID)
+	default:
+		o.log.Error("orchestrator: fence past-deadline phase", "phase", phaseID, "error", err)
+		return false, false
+	}
 }
 
 // sweepStaleCredentialLeases hands abandoned credential leases to
@@ -465,7 +599,10 @@ func (o *Orchestrator) phaseSettledElsewhere(ctx context.Context, q *store.Queri
 
 // phaseIsLive reports whether the attempt's own machinery still owns it: a
 // running phase heartbeats, a reconciling one is mid-recovery. Everything else
-// — terminal, or never claimed — has nobody left to conclude its credential.
+// — terminal, never claimed, or waiting on a human — has nobody left to
+// conclude its credential. A gate is deliberately NOT live here: it never ran
+// a container, so it never took a credential lease, and treating it as live
+// would strand any lease whose ref collided with a gate node's.
 func phaseIsLive(s PhaseStatus) bool {
 	return s == PhaseRunning || s == PhaseReconciling
 }
@@ -615,7 +752,24 @@ func (o *Orchestrator) reconcileAttempt(ctx context.Context, row reconcileRow, a
 		}
 	}
 
-	ins, err := o.exec.Inspect(ctx, ref)
+	var ins InspectResult
+	if cp.plan.Nodes[row.NodeID].Kind == KindGitPublish {
+		// The Executor never saw this attempt: a publication is a control-plane
+		// effect. Its durable position IS the intent row, and the forge is the
+		// only witness for effects whose receipt was lost.
+		//
+		// It must not reach the Inspect path below, whose every unadoptable
+		// answer is a CHARGEABLE reconcile_lost (outcome.go Chargeable): three
+		// lost leases would exhaust a node whose branch is already on the forge
+		// — terminalizing the run, superseding every phase, and leaving nothing
+		// that will ever reconcile the branch. That is the exact failure
+		// runPublish's invariant exists to forbid, entered by the one door
+		// runPublish does not guard. Every answer inspectPublication gives is
+		// either uncharged or the honest permanent one.
+		ins, err = o.inspectPublication(ctx, ref)
+	} else {
+		ins, err = o.exec.Inspect(ctx, ref)
+	}
 	if err != nil || !ins.Completed {
 		out := Outcome{Class: OutcomeTransient, Code: CodeReconcileLost, Message: "attempt lost its lease with no adoptable result"}
 		o.evaluate(ctx, "", cp, claimedFromRow(row), PhaseReconciling, ExecutionResult{}, OutcomeError{Outcome: out})
@@ -679,6 +833,14 @@ func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) 
 		o.log.Error("orchestrator: started event", "error", err)
 	}
 
+	if node.Kind == KindGitPublish {
+		// A publication is a control-plane effect with durable receipts, not
+		// something a container produces. It shares the claim, the lease, the
+		// heartbeat and the evaluation — only the middle differs.
+		o.executePublish(ctx, workerID, cp, c)
+		return
+	}
+
 	// Deadline = the tighter of the two clocks (spec §3 Budgets).
 	deadline := c.RunWallDeadline
 	if rem := RemainingBudgetMS(c.BudgetMS, c.UsedMS); rem > 0 {
@@ -689,7 +851,24 @@ func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) 
 	execCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	// Heartbeat until execution finishes; a fenced heartbeat cancels.
+	hbDone := o.startHeartbeat(execCtx, cancel, c, workerID)
+
+	req, err := o.buildRequest(ctx, cp, node, c.Ref, deadline)
+	var res ExecutionResult
+	if err == nil {
+		res, err = o.exec.Execute(execCtx, req)
+	}
+	close(hbDone)
+	o.evaluate(ctx, workerID, cp, c, PhaseRunning, res, err)
+}
+
+// startHeartbeat keeps the lease alive until the returned channel closes or
+// the attempt's context ends, and cancels the attempt the moment a heartbeat
+// comes back fenced. Both execution paths share it so neither can forget to
+// fence: a publication holds the same lease an agentic attempt does.
+func (o *Orchestrator) startHeartbeat(execCtx context.Context, cancel context.CancelFunc,
+	c claimed, workerID string,
+) chan struct{} {
 	hbDone := make(chan struct{})
 	go func() {
 		tick := time.NewTicker(o.cfg.HeartbeatInterval)
@@ -709,48 +888,57 @@ func (o *Orchestrator) execute(ctx context.Context, workerID string, c claimed) 
 			}
 		}
 	}()
+	return hbDone
+}
 
-	req, err := o.buildRequest(ctx, cp, node, c.Ref, deadline)
-	var res ExecutionResult
-	if err == nil {
-		res, err = o.exec.Execute(execCtx, req)
+// harnessBinding resolves the node's harness against the registry and with it
+// the credential this attempt is pinned to for its whole life. A node that
+// declares no harness binds nothing and that is not an error.
+//
+// It is a function of its own because it is the one part of request assembly
+// that touches no run rows: the rest of buildRequest reads artifacts through
+// the pool, so keeping this callable on its own is what lets the
+// gone-vs-unreachable distinction below be pinned without a database.
+func (o *Orchestrator) harnessBinding(ctx context.Context, node PlanNode) (uuid.UUID, CredentialBinding, error) {
+	if node.Harness == "" {
+		return uuid.Nil, CredentialBinding{}, nil
 	}
-	close(hbDone)
-	o.evaluate(ctx, workerID, cp, c, PhaseRunning, res, err)
+	h, err := o.svc.harnesses.HarnessByName(ctx, node.Harness)
+	// Only a harness that is genuinely GONE is permanent: retrying finds
+	// the same nothing, so the node dies naming what an operator has to
+	// re-register. Everything else here is the database being briefly
+	// unreachable, and this resolution is two round trips wide — the row
+	// and the credential kind it pins (app/runsports.go) — so a pool
+	// timeout on either would otherwise kill the node permanently and tell
+	// the operator something that is not true.
+	switch {
+	case err != nil && xerrors.ClassOf(err) == xerrors.ClassNotFound:
+		return uuid.Nil, CredentialBinding{}, OutcomeError{Outcome: Outcome{
+			Class: OutcomePermanent, Code: CodeHarnessError,
+			Message: fmt.Sprintf("harness %q no longer registered", node.Harness),
+		}}
+	case err != nil:
+		return uuid.Nil, CredentialBinding{}, OutcomeError{Outcome: Outcome{
+			Class: OutcomeTransient, Code: CodeInternalError,
+			Message: fmt.Sprintf("resolve harness %q: %v", node.Harness, err),
+		}}
+	}
+	return h.ID, CredentialBinding{ID: h.CredentialID, Kind: h.CredentialKind}, nil
 }
 
 // buildRequest assembles explicit inputs: latest artifacts of each input
-// origin, harness resolved fresh against the registry — and with it the
-// credential binding this attempt is pinned to for its whole life.
+// origin, the seeds a revision handed this node, and the harness binding.
 func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node PlanNode, ref AttemptRef, deadline time.Time) (ExecutionRequest, error) {
 	req := ExecutionRequest{
 		Ref: ref, Kind: node.Kind, Repo: cp.repo, Instructions: node.Instructions,
 		TaskInputs: cp.taskInputs, BaseSHA: cp.baseSHA, Deadline: deadline,
 	}
-	if node.Harness != "" {
-		h, err := o.svc.harnesses.HarnessByName(ctx, node.Harness)
-		// Only a harness that is genuinely GONE is permanent: retrying finds
-		// the same nothing, so the node dies naming what an operator has to
-		// re-register. Everything else here is the database being briefly
-		// unreachable, and this resolution is two round trips wide — the row
-		// and the credential kind it pins (app/runsports.go) — so a pool
-		// timeout on either would otherwise kill the node permanently and tell
-		// the operator something that is not true.
-		switch {
-		case err != nil && xerrors.ClassOf(err) == xerrors.ClassNotFound:
-			return ExecutionRequest{}, OutcomeError{Outcome: Outcome{
-				Class: OutcomePermanent, Code: CodeHarnessError,
-				Message: fmt.Sprintf("harness %q no longer registered", node.Harness),
-			}}
-		case err != nil:
-			return ExecutionRequest{}, OutcomeError{Outcome: Outcome{
-				Class: OutcomeTransient, Code: CodeInternalError,
-				Message: fmt.Sprintf("resolve harness %q: %v", node.Harness, err),
-			}}
-		}
-		req.HarnessID = h.ID
-		req.Credential = CredentialBinding{ID: h.CredentialID, Kind: h.CredentialKind}
+	harnessID, binding, err := o.harnessBinding(ctx, node)
+	if err != nil {
+		return ExecutionRequest{}, err
 	}
+	req.HarnessID, req.Credential = harnessID, binding
+
 	q := store.New(o.svc.pool)
 	for _, in := range node.Inputs {
 		row, err := q.GetNodeArtifact(ctx, store.GetNodeArtifactParams{
@@ -765,7 +953,55 @@ func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node Pla
 		}
 		req.Inputs = append(req.Inputs, ArtifactInput{ID: row.ID, Type: row.Type, Payload: payload})
 	}
+
+	// Seeded inputs: what a revision handed this node. They are stored at the
+	// node's OWN id with attempt 0, so a successor's structural lookup can
+	// never mistake them for a produced artifact of an ancestor.
+	seeds, err := q.ListSeedArtifacts(ctx, store.ListSeedArtifactsParams{
+		RunID: ref.RunID, NodeID: ref.NodeID,
+	})
+	if err != nil {
+		return ExecutionRequest{}, fmt.Errorf("runs: seed artifacts for %s: %w", ref.NodeID, err)
+	}
+	for _, row := range seeds {
+		payload, err := unmarshalMap(row.Payload)
+		if err != nil {
+			return ExecutionRequest{}, err
+		}
+		req.Inputs = append(req.Inputs, ArtifactInput{ID: row.ID, Type: row.Type, Payload: payload})
+	}
+
+	// One patch reaches a phase, ever (Plan 07's cumulative-patch contract):
+	// every runner-produced patch diffs from the run's base and subsumes its
+	// ancestors, so a chain would double-apply. A seeded patch is strictly
+	// newer than any structural one, so it displaces it. This has to be the
+	// LAST statement: the helper keeps the last patch appended, which is the
+	// seed only because the seed loop above has already run.
+	req.Inputs = collapsePatchInputs(req.Inputs)
 	return req, nil
+}
+
+// collapsePatchInputs keeps at most one patch input: the last one appended,
+// which is the seed when a revision supplied one and the structural binding
+// otherwise. Non-patch inputs pass through untouched and in order.
+func collapsePatchInputs(in []ArtifactInput) []ArtifactInput {
+	lastPatch := -1
+	for i, a := range in {
+		if a.Type == ArtifactKindPatch {
+			lastPatch = i
+		}
+	}
+	if lastPatch < 0 {
+		return in
+	}
+	out := make([]ArtifactInput, 0, len(in))
+	for i, a := range in {
+		if a.Type == ArtifactKindPatch && i != lastPatch {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // evaluate is THE outcome transaction (spec §3 exhaustion never strands
@@ -810,6 +1046,10 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 		return false, nil
 	}
 	q := store.New(tx)
+	gen, err := o.generationOf(ctx, q, c.Ref.RunID)
+	if err != nil {
+		return false, err
+	}
 
 	// Persist artifacts with lineage = this node's input artifact ids.
 	node := cp.plan.Nodes[c.Ref.NodeID]
@@ -820,6 +1060,31 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 			parentIDs = append(parentIDs, row.ID.String())
 		}
 	}
+	// A revised output descends from what the revision handed this node too:
+	// the patch the gate examined and the note. Both were fed to the attempt,
+	// and leaving them out would lose the only link between a revised artifact
+	// and the round that asked for it.
+	//
+	// What parent_ids records, then, is DECLARED lineage plus seeds — not the
+	// exact input set the attempt was handed. The two diverge on a revision
+	// round: collapsePatchInputs drops the structurally-declared patch from the
+	// request when a seeded one displaces it, yet the loop above still records
+	// it. That is deliberate. The declared edge is a real ancestor of this
+	// output whether or not its payload rode along in the request, and dropping
+	// it here would be a lineage change with no caller asking for one.
+	//
+	// The statement's `generation = (SELECT generation FROM runs WHERE id=$1)`
+	// subquery reads the same value this transaction is stamping the rows
+	// with: generationOf above already holds the run row under GetRunForUpdate.
+	seeds, err := q.ListSeedArtifacts(ctx, store.ListSeedArtifactsParams{
+		RunID: c.Ref.RunID, NodeID: c.Ref.NodeID,
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, s := range seeds {
+		parentIDs = append(parentIDs, s.ID.String())
+	}
 	if parentIDs == nil {
 		parentIDs = []string{}
 	}
@@ -827,7 +1092,7 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 	if err != nil {
 		return false, err
 	}
-	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, res.Artifacts, rawParents, now)
+	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, gen, res.Artifacts, rawParents, now)
 	if err != nil {
 		return false, err
 	}
@@ -849,49 +1114,245 @@ func (o *Orchestrator) evaluateSuccess(ctx context.Context, tx pgx.Tx, workerID 
 			EventRunFailed, now, evs)
 	}
 
-	// Materialize newly-ready successors (readiness from succeeded set).
-	succeededNodes, err := q.ListSucceededNodes(ctx, c.Ref.RunID)
+	// Materialize newly-ready successors and read the run's resulting state
+	// back. Both live in materializeReady, which the janitor's resumed-run
+	// pass also calls: readiness has exactly one definition, so the two
+	// callers cannot answer it differently.
+	evs2, waiting, complete, err := o.materializeReady(ctx, tx, cp, c.Ref.RunID, c.MaxAttempts, gen, c.PhaseID)
 	if err != nil {
 		return false, err
+	}
+	evs = append(evs, evs2...)
+	if complete {
+		return true, o.finishRunTx(ctx, tx, cp, c.Ref.RunID, RunSucceeded, Outcome{}, EventRunSucceeded, now, evs)
+	}
+	if err := o.syncWaiting(ctx, tx, c.Ref.RunID, waiting); err != nil {
+		return false, err
+	}
+	return false, appendEvents(ctx, tx, now, evs)
+}
+
+// materializeReady inserts a phase row for every node of the run whose inputs
+// have all succeeded and which has no row spoken for it yet. It is the ONE
+// definition of readiness: evaluateSuccess calls it after a phase lands, and
+// the janitor calls it for runs a gate decision resumed (a decision is not a
+// phase evaluation, so nothing else would ever pick those up).
+//
+// It returns the events announcing what it materialized, whether the run is
+// now waiting on a human, and whether the run is complete.
+func (o *Orchestrator) materializeReady(ctx context.Context, tx pgx.Tx, cp cachedPlan,
+	runID uuid.UUID, maxAttempts, generation int32, excludePhase uuid.UUID,
+) ([]Event, bool, bool, error) {
+	q := store.New(tx)
+	succeededNodes, err := q.ListSucceededNodes(ctx, runID)
+	if err != nil {
+		return nil, false, false, err
 	}
 	succeeded := map[string]bool{}
 	for _, id := range succeededNodes {
 		succeeded[id] = true
 	}
-	attempted := map[string]bool{}
-	phaseRows, err := q.ListPhasesForRun(ctx, c.Ref.RunID)
+	phaseRows, err := q.ListPhasesForRun(ctx, runID)
 	if err != nil {
-		return false, err
+		return nil, false, false, err
 	}
+	live := map[string]bool{}
+	// The next attempt ordinal per node. phase_runs is UNIQUE on
+	// (run_id, node_id, attempt) (schema.sql:262), so a node a revision
+	// rewound already owns ordinal 1 and materializing another one would be a
+	// 23505, not a fresh attempt. The rows are already in hand, so this costs
+	// nothing beyond the loop we are already running.
+	nextAttempt := map[string]int32{}
 	for _, pr := range phaseRows {
-		attempted[pr.NodeID] = true
+		if !PhaseStatus(pr.Status).Terminal() || succeeded[pr.NodeID] {
+			live[pr.NodeID] = true
+		}
+		if pr.Attempt >= nextAttempt[pr.NodeID] {
+			nextAttempt[pr.NodeID] = pr.Attempt + 1
+		}
 	}
+	var evs []Event
 	for _, nodeID := range cp.plan.Order {
-		if attempted[nodeID] || !cp.plan.Ready(nodeID, succeeded) {
+		if live[nodeID] || !cp.plan.Ready(nodeID, succeeded) {
 			continue
 		}
-		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, nodeID, 1, c.MaxAttempts, 0, nil); err != nil {
-			return false, err
+		attempt := nextAttempt[nodeID]
+		if attempt == 0 {
+			attempt = 1 // never materialized before
 		}
-		evs = append(evs, Event{
-			RunID: c.Ref.RunID, ProjectID: cp.projectID, Kind: EventPhaseMaterialized,
-			CorrelationID: AttemptRef{RunID: c.Ref.RunID, NodeID: nodeID, Attempt: 1}.String(),
-			Payload:       map[string]any{"node_id": nodeID, "attempt": 1},
-		})
+		ev, err := o.materializeNode(ctx, tx, cp, runID, nodeID, attempt, maxAttempts, generation)
+		if err != nil {
+			return nil, false, false, err
+		}
+		evs = append(evs, ev)
 	}
 
-	// Completion: every node succeeded.
-	if len(succeeded) == len(cp.plan.Nodes) {
-		return true, o.finishRunTx(ctx, tx, cp, c.Ref.RunID, RunSucceeded, Outcome{}, EventRunSucceeded, now, evs)
+	// The run's status is READ BACK from the database after the inserts, never
+	// inferred from what this pass happened to do (baked decision 20).
+	//
+	// "Did I just insert a gate" is the wrong question twice over, and a
+	// fan-out DAG asks it both ways. Insert a gate beside a runnable sibling
+	// and it says waiting while the sibling is still pending — the run claims
+	// to be waiting on a human who is not the blocker. Let a sibling finish
+	// while a gate is ALREADY waiting and it says nothing, so the run stays
+	// running — and because FinishGatePhase predicates on the run being
+	// waiting, that gate is then undecidable until the wall deadline kills it.
+	// Nothing in the validator forbids either shape: it checks form, cycles,
+	// lineage, revisions and publication dominance, not "one branch at a time".
+	//
+	// `waiting` is DECLARED by this statement — there is no earlier
+	// `waiting := false` to shadow, because a pre-insertion default is exactly
+	// the inference decision 20 forbids.
+	waiting, err := q.RunIsWaitingOnAGate(ctx, store.RunIsWaitingOnAGateParams{
+		RunID: runID, ExcludePhase: excludePhase,
+	})
+	if err != nil {
+		return nil, false, false, err
 	}
-	return false, appendEvents(ctx, tx, now, evs)
+	complete := len(succeeded) == len(cp.plan.Nodes)
+	return evs, waiting.Bool, complete && !anyRunnablePhase(phaseRows, excludePhase), nil
+}
+
+// anyRunnablePhase reports whether the run still has work a worker could pick
+// up. A run is complete only when the ONLY thing left is nothing at all: a
+// parallel branch still running means the last succeeded node was not the last
+// node, whatever the succeeded count says.
+//
+// exclude is the phase whose own completion is being evaluated, dropped for
+// the same reason RunIsWaitingOnAGate takes an exclude_phase: the answer must
+// not depend on when in the transaction the caller read these rows.
+func anyRunnablePhase(rows []store.PhaseRun, exclude uuid.UUID) bool {
+	for _, r := range rows {
+		if r.ID == exclude {
+			continue
+		}
+		switch PhaseStatus(r.Status) {
+		case PhasePending, PhaseRunning, PhaseReconciling:
+			return true
+		}
+	}
+	return false
+}
+
+// syncWaiting moves the run between running and waiting to match what its
+// phases actually say, so that both callers of materializeReady reconcile the
+// run's status through one rule instead of each branching on the answer.
+//
+// The park direction is the live one: a sibling completing while a gate is
+// ALREADY waiting must park the run, and that is the case which would
+// otherwise strand the gate forever, because FinishGatePhase refuses to decide
+// a run that is not waiting. Reading `waiting` back from the database rather
+// than inferring it is what gets that case right — see materializeReady.
+//
+// The un-park direction is DEFENSIVE; neither call site reaches it today.
+// materializeResumedRuns proves that by its own guard: it has already read the
+// locked run row as 'running'. evaluateSuccess needs a longer argument, and
+// "ClaimPhase issues a claim only while the run is 'running'" is not it — that
+// covers the claim instant, not the interval up to here. What covers the
+// interval is that nothing can have parked the run inside it:
+// RunIsWaitingOnAGate never reports waiting while a pending, running or
+// reconciling row of the run is visible to it other than its own caller's
+// exclude_phase; this phase's row has been live since the claim, because
+// liveness is only ever lost terminally (see phaseTransitions); it stays live
+// to every other transaction until this one commits, since the finishPhase CAS
+// above is still uncommitted; and no other transaction can be excluding it,
+// because that same CAS admits exactly one evaluator of this row. So the run
+// cannot read 'waiting' here. The CAS is written out rather than omitted so
+// the rule stays symmetric: readiness answers "is this run waiting" and this
+// pass writes that answer down, whichever way it came out. A zero row count in
+// the un-park direction is the expected outcome, and in the park direction it
+// means the run was already parked or was terminalized under us — success in
+// both cases, never a conflict.
+func (o *Orchestrator) syncWaiting(ctx context.Context, tx pgx.Tx, runID uuid.UUID, waiting bool) error {
+	from, to := RunRunning, RunWaiting
+	if !waiting {
+		from, to = RunWaiting, RunRunning
+	}
+	_, err := store.New(tx).CASRunStatus(ctx, store.CASRunStatusParams{
+		ID: runID, FromStatus: string(from), ToStatus: string(to),
+	})
+	return err
+}
+
+// materializeResumedRuns picks up runs a gate decision moved back to 'running'
+// and materializes whatever the approval unblocked. Cheap: the query returns
+// only running runs with nothing a worker could pick up, so a steady-state run
+// matches nothing.
+//
+// "Nothing a worker could pick up" INCLUDES a run still holding another gate's
+// waiting_decision row — see ListRunsAwaitingMaterialization. That is the
+// parallel-gate case: this pass materializes what the decided gate released,
+// and the syncWaiting below parks the run against the gate that is still open,
+// which is what keeps that one decidable.
+func (o *Orchestrator) materializeResumedRuns(ctx context.Context) error {
+	ids, err := store.New(o.svc.pool).ListRunsAwaitingMaterialization(ctx, 16)
+	if err != nil {
+		return err
+	}
+	for _, runID := range ids {
+		cp, err := o.loadPlan(ctx, runID)
+		if err != nil {
+			o.log.Error("orchestrator: resumed plan load", "run", runID, "error", err)
+			continue
+		}
+		now := o.svc.clock.Now()
+		var runFinished bool
+		err = pg.WithTx(ctx, o.svc.pool, func(tx pgx.Tx) error {
+			q := store.New(tx)
+			// FOR UPDATE, and the generation it carries is the one every row
+			// this pass stamps commits against (see generationOf). Taking it
+			// here also serializes this pass against a worker's concurrent
+			// evaluation of the same run.
+			runRow, err := q.GetRunForUpdate(ctx, runID)
+			if err != nil {
+				return err
+			}
+			if RunStatus(runRow.Status) != RunRunning {
+				return nil // terminalized or re-waiting under us; not ours.
+			}
+			snap, err := snapshotFromRow(runRow.PolicySnapshot)
+			if err != nil {
+				return err
+			}
+			evs, waiting, complete, err := o.materializeReady(ctx, tx, cp, runID,
+				snap.MaxAttempts, runRow.Generation, uuid.Nil)
+			if err != nil {
+				return err
+			}
+			if complete {
+				runFinished = true
+				return o.finishRunTx(ctx, tx, cp, runID, RunSucceeded, Outcome{}, EventRunSucceeded, now, evs)
+			}
+			// Park the run if this pass left it waiting on a human. `waiting`
+			// is read from the post-insertion state rather than from what this
+			// pass did (see materializeReady).
+			//
+			// The un-park half of syncWaiting cannot fire here: the guard above
+			// proved this run is 'running' under the row lock, and
+			// ListRunsAwaitingMaterialization would not have offered a
+			// 'waiting' run in the first place. It goes through syncWaiting
+			// anyway so this pass and evaluateSuccess share one rule.
+			if err := o.syncWaiting(ctx, tx, runID, waiting); err != nil {
+				return err
+			}
+			return appendEvents(ctx, tx, now, evs)
+		})
+		if err != nil {
+			o.log.Error("orchestrator: materialize resumed run", "run", runID, "error", err)
+			continue
+		}
+		if runFinished {
+			o.dropPlan(runID)
+		}
+	}
+	return nil
 }
 
 // insertArtifacts persists one attempt's work products under the
 // caller's tx and returns their ids for the event payload. Lineage is
 // the caller's call: successes descend from their inputs, failures from
 // nothing.
-func insertArtifacts(ctx context.Context, q *store.Queries, ref AttemptRef,
+func insertArtifacts(ctx context.Context, q *store.Queries, ref AttemptRef, generation int32,
 	artifacts []NewArtifact, rawParents []byte, now time.Time,
 ) ([]string, error) {
 	var ids []string
@@ -906,7 +1367,8 @@ func insertArtifacts(ctx context.Context, q *store.Queries, ref AttemptRef,
 		}
 		if _, err := q.InsertArtifact(ctx, store.InsertArtifactParams{
 			ID: id, RunID: ref.RunID, NodeID: ref.NodeID, Attempt: ref.Attempt,
-			Type: a.Type, Payload: rawPayload, ParentIds: rawParents, CreatedAt: now,
+			Generation: generation,
+			Type:       a.Type, Payload: rawPayload, ParentIds: rawParents, CreatedAt: now,
 		}); err != nil {
 			return nil, fmt.Errorf("runs: insert artifact: %w", err)
 		}
@@ -917,8 +1379,14 @@ func insertArtifacts(ctx context.Context, q *store.Queries, ref AttemptRef,
 
 // finishRunTx completes/fails the run inside the caller's tx, appending
 // the accumulated events first so ordering reads naturally.
-func (o *Orchestrator) finishRunTx(ctx context.Context, tx pgx.Tx, cp cachedPlan, runID uuid.UUID,
-	to RunStatus, out Outcome, eventKind string, now time.Time, evs []Event,
+//
+// A free function over exactly the values it needs, because its two callers
+// reach it from different layers — the janitor holds an Orchestrator and a
+// cachedPlan, the gate decision runs in the API's goroutine and holds
+// neither — and a run may have only one way to end.
+func finishRunTx(ctx context.Context, tx pgx.Tx, rec *audit.Recorder,
+	projectID, runID uuid.UUID, to RunStatus, out Outcome, eventKind string,
+	now time.Time, evs []Event,
 ) error {
 	var rawOut []byte
 	payload := map[string]any{}
@@ -944,7 +1412,7 @@ func (o *Orchestrator) finishRunTx(ctx context.Context, tx pgx.Tx, cp cachedPlan
 		}
 	}
 	evs = append(evs, Event{
-		RunID: runID, ProjectID: cp.projectID, Kind: eventKind,
+		RunID: runID, ProjectID: projectID, Kind: eventKind,
 		CorrelationID: "caesar-run-" + runID.String(), Payload: payload,
 	})
 	if err := appendEvents(ctx, tx, now, evs); err != nil {
@@ -954,9 +1422,17 @@ func (o *Orchestrator) finishRunTx(ctx context.Context, tx pgx.Tx, cp cachedPlan
 	if to != RunSucceeded {
 		detail["outcome"] = out.Map()
 	}
-	return o.svc.audit.Record(ctx, tx, audit.Entry{
+	return rec.Record(ctx, tx, audit.Entry{
 		Action: "run.finished", SubjectKind: "run", SubjectID: runID.String(), Detail: detail,
 	})
+}
+
+// finishRunTx keeps the orchestrator's method form, now a forwarding shim, so
+// its call sites are untouched.
+func (o *Orchestrator) finishRunTx(ctx context.Context, tx pgx.Tx, cp cachedPlan, runID uuid.UUID,
+	to RunStatus, out Outcome, eventKind string, now time.Time, evs []Event,
+) error {
+	return finishRunTx(ctx, tx, o.svc.audit, cp.projectID, runID, to, out, eventKind, now, evs)
 }
 
 // evaluateFailure terminalizes or retries a failed attempt, reporting
@@ -985,21 +1461,25 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		newCount++
 	}
 	retry := out.Retryable() && newCount < c.MaxAttempts
+	// One locked read of the run row serves both branches below. It is
+	// unconditional because the generation it carries is stamped on every row
+	// this function writes — the retry's successor and artifacts, the dead
+	// path's artifacts alike — and a generation read outside the lock is one a
+	// concurrent revision can invalidate before this transaction commits.
+	runRow, err := q.GetRunForUpdate(ctx, c.Ref.RunID)
+	if err != nil {
+		return false, err
+	}
+	gen := runRow.Generation
 	budgetBreached := false
-	if retry && out.Code != CodeCredentialBusy {
+	if retry && !exemptFromBudgetPreCheck(out.Code) {
 		// The fencing CAS must pick failed vs dead up front (failed ->
 		// dead is not a legal transition), and a delta that crosses the
 		// budget must not insert a successor the claim predicate
 		// (execution_used_ms < execution_budget_ms) would refuse forever.
 		// The run-row lock makes the read race-free; usage itself is
-		// still only added after the CAS wins. credential_busy is exempt:
-		// it charges nothing, so demoting its requeue to budget_exhausted
-		// would kill a run for time it never spent. A rate_limited attempt
-		// did run before the window shut, so it keeps the pre-check.
-		runRow, err := q.GetRunForUpdate(ctx, c.Ref.RunID)
-		if err != nil {
-			return false, err
-		}
+		// still only added after the CAS wins. A rate_limited attempt did
+		// run before the window shut, so it keeps the pre-check.
 		if runRow.ExecutionUsedMs+max(deltaMS, 0) >= runRow.ExecutionBudgetMs {
 			retry, budgetBreached = false, true
 		}
@@ -1021,8 +1501,12 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		// wait as the worker's own, and it parks or terminalizes on the same
 		// boundary. A zero deadline means nobody read one, which is not a
 		// licence to park past it — it only skips a comparison with nothing.
-		if !c.RunWallDeadline.IsZero() && nb.After(c.RunWallDeadline) {
-			// Never park a row that could not legally run when it woke.
+		if !c.RunWallDeadline.IsZero() && nb.After(c.RunWallDeadline) &&
+			!exemptFromParkPastDeadline(out.Code) {
+			// Never park a row that could not legally run when it woke —
+			// except where terminalizing is the worse answer, because the
+			// outcome leaves an effect behind that only the expiry sweep can
+			// settle and a failed run is swept by nothing (outcome.go).
 			retry, parkedPastDeadline = false, true
 		} else {
 			notBefore = &nb
@@ -1038,7 +1522,7 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		if n == 0 {
 			return false, nil // fenced
 		}
-		artifactIDs, err := insertArtifacts(ctx, q, c.Ref, res.Artifacts, noParents, now)
+		artifactIDs, err := insertArtifacts(ctx, q, c.Ref, gen, res.Artifacts, noParents, now)
 		if err != nil {
 			return false, err
 		}
@@ -1050,7 +1534,7 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 			}
 		}
 		if _, err := o.svc.insertPhaseTx(ctx, tx, c.Ref.RunID, c.Ref.NodeID,
-			c.Ref.Attempt+1, c.MaxAttempts, newCount, notBefore); err != nil {
+			c.Ref.Attempt+1, c.MaxAttempts, newCount, gen, notBefore); err != nil {
 			return false, err
 		}
 		payload := map[string]any{
@@ -1078,7 +1562,7 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	if n == 0 {
 		return false, nil // fenced
 	}
-	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, res.Artifacts, noParents, now)
+	artifactIDs, err := insertArtifacts(ctx, q, c.Ref, gen, res.Artifacts, noParents, now)
 	if err != nil {
 		return false, err
 	}
@@ -1095,7 +1579,17 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 		// The wait would outlast the run, so the run dies of the wait
 		// itself — nothing was exhausted, and the typed code says which
 		// door was shut.
-		runOut = out
+		//
+		// PERMANENT, though the outcome that got here was transient. The code
+		// is a report of the cause and survives; the class is a statement
+		// about what happens next, and for a terminalized run the answer is
+		// nothing. ListExpiredRunIDs matches pending/running/waiting only, so
+		// no sweep revisits a failed run, while Outcome.Retryable() — which is
+		// exactly Class == transient — is what GET /runs/{id} and the
+		// run.finished audit detail publish. Carrying the wait's class through
+		// told every reader to expect a retry that cannot come. The RetryAt is
+		// dropped with it: a dead run has no next instant.
+		runOut = Outcome{Class: OutcomePermanent, Code: out.Code, Message: out.Message}
 	case out.Retryable(): // retryable but exhausted
 		runOut = Outcome{
 			Class: OutcomePermanent, Code: CodeAttemptsExhausted,

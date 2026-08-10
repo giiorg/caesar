@@ -2,6 +2,8 @@ package fake_test
 
 import (
 	"context"
+	"encoding/base64"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -112,9 +114,72 @@ func TestInspectReportsCompletedExecutions(t *testing.T) {
 	}
 }
 
+// The two implement payload shapes are materially different, and this is the
+// only test that says so on its own.
+//
+// Registering a Remote switches the implement artifact from the historical
+// SYNTHETIC patch (raw-text diff, a sha256 of the diff standing in for a tree
+// hash — unpublishable) to the PUBLISHABLE one (base64 canonical wire form, a
+// real git tree oid). Which shape a fixture gets is therefore decided by
+// whether it called Remote, and nothing else.
+//
+// Written as insurance against a specific refactor that keeps being proposed:
+// collapsing the golden environment's builders into one with a wire-remote
+// FLAG argument. The flag is the trap — it turns "which patch shape" into a
+// call-site boolean nobody reads — and the branch it selects is otherwise
+// asserted on in exactly one place tree-wide (the golden seed test). If that
+// collapse is ever taken and the boolean is threaded through wrong, this fails
+// in ten lines instead of somewhere unrelated.
+func TestRegisteringARemoteChangesTheImplementPatchShape(t *testing.T) {
+	dir := t.TempDir()
+	base, err := fake.InitBareRepo(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare := filepath.Join(dir, "bare.git")
+	repoID := uuid.MustParse("019fe7b7-6e37-7d9c-97db-d48907ccaff2")
+
+	r := req(runs.KindImplement, "Implement.")
+	r.Repo = runs.RepoRef{ID: repoID}
+	r.BaseSHA = base
+
+	synthetic, err := fake.NewExecutor().Execute(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withRemote := fake.NewExecutor()
+	withRemote.Remote(repoID, bare)
+	publishable, err := withRemote.Execute(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, p := synthetic.Artifacts[0].Payload, publishable.Artifacts[0].Payload
+	if s["diff"] == p["diff"] {
+		t.Errorf("both shapes produced the same diff %q: Remote is supposed to select between a "+
+			"raw-text synthetic patch and the base64 canonical wire form", s["diff"])
+	}
+	if s["tree_hash"] == p["tree_hash"] {
+		t.Errorf("both shapes produced the same tree hash %q: the synthetic one digests the diff, "+
+			"the publishable one is a git tree object id", s["tree_hash"])
+	}
+	// And name each side, so a swap is a failure rather than a still-passing
+	// difference.
+	if !strings.HasPrefix(s["diff"].(string), "--- a/") {
+		t.Errorf("no remote registered: diff = %q, want the raw-text synthetic patch", s["diff"])
+	}
+	raw, err := base64.StdEncoding.DecodeString(p["diff"].(string))
+	if err != nil || !strings.Contains(string(raw), "+++ b/") {
+		t.Errorf("remote registered: diff = %q, want base64 of a patch (decode err %v)", p["diff"], err)
+	}
+	if len(p["tree_hash"].(string)) != 40 {
+		t.Errorf("remote registered: tree_hash = %q, want a 40-hex git tree object id", p["tree_hash"])
+	}
+}
+
 func TestFakeForge(t *testing.T) {
 	id := uuid.Max
-	f := fake.Forge{Heads: map[uuid.UUID]string{id: "abc"}}
+	f := fake.NewForge(map[uuid.UUID]string{id: "abc"})
 	sha, err := f.ResolveHead(context.Background(), runs.RepoRef{ID: id})
 	if err != nil || sha != "abc" {
 		t.Errorf("ResolveHead = %q, %v", sha, err)

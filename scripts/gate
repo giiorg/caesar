@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+#
+# gate — run caesar's full gate against a NAMED worktree at a NAMED commit.
+#
+# WHY THIS EXISTS
+#
+# The procedure this replaces was: cd to the worktree, run `task backend:ci`,
+# confirm the build lane's stamped Version matches HEAD. Every step of that is
+# cwd-relative, so a stale `cd` gates the WRONG TREE and still emits a real,
+# matching sha — the check is self-consistent when it is wrong. That has already
+# happened once on this project (a round-1 gate ran in the main checkout because
+# the shell's cwd persists between tool calls). It was survivable with one
+# worktree. With two it is a defect with no detector.
+#
+# This script takes the worktree, the sha and the branch as ARGUMENTS and
+# refuses to run unless the tree it lands in is the one that was named.
+#
+# It also fixes the other ways this gate has read green when it was not:
+#   - `task backend:ci | tail` reports TAIL's exit status. Never pipe. Redirect,
+#     then read $? directly.
+#   - An `ok` count decays into a rubber stamp. Assert LANE IDENTITY instead:
+#     every named lane must appear in the log.
+#   - Lane identity is not enough either. go-task fills {{.PKG}} and friends
+#     from the ENVIRONMENT, so an exported PKG narrows every test lane to one
+#     package while the lane names, the exit statuses and the content greps all
+#     still read green — and the `PKG=… task …` workflow this repo documents
+#     trains exactly that habit. So the environment is scrubbed AND the
+#     RESOLVED command of every lane is asserted, character for character.
+#
+# Usage: scripts/gate <worktree-abs-path> <expected-sha> <expected-branch>
+# Exit:  0 = gate passed. 1 = gate failed or refused to run.
+
+set -uo pipefail
+
+die() { printf 'GATE REFUSED: %s\n' "$1" >&2; exit 1; }
+
+[ $# -eq 3 ] || die "usage: gate <worktree-abs-path> <expected-sha> <expected-branch>"
+
+WT="$1"
+WANT_SHA="$2"
+WANT_BRANCH="$3"
+
+command -v task   >/dev/null 2>&1 || die "'task' is not on PATH"
+command -v git    >/dev/null 2>&1 || die "'git' is not on PATH"
+command -v docker >/dev/null 2>&1 || die "'docker' is not on PATH — the integration and runner lanes both need it"
+
+# ---------------------------------------------------------------------------
+# Scrub the environment BEFORE anything reads it.
+#
+# go-task resolves {{.VAR}} from the environment when no Taskfile var shadows
+# it (environment is its lowest precedence, so the global vars and the `sh:`
+# vars in backend:build are safe — verified, not assumed). The unshadowed ones
+# are PKG, RAPID_SEED, RAPID_CHECKS and FUZZTIME. An exported PKG narrows every
+# test lane to a single package and NOTHING else in this script would notice:
+# the lane still runs, still exits 0, still prints no FAIL.
+#
+# CLI_ARGS is deliberately NOT in the list: it is a go-task special var, always
+# defined, so the environment cannot reach it (checked with an exported one).
+#
+# GOFLAGS is here for the same reason with a different mechanism: it never
+# appears in the resolved command line, so no assertion below could see it, and
+# `GOFLAGS=-run=NoSuchTest task backend:test` prints "ok … [no tests to run]"
+# for every package and exits 0. That string is also grepped for below, because
+# the class of "something narrowed the run" is worth catching by its symptom
+# and not only by its known causes.
+# ---------------------------------------------------------------------------
+
+SCRUBBED=""
+for v in PKG RAPID_SEED RAPID_CHECKS FUZZTIME GOFLAGS; do
+	if [ -n "${!v-}" ]; then
+		SCRUBBED="$SCRUBBED $v=${!v}"
+	fi
+	unset "$v"
+done
+[ -z "$SCRUBBED" ] || printf 'gate: dropped from the environment (would have narrowed the lanes):%s\n' "$SCRUBBED"
+
+# ---------------------------------------------------------------------------
+# Pre-flight: prove we are in the tree we were told to gate, at the commit we
+# were told to gate, with nothing uncommitted. All four refusals happen BEFORE
+# a single test runs, so a misaimed gate costs a second rather than a session.
+# ---------------------------------------------------------------------------
+
+[ -d "$WT" ] || die "no such directory: $WT"
+cd "$WT" || die "cannot cd to: $WT"
+
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not a git worktree: $WT"
+[ "$TOP" = "$WT" ] || die "worktree mismatch: asked to gate '$WT', but git says the tree here is '$TOP'"
+
+HEAD_FULL=$(git rev-parse HEAD)
+HEAD_SHORT=$(git rev-parse --short HEAD)
+case "$HEAD_FULL" in
+	"$WANT_SHA"*) ;;
+	*) die "HEAD mismatch: expected '$WANT_SHA', tree is at '$HEAD_SHORT' ($HEAD_FULL)" ;;
+esac
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+[ "$BRANCH" = "$WANT_BRANCH" ] || die "branch mismatch: expected '$WANT_BRANCH', tree is on '$BRANCH'"
+
+DIRT=$(git status --porcelain)
+if [ -n "$DIRT" ]; then
+	printf 'GATE REFUSED: tree is dirty — a gate on uncommitted work proves nothing about the commit\n' >&2
+	printf '%s\n' "$DIRT" >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Run the gate. Redirected, never piped, exit status read directly.
+# ---------------------------------------------------------------------------
+
+LOGDIR=${GATE_LOG_DIR:-$(mktemp -d /tmp/caesar-gate.XXXXXX)}
+mkdir -p "$LOGDIR"
+CI_LOG="$LOGDIR/backend-ci.log"
+CONTRACTS_LOG="$LOGDIR/contracts-check.log"
+IMAGE_LOG="$LOGDIR/image-build.log"
+RUNNER_LOG="$LOGDIR/backend-test-runner.log"
+
+printf 'gate: %s @ %s (%s)\n' "$WT" "$HEAD_SHORT" "$BRANCH"
+printf 'gate: logs -> %s\n' "$LOGDIR"
+
+printf 'gate: running task backend:ci ...\n'
+task backend:ci >"$CI_LOG" 2>&1
+CI_STATUS=$?
+
+printf 'gate: running task contracts:check ...\n'
+task contracts:check >"$CONTRACTS_LOG" 2>&1
+CONTRACTS_STATUS=$?
+
+# The runner suite is the one required CI job `backend:ci` does not contain
+# (.github/workflows/ci.yml runs it as its own job, after `task image:build`,
+# and ci-ok requires it). Locally nothing ran it at all, so a branch could gate
+# green here and go red there — on the lane that exercises real containers.
+#
+# It is NOT folded into backend:ci: the CI `backend` job builds no images, so
+# that would break it and duplicate the `runner` job's work. It belongs here,
+# because this script is the operator-machine instrument and an operator
+# machine has Docker (the integration lane already requires it).
+#
+# The images are BUILT rather than merely checked for. Presence is not
+# freshness: caesar-git:dev carries caesar's own binary and the runner drives
+# `caesar stage` / `caesar extract` inside it, so a stale image tests another
+# commit's code while the gate stamps this one — the same self-consistent-when-
+# wrong failure the whole script exists to prevent. `task image:build` is ~9 s
+# warm, and the stamp assertion below proves it really rebuilt.
+# image:harness is deliberately untouched: those images are the operator's real
+# harness agents, and no test in this lane names them.
+printf 'gate: running task image:build ...\n'
+task image:build >"$IMAGE_LOG" 2>&1
+IMAGE_STATUS=$?
+
+printf 'gate: running task backend:test:runner ...\n'
+task backend:test:runner >"$RUNNER_LOG" 2>&1
+RUNNER_STATUS=$?
+
+# ---------------------------------------------------------------------------
+# Verdict. Exit status alone is not the gate — collect every failure so one run
+# reports all of them.
+# ---------------------------------------------------------------------------
+
+FAILED=0
+fail() { printf '  - %s\n' "$1" >&2; FAILED=1; }
+
+[ "$CI_STATUS" -eq 0 ]        || fail "task backend:ci exited $CI_STATUS"
+[ "$CONTRACTS_STATUS" -eq 0 ] || fail "task contracts:check exited $CONTRACTS_STATUS"
+[ "$IMAGE_STATUS" -eq 0 ]     || fail "task image:build exited $IMAGE_STATUS"
+[ "$RUNNER_STATUS" -eq 0 ]    || fail "task backend:test:runner exited $RUNNER_STATUS"
+
+# Lane identity AND the resolved command, not an ok count.
+#
+# Each entry is the line go-task echoes for that lane, exactly as it resolves
+# when nothing narrowed it. Matching the lane name alone was the hole: `PKG`
+# read from the environment rewrites the tail of these lines and leaves every
+# other signal in this script untouched. The tail is where the package list
+# lives, so asserting the whole line is what makes narrowing visible.
+#
+# The cost is that a deliberate Taskfile change must be mirrored here. That is
+# the point: what this gate runs is now stated in one place instead of implied.
+# backend:build is the one prefix rather than a whole line, because its ldflags
+# carry a build DATE; its sha is pinned separately below, which is stronger.
+# shellcheck disable=SC2016  # these are literal command lines, not expressions
+LANE_CMDS=(
+	'task: [backend:fmt:check] test -z "$(bin/gofumpt -l .)" || (bin/gofumpt -l . && exit 1)'
+	'task: [backend:vet] go vet -tags integration,property,runnerintegration ./...'
+	'task: [backend:lint] bin/golangci-lint run'
+	'task: [backend:analyze] go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze'
+	'task: [backend:analyze] go vet -tags integration,property,runnerintegration -vettool=./bin/caesar-analyze ./...'
+	'task: [backend:test] go test -race  ./...'
+	'task: [backend:test:property] go test -race -tags property -count=1  ./internal/workflows/ ./internal/runs/ -rapid.seed=1 -rapid.checks=100'
+	'task: [backend:test:integration] go test -race -tags integration -count=1  ./...'
+	'task: [backend:vuln] bin/govulncheck -tags integration,property,runnerintegration ./...'
+	'task: [backend:build] go build -trimpath -ldflags "-s -w -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Version='
+)
+RUNNER_CMDS=(
+	'task: [backend:test:runner] go test -race -tags runnerintegration -count=1 -timeout 20m -p 1  ./internal/runs/runner/... ./internal/runs/egress/... ./internal/app/'
+)
+LANE_COUNT=0
+
+# assert_lane <logfile> <expected line>: the lane ran, and ran THIS command.
+assert_lane() {
+	local log=$1 want=$2 lane
+	lane=${want#*[}
+	lane=${lane%%]*}
+	LANE_COUNT=$((LANE_COUNT + 1))
+	if grep -qF "$want" "$log"; then
+		return 0
+	fi
+	if grep -qF "task: [$lane]" "$log"; then
+		fail "lane $lane ran a DIFFERENT command than the gate asserts (something narrowed it)"
+		printf '      want: %s\n' "$want" >&2
+		grep -F "task: [$lane]" "$log" | sed 's/^/      got:  /' >&2
+	else
+		fail "lane did not run: $lane"
+	fi
+}
+
+for want in "${LANE_CMDS[@]}"; do assert_lane "$CI_LOG" "$want"; done
+for want in "${RUNNER_CMDS[@]}"; do assert_lane "$RUNNER_LOG" "$want"; done
+
+# The build lane stamps the sha it actually compiled. This is the only evidence
+# that couples the gate's OUTPUT to the commit rather than to the shell's cwd.
+grep -qF "buildinfo.Commit=$HEAD_SHORT" "$CI_LOG" \
+	|| fail "build lane did not stamp buildinfo.Commit=$HEAD_SHORT (gate may have run against another tree)"
+
+# Same coupling for the images the runner lane runs against, and it has to be
+# read from the IMAGE, not from the build command: `docker build` is happy to
+# print a COMMIT build-arg it then serves from cache. caesar-git:dev's
+# entrypoint is caesar itself, so the image can be asked what it contains.
+# -e, not a bare pattern: it starts with a dash, and grep reads that as flags.
+grep -qF -e "--build-arg COMMIT=$HEAD_SHORT" "$IMAGE_LOG" \
+	|| fail "image:build did not pass COMMIT=$HEAD_SHORT (images may describe another tree)"
+IMAGE_STAMP=$(docker run --rm caesar-git:dev version 2>&1)
+case "$IMAGE_STAMP" in
+	*"commit $HEAD_SHORT"*) ;;
+	*) fail "caesar-git:dev reports '$IMAGE_STAMP', not commit $HEAD_SHORT — the runner lane ran against another commit's image" ;;
+esac
+# Same reading as the build lane's -dirty check, from the other artifact: the
+# image's VERSION comes from `git describe --dirty`, so this fires when the
+# tree was written to after the clean check above.
+case "$IMAGE_STAMP" in
+	*-dirty*) fail "caesar-git:dev stamped a -dirty version ($IMAGE_STAMP): the tree was modified during the gate" ;;
+esac
+
+# `git describe --dirty` appends -dirty. If this fires, the tree changed BETWEEN
+# the clean check above and the build lane — i.e. something wrote during the gate.
+if grep -qE 'buildinfo\.Version=[^ ]*-dirty' "$CI_LOG"; then
+	fail "build lane stamped a -dirty version: the tree was modified during the gate"
+fi
+
+# Content checks. Exit status has been wrong before; these read the output.
+#
+# Every log, not just backend:ci — contracts:check was skipped here until now,
+# and the two new lanes would have arrived with the same hole.
+#
+# "no tests to run" is the symptom half of the environment scrub above: a `-run`
+# filter reaching the lanes by any route the scrub did not anticipate (GOFLAGS,
+# a future var, a Taskfile edit) prints it for every package and exits 0. A full
+# gate run has no legitimate occurrence of it.
+for log in "$CI_LOG" "$CONTRACTS_LOG" "$IMAGE_LOG" "$RUNNER_LOG"; do
+	for pat in 'FAIL' 'panic:' 'DATA RACE' 'no tests to run'; do
+		if grep -qF "$pat" "$log"; then
+			fail "found '$pat' in $(basename "$log")"
+		fi
+	done
+done
+
+# Docker-unavailable is called out separately because it means the gate is red
+# through NO FAULT OF THE CODE, and this project has lost time twice to reading
+# it as a real failure. Both phrasings are needed and that was established by
+# mutation, not by reading: with Docker Desktop actually stopped, testcontainers
+# says "rootless Docker not found, failed to create Docker provider" and never
+# the Docker CLI's "Cannot connect to the Docker daemon" — so the CLI phrasing
+# alone was an assertion that could not fire on the failure it was written for.
+DOCKER_DOWN='Cannot connect to the Docker daemon|failed to create Docker provider|rootless Docker not found'
+for log in "$CI_LOG" "$CONTRACTS_LOG" "$IMAGE_LOG" "$RUNNER_LOG"; do
+	if grep -qE "$DOCKER_DOWN" "$log"; then
+		fail "Docker is unavailable — this gate is red through no fault of the code (see $log). Start Docker, wait for \`docker info\`, re-gate."
+	fi
+done
+
+if [ "$FAILED" -ne 0 ]; then
+	printf 'GATE FAIL  %s @ %s\n' "$BRANCH" "$HEAD_SHORT" >&2
+	printf 'logs: %s\n' "$LOGDIR" >&2
+	exit 1
+fi
+
+printf 'GATE PASS  %s @ %s  (%d lanes resolved unnarrowed, Commit=%s stamped in the binary and in caesar-git:dev, contracts clean)\n' \
+	"$BRANCH" "$HEAD_SHORT" "$LANE_COUNT" "$HEAD_SHORT"
+printf 'logs: %s\n' "$LOGDIR"

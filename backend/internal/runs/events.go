@@ -29,6 +29,18 @@ const (
 	EventPhaseDead         = "phase.dead"
 	EventPhaseLogTruncated = "phase.log_truncated"
 	EventPhaseEgressDenied = "phase.egress_denied"
+
+	// Plan 08. Gates and publications get their own namespaces rather than
+	// living under phase.*: they are the run's attention items, and Plan 10's
+	// global stream filters on the kind prefix to build badges and cards.
+	EventGateWaiting          = "gate.waiting"
+	EventGateDecided          = "gate.decided"
+	EventRunRevisionOpened    = "run.revision_opened"
+	EventPublishIntentCreated = "publish.intent_created"
+	EventPublishPushed        = "publish.pushed"
+	EventPublishPROpened      = "publish.pr_opened"
+	EventPublishAdopted       = "publish.adopted"
+	EventPublishHalted        = "publish.halted"
 )
 
 // Event is one observation appended in the same tx as its state change.

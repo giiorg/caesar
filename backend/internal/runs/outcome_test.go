@@ -54,11 +54,49 @@ func TestOutcome_ChargeableExemptsCapAndContentionWaits(t *testing.T) {
 		{runs.Outcome{Class: runs.OutcomeTransient, Code: runs.CodeHarnessError}, true},
 		{runs.Outcome{Class: runs.OutcomeTransient, Code: runs.CodeRateLimited}, false},
 		{runs.Outcome{Class: runs.OutcomeTransient, Code: runs.CodeCredentialBusy}, false},
+		{runs.Outcome{Class: runs.OutcomeTransient, Code: runs.CodePublishNotStarted}, false},
+		{runs.Outcome{Class: runs.OutcomeTransient, Code: runs.CodePublishResumable}, false},
 		{runs.Outcome{Class: runs.OutcomePermanent, Code: runs.CodeAuthExpired}, false}, // permanent: never retried, charge is moot
 	}
 	for _, c := range cases {
 		if got := c.out.Chargeable(); got != c.want {
 			t.Errorf("Chargeable(%s/%s) = %v, want %v", c.out.Class, c.out.Code, got, c.want)
+		}
+	}
+}
+
+func TestPublishOutcomes_RetryabilityMatchesTheDecisionTable(t *testing.T) {
+	cases := []struct {
+		out            runs.Outcome
+		wantRetryable  bool
+		wantChargeable bool
+	}{
+		// A rejected push and an unreachable forge are worth another attempt.
+		// They are chargeable only while NOTHING has landed: once an intent
+		// is unfinished, Task 9's state machine reports publish_resumable
+		// instead, and that is what keeps a forge outage from spending the
+		// budget of a run whose branch is already pushed.
+		{runs.Outcome{Class: runs.OutcomeTransient, Code: runs.CodePushRejected}, true, true},
+		{runs.Outcome{Class: runs.OutcomeTransient, Code: runs.CodeForgeUnavailable}, true, true},
+		// The two publish waits requeue WITHOUT charging: one publication
+		// never began, the other is merely unfinished. Charging either would
+		// let a lease hiccup or a forge outage exhaust max_attempts on a
+		// publication that in fact succeeded.
+		{runs.Outcome{Class: runs.OutcomeTransient, Code: runs.CodePublishNotStarted}, true, false},
+		{runs.Outcome{Class: runs.OutcomeTransient, Code: runs.CodePublishResumable}, true, false},
+		// A stale authorization, a halted publication and a human's reject
+		// are decisions, not hiccups: retrying reaches the same answer.
+		{runs.Outcome{Class: runs.OutcomePermanent, Code: runs.CodeAuthorizationStale}, false, false},
+		{runs.Outcome{Class: runs.OutcomePermanent, Code: runs.CodePublishConflict}, false, false},
+		{runs.Outcome{Class: runs.OutcomePermanent, Code: runs.CodeGateRejected}, false, false},
+		{runs.Outcome{Class: runs.OutcomePermanent, Code: runs.CodeRevisionRoundsExhausted}, false, false},
+	}
+	for _, c := range cases {
+		if got := c.out.Retryable(); got != c.wantRetryable {
+			t.Errorf("Retryable(%s) = %v, want %v", c.out.Code, got, c.wantRetryable)
+		}
+		if got := c.out.Chargeable(); got != c.wantChargeable {
+			t.Errorf("Chargeable(%s) = %v, want %v", c.out.Code, got, c.wantChargeable)
 		}
 	}
 }

@@ -4,6 +4,26 @@
  */
 
 export interface paths {
+    "/api/v1/approvals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List gates awaiting a decision on the projects the caller holds any grant on (an admin sees every one). Unbounded by design at V1.
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["listApprovals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/login": {
         parameters: {
             query?: never;
@@ -392,6 +412,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/runs/{id}/gates/{node}/decision": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve, request changes on, or reject a waiting gate (approve grant). The generation in the response is the one decided on approve and reject, and the new one the revision opened on request_changes.
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        post: operations["decideGate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tasks": {
         parameters: {
             query?: never;
@@ -608,11 +648,30 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ApiApprovalListResponse: {
+            approvals?: components["schemas"]["ApiApprovalResponse"][] | null;
+        };
+        ApiApprovalResponse: {
+            /** Format: int32 */
+            attempt?: number;
+            /** Format: int32 */
+            generation?: number;
+            node_id?: string;
+            project_id?: string;
+            requester_id?: string;
+            run_id?: string;
+            task_id?: string;
+            task_title?: string;
+            /** Format: date-time */
+            waiting_since?: string;
+        };
         ApiArtifactResponse: {
             /** Format: int32 */
             attempt?: number;
             /** Format: date-time */
             created_at?: string;
+            /** Format: int32 */
+            generation?: number;
             id?: string;
             node_id?: string;
             parent_ids?: string[] | null;
@@ -671,6 +730,24 @@ export interface components {
             /** Format: date-time */
             updated_at?: string;
         };
+        ApiGateDecisionResponse: {
+            authorization_id?: string;
+            decision?: string;
+            decision_id?: string;
+            /** Format: int32 */
+            generation?: number;
+            run_status?: string;
+        };
+        ApiGateDecisionSummary: {
+            /** Format: date-time */
+            acted_at?: string;
+            acted_by_email?: string;
+            acted_by_id?: string;
+            decision?: string;
+            examined_artifact_id?: string;
+            note?: string;
+            self_approval?: boolean;
+        };
         ApiGrantListResponse: {
             grants?: components["schemas"]["ApiProjectGrantResponse"][] | null;
         };
@@ -716,8 +793,11 @@ export interface components {
             attempt?: number;
             /** Format: date-time */
             created_at?: string;
+            decision?: components["schemas"]["ApiGateDecisionSummary"];
             /** Format: date-time */
             finished_at?: null | string;
+            /** Format: int32 */
+            generation?: number;
             /** Format: int32 */
             max_attempts?: number;
             node_id?: string;
@@ -740,6 +820,18 @@ export interface components {
             name?: string;
             /** Format: date-time */
             updated_at?: string;
+        };
+        ApiPublicationResponse: {
+            base_sha?: string;
+            branch?: string;
+            halt_reason?: string;
+            head_sha?: string;
+            node_id?: string;
+            /** Format: int64 */
+            pr_number?: number;
+            pr_url?: string;
+            status?: string;
+            target_branch?: string;
         };
         ApiRegisterHarnessRequest: {
             credential_id?: string;
@@ -792,10 +884,13 @@ export interface components {
             execution_used_ms?: number;
             /** Format: date-time */
             finished_at?: null | string;
+            /** Format: int32 */
+            generation?: number;
             id?: string;
             outcome?: components["schemas"]["ApiOutcomeResponse"];
             phases?: components["schemas"]["ApiPhaseResponse"][] | null;
             policy_snapshot?: components["schemas"]["RunsPolicySnapshot"];
+            publications?: components["schemas"]["ApiPublicationResponse"][] | null;
             /** Format: date-time */
             started_at?: null | string;
             status?: string;
@@ -864,6 +959,10 @@ export interface components {
             version?: number;
             workflow_id?: string;
         };
+        ContractsGateDecisionParams: {
+            decision?: string;
+            note?: string;
+        };
         ContractsIdAndCreateRepo: {
             credential_id?: string;
             default_branch?: string;
@@ -915,6 +1014,7 @@ export interface components {
             type?: string;
         };
         RunsPolicySnapshot: {
+            allow_self_approval?: boolean;
             /** Format: int64 */
             execution_budget_ms?: number;
             /** Format: int32 */
@@ -936,6 +1036,35 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    listApprovals: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiApprovalListResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
     login: {
         parameters: {
             query?: never;
@@ -1867,6 +1996,53 @@ export interface operations {
             };
         };
     };
+    decideGate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+                /** @description gate node id */
+                node: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ContractsGateDecisionParams"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiGateDecisionResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
     listTasks: {
         parameters: {
             query?: never;
@@ -1920,6 +2096,24 @@ export interface operations {
             };
             /** @description Bad Request */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2016,6 +2210,24 @@ export interface operations {
             };
             /** @description Bad Request */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

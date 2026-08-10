@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/authn"
@@ -27,6 +28,10 @@ type fixturePorts struct {
 	hash        string
 	harness     uuid.UUID
 	harnessCred uuid.UUID
+	// The two doubles a publication drives. They are handed back with the
+	// service so a test can inject into the very instances it wired.
+	forge     *fake.Forge
+	publisher *fake.Publisher
 }
 
 func (p fixturePorts) Definition(_ context.Context, workflowID uuid.UUID, version int32) (runs.PinnedDefinition, error) {
@@ -49,11 +54,29 @@ func (p fixturePorts) DefinitionByVersionID(_ context.Context, versionID uuid.UU
 	}, nil
 }
 
-func (p fixturePorts) Repo(_ context.Context, id uuid.UUID) (runs.RepoRef, error) {
-	if id != p.f.repoID {
+// Repo reads the REAL repos row rather than answering from constants, which
+// is what the production adapter does and what makes the mutable-repo half of
+// revalidateAuthorization testable at all: a rename or a moved default branch
+// has to be visible to the run for the refusal to have anything to refuse.
+func (p fixturePorts) Repo(ctx context.Context, id uuid.UUID) (runs.RepoRef, error) {
+	ref := runs.RepoRef{ID: id, ProjectID: p.f.projectID}
+	err := p.f.pool.QueryRow(ctx,
+		`SELECT forge_kind, slug, default_branch, credential_id FROM repos WHERE id = $1`, id,
+	).Scan(&ref.Forge, &ref.Slug, &ref.DefaultBranch, &ref.CredentialID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return runs.RepoRef{}, xerrors.E(xerrors.ClassNotFound, "no such repo")
 	}
-	return runs.RepoRef{ID: p.f.repoID, ProjectID: p.f.projectID, Forge: "github", Slug: "spine/repo", DefaultBranch: "main"}, nil
+	return ref, err
+}
+
+// Email is runs.PrincipalSource over the fixture's users table.
+func (p fixturePorts) Email(ctx context.Context, userID uuid.UUID) (string, error) {
+	var email string
+	err := p.f.pool.QueryRow(ctx, `SELECT email FROM users WHERE id = $1`, userID).Scan(&email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", xerrors.E(xerrors.ClassNotFound, "no such user")
+	}
+	return email, err
 }
 
 func (p fixturePorts) HarnessByName(_ context.Context, name string) (runs.HarnessRef, error) {
@@ -80,12 +103,42 @@ func agenticDoc() runs.DefinitionDoc {
 	}
 }
 
+// gatedConveyorDoc is agenticDoc closed with the gate and the publish it
+// authorizes — the shape Plan 05 refused at intake and Plan 08 executes.
+func gatedConveyorDoc() runs.DefinitionDoc {
+	doc := agenticDoc()
+	doc.Nodes = append(doc.Nodes,
+		runs.DefNode{ID: "gate", Kind: runs.KindGate, Revision: &runs.DefRevision{Target: "impl", MaxRounds: 2}},
+		runs.DefNode{ID: "publish", Kind: runs.KindGitPublish},
+	)
+	doc.Edges = append(doc.Edges,
+		runs.DefEdge{From: "impl", To: "gate", Artifact: runs.ArtifactKindPatch},
+		runs.DefEdge{From: "review", To: "gate", Artifact: runs.ArtifactKindReviewVerdict},
+		runs.DefEdge{From: "gate", To: "publish", Artifact: runs.ArtifactKindPatch},
+	)
+	return doc
+}
+
 func newService(t *testing.T, f fixture, doc runs.DefinitionDoc, snap runs.PolicySnapshot) (*runs.Service, fixturePorts) {
 	t.Helper()
-	ports := fixturePorts{f: f, doc: doc, hash: "deadbeef", harness: uuid.Max, harnessCred: uuid.New()}
-	forge := fake.Forge{Heads: map[uuid.UUID]string{f.repoID: "basesha0000000000000000000000000000000000"}}
+	// A fixture with a real remote pins that remote's head; everything else
+	// keeps the synthetic literal its assertions were written against.
+	head := "basesha0000000000000000000000000000000000"
+	if f.baseSHA != "" {
+		head = f.baseSHA
+	}
+	forge := fake.NewForge(map[uuid.UUID]string{f.repoID: head})
+	publisher := fake.NewPublisher(nil)
+	if f.remote != "" {
+		forge.Remote(f.repoID, f.remote)
+		publisher.Remote(f.repoID, f.remote)
+	}
+	ports := fixturePorts{
+		f: f, doc: doc, hash: "deadbeef", harness: uuid.Max, harnessCred: uuid.New(),
+		forge: forge, publisher: publisher,
+	}
 	svc := runs.NewService(f.pool, clock.System{}, audit.NewRecorder(clock.System{}),
-		ports, ports, ports, forge, runs.Params{Snapshot: snap})
+		ports, ports, ports, forge, publisher, ports, runs.Params{Snapshot: snap})
 	return svc, ports
 }
 
@@ -138,10 +191,6 @@ func TestCreateTaskPinsEverything(t *testing.T) {
 
 func TestCreateTaskValidation(t *testing.T) {
 	f := newFixture(t)
-	gated := agenticDoc()
-	gated.Nodes = append(gated.Nodes, runs.DefNode{ID: "gate", Kind: runs.KindGate})
-	gated.Edges = append(gated.Edges, runs.DefEdge{From: "impl", To: "gate", Artifact: runs.ArtifactKindPatch})
-
 	cases := []struct {
 		name  string
 		doc   runs.DefinitionDoc
@@ -151,7 +200,6 @@ func TestCreateTaskValidation(t *testing.T) {
 		{"empty title", agenticDoc(), runs.NewTask{RepoID: uuid.Max, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: ""}, "title"},
 		{"title too long", agenticDoc(), runs.NewTask{RepoID: uuid.Max, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: strings.Repeat("x", 201)}, "title"},
 		{"unknown harness", func() runs.DefinitionDoc { d := agenticDoc(); d.Nodes[0].Harness = "ghost"; return d }(), runs.NewTask{WorkflowVersion: 1, Title: "t"}, "harness"},
-		{"gate rejected in plan 05", gated, runs.NewTask{WorkflowVersion: 1, Title: "t"}, "definition"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -183,6 +231,37 @@ func TestCreateTaskValidation(t *testing.T) {
 				t.Errorf("fields = %+v, want one blaming %q", xe.Fields, tc.field)
 			}
 		})
+	}
+}
+
+// Plan 05 refused a definition containing a gate or a git-publish node at
+// intake. Plan 08's compiler assigns the gate that authorizes the publish
+// instead, so the refusal is gone and the whole conveyor must now pin a run
+// like any other definition. Without this the removal is untested: the
+// deleted "gate rejected" case asserted the old behaviour and nothing
+// asserted the new one.
+func TestCreateTaskAcceptsAGatedDefinition(t *testing.T) {
+	f := newFixture(t)
+	svc, _ := newService(t, f, gatedConveyorDoc(), runs.DefaultSnapshot())
+	ctx := context.Background()
+
+	task, run, err := svc.CreateTask(ctx, principal(f), runs.NewTask{
+		RepoID: f.repoID, WorkflowID: uuid.Max, WorkflowVersion: 1, Title: "ship it",
+	})
+	if err != nil {
+		t.Fatalf("a gated definition must be accepted at intake: %v", err)
+	}
+	if run.Status != runs.RunPending || task.LatestRunID != run.ID {
+		t.Errorf("gated run not pinned pending: run %+v, task %+v", run, task)
+	}
+	// Intake still materializes nothing; the gate node is the orchestrator's
+	// business, and the run is a pending row like any other.
+	_, phases, _, err := svc.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(phases) != 0 {
+		t.Errorf("intake must not materialize phases, got %d", len(phases))
 	}
 }
 

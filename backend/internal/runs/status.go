@@ -22,10 +22,12 @@ const (
 
 // runTransitions is the run transition table (plan header). Data, not
 // code: CAS sites and the property suite both read it.
+// A waiting run must be able to end directly: a gate can be the last node
+// (approve -> succeeded) and a reject terminalizes straight from waiting.
 var runTransitions = map[RunStatus][]RunStatus{
 	RunPending: {RunRunning, RunSuperseded, RunDead},
 	RunRunning: {RunWaiting, RunSucceeded, RunFailed, RunDead},
-	RunWaiting: {RunRunning, RunDead},
+	RunWaiting: {RunRunning, RunSucceeded, RunFailed, RunDead},
 }
 
 func (s RunStatus) Valid() bool {
@@ -48,24 +50,37 @@ func (s RunStatus) CanTransition(to RunStatus) bool { return transitionIn(runTra
 type PhaseStatus string
 
 const (
-	PhasePending     PhaseStatus = "pending"
-	PhaseRunning     PhaseStatus = "running"
-	PhaseReconciling PhaseStatus = "reconciling"
-	PhaseSucceeded   PhaseStatus = "succeeded"
-	PhaseFailed      PhaseStatus = "failed"
-	PhaseDead        PhaseStatus = "dead"
-	PhaseSuperseded  PhaseStatus = "superseded"
+	PhasePending PhaseStatus = "pending"
+	PhaseRunning PhaseStatus = "running"
+	// PhaseWaitingDecision is a gate: a phase whose completion is a human
+	// decision (spec §2). Rows are INSERTED in this state — the claim CTE
+	// predicates on 'pending', so no worker can ever pick one up, and with
+	// no worker there is no lease, no heartbeat and no timeout. The wall
+	// deadline is the only clock that still applies.
+	PhaseWaitingDecision PhaseStatus = "waiting_decision"
+	PhaseReconciling     PhaseStatus = "reconciling"
+	PhaseSucceeded       PhaseStatus = "succeeded"
+	PhaseFailed          PhaseStatus = "failed"
+	PhaseDead            PhaseStatus = "dead"
+	PhaseSuperseded      PhaseStatus = "superseded"
 )
 
 var phaseTransitions = map[PhaseStatus][]PhaseStatus{
-	PhasePending:     {PhaseRunning, PhaseSuperseded},
-	PhaseRunning:     {PhaseSucceeded, PhaseFailed, PhaseDead, PhaseReconciling, PhaseSuperseded},
-	PhaseReconciling: {PhaseSucceeded, PhaseFailed, PhaseDead, PhaseSuperseded},
+	PhasePending:         {PhaseRunning, PhaseSuperseded},
+	PhaseRunning:         {PhaseSucceeded, PhaseFailed, PhaseDead, PhaseReconciling, PhaseSuperseded},
+	PhaseReconciling:     {PhaseSucceeded, PhaseFailed, PhaseDead, PhaseSuperseded},
+	PhaseWaitingDecision: {PhaseSucceeded, PhaseDead, PhaseSuperseded, PhaseFailed},
+	// A revision supersedes the WHOLE slice, succeeded rows included. This
+	// is the only edge out of a terminal state in either table, and it is
+	// what makes latest-attempt readiness (decision 2) actually forget a
+	// node the new generation must re-run: leaving a succeeded row as the
+	// node's newest row would keep it readable as done forever.
+	PhaseSucceeded: {PhaseSuperseded},
 }
 
 func (s PhaseStatus) Valid() bool {
 	switch s {
-	case PhasePending, PhaseRunning, PhaseReconciling, PhaseSucceeded, PhaseFailed, PhaseDead, PhaseSuperseded:
+	case PhasePending, PhaseRunning, PhaseWaitingDecision, PhaseReconciling, PhaseSucceeded, PhaseFailed, PhaseDead, PhaseSuperseded:
 		return true
 	}
 	return false

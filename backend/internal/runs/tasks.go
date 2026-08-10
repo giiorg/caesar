@@ -45,12 +45,15 @@ type Task struct {
 }
 
 type Run struct {
-	ID              uuid.UUID
-	TaskID          uuid.UUID
-	Status          RunStatus
-	DefinitionHash  string
-	BaseSHA         string
-	Snapshot        PolicySnapshot
+	ID             uuid.UUID
+	TaskID         uuid.UUID
+	Status         RunStatus
+	DefinitionHash string
+	BaseSHA        string
+	Snapshot       PolicySnapshot
+	// Generation is the revision round the run is on: 1 until a gate sends
+	// work back, then one higher per round.
+	Generation      int32
 	ExecutionUsedMS int64
 	WallDeadline    time.Time
 	Outcome         *Outcome
@@ -65,19 +68,51 @@ type Phase struct {
 	Attempt     int32
 	MaxAttempts int32
 	Status      PhaseStatus
+	Generation  int32
 	WorkerID    string
 	Outcome     *Outcome
 	CreatedAt   time.Time
 	FinishedAt  *time.Time
+	// Decision is set only on a gate attempt that was decided. It is joined
+	// on the phase row's own id, so a revision's two gate attempts carry
+	// their own verdicts rather than sharing the newest.
+	Decision *GateDecision
 }
 
 type ArtifactMeta struct {
-	ID        uuid.UUID
-	NodeID    string
-	Attempt   int32
-	Type      string
-	ParentIDs []uuid.UUID
-	CreatedAt time.Time
+	ID         uuid.UUID
+	NodeID     string
+	Attempt    int32
+	Generation int32
+	Type       string
+	ParentIDs  []uuid.UUID
+	CreatedAt  time.Time
+}
+
+// RunDetail is the single-run read: everything the run page renders, from one
+// query set. It replaces GetRun's four return values, which had run out of
+// room the moment publications joined phases and artifacts.
+type RunDetail struct {
+	Run          Run
+	Phases       []Phase
+	Artifacts    []ArtifactMeta
+	Publications []Publication
+}
+
+// Publication projects one publish intent. absent_since is deliberately NOT
+// carried: it is the settlement sweep's own bookkeeping, it changes on every
+// tick, and a UI rendering it would invite a human to act on a probe that is
+// designed to be re-run.
+type Publication struct {
+	NodeID       string
+	Status       string
+	Branch       string
+	TargetBranch string
+	BaseSHA      string
+	HeadSHA      string
+	PRNumber     int64
+	PRURL        string
+	HaltReason   string
 }
 
 type RunEventRecord struct {
@@ -121,9 +156,9 @@ func (s *Service) RepoProject(ctx context.Context, repoID uuid.UUID) (uuid.UUID,
 	return repo.ProjectID, nil
 }
 
-// resolveIntake pins everything a run needs before any row exists:
-// repo, definition (compiled, gates refused until Plan 08), per-node
-// harness refs, snapshot, base SHA.
+// resolveIntake pins everything a run needs before any row exists: repo,
+// definition (compiled — gates and publishes are executable from Plan 08
+// on), per-node harness refs, snapshot, base SHA.
 func (s *Service) resolveIntake(ctx context.Context, in NewTask) (RepoRef, PinnedDefinition, string, error) {
 	repo, err := s.repos.Repo(ctx, in.RepoID)
 	if err != nil {
@@ -137,10 +172,21 @@ func (s *Service) resolveIntake(ctx context.Context, in NewTask) (RepoRef, Pinne
 	if err != nil {
 		return RepoRef{}, PinnedDefinition{}, "", err
 	}
-	if unsupported := plan.HasUnsupportedNodes(); len(unsupported) > 0 {
-		return RepoRef{}, PinnedDefinition{}, "", xerrors.E(xerrors.ClassInvalid, "validation failed").
-			WithFields(xerrors.FieldError{Field: "definition", Message: fmt.Sprintf("gates and publishing arrive in Plan 08 (nodes: %v)", unsupported)})
+	if err := s.checkHarnesses(ctx, plan); err != nil {
+		return RepoRef{}, PinnedDefinition{}, "", err
 	}
+	baseSHA, err := s.forge.ResolveHead(ctx, repo)
+	if err != nil {
+		return RepoRef{}, PinnedDefinition{}, "", fmt.Errorf("runs: resolve head: %w", err)
+	}
+	return repo, def, baseSHA, nil
+}
+
+// checkHarnesses resolves every agentic node's harness against the registry.
+// Both intake paths run it: a run whose harness no longer exists can never
+// execute, and minting it anyway trades a clear 400 at the door for a typed
+// harness_error three phases later.
+func (s *Service) checkHarnesses(ctx context.Context, plan ExecPlan) error {
 	for _, id := range plan.Order {
 		n := plan.Nodes[id]
 		if n.Harness == "" {
@@ -148,17 +194,13 @@ func (s *Service) resolveIntake(ctx context.Context, in NewTask) (RepoRef, Pinne
 		}
 		if _, err := s.harnesses.HarnessByName(ctx, n.Harness); err != nil {
 			if xerrors.ClassOf(err) == xerrors.ClassNotFound {
-				return RepoRef{}, PinnedDefinition{}, "", xerrors.E(xerrors.ClassInvalid, "validation failed").
+				return xerrors.E(xerrors.ClassInvalid, "validation failed").
 					WithFields(xerrors.FieldError{Field: "harness", Message: fmt.Sprintf("node %q references unknown harness %q", id, n.Harness)})
 			}
-			return RepoRef{}, PinnedDefinition{}, "", err
+			return err
 		}
 	}
-	baseSHA, err := s.forge.ResolveHead(ctx, repo)
-	if err != nil {
-		return RepoRef{}, PinnedDefinition{}, "", fmt.Errorf("runs: resolve head: %w", err)
-	}
-	return repo, def, baseSHA, nil
+	return nil
 }
 
 // insertRun mints one pending run for a task inside tx: snapshot pinned
@@ -279,8 +321,11 @@ func (s *Service) Rerun(ctx context.Context, actor authn.Principal, taskID uuid.
 	if err != nil {
 		return Run{}, err
 	}
-	def, err := s.definitionByVersionID(ctx, taskRow.WorkflowVersionID)
+	def, plan, err := s.definitionByVersionID(ctx, taskRow.WorkflowVersionID)
 	if err != nil {
+		return Run{}, err
+	}
+	if err := s.checkHarnesses(ctx, plan); err != nil {
 		return Run{}, err
 	}
 	baseSHA, err := s.forge.ResolveHead(ctx, repo)
@@ -329,6 +374,13 @@ func (s *Service) Rerun(ctx context.Context, actor authn.Principal, taskID uuid.
 		}
 
 		run, err = s.insertRun(ctx, tx, taskID, taskRow.ProjectID, def, baseSHA, correlationID)
+		if isUniqueViolation(err) {
+			// runs_task_live_key: another rerun committed its pending run
+			// between our LatestRunForUpdate and this insert. That is a
+			// conflict, not an internal failure — the caller should retry or
+			// look at the run that won.
+			return xerrors.E(xerrors.ClassConflict, "another re-run of this task is already pending")
+		}
 		if err != nil {
 			return err
 		}
@@ -353,16 +405,19 @@ func (s *Service) Rerun(ctx context.Context, actor authn.Principal, taskID uuid.
 
 // definitionByVersionID re-resolves a task's pinned version through the
 // port's second method; the compile pass rejects stored corruption
-// before any row is minted against it.
-func (s *Service) definitionByVersionID(ctx context.Context, versionID uuid.UUID) (PinnedDefinition, error) {
+// before any row is minted against it. The compiled plan comes back with
+// the definition so the re-run intake's harness check does not compile it
+// a second time.
+func (s *Service) definitionByVersionID(ctx context.Context, versionID uuid.UUID) (PinnedDefinition, ExecPlan, error) {
 	def, err := s.defs.DefinitionByVersionID(ctx, versionID)
 	if err != nil {
-		return PinnedDefinition{}, err
+		return PinnedDefinition{}, ExecPlan{}, err
 	}
-	if _, err := compilePinned(def); err != nil {
-		return PinnedDefinition{}, err
+	plan, err := compilePinned(def)
+	if err != nil {
+		return PinnedDefinition{}, ExecPlan{}, err
 	}
-	return def, nil
+	return def, plan, nil
 }
 
 func runFromRow(r store.Run) (Run, error) {
@@ -377,6 +432,7 @@ func runFromRow(r store.Run) (Run, error) {
 	return Run{
 		ID: r.ID, TaskID: r.TaskID, Status: RunStatus(r.Status),
 		DefinitionHash: r.DefinitionHash, BaseSHA: r.BaseSha, Snapshot: snap,
+		Generation:      r.Generation,
 		ExecutionUsedMS: r.ExecutionUsedMs, WallDeadline: r.WallDeadline, Outcome: out,
 		CreatedAt: r.CreatedAt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
 	}, nil
@@ -458,57 +514,110 @@ func phaseFromRow(r store.PhaseRun) (Phase, error) {
 	}
 	return Phase{
 		ID: r.ID, NodeID: r.NodeID, Attempt: r.Attempt, MaxAttempts: r.MaxAttempts,
-		Status: PhaseStatus(r.Status), WorkerID: worker, Outcome: out,
+		Status: PhaseStatus(r.Status), Generation: r.Generation, WorkerID: worker, Outcome: out,
 		CreatedAt: r.CreatedAt, FinishedAt: r.FinishedAt,
 	}, nil
 }
 
+// GetRun is GetRunDetail for the callers that only ever wanted the first three
+// values. It stays because it has twenty-seven of them across three build
+// lanes, and widening a signature they do not read would be churn, not clarity.
 func (s *Service) GetRun(ctx context.Context, id uuid.UUID) (Run, []Phase, []ArtifactMeta, error) {
-	q := store.New(s.pool)
-	row, err := q.GetRun(ctx, id)
-	if err != nil {
-		return Run{}, nil, nil, notFound(err, "no such run")
-	}
-	run, err := runFromRow(row)
+	d, err := s.GetRunDetail(ctx, id)
 	if err != nil {
 		return Run{}, nil, nil, err
 	}
+	return d.Run, d.Phases, d.Artifacts, nil
+}
+
+// GetRunSummary reads the run row alone. It is what a caller that only has to
+// authorize against the run — the event poll, on every tick — should pay for;
+// GetRunDetail's five queries exist for the page, not for the loop.
+func (s *Service) GetRunSummary(ctx context.Context, id uuid.UUID) (Run, error) {
+	row, err := store.New(s.pool).GetRun(ctx, id)
+	if err != nil {
+		return Run{}, notFound(err, "no such run")
+	}
+	return runFromRow(row)
+}
+
+// GetRunDetail is the single-run read behind GET /runs/{id}.
+func (s *Service) GetRunDetail(ctx context.Context, id uuid.UUID) (RunDetail, error) {
+	q := store.New(s.pool)
+	row, err := q.GetRun(ctx, id)
+	if err != nil {
+		return RunDetail{}, notFound(err, "no such run")
+	}
+	run, err := runFromRow(row)
+	if err != nil {
+		return RunDetail{}, err
+	}
 	phaseRows, err := q.ListPhasesForRun(ctx, id)
 	if err != nil {
-		return Run{}, nil, nil, fmt.Errorf("runs: list phases: %w", err)
+		return RunDetail{}, fmt.Errorf("runs: list phases: %w", err)
+	}
+	decisions, err := q.ListGateDecisionsForRun(ctx, id)
+	if err != nil {
+		return RunDetail{}, fmt.Errorf("runs: list gate decisions: %w", err)
+	}
+	byPhase := make(map[uuid.UUID]GateDecision, len(decisions))
+	for _, d := range decisions {
+		byPhase[d.PhaseRunID] = gateDecisionFromRow(d)
 	}
 	phases := make([]Phase, 0, len(phaseRows))
 	for _, pr := range phaseRows {
 		p, err := phaseFromRow(pr)
 		if err != nil {
-			return Run{}, nil, nil, err
+			return RunDetail{}, err
+		}
+		if d, ok := byPhase[pr.ID]; ok {
+			p.Decision = &d
 		}
 		phases = append(phases, p)
 	}
 	artRows, err := q.ListArtifactsForRun(ctx, id)
 	if err != nil {
-		return Run{}, nil, nil, fmt.Errorf("runs: list artifacts: %w", err)
+		return RunDetail{}, fmt.Errorf("runs: list artifacts: %w", err)
 	}
 	arts := make([]ArtifactMeta, 0, len(artRows))
 	for _, ar := range artRows {
 		var parentStrs []string
 		if err := json.Unmarshal(ar.ParentIds, &parentStrs); err != nil {
-			return Run{}, nil, nil, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
+			return RunDetail{}, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
 		}
 		parents := make([]uuid.UUID, 0, len(parentStrs))
 		for _, ps := range parentStrs {
 			pid, err := uuid.Parse(ps)
 			if err != nil {
-				return Run{}, nil, nil, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
+				return RunDetail{}, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
 			}
 			parents = append(parents, pid)
 		}
 		arts = append(arts, ArtifactMeta{
-			ID: ar.ID, NodeID: ar.NodeID, Attempt: ar.Attempt, Type: ar.Type,
-			ParentIDs: parents, CreatedAt: ar.CreatedAt,
+			ID: ar.ID, NodeID: ar.NodeID, Attempt: ar.Attempt, Generation: ar.Generation,
+			Type: ar.Type, ParentIDs: parents, CreatedAt: ar.CreatedAt,
 		})
 	}
-	return run, phases, arts, nil
+	intents, err := q.ListPublishIntentsForRun(ctx, id)
+	if err != nil {
+		return RunDetail{}, fmt.Errorf("runs: list publish intents: %w", err)
+	}
+	pubs := make([]Publication, 0, len(intents))
+	for _, pi := range intents {
+		pubs = append(pubs, publicationFromRow(pi))
+	}
+	return RunDetail{Run: run, Phases: phases, Artifacts: arts, Publications: pubs}, nil
+}
+
+// publicationFromRow flattens the receipt columns. Each is NULL until its
+// effect landed, and the zero value is exactly what an absent receipt means.
+func publicationFromRow(r store.PublishIntent) Publication {
+	return Publication{
+		NodeID: r.NodeID, Status: r.Status, Branch: r.Branch,
+		TargetBranch: r.TargetBranch, BaseSHA: r.BaseSha,
+		HeadSHA: r.HeadSha.String, PRNumber: r.PrNumber.Int64,
+		PRURL: r.PrUrl.String, HaltReason: r.HaltReason.String,
+	}
 }
 
 func (s *Service) ListRunsForTask(ctx context.Context, taskID uuid.UUID) ([]Run, error) {

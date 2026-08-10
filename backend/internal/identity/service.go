@@ -73,7 +73,7 @@ func validatePassword(pw string) error {
 		return xerrors.E(xerrors.ClassInvalid, "validation failed").
 			WithFields(xerrors.FieldError{
 				Field:   "password",
-				Message: fmt.Sprintf("must be between %d and %d characters", MinPasswordLen, MaxPasswordLen),
+				Message: fmt.Sprintf("must be between %d and %d bytes", MinPasswordLen, MaxPasswordLen),
 			})
 	}
 	return nil
