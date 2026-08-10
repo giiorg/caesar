@@ -2,9 +2,13 @@ package contracts_test
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/giiorg/caesar/backend/internal/contracts"
 )
@@ -109,6 +113,23 @@ func TestBuild_DocumentsTheErrorStatusesAnOperationDeclares(t *testing.T) {
 	listed := doc.Paths["/api/v1/approvals"]["get"]
 	if got := sortedKeys(listed.Responses); len(got) != 2 || got[0] != "200" || got[1] != "400" {
 		t.Errorf("listApprovals responses = %v, want only 200 and 400", got)
+	}
+}
+
+// The existing document must not move when the field is merely added.
+// Every operation today is JSON, so adding the knob is a no-op on bytes.
+func TestBuild_UnchangedWhenNoOperationOptsIn(t *testing.T) {
+	t.Parallel()
+	raw, err := contracts.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(string(committed), string(raw)); diff != "" {
+		t.Errorf("generated document drifted from the committed one (-committed +generated):\n%s", diff)
 	}
 }
 

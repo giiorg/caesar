@@ -153,7 +153,9 @@ func Build() ([]byte, error) {
 				oc.AddReqStructure(req)
 			}
 			if op.Response != nil {
-				oc.AddRespStructure(op.Response, openapi.WithHTTPStatus(op.Status))
+				oc.AddRespStructure(op.Response,
+					openapi.WithHTTPStatus(op.Status),
+					openapi.WithContentType(contentTypeOf(op)))
 			} else {
 				oc.AddRespStructure(nil, openapi.WithHTTPStatus(op.Status))
 			}
@@ -193,4 +195,14 @@ func requestStructure(op httpx.Operation, path string) any {
 	default:
 		panic(fmt.Sprintf("contracts: no path-param wrapper for %s — add one to requestOverrides", op.Pattern))
 	}
+}
+
+// contentTypeOf is the success response media type. Operations that do not
+// declare one answer with JSON, which is every REST endpoint; the streams
+// in Plan 10 are the only opt-outs.
+func contentTypeOf(op httpx.Operation) string {
+	if op.ResponseContentType == "" {
+		return "application/json"
+	}
+	return op.ResponseContentType
 }
