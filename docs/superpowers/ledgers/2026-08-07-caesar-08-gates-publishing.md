@@ -1,38 +1,106 @@
 # SDD ledger — plan: docs/superpowers/plans/2026-08-07-caesar-08-gates-publishing.md
 
 
-## >>> RESUME HERE (session 54 — the whole-branch review AND its fix round have run) <<<
+## >>> RESUME HERE (end of session 54 — REVIEW, FIX ROUND AND RE-REVIEW ARE ALL DONE) <<<
 
-# >>> ALL 16 TASKS COMPLETE. THE REVIEW IS DONE. THE FIX ROUND IS DONE. <<<
+# >>> PLAN 08 IS COMPLETE AND REVIEWED. THE ONLY REMAINING ACTION IS SOFO'S MERGE DECISION. <<<
+
+**HEAD = `ca8eccc`, tree clean, 113 commits ahead of `main`. GATE PASS at `ca8eccc`.**
+Nothing is in flight: no task, no fix round, no open review.
 
 **Tasks 1-16 COMPLETE.** Session 53 executed Tasks 13-16 end to end at `eb91334`.
 
-Session 54 ran the whole-branch review (three reviewers on Opus 5, disjoint charters,
-base `38b4f75`) and adjudicated it into
-`.superpowers/sdd/2026-08-07-caesar-08-gates-publishing/whole-branch-review-adjudicated.md`.
-The fix round ran as **three fixers with disjoint ownership**, in series, each gated by
-the controller:
+Session 54 ran the whole-branch review as **three reviewers on Opus 5 with disjoint
+charters** (verification/mutation in an isolated worktree; production architecture;
+tests + contract surface), base `38b4f75`, adjudicated into
+`whole-branch-review-adjudicated.md` — 2 Critical, 14 Important. The fix round ran as
+**three lane-shaped fixers IN SERIES** (serial because three agents committing to one
+branch races the index), then a follow-up, then **one scoped re-review**:
 
-- **Fixer A** — production code under `internal/runs/**` and `internal/app/**`:
-  C1, C2/I4, I2, I3, I7, I8, I9 and four minors. 8 commits, `1c628c1..9fb3522`.
-- **Fixer B** — forge, the gate script, the message batch: I1, I10, I5, I6 and the
-  bytes-for-characters batch. 5 commits, `a6bb5ff..26ad7a0`.
-- **Fixer C** — documentation truth, contracts and this record: I11, I12, I13, I14, the
-  README reconciliation against A's and B's behaviour changes, and the record
-  corrections below.
+- **Fixer A** — `internal/runs/**`, `internal/app/**`: C1, C2/I4, I2, I3, I7, I8, I9
+  and four minors. 8 commits, `1c628c1..9fb3522`. **Gated.**
+- **Fixer B** — forge, the gate script, the message batch: I1, I10, I5, I6, the
+  bytes-for-characters batch. 5 commits, `a6bb5ff..26ad7a0`. **Gated.**
+- **Fixer C** — documentation truth, contracts, this record: I11-I14, the README
+  reconciliation against A's and B's behaviour changes, the record corrections.
+  9 commits, `bff3288..39ad76f`.
+- **Follow-up** — `3533466`, the `run.finished` audit gap the controller dropped.
+  **Gated.**
+- **Re-review** — `rereview-report.md`. Verdict: both Criticals HOLD (C1's no-hot-loop
+  claim MEASURED, not argued: 0/174 anti-join matches while gates open, 0/439 after);
+  **14/14 mutation spot-checks killed**; no code regression; 3 blocking DOC lines.
+- **`ca8eccc`** — those three doc lines, by the controller. **Gated.**
 
-Reports: `fix-round-{a,b,c}-report.md` in the same directory.
+Reports: `whole-branch-review-r{1,2,3}.md`, `fix-round-{a,b,c}-report.md`,
+`rereview-report.md`, all in this directory.
 
-**There is no Task 17.** Task 16 was created mid-session by a user ruling (see below)
-and is not in the plan document. The plan's own task list ends at 15.
+**There is no Task 17.** Task 16 was created mid-session by a user ruling and is not in
+the plan document. The plan's own task list ends at 15.
+
+### The two Criticals the review found — after 16 tasks × 4 review rounds each
+
+1. **Approving one of two simultaneously-waiting gates stranded the run for ever.**
+   `ListRunsAwaitingMaterialization`'s anti-join excluded any run holding a
+   `waiting_decision` phase, so the janitor's pass was skipped, the other gate became
+   undecidable (`FinishGatePhase` needs `status='waiting'`), and the approved gate's
+   successors — including an authorized publish node — never materialized. **Every gate
+   fixture on the branch was CHAINED**, which is why nothing caught it. Fixed in
+   `1c628c1` with the parallel-gate fixture whose absence hid it.
+2. **`haltsPublication` was an allow-list, therefore fail-open.** A permanent
+   `invalid_output` left the intent `pending` for ever on a `failed` run with a branch
+   already live on the remote — no halt reason, no `publish.halted`, no audit row, and no
+   sweep revisits a failed run. Fixer A rejected the narrow fix, **DELETED
+   `haltsPublication`**, and made `maybeHalt` halt on ANY permanent (gitops types nine
+   permanent exits; `publish.go` raised a tenth raw). `ea14950`.
 
 ### The next action
 
-**The controller gates Fixer C's head, then `superpowers:finishing-a-development-branch`.**
-The merge/PR decision is sofo's — do not pre-commit it. Two loose ends to reconcile
-then: a stale `caesar-07-harness-drivers` worktree on disk though plan 07 merged, and
-**roadmap row 07's smoke run still open**. Roadmap row 08's own smoke run is also still
-open, and what it can now close CHANGED — see record correction 8.
+**`superpowers:finishing-a-development-branch`. THE MERGE/PR DECISION IS SOFO'S — do not
+pre-commit it.** Ask; do not assume PR-vs-merge from how plans 01-07 landed.
+
+**Loose ends:**
+- ~~stale `caesar-07-harness-drivers` worktree~~ **RESOLVED** — verified gone via
+  `git worktree list`; the leftover reviewer worktree was removed too. Only `main` and
+  this branch's worktree remain.
+- **Roadmap row 07's smoke run is still open**, and row 08's too. **What they can close
+  CHANGED — see record correction 8**: `repo_unavailable`'s "unreachable by any manual
+  procedure" was WRONG (it rests on a 404-folding choice in `github.go:94-97`,
+  disambiguable with one `GET /repos/{slug}`), and a bare 403 is now permanent
+  `auth_expired`, so the credential-dead case DOES reach the halting arm.
+
+### Residuals carried into main — recorded, deliberately NOT fixed
+
+- **The `PublicationBranch` marker collision.** Two gates over one patch, each
+  authorizing a publish, collide on `publish_intents_marker_key`; the second dies
+  permanent `publish_conflict`. Reproduces on `twoGateDoc`, whose gates are **CHAINED**
+  and which `validate_test.go:323` blesses by name. **Bounded**: the losing INSERT fails
+  before any forge call, so no orphan and nothing to reconcile — but the message
+  misdirects, reading like recovery found somebody else's branch. Design question
+  (should the marker include the publish node id? changing it renames every
+  publication's branch).
+- **The gate is NOT a superset of the required CI check** — `task secrets` and
+  `task lint:actions` are in `ci-ok`'s `needs` but in neither the gate nor `backend:ci`.
+- **The env scrub is environment-only** — `go env -w GOFLAGS` bypasses it, caught only by
+  the `no tests to run` symptom grep.
+- `gitops` types every `git commit` failure permanent; `auth_expired` now has two
+  producers but only the harness side writes `last_auth_expired_at`.
+
+**Named follow-up tasks:** the `schema.sql` equality assertion — whose sharper half is
+that **no CI lane runs `atlas migrate validate` and `atlas.sum` was re-hashed by hand**;
+the `publish.go` split at its existing line-1191 divider; the `materialize.go` cut.
+
+### ⚠️ THE GATE CHANGED AGAIN — and the old `PKG=` habit is what it now defends against
+
+`scripts/gate` now **scrubs `PKG` / `RAPID_SEED` / `RAPID_CHECKS` / `FUZZTIME` /
+`GOFLAGS`** from the environment and announces what it dropped, asserts the **resolved
+command per lane** (not just the lane name), greps for `no tests to run`, and runs
+`image:build` + `backend:test:runner`. Four commands, 11 lanes, ~4 minutes.
+
+Why: go-task reads those from the environment, so an **exported** `PKG` narrowed all nine
+lanes while every gate assertion still passed — and `GOFLAGS` could zero every test at
+exit 0, invisible in any command line. **`scripts/gate` is the instrument every "gated"
+claim in this ledger rests on.** Use the inline form `PKG=./x task ...`, never `export`.
+The controller gated with a hostile environment deliberately on every run.
 
 ### >>> WHAT THE WHOLE-BRANCH REVIEW WAS TOLD — CONSUMED, WITH DISPOSITIONS <<<
 
