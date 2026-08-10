@@ -64,10 +64,16 @@ func TestPublish_CreatesTheBranchAndCommitsWithTheHumanAsAuthor(t *testing.T) {
 	// `<epoch> <offset>` and the offset is hashed, so a stamp that leaves the
 	// zone to the host makes the sha host-dependent — which breaks the adopt
 	// comparison the whole crash-recovery design rests on.
-	if got := gitOut(t, remote, "log", "-1", "--format=%aI", rep.HeadSHA); got != "2026-08-07T12:00:00+00:00" {
+	//
+	// Assert `--date=raw`, which prints the stored `<epoch> <offset>` verbatim.
+	// Do NOT go back to %aI/%cI: those render the offset, and the rendering is
+	// git-version-dependent — 2.39 prints "+00:00" where 2.54 prints "Z" for
+	// the same bytes, so a passing %aI assertion on the dev host reds CI while
+	// the commit is byte-identical. Raw is both stricter and version-stable.
+	if got := gitOut(t, remote, "log", "-1", "--format=%ad", "--date=raw", rep.HeadSHA); got != "1786104000 +0000" {
 		t.Errorf("author date = %q; the stamp must carry its zone or the sha is host-dependent", got)
 	}
-	if got := gitOut(t, remote, "log", "-1", "--format=%cI", rep.HeadSHA); got != "2026-08-07T12:00:00+00:00" {
+	if got := gitOut(t, remote, "log", "-1", "--format=%cd", "--date=raw", rep.HeadSHA); got != "1786104000 +0000" {
 		t.Errorf("committer date = %q; both identities are pinned", got)
 	}
 	// The tree the caller is handed back is the commit's own, not the base's
