@@ -1,10 +1,15 @@
 # SDD ledger — plan: docs/superpowers/plans/2026-08-10-caesar-10-realtime-sse.md
 
-> **HANDOFF 2026-08-11 — paused after Task 2 at sofo's request. RESUME AT TASK 3.**
+> **HANDOFF 2026-08-11 (session 57) — RESUME AT TASK 4.**
 >
 > Worktree `/Users/sofo/Projects/caesar/repos/caesar/.claude/worktrees/caesar-10-realtime-sse`,
-> branch `caesar-10-realtime-sse`, clean tree. Tasks 1-2 complete and reviewed;
-> Tasks 3-12 untouched. **Verify with `git log` before acting on any of this.**
+> branch `caesar-10-realtime-sse`, clean tree. Tasks 1-3 complete and reviewed;
+> Tasks 4-12 untouched. **Verify with `git log` before acting on any of this.**
+>
+> **Task 3 is done and GATED: `78a4346`, review clean on the first pass, and
+> `GATE PASS … 78a4346 (11 lanes resolved unnarrowed)`.** The Docker item below is
+> RESOLVED — see the section on it; the daemon had simply been down, and Docker Hub
+> is intermittent rather than dead.
 >
 > **SOFO RULED the one open question** — `SnapshotWatermark` becomes `Snapshot` returning
 > both halves from one call. See the RULING block below. It is NOT open; do not re-ask it.
@@ -21,11 +26,10 @@
 >      dev-JSON block verbatim.
 >   4. Task 12's docs step says "the config knobs from Task 2" — that is now Task 11.
 >
-> **The gate has not returned GATE PASS since `4475e6d`** because Docker Hub is
-> unreachable (`docker pull alpine:3.22` times out — controller-verified, not inferred).
-> `image:build` and `backend:test:runner` fail environmentally; the other nine lanes pass,
-> including `internal/arch`. A clean 11-lane pass at the final sha is still owed before
-> merge. Do not record a "gated" claim for Tasks 2+ until then.
+> ~~**The gate has not returned GATE PASS since `4475e6d`**~~ **CLOSED 2026-08-11 at
+> `78a4346`:** `GATE PASS … 11 lanes resolved unnarrowed, Commit=78a4346 stamped in the
+> binary and in caesar-git:dev, contracts clean`. A clean pass at the *final* sha is still
+> owed before merge, as always, but the branch is no longer carrying an unproven gate.
 >
 > **Durability:** this directory is GITIGNORED. It is mirrored to the tracked path
 > `docs/superpowers/ledgers/2026-08-10-caesar-10-realtime-sse.md` (a SNAPSHOT — refresh it
@@ -193,17 +197,93 @@ Task 2: minor (deferred): `Filter`'s doc (`realtime.go:55-56`) still says "Exact
   RunID or Attention is set", in mild tension with the both-set precedence doc four lines
   below. Pre-existing text, harmless — the new doc covers the invalid shapes explicitly.
 
-### OPEN — the gate has not passed on this branch since 4475e6d (Docker Hub outage)
+Task 3: complete (commits 7e7947e..78a4346, review clean on the FIRST pass — spec ✅, no
+  Critical/Important) and **GATED: `GATE PASS … 78a4346`, 11 lanes resolved unnarrowed.**
+Task 3: the review judged the mutation evidence genuine rather than taking it on the report's
+  word — the mutant (NOTIFY on a side connection via `pgx.ConnectConfig`) breaks exactly the
+  property the rollback assertion pins, and only the rollback half went red under it.
+Task 3: **INTERFACE PRODUCED FOR TASK 4** — channel `caesar_run_events`, payload always
+  **empty**, one NOTIFY per *transaction* (not per event), global (not per project). Task 4's
+  tailer must LISTEN on exactly that string and treat a wake as "something, somewhere, may
+  have committed" — re-read from its own cursor, never trust the signal for content.
+Task 3: **behaviour change worth knowing** — `appendEvents` now fails the caller's transaction
+  if the NOTIFY fails. Deliberate (a silent notify failure would strand tailers on polling
+  latency), and the review checked all 19 production call sites propagate the error, but this
+  is a function every state transition in the system calls.
+Task 3: ⚠️ resolved by controller — the reviewer's two "cannot verify from diff" items. (a) The
+  Task 4 LISTEN-string match is a genuine cross-task interface claim, carried into Task 4's
+  dispatch above. (b) The pgx claim that a `WaitForNotification` deadline leaves the connection
+  healthy is corroborated behaviourally by the green run, which re-uses that connection after
+  the 1s timeout. Neither is a gap.
+Task 3: minor (deferred): `events_integration_test.go:262-275` — the commit half does not drain
+  queued notifications before the rollback half. Harmless today (one append, one NOTIFY); a
+  future second committed append before the rollback half would make the quiet-wait fail
+  confusingly. A drain loop or a comment noting the assumption would future-proof it.
+Task 3: minor (deferred): the whole-package integration evidence is a package-level `ok` line
+  without `-v`, so "the 3 pre-existing tests still pass" rests on that rather than per-test
+  output. Acceptable; noted.
 
-`scripts/gate` returns GATE FAIL on `image:build` because Docker Hub is unreachable from this
-machine. **Controller-verified, not taken on the implementer's word:** `docker pull
-alpine:3.22` — the exact base image `Dockerfile:19` needs — times out against
-`auth.docker.io`. `backend:test:runner` fails downstream because it needs that image.
+### Task 3 pre-flight (controller, 2026-08-11, session 57) — FOUR plan defects, all corrected in the brief
 
-Nine of eleven lanes pass, including `internal/arch`, `contracts:check` and all of
-`backend:ci`. This is an environment outage, not a code defect — but it means **no clean
-11-lane GATE PASS exists on this branch after 4475e6d**, and one must be obtained at the
-final sha before merge. Do not record a "gated" claim for Tasks 2+ until then.
+Read against the tree at `7e7947e` before dispatching. Recorded in full at the top of
+`task-3-brief.md` as a CONTROLLER PRE-FLIGHT block that overrides the plan text.
+
+1. **`backend/internal/runs/events_integration_test.go` ALREADY EXISTS** (229 lines, three
+   tests). The brief says "create". An implementer following it literally would have
+   destroyed `TestEventAppendIsAtomic`, `TestEventIDsAreCommitOrdered` and
+   `TestAppendRuntimeEvent_OwnTxProjectScopedAndOrdered`. Resolution: APPEND.
+2. **The plan's test calls `appendEvents`, which is unexported, from `package runs_test`.**
+   Would not compile — *the identical defect Task 1 hit*. The exported hook
+   `runs.AppendEventsForTest` already exists (`export_integration_test.go:17`). This is now
+   three tasks out of three where the plan's test snippet was not compilable as written.
+3. **The plan says `testdb.New(t)` for the pool.** `run_events.run_id` is
+   `NOT NULL REFERENCES runs (id)` (`schema.sql:313`), so an append against an empty
+   database dies on the FK before reaching the NOTIFY. Resolution: `newFixture(t)` +
+   `f.newRunRow(t, "running")`, as the file's three existing tests already do.
+4. **`WaitForNotification` is not on `*pgxpool.Conn`.** It is on the underlying `*pgx.Conn` —
+   `lc.Conn().WaitForNotification(ctx)`, with `LISTEN` issued on that same acquired conn.
+
+**Verified NOT a defect:** raw `tx.Exec` for a utility statement needs no sqlc query and
+breaks no arch rule — `internal/identity/service.go:103` sets the precedent with
+`tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", …)`.
+
+### RESOLVED — the Docker picture was misdiagnosed; the daemon was simply DOWN
+
+Controller-verified 2026-08-11, session 57. **The Docker daemon was not running** (the
+reboot trap: Docker Desktop does not survive a crash/restart). Started it with
+`open -a Docker`; server 29.6.2 is up.
+
+**The local image cache is intact and holds everything the gate needs** — `alpine:3.22`,
+`postgres:18-alpine`, `postgres:18`, `testcontainers/ryuk:0.14.0`, `golang:alpine`, and the
+two pinned harness images. So the integration lanes and plausibly `image:build` can run
+after all; the previous session's "no clean 11-lane pass is obtainable" conclusion was too
+pessimistic.
+
+**Still true:** Docker Hub itself is unreachable — `curl https://auth.docker.io/token…`
+times out at 20s with HTTP 000, independent of the daemon. Any lane needing a *new* pull
+will hang. Whether `image:build` re-resolves the cached `alpine:3.22` manifest against the
+registry is an open empirical question — the Task 3 gate run answers it.
+
+⚠️ `timeout` does not exist on this macOS shell (`command not found`). Use
+`curl --max-time` or a polling loop.
+
+### CLOSED — the Docker gate problem, correctly diagnosed at last
+
+Superseded by the session-57 findings above. The previous session's diagnosis ("Docker Hub is
+unreachable, no 11-lane pass is obtainable") was two separate problems read as one, and the
+pessimistic half was wrong:
+
+1. **The daemon was down.** Docker Desktop does not survive a restart. `open -a Docker`.
+2. **Docker Hub is INTERMITTENT, not dead.** The first gate run of this session did fail
+   `image:build` on exactly this, with the precise cause now on record: buildkit resolves
+   `golang:1.26-alpine` (`Dockerfile:1`) from the registry and `auth.docker.io` timed out.
+   Note the local cache holds `golang:alpine`, **not** the `1.26-alpine` tag the Dockerfile
+   pins, so a cached-image workaround does not exist. Minutes later the same endpoint
+   answered HTTP 200 in 0.56s and **the identical gate command passed all 11 lanes.**
+
+**The lesson for the next controller: on an `image:build` registry timeout, just retry the
+gate before concluding anything.** Do not retag a local image to fake the pinned tag — that
+would swap the Go toolchain version under the build and pass a gate that means nothing.
 
 **Gate ordering note (applies from Task 2 on):** `scripts/gate` takes a sha as an argument
 and verifies the named worktree is at it, so the commit must exist BEFORE the gate runs.
