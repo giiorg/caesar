@@ -423,6 +423,91 @@ Task 5: minor (deferred → Task 11): eviction is invisible to operators. A clie
   stream to a full queue is the signal that a queue is mistuned or a client is pathological,
   and only the client that lost the stream can currently observe it.
 
+Task 7: complete (commits 7d57ab5..ceadbaf, review clean after 1 fix round) and **GATED:
+  `GATE PASS … ceadbaf`, 11 lanes resolved unnarrowed, on a confirmed-clean tree.** The earlier
+  `GATE PASS @ 0023257` was DISCARDED, not trusted — a reviewer's in-tree probe overlapped it; see
+  the process-hazard section below.
+Task 7: fix round 1/5 (4 addressed, 0 open — LIFO cleanup inversion hanging the suite, unenforced
+  LIKE-metacharacter assumption, untested RunID precedence, undocumented `Replay` limit;
+  commits `0023257`..`ceadbaf`)
+Task 7: **THE ACCEPTANCE PROPERTY IS GENUINELY PINNED.** The reviewer re-ran
+  `RepeatableRead`→`ReadCommitted` itself: it reddens the invariant **"every event in
+  `Snapshot.Events` has `id <= Watermark.EventID`"** with `snapshot carries event 6 above its own
+  watermark 5`. The controller's pre-flight item 3 designed that invariant precisely because the
+  plan's own two assertions would have stayed green under read-committed.
+Task 7: **DO NOT ADD an `id <= watermark` PREDICATE** to the snapshot's events query, ever. The
+  transaction's snapshot view already implies it, and writing it out makes the isolation level
+  irrelevant and the acceptance test unfalsifiable. Only a comment guards this — no test can
+  detect its own defeat here. Flagged for the final review.
+Task 7: read order inside the tx is **watermark first, then events** — the fail-safe direction.
+  Under any weaker isolation the degradation is then a DUPLICATE (Task 8 dedups on id), never a
+  gap. Postgres takes the RR snapshot at the first statement, so the watermark read is literally
+  what pins the view the events read gets.
+Task 7: **the SQL and `Filter.Matches` agree on every constructed input** — the reviewer built the
+  disagreement cases (both selectors set, neither set, empty scope, admin scope, non-attention
+  kind) and found none. Every predicate is in SQL; the only Go-side reorder is `slices.Reverse`
+  over the rows the LIMIT already chose, which can neither hide nor invent a row.
+Task 7: **CONTROLLER OVERRIDE ITEM 6 WAS WRONG; the implementer's deviation stands.** It added
+  `ListRunEventsForRunAfter` (same shape **plus** a scope guard) rather than reusing the existing
+  unguarded `ListRunEventsAfter`. Reusing it would have forced either Go-side scope filtering after
+  the LIMIT — which breaks Task 8's pager — or reliance on an unstated invariant that every event
+  of a run carries that run's project id. `ListRunEventsAfter` is untouched for its existing caller.
+  The reviewer reached the same conclusion independently. **Both my override items that the
+  implementer pushed back on turned out to be wrong in its favour.**
+Task 7: **`ScopeFor` RULING — the deactivation check and the DB role read STAY.** It returns the
+  empty (matches-nothing) scope for `active = false` and reads the role from the database rather
+  than the session, so deactivation AND demotion both reach a live subscription. Grants survive
+  deactivation, so role alone would keep a disabled admin's stream open forever. No divergence from
+  `handleListApprovals`, which a deactivated user cannot reach at all.
+Task 7: **CARRY-FORWARD TO TASK 9 — `ScopeFor` returns an ERROR (`ClassNotFound`) for a deleted or
+  unknown user, not an empty scope.** The plan's Task 9 test 3 says a resolver error must "keep the
+  last known scope and retry" so a DB blip does not look like a permissions change — but a
+  `ClassNotFound` is NOT transient, and keeping the last known scope would stream to a deleted user
+  forever. **Task 9 must distinguish the two.**
+Task 7: **CARRY-FORWARD TO TASK 8** — every filtering predicate is in SQL, so a non-empty page never
+  comes back empty and the pager cannot stop early. `Replay` with a non-positive `limit` yields an
+  empty page and is a documented programming error (ruled: documented, NOT defaulted — config
+  validation makes it unreachable and a surprising 500-row fallback is worse than a stated
+  contract). Task 8 must pass `ReplayBatch`.
+Task 7: **CARRY-FORWARD TO TASK 12 (load test)** — none of these plans use
+  `run_events_run_id_idx` or `run_events_project_id_idx`: `ORDER BY id … LIMIT n` makes the pkey the
+  cheapest path and the run/project predicates become filters. `ListAttentionEventsAfter` for a
+  member with sparse grants and an old cursor removed 59 332 rows by filter. Bounded by the LIMIT
+  and still an index scan, but it is the shape a load test should measure.
+Task 7: **the second confident-but-backwards safety explanation in this plan.** The implementer's
+  comment AND its report both claimed `t.Cleanup(g.Release)` registered first made a failing test
+  safe; `t.Cleanup` runs **LIFO**, so registering earlier means running LATER, and `pgxpool.Close`
+  ran first while the tracer held a pooled connection — `puddle.Pool.Close` then blocked on that
+  connection's WaitGroup forever. A failing test burned the full 60s package timeout and buried its
+  own message in a panic dump. Same pattern as Task 5's `break` comment. **Read every "this is why
+  it is safe" paragraph as a claim to falsify, not to check.**
+Task 7: minor (deferred): `Snapshot.Events` is a non-nil empty slice when a selector matches
+  nothing but `nil` when no selector is set. Cosmetic; callers compare lengths.
+Task 7: ⚠️ not re-verified by the review: the EXPLAIN transcript (the implementer's 120k-row test
+  was deleted and not reconstructed) and Step 2's historical red. Both plausible, neither pinned.
+
+### PROCESS HAZARD FOUND 2026-08-11 — a reviewer's mutation dirtied the tree DURING a gate run
+
+Task 7's reviewer injected `t.Fatalf("REVIEW PROBE: …")` straight into
+`backend/internal/app/realtimeports_integration_test.go` to test whether a failing acceptance test
+can leave a goroutine parked on a pooled connection. **The question was one I asked it to ask; the
+method violated its dispatch** (which said use a scratch directory and never modify a repo file).
+
+**Why this is more than tidiness:** an 11-lane gate was running against this worktree at the same
+time. `scripts/gate` verifies the worktree is at the named sha but **tests whatever is on disk**,
+so a dirty tree during a gate run makes GATE PASS unfalsifiable — you cannot tell whether the
+lanes saw the probe. The `0023257` gate was therefore re-run after the tree was clean.
+
+**Rules that follow, for every future review dispatch:**
+1. Name the mechanism, not just the prohibition — say "`go test -overlay`", because "do not modify
+   repo files" alone leaves the reviewer to invent a way and it will pick the obvious one.
+2. Forbid `task db:sqlc` in reviews explicitly: regenerating sqlc writes `queries.sql.go` into the
+   repo, so an sqlc-shaped mutation cannot be run the obvious way at all.
+3. **Do not run the gate while a reviewer is working the same worktree.** Gate first, then review,
+   or re-gate after the tree is confirmed clean.
+4. An unrun mutation reported honestly beats a run one that leaves the branch dirty — say so in the
+   dispatch, so the reviewer has an honourable way out.
+
 Task 6: fix round 1/5 (3 addressed, 0 open — untested `Heartbeat` flush, unpinned `WriteEvent`
   idle-reset, undocumented raw-`Kind` interpolation; commits `2b23b4d`..`510d9bb`)
 Task 6: complete (commits c3c6fe5..510d9bb, review clean after 1 fix round) and **GATED:
