@@ -1,83 +1,126 @@
 # SDD ledger — plan: docs/superpowers/plans/2026-08-10-caesar-10-realtime-sse.md
 
-> **HANDOFF 2026-08-11 (session 58) — RESUME AT TASK 8.** This block supersedes the session-57
-> handoff below it, which is kept only for its Docker/gate notes.
+> **HANDOFF 2026-08-11 (session 59) — RESUME AT TASK 9.** This block supersedes the session-58
+> and session-57 handoffs below it, which are kept only for the Docker/gate operational notes.
 >
 > Worktree `/Users/sofo/Projects/caesar/repos/caesar/.claude/worktrees/caesar-10-realtime-sse`,
-> branch `caesar-10-realtime-sse`, HEAD **`4f41fce`** (last CODE commit **`ceadbaf`**), clean tree.
-> **Tasks 1-7 complete, reviewed and GATED; Tasks 8-12 untouched.** `main` untouched at `64de023`.
+> branch `caesar-10-realtime-sse`, last CODE commit **`8f1a133`**, clean tree.
+> **Tasks 1-8 complete, reviewed and GATED; Tasks 9-12 untouched.** `main` untouched at `64de023`.
 > **Verify with `git log` before acting on any of this.**
 >
 > Gated shas, all 11 lanes unnarrowed: Task 3 `78a4346` · Task 4 `1ed903a` · Task 5 `8c4bfc1` ·
-> Task 6 `510d9bb` · Task 7 `ceadbaf`. A clean pass at the FINAL sha is still owed before merge.
-> **The `GATE PASS @ 0023257` in the log was discarded, not trusted** — see the process-hazard
-> section.
+> Task 6 `510d9bb` · Task 7 `ceadbaf` · Task 8 `9108992` and `8f1a133`. A clean pass at the FINAL
+> sha is still owed before merge. **The `GATE PASS @ 0023257` in the log was discarded, not
+> trusted** — see the process-hazard section.
 >
-> **Tasks 5, 6 and 7 each took exactly one fix round** and each closed with every finding
-> demonstrated by a falsifying mutation, not asserted.
+> **Tasks 5, 6, 7 and 8 each took exactly one fix round**, and every finding in all four was
+> demonstrated by a falsifying mutation rather than argued.
 >
 > **WHAT THE PLAN DOES NOT KNOW — the carry-forwards. Each is a `Task N:` line in the body below;
 > read them there for the reasoning, this is only the index.**
 >
-> **Task 8 (the splice) inherits the most:**
->   1. `Serve` must NOT call `Flush()` per event — `WriteEvent` and `Heartbeat` flush themselves.
->      This is a *tested* guarantee (op-log `["flush","write","flush"]`), upheld deliberately.
->   2. The Writer owns idleness: just tick and call `Heartbeat()`. Do NOT track last-write or reset
->      a ticker per event.
->   3. `Snapshot` returns **events** (sofo's ruling), most recent 500, ascending, same shape for
->      both stream kinds. The plan's "run projection" wording is SUPERSEDED.
->   4. Pass `ReplayBatch` to `Replay` — a non-positive limit yields an empty page the pager cannot
->      distinguish from "no more events".
->   5. `Err()` is meaningful only AFTER `C()` has closed. A handler that returns without `Close` is
->      the one leak the hub cannot prevent.
->   6. Once headers are flushed the HTTP status is committed 200 forever — hence "403-shaped
->      terminal **frame**", never a status code.
->
-> **Task 9:** `CloseForbidden CloseReason = "…"` is the ENTIRE change (no error var, no mapping).
-> First reason wins on close. **And the plan's test 3 is wrong as written:** it says a resolver
-> error must "keep the last known scope and retry", but `ScopeFor` returns `ClassNotFound` for a
-> deleted user, which is not transient — keeping the last known scope would stream to a deleted
-> user forever. Task 9 must distinguish the two.
+> **Task 9 (grant re-check) inherits these:**
+>   1. `CloseForbidden CloseReason = "…"` is the ENTIRE change — no error var, no mapping.
+>      First reason wins on close.
+>   2. **The plan's test 3 is WRONG as written.** It says a resolver error must "keep the last
+>      known scope and retry", but `ScopeFor` returns `ClassNotFound` for a deleted or unknown
+>      user, which is NOT transient — keeping the last known scope would stream to a deleted user
+>      forever. Task 9 must distinguish the transient blip from the terminal answer.
+>   3. Task 8 built the seam: `Streamer`/`StreamerConfig` in `stream.go`, and
+>      `StreamRequest.UserID` is already carried and deliberately unread — Task 9 makes it live.
+>      Add `GrantResolver` to the `Streamer` and `GrantRecheck` to `StreamerConfig`, and default a
+>      non-positive `GrantRecheck` (`time.NewTicker` panics on <= 0, as `HeartbeatInterval` does).
+>   4. The natural place is a second ticker case in `follow`. **Serve's contract is `nil` on
+>      client disconnect** — do not let a new phase return a wrapped `context.Canceled`; the
+>      single `ctx.Err()` funnel in `Serve` exists so a new phase cannot forget.
+>   5. ⚠️ **The flush pin does NOT cover `follow`.** `TestServe_AddsNoFlushOfItsOwn` ends its
+>      stream on a closed channel, so a `Flush()` added only in `follow`'s event case survives
+>      (verified). Task 9 edits exactly that function AND legitimately calls `Writer.Flush()` for
+>      the terminal frame — so extend that test (one live event before `hub.Close()`, `want` gains
+>      `"write","flush"`) rather than trusting it.
+>   6. Once `NewWriter` has flushed the headers the HTTP status is committed 200 forever — hence
+>      "403-shaped terminal **frame**", never a status code. `Writer.Flush()` exists for exactly
+>      that direct write and has no other caller today.
+>   7. If you open `hub.go`, move the unexported `closeClientGone` (`stream.go:26`) into its const
+>      block or leave a pointer — `hub.go` calls that block "the canonical sentinels" and the
+>      reason set is now split across two files.
 >
 > **Task 10:** reflect `realtime.StreamFrame` — do NOT declare a parallel DTO. Its five fields and
-> the deliberate absence of `project_id`/`correlation_id` are in the Task 6 block below.
+> the deliberate absence of `project_id`/`correlation_id` are in the Task 6 block below. **It must
+> reject the ambiguous `Filter` at the edge** (both selectors set, or neither): `Serve` does not
+> police it, and neither-set today opens a stream that writes nothing and heartbeats forever.
+> Decide how each of `Serve`'s three return shapes is logged — `nil` is a disconnect and must stay
+> quiet, `ErrSlowConsumer` is expected traffic and not a fault, only write/source errors deserve
+> error level. And `Serve` returns nil, not `CloseShutdown`, when a disconnect races hub close —
+> do not build a shutdown-frame guarantee on the return value.
 >
 > **Task 11:** shutdown order is **cancel tailer → WAIT for `Run` to return → `Hub.Close()` →
 > `srv.Shutdown`** (the plan omits the wait). `Tailer.Run` can return an error BEFORE it loops —
 > treat that as failed startup. Apply `task-11-config-section.patch` from this directory; its brief
-> does not mention it. `config.Realtime.SubscriberQueue` → `HubConfig.SubscriberQueue`.
+> does not mention it. `config.Realtime.SubscriberQueue` → `HubConfig.SubscriberQueue`;
+> `HeartbeatInterval`/`ReplayBatch` → `StreamerConfig` (names already match);
+> `newRealtimeEventSource(pool, cfg.Realtime.ReplayBatch)` for the snapshot cap. **Decide whether
+> `stream.go`'s duplicated 20s/500 defaults get a compile-time tie-back to `config.Realtime` or
+> stay a comment** — they are currently two independent literals.
 >
 > **Task 12:** docs step's "config knobs from Task 2" means Task 11. For the load test: none of the
 > realtime query plans use the run/project indexes — `ORDER BY id … LIMIT n` makes the pkey
-> cheapest and those predicates become filters. That is the shape to measure.
+> cheapest and those predicates become filters. That is the shape to measure. Expect this and do
+> not call it a bug: a long replay keeps the live queue filling and can evict the subscriber
+> mid-catch-up; the client resumes from `Last-Event-ID` and makes progress each round, but a
+> `SubscriberQueue` too small relative to `ReplayBatch` turns it into a reconnect loop.
 >
 > **NEVER add an `id <= watermark` predicate** to the snapshot's events query. It would make the
 > isolation level irrelevant and silently un-falsify the acceptance test. Only a comment guards it.
 >
-> **METHOD — the four things that earned their keep this session:**
->   1. **Pre-flight every brief against the real source before dispatching.** Task 5 found 6 defects,
->      Task 6 found 8 (two of them decisions the plan never made), Task 7 found 11. The plan's own
->      `Publish` sketch panicked; the plan's acceptance test for Task 7 was unfalsifiable.
->   2. **Demand a demonstrated mutation, never an assertion**, for any test-shaped finding. Every
->      Important finding this session was found by mutation and invisible to reading.
+> **METHOD — what has earned its keep, now over six tasks:**
+>   1. **Pre-flight every brief against the real source before dispatching.** Defects found: Task 5
+>      six, Task 6 eight, Task 7 eleven, Task 8 thirteen. The plan's `Publish` sketch panicked;
+>      Task 7's acceptance test was unfalsifiable; **Task 8's `Serve` signature could not compile
+>      and its required mutation would not have reddened its own test.**
+>   2. **Demand a demonstrated mutation, never an assertion**, for any test-shaped finding — and
+>      hold your own mutants to it. Task 8's implementer discarded one of its own as invalid
+>      (it reddened nine tests on an unrelated assertion) and wrote a faithful one.
 >   3. **Name `go test -overlay` as the mechanism in review dispatches** and forbid codegen
->      explicitly. A prohibition without a mechanism gets the obvious method — a reviewer edited the
->      repo mid-gate. **Never gate while a reviewer is working the worktree.**
+>      explicitly. A prohibition without a mechanism gets the obvious method — a reviewer edited
+>      the repo mid-gate. **Never gate while a reviewer is working the worktree**, and never
+>      commit during a gate run either: `scripts/gate` checks the sha but tests what is on disk.
 >   4. **Give every subagent a named report FILE as its deliverable.** Chat replies arrive late,
->      out of order, or not at all; one report file was written seconds after the idle notification.
+>      out of order, or not at all.
+>   5. **Let reviewers find what you already suspect.** Task 8's Important finding was one the
+>      controller had spotted and deliberately withheld; pre-judging it would have cost the
+>      independent confirmation and the root cause (the fake ignored its context).
 >
-> **THE PATTERN TO DISTRUST:** twice in this plan a confident written explanation of *why something
-> is safe* was exactly backwards — Task 5's `break` comment (the mutex was the guard) and Task 7's
-> cleanup-order comment (`t.Cleanup` is LIFO, so registering earlier runs LATER, and a failing test
-> hung for the full 60s timeout). Both appeared in the source AND the report. Read every "this is
-> why it is safe" paragraph as a claim to falsify.
+> **THE PATTERN TO DISTRUST:** three times now a confident written explanation of *why something
+> is safe* was exactly backwards — Task 5's `break` comment (the mutex was the guard), Task 7's
+> cleanup-order comment (`t.Cleanup` is LIFO, so registering earlier runs LATER and the suite hung
+> for its full timeout), and Task 8's `Serve` godoc promising `nil` on disconnect while two of its
+> three phases returned a wrapped `context.Canceled`. Each appeared in the source AND the report.
+> Read every "this is why it is safe" paragraph as a claim to falsify.
 >
-> **Task 8's brief is extracted at `task-8-brief.md` but NOT yet pre-flighted.** Do that first.
+> **AND DISTRUST THE CONTROLLER'S OVERRIDES TOO.** Three implementer push-backs against my
+> instructions have now been right on the merits (Task 7's query reuse, and Task 8's single-funnel
+> shape and its `t.Cleanup` correction — the last settled by a counterfactual that printed
+> `panic: test timed out after 15s`). Ask for reasons, not compliance.
+>
+> ⚠️ **The editor's language server produced FALSE compile errors on this worktree twice**, at both
+> Task 8 shas. `go vet ./internal/realtime/...` exited 0 both times and the gate passed. Verify
+> with the compiler, never the diagnostics.
+>
+> **Task 9's brief is NOT yet extracted or pre-flighted.** Run
+> `scripts/task-brief <plan> 9`, then pre-flight it against the tree — that is the next
+> controller's first job, and on this plan pre-flight has found 6, 8, 11 and 13 defects on the last
+> four tasks.
 >
 > **Durability:** this directory is GITIGNORED. Mirrored to the tracked
 > `docs/superpowers/ledgers/2026-08-10-caesar-10-realtime-sse.md` (refresh with `cp` + commit at
 > each task boundary) and copied whole to `/Users/sofo/Projects/caesar/sdd-backups/plan10-latest/`
 > outside the repo. Verified byte-identical at this handoff.
+
+---
+
+> **SUPERSEDED — session 58's handoff said RESUME AT TASK 8, which is now done and gated.
+> Kept only for the carry-forward reasoning its index points at.**
 
 ---
 
@@ -684,6 +727,198 @@ BASE for the review package is **`2d4b288`**.
 
 Also corrected in the brief: plan Test 5's "assert via a counter" (made concrete as a registry
 check), and a note that `backend:test` already runs `-race` in the Taskfile recipe.
+
+Task 8: implemented at `9108992` (stream.go + stream_test.go, 949 lines, no other file touched).
+  **GATED BEFORE REVIEW on a confirmed-clean tree: `GATE PASS … 9108992`, 11 lanes resolved
+  unnarrowed, contracts clean.** Review in flight.
+Task 8: **PRE-FLIGHT FINDING 5 CONFIRMED BY MUTATION, and it is the one that mattered.** Under
+  mutation 1 (`Subscribe` moved after `prime`) the duplicate event STILL arrived exactly once via
+  `Replay` — so the plan's test 2, written as the plan sketched it, would have stayed green under
+  the very mutation the plan names as its acceptance evidence. Only the added `liveOnly` event
+  (delivered by no path but the hub) reddens it. **Second task running where the plan's stated
+  acceptance test proved nothing as written** — Task 7's would have passed under read-committed.
+Task 8: the implementer reports all 13 pre-flight findings held against the tree and nothing in
+  the brief was wrong; two clarifications only (report §6). It added 5 tests beyond the brief's 7,
+  one per otherwise-untested ruling: zero-config usable, non-flusher rejected before subscribing,
+  subscription closed on a write error, and the replay spin guard.
+Task 8: review at `9108992` — spec ✅ (all 13 pre-flight findings honoured, checked against the code
+  and not the report), quality "Needs fixes": 0 Critical, 1 Important, 4 Minor. **The reviewer ran
+  every probe through `go test -overlay` with copies in a scratch dir outside the repo, and left
+  `git status` empty — the Task 7 hazard did not repeat.** It also tried to falsify the pre-flight
+  block itself and could not, checking findings 11 and 12 against `internal/app/realtimeports.go`.
+Task 8: **THE IMPORTANT FINDING — `Serve`'s godoc was false for the entire prime/replay window.**
+  It promises "nil when ctx is done"; that held only inside `follow`. A disconnect during the
+  snapshot or the catch-up returned `snapshot: context canceled`. **Root cause is the fake:
+  `streamSource` ignores its context entirely, so no test in the file COULD exercise a cancelled
+  read — structurally invisible, not merely uncovered.** Third instance on this plan of a
+  confident doc/comment that the code did not keep.
+Task 8: **controller ruling — fix the CODE, not the doc.** Catch-up is expected to be long (the
+  source's own comment says a long replay can evict the subscriber), so a tab closed mid-catch-up
+  is ordinary, and the report's Task 10 carry-forward would have routed it to error level — the
+  exact outcome the ruling exists to prevent. Guard on `ctx.Err() != nil`, NOT
+  `errors.Is(err, context.Canceled)`: a source may translate the cancellation into its own error
+  class, and the question Serve asks is "is there still a client to serve?". Stated cost: a genuine
+  source failure racing a disconnect reports nil. Accepted — nobody is left to serve, and a real
+  outage shows on every other stream and in the tailer. **A write error is deliberately NOT
+  collapsed into this**; it can be a real fault.
+Task 8: **two Minors PROMOTED into the fix round, both demonstrated-green mutants.** (a) Finding
+  9's "no per-event `Flush()`" had no test at all — adding `st.wr.Flush()` to `send` left the whole
+  suite green. Promoted because of what it is a link in: Task 6 pinned the op-log
+  `["flush","write","flush"]` deliberately against an "over-pin" objection, so a future batching
+  change must renegotiate it — and the chain broke exactly here. (b)
+  `TestServe_RejectsANonFlusherWithoutSubscribing` runs on `context.Background()` outside the
+  cleanup guard, so a regression would HANG the package to its timeout instead of failing — the
+  Task 7 failure mode again. Renamed too: moving `NewWriter` after `Subscribe` leaves the suite
+  green, so the name claimed a pin it did not have (finding 10 is a preference, not an invariant,
+  as the brief itself says).
+Task 8: **`closeClientGone` RATIFIED** (controller + reviewer independently). Passing
+  `CloseShutdown` — "hub shut down" — on a closed browser tab would put a false statement in the
+  data, and `hub.go:11-14` designs for a new reason costing one const. **Carry-forward: when a
+  later task next opens `hub.go`, move it into that const block or leave a pointer** — `hub.go`
+  calls its own block "the canonical sentinels" and the set is now split across two files.
+Task 8: ⚠️ the review's three cannot-verify items, all resolved by the controller, none a gap.
+  (a) `config.Realtime`'s defaults/field names are unverifiable because the section arrives with
+  Task 11 — controller-verified against `task-11-config-section.patch` at pre-flight:
+  `HeartbeatInterval` 20s and `ReplayBatch` 500, names identical. **Task 11 should decide whether
+  the duplicated defaults get a compile-time tie-back or stay a comment.** (b) `-race -count=20`
+  and lint were not re-run by the reviewer by instruction; the 11-lane GATE PASS covers both lanes.
+  (c) The ambiguous `Filter` (neither selector set) opens a stream that writes nothing and
+  heartbeats forever — **Task 10 must reject it at the edge**; now a real obligation, not theory.
+Task 8: minor (deferred): error-string stutter — `snapshot: app: realtime snapshot: begin: …`;
+  the cursor value realtime adds is new information, the bare noun is not. Folded into fix round 1
+  as the lowest-priority item since it touches the same lines.
+Task 8: fix round 1/5 (4 addressed, 0 open — false ctx contract in prime/replay, untested
+  no-per-event-Flush guarantee, a test that hung rather than failed, error-string stutter;
+  commits `9108992`..`8f1a133`). 14 TestServe functions / 21 with subtests.
+Task 8: **GATED AT THE FIX SHA on a confirmed-clean tree: `GATE PASS … 8f1a133`, 11 lanes
+  resolved unnarrowed, contracts clean.** Gated twice — `9108992` before review, `8f1a133` after
+  the fix round. Scoped re-review of `9108992..8f1a133` dispatched afterwards, never during.
+Task 8: **BOTH OF THE IMPLEMENTER'S PUSHBACKS WERE RIGHT, AND ONE OF MY ITEMS WAS WRONG.**
+  (a) It used ONE translation point around all three phases instead of my two call-site guards.
+  Reason: two guards leave `follow` open, and that case is *correlated, not rare* — on a real
+  disconnect the cancelled ctx and the failing write are the SAME event, so `follow`'s select is a
+  coin-flip on writing a queued event to a dead socket and returning broken-pipe where the contract
+  promises nil. Strictly better than what I specified; also one funnel for the phase Task 9 adds.
+  **RATIFIED.** (b) **My item 3 was wrong**: `context.WithCancel` + `t.Cleanup(cancel)` does NOT
+  fix a hang when the call is synchronous — a blocked test function never reaches Cleanup, so the
+  package still dies on the suite timeout. It kept the cancellable ctx AND moved the call behind
+  `waitServe`; falsified rather than argued (a Flusher recorder now fails in 2.00s). **That is the
+  third controller override an implementer has correctly refused on this plan.**
+Task 8: **THE `ctx.Err()` RULING WAS LOAD-BEARING, NOT STYLISTIC — and the evidence is accidental.**
+  The replay mutant printed `stream replay from 1: streamSource: read aborted`: the fake reports a
+  cancelled read as its OWN error class, wrapping nothing. An `errors.Is(err, context.Canceled)`
+  guard would have left that half broken while looking fixed. Keep the "is there still a client to
+  serve?" framing over "which error did the source pick?".
+Task 8: **a mutant that FAILED as evidence, discarded honestly.** Closing the subscription at the
+  top of `deliver` reddened nine tests on the close-reason assertion without touching the ordering
+  property — so it proved nothing about what it claimed. Replaced with a faithful one that
+  reproduced round 1's exact result, confirming the refactor did not weaken the ordering pins.
+  **This is the standard: a mutant that reddens the wrong thing is not evidence.**
+Task 8: the finding-13 lint lane bit again, in a NEW way — revive's `context-as-argument` on a test
+  helper (ctx must come first). Invisible to gofumpt, `go build` and `go vet`. The trap is not only
+  goimports grouping: **only `backend:lint` sees this whole class.**
+Task 8: ⚠️ **the LSP produced FALSE compile errors twice, at both shas** — 10 `undefined: Streamer`
+  at `9108992`, then 6 argument-order errors at `8f1a133` (it held the old `startServeOn` signature
+  against the new call sites). Both times `go vet ./internal/realtime/...` exited 0 and the gate
+  passed. **Verify with the compiler, never the editor diagnostics, on this worktree.**
+
+Task 8: **complete (commits `e7053ca`..`8f1a133`, review clean after 1 fix round) and GATED:
+  `GATE PASS … 8f1a133`, 11 lanes resolved unnarrowed, on a confirmed-clean tree.**
+Task 8: **the re-review re-ran every mutation itself rather than reading the fix**, all through
+  `go test -overlay` from a scratch dir, leaving `git status` empty. Its decisive check was one
+  nobody asked for: substituting `errors.Is(err, context.Canceled)` for `ctx.Err() != nil` leaves
+  the snapshot subtest GREEN and reddens only the replay subtest — proving the fake's asymmetry is
+  real (`errAbortedRead` wraps nothing, `stream_test.go:72`) and that the `ctx.Err()` ruling is
+  load-bearing rather than stylistic. **An `errors.Is` implementation would have looked fixed.**
+Task 8: **the re-review ran the COUNTERFACTUAL on the controller's wrong instruction** — the same
+  regression against the pre-fix inline shape, keeping the cancellable ctx and `t.Cleanup`:
+  `panic: test timed out after 15s`. My item 3 alone would not have fixed the hang; moving the
+  call behind `waitServe` is what did. Settled by experiment, not by concession.
+Task 8: the single-funnel deviation was **ratified independently**, and the out-of-scope boundary
+  was verified rather than trusted: under an unconditional `return nil`,
+  `TestServe_ClosesTheSubscriptionOnAWriteError` reddens — so a write failure with the client
+  still connected is held to an error BY A TEST, not by a comment. The re-review also re-ran round
+  1's ordering mutation in the new shape: same three tests red, so the `deliver` funnel did not
+  weaken the ordering pin.
+Task 8: minor (deferred → **TASK 9 MUST READ THIS**): `TestServe_AddsNoFlushOfItsOwn` never
+  reaches the live path — its stream ends on a closed subscription channel, so **a `Flush()` added
+  only in `follow`'s event case survives** (verified green under that mutant). Task 9 edits
+  `follow` and adds a terminal frame that legitimately calls `Writer.Flush()`, so this is the one
+  deferred minor with a live consumer. Closing it costs one published event before `hub.Close()`
+  and `"write","flush"` appended to `want`.
+Task 8: minor (deferred): `stream replay from 1: app: realtime replay after 1: …` still repeats
+  the verb; keeping the cursor is contractually right, the verb is noise.
+Task 8: minor (deferred → Task 10): `Serve` returns nil rather than `CloseShutdown` when the
+  request ctx is cancelled at the same moment the hub closes. Correct per the godoc — **do not
+  build a shutdown-frame guarantee on the return value alone.**
+
+### Task 8 pre-flight (controller, 2026-08-11, session 59) — THIRTEEN findings, all in the brief
+
+Read against the tree at `e7053ca`/`ceadbaf` before dispatching. Recorded in full as a
+CONTROLLER PRE-FLIGHT block at the top of `task-8-brief.md` that overrides the plan text.
+BASE for the review package is **`e7053ca`**. Pre-flight has now found 6, 8, 11 and 13
+defects on the last four tasks.
+
+1. **`SnapshotWatermark` does not exist** — the plan's ordering list, test 1 and Step 5 all
+   name it. And "write the snapshot **frame**" (singular) is superseded by sofo's events
+   ruling: `Snapshot.Events` is up to 500 events ascending; write each as its own frame.
+2. **PLAN DEFECT — `realtime.Serve(ctx, w, req)` as a package-level function cannot work.**
+   No Hub, no EventSource, no `ReplayBatch`, no heartbeat interval. Plan Task 9 already
+   contradicts it ("the resolver is a `Serve` dependency", `cfg.GrantRecheck`). **Ruled:
+   `NewStreamer(hub, src, StreamerConfig{HeartbeatInterval, ReplayBatch}) *Streamer` with
+   `Serve` a method**, field names matching `config.Realtime` per the Task 11 patch.
+3. **`NewStreamer` must default a non-positive config** — `time.NewTicker(d)` PANICS for
+   `d <= 0`, and a non-positive `ReplayBatch` yields the empty page `ports.go:20-27` says a
+   pager cannot distinguish from "caught up". Same house pattern as `NewTailer`/`NewHub`/
+   `newRealtimeEventSource`.
+4. **The dedup floor must start at the CURSOR, not 0.** The plan's "highest id already
+   written" collapses on an empty `Snapshot.Events` or a caught-up resume. Floor is
+   `max(cursor, highest written)`, seeded from the watermark (or `LastEventID`). The
+   invariant to state: **ids on the wire are strictly ascending** — that is what makes
+   `Last-Event-ID` correct.
+5. ⚠️ **PLAN DEFECT, the important one — test 2 as sketched stays GREEN under Step 5's own
+   mutation.** Moving `Subscribe` after `Snapshot` causes LOSS, and loss is observable only
+   for an event whose *only* path is live; an event that also returns from `Snapshot` or
+   `Replay` still arrives exactly once under the mutant. Required design: TWO events, both
+   published from inside the fake's `Snapshot` (the only window the mutation crosses — a
+   publish inside `Replay` lands after `Subscribe` even when mutated): `dup` (returned by
+   `Replay`, asserts exactly-once) and `liveOnly` (returned by nothing, asserts present).
+   Three mutations required at Step 5, each with the test names it reddens.
+6. **Name collisions** — `stream_test.go` is `package realtime` and 24 identifiers are
+   already taken across the three existing test files. Listed in the brief. **`fakeSource`
+   must not be taught `Snapshot`/`Replay`/`Oldest`** — those are deliberate
+   `NotImplemented` stubs whose comment forbids exactly that; declare a new fake. REUSE
+   `eventually`, `registryLen`/`registryHas`, `hubEvent`, `patience`, `settle`.
+7. ⚠️ **`sseRecorder` is not concurrency-safe and Step 4 runs `-race -count=20`.** Task 6
+   had one goroutine; Task 8 has `Serve` writing while the test inspects. Guaranteed race.
+   Required: a mutex-guarded recorder in `stream_test.go`. Also recorded: a closed channel
+   still yields its buffered values, so `Publish(...)` then `hub.Close()` drives `Serve` to
+   completion deterministically without sleeping.
+8. `Serve` must `defer sub.Close(...)` on every return path (the one leak the hub cannot
+   prevent); `Err()` read only after `C()` closes; first close reason wins.
+9. Writer owns flushing AND idleness: no per-event `Flush()` (tested op-log), no last-write
+   tracking, plain ticker → `Heartbeat()`. Idle heartbeat lands in `[hb, 2*hb)` — must be
+   commented, since the next person to tighten a proxy timeout needs to meet that fact.
+10. **`NewWriter` first, then `Subscribe`** — it reads no events so nothing can be missed,
+    and it is the one error that precedes the committed 200. The invariant is `Subscribe`
+    strictly before `Snapshot`, which is what test 1 pins.
+11. Pager: always pass `cfg.ReplayBatch`; may rely on Task 7's "every predicate is in SQL";
+    must guard the spin (a non-empty page whose max id does not exceed the cursor).
+    A long replay evicting the subscriber is correct behaviour, not a bug.
+12. **`Oldest()` comparison is conservative by one** — lossless resume needs
+    `LastEventID+1 >= oldest`; the plan re-snapshots one boundary case unnecessarily.
+    **Ruled: the plan's form stands** (errs toward a duplicate, not a gap — same
+    degradation direction as Task 7's read order), documented as deliberate. Also
+    controller-verified: **nothing prunes `run_events`**, so the branch is unreachable in
+    production and only a fake exercises it.
+13. The goimports grouping trap, again.
+
+Two smaller rulings: `StreamRequest.UserID` is unused by Task 8 and stays, documented as
+Task 9's input; `Serve` returns **nil** on `ctx.Done()` (a disconnect is the normal end of
+an SSE request and Task 10 must not log every one as an error), `sub.Err()` on close, the
+write error on a write failure. One test ADDED beyond the plan's six:
+`TestServe_HeartbeatsWhileIdle` — nothing in the plan exercises Serve's ticker wiring, and
+a ticker never started would pass all six.
 
 ### RESOLVED — the Docker picture was misdiagnosed; the daemon was simply DOWN
 
