@@ -1,5 +1,89 @@
 # SDD ledger — plan: docs/superpowers/plans/2026-08-10-caesar-10-realtime-sse.md
 
+> **HANDOFF 2026-08-11 (session 58) — RESUME AT TASK 8.** This block supersedes the session-57
+> handoff below it, which is kept only for its Docker/gate notes.
+>
+> Worktree `/Users/sofo/Projects/caesar/repos/caesar/.claude/worktrees/caesar-10-realtime-sse`,
+> branch `caesar-10-realtime-sse`, HEAD **`4f41fce`** (last CODE commit **`ceadbaf`**), clean tree.
+> **Tasks 1-7 complete, reviewed and GATED; Tasks 8-12 untouched.** `main` untouched at `64de023`.
+> **Verify with `git log` before acting on any of this.**
+>
+> Gated shas, all 11 lanes unnarrowed: Task 3 `78a4346` · Task 4 `1ed903a` · Task 5 `8c4bfc1` ·
+> Task 6 `510d9bb` · Task 7 `ceadbaf`. A clean pass at the FINAL sha is still owed before merge.
+> **The `GATE PASS @ 0023257` in the log was discarded, not trusted** — see the process-hazard
+> section.
+>
+> **Tasks 5, 6 and 7 each took exactly one fix round** and each closed with every finding
+> demonstrated by a falsifying mutation, not asserted.
+>
+> **WHAT THE PLAN DOES NOT KNOW — the carry-forwards. Each is a `Task N:` line in the body below;
+> read them there for the reasoning, this is only the index.**
+>
+> **Task 8 (the splice) inherits the most:**
+>   1. `Serve` must NOT call `Flush()` per event — `WriteEvent` and `Heartbeat` flush themselves.
+>      This is a *tested* guarantee (op-log `["flush","write","flush"]`), upheld deliberately.
+>   2. The Writer owns idleness: just tick and call `Heartbeat()`. Do NOT track last-write or reset
+>      a ticker per event.
+>   3. `Snapshot` returns **events** (sofo's ruling), most recent 500, ascending, same shape for
+>      both stream kinds. The plan's "run projection" wording is SUPERSEDED.
+>   4. Pass `ReplayBatch` to `Replay` — a non-positive limit yields an empty page the pager cannot
+>      distinguish from "no more events".
+>   5. `Err()` is meaningful only AFTER `C()` has closed. A handler that returns without `Close` is
+>      the one leak the hub cannot prevent.
+>   6. Once headers are flushed the HTTP status is committed 200 forever — hence "403-shaped
+>      terminal **frame**", never a status code.
+>
+> **Task 9:** `CloseForbidden CloseReason = "…"` is the ENTIRE change (no error var, no mapping).
+> First reason wins on close. **And the plan's test 3 is wrong as written:** it says a resolver
+> error must "keep the last known scope and retry", but `ScopeFor` returns `ClassNotFound` for a
+> deleted user, which is not transient — keeping the last known scope would stream to a deleted
+> user forever. Task 9 must distinguish the two.
+>
+> **Task 10:** reflect `realtime.StreamFrame` — do NOT declare a parallel DTO. Its five fields and
+> the deliberate absence of `project_id`/`correlation_id` are in the Task 6 block below.
+>
+> **Task 11:** shutdown order is **cancel tailer → WAIT for `Run` to return → `Hub.Close()` →
+> `srv.Shutdown`** (the plan omits the wait). `Tailer.Run` can return an error BEFORE it loops —
+> treat that as failed startup. Apply `task-11-config-section.patch` from this directory; its brief
+> does not mention it. `config.Realtime.SubscriberQueue` → `HubConfig.SubscriberQueue`.
+>
+> **Task 12:** docs step's "config knobs from Task 2" means Task 11. For the load test: none of the
+> realtime query plans use the run/project indexes — `ORDER BY id … LIMIT n` makes the pkey
+> cheapest and those predicates become filters. That is the shape to measure.
+>
+> **NEVER add an `id <= watermark` predicate** to the snapshot's events query. It would make the
+> isolation level irrelevant and silently un-falsify the acceptance test. Only a comment guards it.
+>
+> **METHOD — the four things that earned their keep this session:**
+>   1. **Pre-flight every brief against the real source before dispatching.** Task 5 found 6 defects,
+>      Task 6 found 8 (two of them decisions the plan never made), Task 7 found 11. The plan's own
+>      `Publish` sketch panicked; the plan's acceptance test for Task 7 was unfalsifiable.
+>   2. **Demand a demonstrated mutation, never an assertion**, for any test-shaped finding. Every
+>      Important finding this session was found by mutation and invisible to reading.
+>   3. **Name `go test -overlay` as the mechanism in review dispatches** and forbid codegen
+>      explicitly. A prohibition without a mechanism gets the obvious method — a reviewer edited the
+>      repo mid-gate. **Never gate while a reviewer is working the worktree.**
+>   4. **Give every subagent a named report FILE as its deliverable.** Chat replies arrive late,
+>      out of order, or not at all; one report file was written seconds after the idle notification.
+>
+> **THE PATTERN TO DISTRUST:** twice in this plan a confident written explanation of *why something
+> is safe* was exactly backwards — Task 5's `break` comment (the mutex was the guard) and Task 7's
+> cleanup-order comment (`t.Cleanup` is LIFO, so registering earlier runs LATER, and a failing test
+> hung for the full 60s timeout). Both appeared in the source AND the report. Read every "this is
+> why it is safe" paragraph as a claim to falsify.
+>
+> **Task 8's brief is extracted at `task-8-brief.md` but NOT yet pre-flighted.** Do that first.
+>
+> **Durability:** this directory is GITIGNORED. Mirrored to the tracked
+> `docs/superpowers/ledgers/2026-08-10-caesar-10-realtime-sse.md` (refresh with `cp` + commit at
+> each task boundary) and copied whole to `/Users/sofo/Projects/caesar/sdd-backups/plan10-latest/`
+> outside the repo. Verified byte-identical at this handoff.
+
+---
+
+> **SUPERSEDED — session 57's handoff. Resume instructions here are STALE (it says Task 5).
+> Kept only for the Docker/gate operational notes.**
+>
 > **HANDOFF 2026-08-11 (session 57) — RESUME AT TASK 5.**
 >
 > Worktree `/Users/sofo/Projects/caesar/repos/caesar/.claude/worktrees/caesar-10-realtime-sse`,
