@@ -1,15 +1,41 @@
 # SDD ledger — plan: docs/superpowers/plans/2026-08-10-caesar-10-realtime-sse.md
 
-> **HANDOFF 2026-08-11 (session 57) — RESUME AT TASK 4.**
+> **HANDOFF 2026-08-11 (session 57) — RESUME AT TASK 5.**
 >
 > Worktree `/Users/sofo/Projects/caesar/repos/caesar/.claude/worktrees/caesar-10-realtime-sse`,
-> branch `caesar-10-realtime-sse`, clean tree. Tasks 1-3 complete and reviewed;
-> Tasks 4-12 untouched. **Verify with `git log` before acting on any of this.**
+> branch `caesar-10-realtime-sse`, HEAD **`1ed903a`**, clean tree. Tasks 1-4 complete,
+> reviewed and GATED; Tasks 5-12 untouched. `main` is untouched at `64de023`.
+> **Verify with `git log` before acting on any of this.**
 >
-> **Task 3 is done and GATED: `78a4346`, review clean on the first pass, and
-> `GATE PASS … 78a4346 (11 lanes resolved unnarrowed)`.** The Docker item below is
-> RESOLVED — see the section on it; the daemon had simply been down, and Docker Hub
-> is intermittent rather than dead.
+> - Task 3 `78a4346` — `NOTIFY caesar_run_events` in the writer's tx. Review clean first pass.
+>   `GATE PASS @ 78a4346`, 11 lanes unnarrowed.
+> - Task 4 `1ed903a` — the tailer, plus the ruled `Snapshot` port rename and `Head`.
+>   Clean after 1 fix round. `GATE PASS @ 1ed903a`, 11 lanes unnarrowed.
+>
+> **SOFO'S `Snapshot` RULING IS IMPLEMENTED AND CLOSED** — landed in Task 4, verified
+> zero remaining `SnapshotWatermark` references tree-wide. Nothing to carry.
+>
+> **The three things the plan still does not know:**
+>   1. **Task 5's hub `sink` MUST be non-blocking** — the tailer depends on it by contract
+>      and deliberately does not enforce it. A blocking sink stalls the single per-process
+>      tailer and therefore every subscriber.
+>   2. **Task 7's `Since` MUST be `ORDER BY id LIMIT limit`** — now written into `ports.go`,
+>      and load-bearing: the cursor advances to the highest id handed over, so a source that
+>      skips lower ids before truncating strands them permanently. Task 7 also cannot use
+>      `pg.WithTx` (no `TxOptions`, cannot open repeatable-read) — use `pool.BeginTx`.
+>   3. **Task 11 must apply `task-11-config-section.patch`** from this directory; its brief
+>      does not mention it. And Task 12's docs step says "config knobs from Task 2" — that
+>      is now Task 11.
+>
+> **The Docker/gate blocker from the last handoff is RESOLVED** — see the section below.
+> Both gates this session passed all 11 lanes. On an `image:build` registry timeout, just
+> retry: Docker Hub is intermittent, not down.
+>
+> **Method note that earned its keep:** pre-flighting each brief against the real source
+> before dispatch found 4 plan defects in Task 3 and 6 in Task 4 — including one that would
+> have silently destroyed 229 lines of existing tests. That is 10 defects in 2 tasks, on top
+> of the 2-in-2 the previous session found. **Do not dispatch a brief you have not read
+> against the tree.**
 >
 > **SOFO RULED the one open question** — `SnapshotWatermark` becomes `Snapshot` returning
 > both halves from one call. See the RULING block below. It is NOT open; do not re-ask it.
@@ -222,6 +248,52 @@ Task 3: minor (deferred): `events_integration_test.go:262-275` — the commit ha
 Task 3: minor (deferred): the whole-package integration evidence is a package-level `ok` line
   without `-v`, so "the 3 pre-existing tests still pass" rests on that rather than per-test
   output. Acceptable; noted.
+
+Task 4: fix round 1/5 (2 addressed, 0 open — untestable multi-batch drain loop, and a sort
+  comment claiming a gap defence that was false in the truncation case; commit 0ea1a74,
+  amended to 1ed903a)
+Task 4: complete (commits eacbf5c..1ed903a, review clean after 1 fix round) and **GATED:
+  `GATE PASS … 1ed903a`, 11 lanes resolved unnarrowed.**
+Task 4: ⚠️ **the gate caught what four review passes did not** — `0ea1a74` failed
+  `backend:lint` on a goimports **grouping** violation for the `xerrors` import added during
+  the fix round (`tailer_test.go:14`). Note `backend:fmt:check` (gofumpt) passed; only
+  golangci-lint's goimports catches import grouping. Amended to `1ed903a`. **Lesson: gofumpt
+  clean ≠ lint clean; neither an implementer's local run nor a reviewer reading a diff sees
+  this — only the gate does.**
+Task 4: **THE `Snapshot` PORT RENAME IS LANDED.** `EventSource.SnapshotWatermark` is gone;
+  `Snapshot(ctx, Filter) (Snapshot, error)` returns `Snapshot{Events []Event; Watermark
+  Watermark}`. `Head(ctx) (int64, error)` added for the tailer's startup cursor. Controller
+  verified `grep -rn SnapshotWatermark` returns ZERO hits tree-wide. Sofo's ruling is DONE —
+  Task 7 implements this shape; Task 8 calls `Snapshot` once and uses `.Watermark` as its
+  replay cursor.
+Task 4: **CARRY-FORWARD TO TASK 7 — `Since` MUST be `ORDER BY id LIMIT limit`**, never a
+  truncation of some other order. This is now written into `ports.go`'s doc, and it is not
+  stylistic: the tailer advances its cursor to the highest id handed over, so a source that
+  skips lower ids before truncating strands them PERMANENTLY, and the tailer's sort cannot
+  recover them (it runs after truncation, so it raises the cursor to max(batch)). The review
+  caught the original comment asserting the exact opposite.
+Task 4: **CARRY-FORWARD TO TASK 5 — the hub's `sink` MUST be non-blocking.** The tailer
+  documents the dependency and deliberately does not enforce it; a blocking sink stalls the
+  single per-process tailer and therefore every subscriber.
+Task 4: ⚠️ resolved by controller — the reviewer's four "cannot verify from diff" items. Two I
+  checked directly: `SnapshotWatermark` has zero remaining references, and
+  `xerrors.NotImplemented(what string) error` matches the fake's usage. The other two are the
+  Task 7 `ORDER BY id` and Task 5 non-blocking-sink carry-forwards recorded above. No gaps.
+Task 4: controller ruling (the review asked for it): **the `NewTailer` defaults stay**
+  (`tailer.go:14-21`, `:60-66`). They are beyond the brief, but they close two silent-deadlock
+  modes — a zero `PollFallback` is a hot loop, a zero `Batch` never advances — and that is
+  worth more than strict brief-minimalism.
+Task 4: minor (deferred): one `Warn` per poll interval while the LISTEN connection is down
+  (~1800 identical lines/hour at the 2s default) for a condition the poll fallback is already
+  handling. First occurrence at `Warn`, subsequent at `Debug` until a `Wait` succeeds.
+Task 4: minor (deferred): the fatal `Head`-error path (`tailer.go:83-86`) and the non-deadline
+  waker-error path (`tailer.go:141-144`) are untested — the fake never errors on either. The
+  seed-failure path is the one Task 11 is told to depend on.
+Task 4: minor (deferred): `tailer.go` sorts the source's slice in place and hands that same
+  slice to `sink`. Safe for a fresh pgx result set, hostile to any future cached/pooled slice;
+  nothing documents that the hub must not retain-and-mutate it.
+Task 4: minor (deferred): `NewTailer` does not guard a nil `*slog.Logger`; it would panic only
+  on the two error paths, so the happy path hides the mistake until the first DB blip.
 
 ### Task 3 pre-flight (controller, 2026-08-11, session 57) — FOUR plan defects, all corrected in the brief
 
