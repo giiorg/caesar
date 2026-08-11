@@ -18,7 +18,11 @@
 > **The three things the plan still does not know:**
 >   1. **Task 5's hub `sink` MUST be non-blocking** — the tailer depends on it by contract
 >      and deliberately does not enforce it. A blocking sink stalls the single per-process
->      tailer and therefore every subscriber.
+>      tailer and therefore every subscriber. **Also: Task 5's test CANNOT redeclare
+>      `collector`, `eventually`, `logBuf`, `newLogger`, `assertQuiet`, `settle`, `patience`,
+>      `startTailer`, `fakeSource`, `fakeWaker`** — `tailer_test.go` is `package realtime` and
+>      owns them all. And any test that adds events after starting a tailer must use the
+>      `seeded` channel, not a sleep. See the Task 4 carry-forward lines below.
 >   2. **Task 7's `Since` MUST be `ORDER BY id LIMIT limit`** — now written into `ports.go`,
 >      and load-bearing: the cursor advances to the highest id handed over, so a source that
 >      skips lower ids before truncating strands them permanently. Task 7 also cannot use
@@ -294,6 +298,37 @@ Task 4: minor (deferred): `tailer.go` sorts the source's slice in place and hand
   nothing documents that the hub must not retain-and-mutate it.
 Task 4: minor (deferred): `NewTailer` does not guard a nil `*slog.Logger`; it would panic only
   on the two error paths, so the happy path hides the mistake until the first DB blip.
+Task 4: ⚠️ **CARRY-FORWARD TO TASK 5 — THE HUB TEST WILL NOT COMPILE IF IT REDECLARES THESE.**
+  `tailer_test.go` is `package realtime` (internal), and already owns at package scope:
+  `collector`, `eventually`, `logBuf`, `newLogger`, `assertQuiet`, `settle`, `patience`,
+  `neverPolls`, `pollingCfg`, `startTailer`, `fakeSource`/`newSource`, `fakeWaker`. Task 5's
+  hub test must **reuse** them, not redeclare them. Put this in Task 5's dispatch.
+Task 4: ⚠️ **CARRY-FORWARD TO TASK 5 — the "adds racing the tailer's startup `Head` read"
+  trap.** The implementer's first green run had three failures caused by a real bug *in the
+  tests*: events added after `Run` starts can land before or after the one-time `Head` seed,
+  so the test is non-deterministic. Fixed with a `seeded` channel the fake closes after the
+  `Head` read. **Any future test in this package that adds events after starting a tailer has
+  the same race** — reuse that channel rather than sleeping.
+Task 4: ⚠️ **CARRY-FORWARD TO TASK 11 — `Tailer.Run` can return an error BEFORE it loops.**
+  A `Head` failure at startup is deliberately fatal (`seed tailer cursor: %w`) rather than
+  retried: falling back to cursor 0 would replay history (design constraint 1) and a silent
+  retry would let the process report healthy while realtime is dead. Task 11 must treat that
+  return as failed startup, not as a background goroutine exiting.
+Task 4: ⚠️ **CARRY-FORWARD TO EVERY REMAINING TASK (5-12) — the goimports grouping trap.**
+  Root cause of the gate failure at `0ea1a74`, found by the implementer: `.golangci.yml` sets
+  `local-prefixes: github.com/giiorg/caesar/backend`, so **caesar imports need their own third
+  group**, after stdlib and third-party. gofumpt does not check grouping, so
+  `backend:fmt:check`, `go build` and `go vet` all pass while `backend:lint` fails. **Every
+  remaining task creates fresh files that import caesar packages** — expect this, and run
+  `bin/golangci-lint run ./internal/<pkg>/...` before claiming done.
+Task 4: controller ruling — the implementer asked whether the sort comment should name "Task 7"
+  literally, having written "the ORDER BY id in the EventSource implementation" instead.
+  **Its wording stands.** A plan task number baked into a permanent source comment goes stale
+  the moment Plan 10 ships; the substance (which component guarantees the ordering) is what
+  the comment needed to carry. The re-review reached the same conclusion independently.
+Task 4: the implementer killed **three** mutants on the first pass, not the two required — the
+  extra one dropped the sort and reddened `DeliversInIDOrder`, showing both the mis-ordering
+  and the cursor stranded at 11. Mutant 4 came in the fix round.
 
 ### Task 3 pre-flight (controller, 2026-08-11, session 57) — FOUR plan defects, all corrected in the brief
 
