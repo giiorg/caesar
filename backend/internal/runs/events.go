@@ -90,5 +90,14 @@ func appendEvents(ctx context.Context, tx pgx.Tx, now time.Time, evs []Event) er
 			return fmt.Errorf("runs: insert outbox: %w", err)
 		}
 	}
+	// Wake any tailer. Inside a tx, NOTIFY is delivered on COMMIT and
+	// dropped on rollback, so a listener is only ever woken for events
+	// that exist. The payload is empty on purpose: LISTEN/NOTIFY is a
+	// wake-up signal and never the data (locked decision §2) — the tailer
+	// re-reads from its own cursor and a lost notification costs latency,
+	// never correctness.
+	if _, err := tx.Exec(ctx, `NOTIFY caesar_run_events`); err != nil {
+		return fmt.Errorf("runs: notify run events: %w", err)
+	}
 	return nil
 }
