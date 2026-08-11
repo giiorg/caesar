@@ -114,9 +114,14 @@ func (t *Tailer) drain(ctx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
-		// Since is contractually oldest-first; sorting is a cheap guard so
-		// that a source breaking that contract delivers out of order rather
-		// than silently skipping past unread ids.
+		// Normalise the order the hub sees. This is delivery order ONLY and
+		// is NOT a defence against a source that violates Since's
+		// oldest-first contract: it runs after the source already truncated
+		// at limit, so sorting a [22 21 11] read moves the cursor to 22 and
+		// strands 12..20 forever, where leaving it alone would have stopped
+		// at 11 and recovered them on the next pass. What actually makes the
+		// advance gapless is the ORDER BY id in the EventSource
+		// implementation.
 		slices.SortFunc(batch, func(a, b Event) int { return cmp.Compare(a.ID, b.ID) })
 		t.sink(batch)
 		// Only to the highest id actually handed over.

@@ -21,6 +21,13 @@ type EventSource interface {
 
 	// Since returns every event with id > after regardless of filter, for
 	// the tailer's cursor advance. Filtering is per-subscriber.
+	//
+	// It MUST return rows oldest first, at most limit of them — ORDER BY id
+	// LIMIT limit, never a truncation of some other order. That ordering is
+	// what makes the cursor advance gapless: the tailer moves its cursor to
+	// the highest id it was handed, so a source that skipped lower ids and
+	// then truncated at limit would strand them permanently. Sorting the
+	// batch afterwards cannot recover them; only the query's order can.
 	Since(ctx context.Context, after int64, limit int) ([]Event, error)
 
 	// Oldest is the lowest retained event id, used to decide whether a

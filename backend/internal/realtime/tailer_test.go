@@ -11,9 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
+
+	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
 
 const (
@@ -31,7 +32,19 @@ const (
 	// generous on purpose: these tests assert which ids arrive and by what
 	// mechanism, never how fast a loaded CI box gets there.
 	patience = 2 * time.Second
+
+	// neverPolls is a fallback interval no test will ever reach. A tailer
+	// configured with it delivers only on a wake-up, so every id that
+	// arrives is attributable to one drain pass rather than to a later tick.
+	neverPolls = time.Hour
 )
+
+// pollingCfg is what every test but the burst one runs at: a short fallback
+// so the poll path resolves in milliseconds, and a batch far larger than any
+// event count here so one read drains everything.
+func pollingCfg() TailerConfig {
+	return TailerConfig{PollFallback: testPoll, Batch: 100}
+}
 
 // fakeSource is a hand-written EventSource over an in-memory slice. It holds
 // events in the order they were added rather than by id, which is what lets
@@ -175,6 +188,14 @@ func (c *collector) ids() []int64 {
 	return out
 }
 
+// batchCount is how many times the sink was called. It is what separates
+// "everything arrived" from "everything arrived in one read".
+func (c *collector) batchCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.batches)
+}
+
 // logBuf captures the tailer's output so a test can assert a fault was
 // reported, and so nothing leaks into the test run's own output.
 type logBuf struct {
@@ -228,12 +249,12 @@ func eventually(t *testing.T, cond func() bool, what string) {
 //
 // Cleanup cancels and waits, so every test here also asserts that its tailer
 // shuts down.
-func startTailer(t *testing.T, src *fakeSource, w *fakeWaker, sink func([]Event), log *slog.Logger) (context.CancelFunc, <-chan error) {
+func startTailer(t *testing.T, src *fakeSource, w *fakeWaker, sink func([]Event), cfg TailerConfig, log *slog.Logger) (context.CancelFunc, <-chan error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
 	stopped := make(chan struct{})
-	tailer := NewTailer(src, w, sink, TailerConfig{PollFallback: testPoll, Batch: 100}, log)
+	tailer := NewTailer(src, w, sink, cfg, log)
 	go func() {
 		defer close(stopped)
 		errc <- tailer.Run(ctx)
@@ -261,7 +282,7 @@ func TestTailer_StartsAtHead(t *testing.T) {
 	t.Parallel()
 	src := newSource(1, 2, 3, 4, 5)
 	w, c, lb := newWaker(), &collector{}, &logBuf{}
-	startTailer(t, src, w, c.sink, newLogger(lb))
+	startTailer(t, src, w, c.sink, pollingCfg(), newLogger(lb))
 
 	// Several poll intervals, plus a wake-up to remove any doubt that the
 	// tailer looked: a cursor seeded at 0 would have replayed 1..5 by now.
@@ -286,7 +307,7 @@ func TestTailer_DeliversInIDOrder(t *testing.T) {
 	t.Parallel()
 	src := newSource(10)
 	w, c, lb := newWaker(), &collector{}, &logBuf{}
-	startTailer(t, src, w, c.sink, newLogger(lb))
+	startTailer(t, src, w, c.sink, pollingCfg(), newLogger(lb))
 
 	// Deliberately not ascending, and deliberately not ending on the
 	// highest id: a cursor taken from the last row read rather than from
@@ -310,6 +331,40 @@ func TestTailer_DeliversInIDOrder(t *testing.T) {
 	assertQuiet(t, lb)
 }
 
+// A burst larger than Batch must drain within a single wake-up. If drain
+// read only once per tick, a backlog would trickle out one batch per
+// PollFallback — 2s each at the default — with nothing logged to say why the
+// stream was falling behind.
+//
+// The tailer here polls only once an hour, so the poll path cannot rescue a
+// partial drain: every id below arrived because one drain pass kept reading.
+func TestTailer_DrainsBurstLargerThanBatch(t *testing.T) {
+	t.Parallel()
+	src := newSource(1)
+	w, c, lb := newWaker(), &collector{}, &logBuf{}
+	startTailer(t, src, w, c.sink, TailerConfig{PollFallback: neverPolls, Batch: 2}, newLogger(lb))
+
+	// One atomic add: all five are visible to whichever read comes next, so
+	// nothing here depends on the burst being sliced up by arrival timing.
+	src.add(2, 3, 4, 5, 6)
+	w.wake()
+	eventually(t, func() bool { return len(c.ids()) >= 5 }, "the whole burst")
+	time.Sleep(settle)
+
+	// In order, and each exactly once — a cursor advanced per batch must not
+	// re-read what it already delivered.
+	if diff := cmp.Diff([]int64{2, 3, 4, 5, 6}, c.ids()); diff != "" {
+		t.Errorf("delivered ids (-want +got):\n%s", diff)
+	}
+	// Five events at Batch 2 is 3 reads. The count is what proves the batch
+	// limit was real and the loop is what got past it, rather than one
+	// oversized read making the whole test vacuous.
+	if got := c.batchCount(); got < 2 {
+		t.Errorf("sink called %d time(s); want the burst split across several batches", got)
+	}
+	assertQuiet(t, lb)
+}
+
 // LISTEN/NOTIFY is at-most-once and non-durable, so a dropped notification
 // must cost latency and never an event. This waker is never signalled: the
 // delivery below can only have come from the poll fallback.
@@ -317,7 +372,7 @@ func TestTailer_PollsWithoutNotification(t *testing.T) {
 	t.Parallel()
 	src := newSource(1)
 	w, c, lb := newWaker(), &collector{}, &logBuf{}
-	startTailer(t, src, w, c.sink, newLogger(lb))
+	startTailer(t, src, w, c.sink, pollingCfg(), newLogger(lb))
 
 	src.add(2)
 	eventually(t, func() bool { return len(c.ids()) > 0 }, "id 2 to arrive without any notification")
@@ -334,7 +389,7 @@ func TestTailer_SurvivesSourceError(t *testing.T) {
 	src := newSource(1)
 	src.failSinceOnce(errors.New("connection reset by peer"))
 	w, c, lb := newWaker(), &collector{}, &logBuf{}
-	_, errc := startTailer(t, src, w, c.sink, newLogger(lb))
+	_, errc := startTailer(t, src, w, c.sink, pollingCfg(), newLogger(lb))
 
 	src.add(2)
 	eventually(t, func() bool { return len(c.ids()) > 0 }, "id 2 after a failed Since")
@@ -360,7 +415,7 @@ func TestTailer_StopsOnContextCancel(t *testing.T) {
 	t.Parallel()
 	src := newSource(1)
 	w, c, lb := newWaker(), &collector{}, &logBuf{}
-	cancel, errc := startTailer(t, src, w, c.sink, newLogger(lb))
+	cancel, errc := startTailer(t, src, w, c.sink, pollingCfg(), newLogger(lb))
 
 	cancel()
 	select {
