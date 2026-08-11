@@ -423,6 +423,63 @@ Task 5: minor (deferred → Task 11): eviction is invisible to operators. A clie
   stream to a full queue is the signal that a queue is mistuned or a client is pathological,
   and only the client that lost the stream can currently observe it.
 
+Task 6: fix round 1/5 (3 addressed, 0 open — untested `Heartbeat` flush, unpinned `WriteEvent`
+  idle-reset, undocumented raw-`Kind` interpolation; commits `2b23b4d`..`510d9bb`)
+Task 6: complete (commits c3c6fe5..510d9bb, review clean after 1 fix round) and **GATED:
+  `GATE PASS … 510d9bb`, 11 lanes resolved unnarrowed.** Gated twice, at `2b23b4d` and the fix sha.
+Task 6: **THE `StreamFrame` CONTRACT — TASK 10 REFLECTS THIS TYPE, DO NOT REDECLARE IT.** Defined
+  in `realtime/sse.go` (controller ruling: defined here, not in Task 10, so the documented
+  contract and the wire bytes cannot drift):
+  `ID int64 json:"id"` · `RunID uuid.UUID json:"run_id"` · `Kind string json:"kind"` ·
+  `Payload map[string]any json:"payload"` (renders `null` for a nil map — document as a nullable
+  object) · `OccurredAt time.Time json:"occurred_at"` (RFC 3339). **`project_id` and
+  `correlation_id` are deliberately ABSENT** — project scope is an authorization internal, not
+  client data — and `TestWriter_FrameShape`'s exact-bytes assertion proves they never reach the
+  wire. Task 10's `Response: StreamFrame{}` is `realtime.StreamFrame`.
+Task 6: **CARRY-FORWARD TO TASKS 8/9 — `WriteEvent` and `Heartbeat` FLUSH THEMSELVES.** `Serve`
+  must NOT call `Flush()` per event; `Flush()` exists only for direct writes to the underlying
+  `ResponseWriter` (Task 9's terminal frame). This is a *tested* guarantee, not a note — the
+  op-log assertion `["flush","write","flush"]` pins it, and it was deliberately upheld against
+  the "over-pin" objection precisely so a future batching change has to renegotiate it explicitly.
+Task 6: **CARRY-FORWARD TO TASK 8 — the Writer owns idleness** (controller ruling 1: the plan's
+  `hb` and `clock` parameters were otherwise dead). `Heartbeat()` writes `: hb\n\n` **only when
+  `clock().Sub(lastWrite) >= hb`** and is a nil-returning no-op otherwise; `lastWrite` is reset by
+  connect, by every `WriteEvent`, and by every heartbeat that actually writes. So Serve just ticks
+  and calls `Heartbeat()` — it must NOT track last-write itself or reset a ticker per event.
+Task 6: **CARRY-FORWARD TO TASKS 9/10 — once `NewWriter` flushes the headers the HTTP status is
+  committed (200) forever.** No later failure on that stream can become an HTTP error response.
+  That is intended and it is *why* the plan says "403-shaped terminal **frame**" rather than a 403
+  status. Documented in the source so the next reader meets it there.
+Task 6: the Writer belongs to a **single goroutine** (Serve's loop) by documented contract and has
+  no mutex — adding one would imply a sharing model that does not exist.
+Task 6: `e.Kind` is interpolated raw into the `event:` line. **Ruling: documented, NOT sanitized.**
+  Kinds are server-controlled constants (`runs/events.go`), never client input; a newline-bearing
+  kind would inject arbitrary SSE fields, so any future path routing user-supplied kinds must
+  sanitize upstream. A codec that silently rewrote a kind would be a worse failure than an
+  obviously bad constant.
+Task 6: the review's Important finding was demonstrated, not asserted — deleting `Heartbeat`'s
+  `Flush()` left all five tests green, meaning the comment would sit in the `bufio` buffer and the
+  idle tunnel would die silently. Both reviewer and implementer re-ran it after the fix.
+Task 6: no deferred minors — all three findings were closed in the fix round.
+
+### RULED BY SOFO 2026-08-11 — what `Snapshot.Events` contains (the other half of the Snapshot ruling)
+
+The original `Snapshot` ruling left this open in its own comment: `Events []Event // or the run
+projection`. The plan text (Task 7) says "read the run's **current projection**"; the V1 spec
+(§4) says "snapshot-then-deltas **over run_events**" and "every snapshot carries the event-id
+high-watermark it was computed at"; the ruled type says `Events []Event`. Two of three said
+events. **RULING: events, bounded.**
+
+`Snapshot(ctx, f)` returns **the events matching `f`, most recent N, ascending by id**, together
+with the watermark — the SAME shape for both stream kinds. N defaults to 500 and is a field on
+the `internal/app` adapter, wired from `config.Realtime.ReplayBatch` later; Task 7 does not read
+config. Task 8 writes each returned event as a frame.
+
+**Rejected:** per-run returning the whole unbounded history (a pathological run bursts the
+client's first frame batch), and per-run returning a run projection while attention returns
+events (two structurally different shapes for Task 8 to splice, and the ruled `Snapshot` type
+would have had to change). The plan's "projection" wording is **superseded** — do not restore it.
+
 ### Task 5 pre-flight (controller, 2026-08-11, session 58) — SIX findings, all in the brief
 
 Read against the tree at `1ed903a`/`2d4b288` before dispatching. Recorded in full as a
