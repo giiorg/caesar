@@ -17,6 +17,14 @@ type EventSource interface {
 	// Replay returns events with id > after that match f, oldest first,
 	// at most limit rows. It is the catch-up path for both the initial
 	// splice and Last-Event-ID resume.
+	//
+	// limit MUST be positive. A non-positive limit yields an empty page,
+	// which a pager cannot tell apart from "no more events" — it would read
+	// as a caught-up stream while events are still waiting. That is a
+	// programming error, not a mode: it is not defaulted to a batch size,
+	// because inventing a page nobody asked for hides the bug instead of
+	// stopping it. Callers take the limit from configuration, which is
+	// validated positive.
 	Replay(ctx context.Context, f Filter, after int64, limit int) ([]Event, error)
 
 	// Since returns every event with id > after regardless of filter, for

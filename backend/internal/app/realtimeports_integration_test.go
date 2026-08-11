@@ -173,14 +173,8 @@ type queryGate struct {
 	releaseOnce sync.Once
 }
 
-func newQueryGate(t *testing.T, name string) *queryGate {
-	t.Helper()
-	g := &queryGate{name: name, reached: make(chan struct{}), release: make(chan struct{})}
-	// Registered before the gate can ever block: a test that fails while a
-	// query is held would otherwise leave a goroutine parked on a pooled
-	// connection and hang pgxpool.Close.
-	t.Cleanup(g.Release)
-	return g
+func newQueryGate(name string) *queryGate {
+	return &queryGate{name: name, reached: make(chan struct{}), release: make(chan struct{})}
 }
 
 func (g *queryGate) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
@@ -227,6 +221,13 @@ func gatedPool(ctx context.Context, t *testing.T, url string, gate *queryGate) *
 		t.Fatalf("gated pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	// Registered AFTER pool.Close, because cleanups run LIFO and this one has
+	// to run FIRST. A test that fails inside the gate window leaves the gated
+	// goroutine parked in TraceQueryStart holding a pooled connection, and
+	// puddle.Pool.Close waits on a WaitGroup for exactly that connection — so
+	// closing before releasing deadlocks the whole run into the test binary's
+	// timeout panic instead of reporting the failure.
+	t.Cleanup(gate.Release)
 	return pool
 }
 
@@ -261,7 +262,7 @@ func TestSnapshot_IsGaplessUnderConcurrentCommit(t *testing.T) {
 		log.append(ctx, t, run, kind)
 	}
 
-	gate := newQueryGate(t, "ListRecentRunEvents")
+	gate := newQueryGate("ListRecentRunEvents")
 	src := newRealtimeEventSource(gatedPool(ctx, t, url, gate), 500)
 	f := realtime.Filter{RunID: &run.runID, Scope: realtime.Scope{Projects: []uuid.UUID{run.projectID}}}
 
@@ -510,6 +511,36 @@ func TestRunStream_IsScopedAndCarriesTheMostRecentEvents(t *testing.T) {
 	}
 	if got := eventIDs(replayed); got != nil {
 		t.Errorf("replay for an ungranted project = %v, want none", got)
+	}
+
+	// RunID WINS over Attention. Matches states the precedence and both
+	// dispatch switches in the adapter reproduce it by case ORDER, which
+	// nothing else would catch: reorder either switch and this filter would
+	// be served as a global stream by the snapshot or the replay while the
+	// live path still treats it as a per-run one. The events are seeded so
+	// the two answers differ — event 6 is attention-worthy, on a project this
+	// scope grants, and belongs to a DIFFERENT run.
+	both := realtime.Filter{
+		RunID: &runA.runID, Attention: true,
+		Scope: realtime.Scope{Projects: []uuid.UUID{runA.projectID, runB.projectID}},
+	}
+	wantBoth := log.matches(both)
+	if diff := cmp.Diff([]int64{1, 2, 3, 4, 5}, wantBoth); diff != "" {
+		t.Fatalf("fixture bug: Filter.Matches does not give RunID precedence (-want +got):\n%s", diff)
+	}
+	replayed, err = src.Replay(ctx, both, 0, 100)
+	if err != nil {
+		t.Fatalf("Replay with both selectors: %v", err)
+	}
+	if diff := cmp.Diff(wantBoth, eventIDs(replayed)); diff != "" {
+		t.Errorf("replay with both selectors vs Filter.Matches (-want +got):\n%s", diff)
+	}
+	snap, err = src.Snapshot(ctx, both)
+	if err != nil {
+		t.Fatalf("Snapshot with both selectors: %v", err)
+	}
+	if diff := cmp.Diff([]int64{3, 4, 5}, eventIDs(snap.Events)); diff != "" {
+		t.Errorf("snapshot with both selectors is not the per-run stream's most recent 3 (-want +got):\n%s", diff)
 	}
 
 	// A filter that selects neither stream selects nothing at all, whatever

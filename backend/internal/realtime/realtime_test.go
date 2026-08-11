@@ -1,6 +1,7 @@
 package realtime
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -49,5 +50,31 @@ func TestFilter_Matches(t *testing.T) {
 				t.Errorf("Matches(%+v) = %v, want %v", in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestAttentionKindPatterns_CarryNoLikeMetacharacters is what makes the
+// prefix-to-LIKE translation safe rather than merely true today.
+//
+// '%' and '_' are LIKE metacharacters, and '_' matches ANY single character.
+// A namespace like "gate_review." would therefore make the EventSource's SQL
+// over-select relative to Matches — the snapshot and the replay would carry
+// events the live path drops — silently, and only against a database. Adding
+// such a prefix has to fail here, in a unit test, and force a deliberate
+// escape rather than be found as a stream that disagrees with itself.
+func TestAttentionKindPatterns_CarryNoLikeMetacharacters(t *testing.T) {
+	t.Parallel()
+	patterns := AttentionKindPatterns()
+	if len(patterns) != len(attentionPrefixes) {
+		t.Fatalf("got %d patterns for %d prefixes", len(patterns), len(attentionPrefixes))
+	}
+	for i, prefix := range attentionPrefixes {
+		if strings.ContainsAny(prefix, "%_") {
+			t.Errorf("prefix %q contains a LIKE metacharacter: the SQL would over-select "+
+				"relative to Matches, so escape it before appending the wildcard", prefix)
+		}
+		if want := prefix + "%"; patterns[i] != want {
+			t.Errorf("pattern %d = %q, want %q", i, patterns[i], want)
+		}
 	}
 }
