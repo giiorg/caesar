@@ -80,6 +80,14 @@ func NewWriter(w http.ResponseWriter, hb time.Duration, clock func() time.Time) 
 // json.Marshal both escapes newlines and sorts map keys, so the line is
 // single and deterministic. It only reads e.Payload, whose backing map is
 // shared with every other subscriber of this event.
+//
+// e.Kind is interpolated into the event: line RAW, on the assumption that
+// kinds are server-controlled constants (runs/events.go) and never client
+// input — a newline-bearing kind would inject arbitrary SSE fields into the
+// frame. A future task that routes user-supplied kinds must sanitize them
+// before they reach this codec; deliberately, the codec does not rewrite a
+// kind itself, because a silently mangled constant would be a worse failure
+// than an obviously bad one.
 func (wr *Writer) WriteEvent(e Event) error {
 	data, err := json.Marshal(StreamFrame{
 		ID:         e.ID,

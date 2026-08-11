@@ -190,6 +190,13 @@ func TestWriter_HeartbeatIsAComment(t *testing.T) {
 	if diff := cmp.Diff(": hb\n\n", rec.Body.String()); diff != "" {
 		t.Errorf("heartbeat bytes (-want +got):\n%s", diff)
 	}
+	// And the comment must be FLUSHED, not merely written: on a real server an
+	// unflushed heartbeat sits in the bufio buffer and never reaches the
+	// socket, so the idle tunnel dies silently — the exact failure the
+	// heartbeat exists to prevent.
+	if diff := cmp.Diff([]string{"flush", "write", "flush"}, rec.ops); diff != "" {
+		t.Errorf("ops after an elapsed heartbeat (-want +got):\n%s", diff)
+	}
 
 	// The heartbeat itself counts as a write: a second tick at the same
 	// instant is idle-by-zero and must stay silent.
@@ -198,6 +205,22 @@ func TestWriter_HeartbeatIsAComment(t *testing.T) {
 	}
 	if diff := cmp.Diff(": hb\n\n", rec.Body.String()); diff != "" {
 		t.Errorf("body after an immediate second tick (-want +got):\n%s", diff)
+	}
+
+	// An event resets the idle clock too: a tick less than hb after a write
+	// must stay silent however long ago the last HEARTBEAT was, or busy
+	// streams get padded with a comment on every tick.
+	now = now.Add(15 * time.Second)
+	if err := w.WriteEvent(hubEvent(9, uuid.New(), uuid.New(), "run.started")); err != nil {
+		t.Fatalf("WriteEvent() error = %v, want nil", err)
+	}
+	busy := rec.Body.String()
+	now = now.Add(29 * time.Second) // 44s since the heartbeat, 29s since the event
+	if err := w.Heartbeat(); err != nil {
+		t.Fatalf("Heartbeat() error = %v, want nil", err)
+	}
+	if got := rec.Body.String(); got != busy {
+		t.Errorf("Heartbeat wrote %q within hb of an event, want nothing", strings.TrimPrefix(got, busy))
 	}
 }
 
