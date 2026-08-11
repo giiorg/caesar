@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strconv"
@@ -63,7 +64,14 @@ type replayCall struct {
 
 var _ EventSource = (*streamSource)(nil)
 
-func (s *streamSource) Snapshot(context.Context, Filter) (Snapshot, error) {
+// errAbortedRead is what Replay reports for a cancelled read, and it
+// deliberately does NOT wrap context.Canceled: a real driver is free to
+// translate a cancelled query into its own error class, so a Serve that asked
+// errors.Is(err, context.Canceled) instead of asking the context would miss
+// it. Snapshot wraps ctx.Err() instead, so both shapes are exercised.
+var errAbortedRead = errors.New("streamSource: read aborted")
+
+func (s *streamSource) Snapshot(ctx context.Context, _ Filter) (Snapshot, error) {
 	s.mu.Lock()
 	s.snapshotCalls++
 	hook, snap, err := s.onSnapshot, s.snapshot, s.snapshotErr
@@ -72,13 +80,19 @@ func (s *streamSource) Snapshot(context.Context, Filter) (Snapshot, error) {
 	if hook != nil {
 		hook()
 	}
+	// A real query notices a cancelled context and abandons the read. A fake
+	// that ignored ctx would make a whole class of defect — what Serve returns
+	// when the client leaves mid-catch-up — structurally untestable.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return Snapshot{}, fmt.Errorf("streamSource.Snapshot: %w", ctxErr)
+	}
 	if err != nil {
 		return Snapshot{}, err
 	}
 	return snap, nil
 }
 
-func (s *streamSource) Replay(_ context.Context, f Filter, after int64, limit int) ([]Event, error) {
+func (s *streamSource) Replay(ctx context.Context, f Filter, after int64, limit int) ([]Event, error) {
 	s.mu.Lock()
 	s.replayCalls = append(s.replayCalls, replayCall{After: after, Limit: limit})
 	hook, err := s.onReplay, s.replayErr
@@ -105,6 +119,9 @@ func (s *streamSource) Replay(_ context.Context, f Filter, after int64, limit in
 	s.mu.Unlock()
 	if hook != nil {
 		hook()
+	}
+	if ctx.Err() != nil {
+		return nil, errAbortedRead
 	}
 	if err != nil {
 		return nil, err
@@ -141,9 +158,14 @@ func (s *streamSource) calls() (snapshots int, replays []replayCall) {
 // unguarded bytes.Buffer, so reusing it would be a -race failure rather than
 // a flake.
 type streamRecorder struct {
-	mu       sync.Mutex
-	header   http.Header
-	body     bytes.Buffer
+	mu     sync.Mutex
+	header http.Header
+	body   bytes.Buffer
+	// ops is the interleaving of body writes and flushes, the same op-log
+	// sseRecorder keeps. It is what makes "Serve adds no Flush of its own"
+	// observable at all — a Flush() that recorded nothing leaves finding 9
+	// enforced by a comment.
+	ops      []string
 	writeErr error
 }
 
@@ -164,10 +186,15 @@ func (r *streamRecorder) Write(p []byte) (int, error) {
 	if r.writeErr != nil {
 		return 0, r.writeErr
 	}
+	r.ops = append(r.ops, "write")
 	return r.body.Write(p)
 }
 
-func (r *streamRecorder) Flush() {}
+func (r *streamRecorder) Flush() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ops = append(r.ops, "flush")
+}
 
 // failWrites makes every subsequent body write fail, as a client that has
 // gone away does.
@@ -183,6 +210,13 @@ func (r *streamRecorder) written() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.body.String()
+}
+
+// opLog is the write/flush interleaving so far.
+func (r *streamRecorder) opLog() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.ops)
 }
 
 // ids is every id: line in the order it was written — what the client
@@ -223,16 +257,18 @@ func idleStreamer(hub *Hub, src EventSource, batch int) *Streamer {
 func startServe(t *testing.T, s *Streamer, req StreamRequest) (*streamRecorder, context.CancelFunc, <-chan error) {
 	t.Helper()
 	rec := newStreamRecorder()
-	cancel, errc := startServeOn(t, s, rec, req)
-	return rec, cancel, errc
+	ctx, cancel := context.WithCancel(context.Background())
+	return rec, cancel, startServeOn(ctx, t, s, rec, req)
 }
 
-// startServeOn is startServe onto a recorder the test prepared — a recorder
-// that will fail its writes has to be armed BEFORE Serve runs, or the first
-// frame races the arming and the stream blocks instead of failing.
-func startServeOn(t *testing.T, s *Streamer, rec *streamRecorder, req StreamRequest) (context.CancelFunc, <-chan error) {
+// startServeOn is startServe with the context and the recorder supplied by the
+// test: a recorder that will fail its writes has to be armed BEFORE Serve
+// runs, and a test that cancels from inside a source hook needs to hold the
+// cancel before Serve starts. Cancelling the ctx passed here cancels the one
+// Serve sees.
+func startServeOn(parent context.Context, t *testing.T, s *Streamer, rec *streamRecorder, req StreamRequest) <-chan error {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	errc := make(chan error, 1)
 	stopped := make(chan struct{})
 	go func() {
@@ -247,7 +283,7 @@ func startServeOn(t *testing.T, s *Streamer, rec *streamRecorder, req StreamRequ
 			t.Errorf("Serve did not return within %s of cancellation", patience)
 		}
 	})
-	return cancel, errc
+	return errc
 }
 
 // waitServe is what Serve returned. Reading it is also the happens-before
@@ -536,6 +572,92 @@ func TestServe_StopsOnClientDisconnect(t *testing.T) {
 	}
 }
 
+// Serve's contract says nil when ctx is done, WHEREVER the stream had got to
+// — and catch-up is the long part, so a tab closed during it is an ordinary
+// event rather than a corner. Before the fix these two returned a wrapped
+// context.Canceled, which Task 10's logging rule would have raised as a fault
+// on every closed tab.
+//
+// The two cases differ in what the source reports for the cancelled read:
+// Snapshot wraps ctx.Err(), Replay answers with an error class of its own that
+// does not wrap it at all. Both must yield nil, which is what pins Serve on
+// asking the CONTEXT rather than errors.Is-ing the error.
+func TestServe_ReturnsNilWhenTheClientLeavesDuringCatchUp(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		phase string
+	}{
+		{name: "during the snapshot", phase: "snapshot"},
+		{name: "during the replay", phase: "replay"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			proj, run := uuid.New(), uuid.New()
+			hub := NewHub(HubConfig{SubscriberQueue: 8})
+			src := &streamSource{
+				snapshot: Snapshot{
+					Events:    []Event{hubEvent(1, proj, run, "run.started")},
+					Watermark: Watermark{EventID: 1},
+				},
+				retained: []Event{hubEvent(2, proj, run, "run.started")},
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			// The client goes away in the middle of the read, which is the
+			// window the contract is about.
+			if tt.phase == "snapshot" {
+				src.onSnapshot = cancel
+			} else {
+				src.onReplay = sync.OnceFunc(cancel)
+			}
+
+			rec := newStreamRecorder()
+			errc := startServeOn(ctx, t, idleStreamer(hub, src, 10), rec, StreamRequest{Filter: runFilter(run, proj)})
+
+			if err := waitServe(t, errc); err != nil {
+				t.Fatalf("Serve() with the client gone during the %s = %v, want nil", tt.phase, err)
+			}
+			// And it still unsubscribed on the way out.
+			if got := registryLen(hub); got != 0 {
+				t.Errorf("registry holds %d subscription(s) after the client left, want 0", got)
+			}
+		})
+	}
+}
+
+// Finding 9: the Writer owns flushing, and Serve adds none of its own. Task 6
+// pinned ["flush","write","flush"] with an exact op-log and upheld it against
+// an over-pin objection, deliberately, so that a future batching change has to
+// renegotiate the guarantee rather than quietly acquire it. This is the other
+// end of that chain: without it, an st.wr.Flush() added to send is invisible.
+func TestServe_AddsNoFlushOfItsOwn(t *testing.T) {
+	t.Parallel()
+	proj, run := uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{
+		snapshot: Snapshot{
+			Events:    []Event{hubEvent(1, proj, run, "run.started")},
+			Watermark: Watermark{EventID: 1},
+		},
+		retained: []Event{hubEvent(2, proj, run, "run.started")},
+	}
+	src.onSnapshot = func() { hub.Close() }
+
+	rec, _, errc := startServe(t, idleStreamer(hub, src, 10), StreamRequest{Filter: runFilter(run, proj)})
+
+	if err := waitServe(t, errc); !errors.Is(err, CloseShutdown) {
+		t.Fatalf("Serve() = %v, want %v", err, CloseShutdown)
+	}
+	// NewWriter's connect flush, then exactly one write and one flush per
+	// frame — nothing else. The heartbeat is an hour away and cannot appear.
+	want := []string{"flush", "write", "flush", "write", "flush"}
+	if diff := cmp.Diff(want, rec.opLog()); diff != "" {
+		t.Errorf("write/flush interleaving (-want +got):\n%s", diff)
+	}
+}
+
 // Nothing else here exercises the ticker at all: one that is never started,
 // or started at the wrong interval, would pass every other test in this file
 // and leave idle streams to be culled by the proxy.
@@ -594,20 +716,40 @@ func TestServe_ZeroConfigIsUsable(t *testing.T) {
 }
 
 // The one failure that can still become an HTTP error response, because it
-// happens before NewWriter commits the 200. It must also happen before
-// Subscribe, or the error path leaves a subscription behind.
-func TestServe_RejectsANonFlusherWithoutSubscribing(t *testing.T) {
+// happens before NewWriter commits the 200.
+//
+// It does NOT pin that the rejection precedes Subscribe: the registry is
+// asserted after Serve has returned, by which time the deferred Close would
+// have tidied a subscription away regardless, and moving NewWriter after
+// Subscribe is behaviourally equivalent anyway — finding 10 is a preference,
+// not an invariant. What it pins is the error, the absence of a leak, and
+// that no read was issued.
+//
+// Serve runs in a goroutine even though the call is expected to return at
+// once. If NewWriter ever stopped rejecting non-flushers, Serve would park in
+// follow on the one-hour heartbeat: called inline that hangs the test — and
+// with it the whole package, on the suite timeout, burying its own message —
+// and t.Cleanup cannot rescue it, because the test is the thing that is
+// blocked. In a goroutine the same regression fails at patience with the
+// message below, and the cleanup cancel releases the parked stream.
+func TestServe_RejectsANonFlusher(t *testing.T) {
 	t.Parallel()
 	proj, run := uuid.New(), uuid.New()
 	hub := NewHub(HubConfig{SubscriberQueue: 8})
 	src := &streamSource{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
-	err := idleStreamer(hub, src, 10).Serve(
-		context.Background(),
-		&plainResponseWriter{header: http.Header{}},
-		StreamRequest{Filter: runFilter(run, proj)},
-	)
+	errc := make(chan error, 1)
+	go func() {
+		errc <- idleStreamer(hub, src, 10).Serve(
+			ctx,
+			&plainResponseWriter{header: http.Header{}},
+			StreamRequest{Filter: runFilter(run, proj)},
+		)
+	}()
 
+	err := waitServe(t, errc)
 	if err == nil {
 		t.Fatal("Serve() on a non-Flusher returned nil, want an error")
 	}
@@ -635,7 +777,7 @@ func TestServe_ClosesTheSubscriptionOnAWriteError(t *testing.T) {
 	rec := newStreamRecorder()
 	rec.failWrites(boom)
 
-	_, errc := startServeOn(t, idleStreamer(hub, src, 10), rec, StreamRequest{Filter: runFilter(run, proj)})
+	errc := startServeOn(context.Background(), t, idleStreamer(hub, src, 10), rec, StreamRequest{Filter: runFilter(run, proj)})
 
 	if err := waitServe(t, errc); !errors.Is(err, boom) {
 		t.Fatalf("Serve() = %v, want it to wrap %v", err, boom)

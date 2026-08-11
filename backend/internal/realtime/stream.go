@@ -83,8 +83,9 @@ type StreamRequest struct {
 // Serve streams to w until the client disconnects, the subscription ends or a
 // write fails. It returns:
 //
-//   - nil when ctx is done. A disconnect is how an SSE request normally ends,
-//     and Task 10 must not log every closed tab as a fault.
+//   - nil when ctx is done, WHEREVER the stream had got to. A disconnect is
+//     how an SSE request normally ends, and Task 10 must not log every closed
+//     tab as a fault.
 //   - the subscription's Err when its channel closes: CloseSlowConsumer if
 //     this client fell behind, CloseShutdown if the process is going away.
 //   - the write or source error otherwise.
@@ -118,7 +119,36 @@ func (s *Streamer) Serve(ctx context.Context, w http.ResponseWriter, req StreamR
 	// CloseSlowConsumer of a subscription that was already evicted.
 	defer sub.Close(closeClientGone)
 
-	st := &stream{wr: wr}
+	err = s.deliver(ctx, &stream{wr: wr}, sub, req)
+	// ONE translation point for the whole stream rather than a check per
+	// phase, because the question is not "which phase failed" but "is there
+	// still a client to serve": once the answer is no, there is nobody left to
+	// report anything to. Catch-up is expected to be long here — see replay —
+	// so a tab closed mid-snapshot or mid-replay is an ordinary event, and
+	// without this it returns a wrapped context.Canceled that Task 10 would
+	// log at error level for every closed tab.
+	//
+	// The test is ctx, NOT errors.Is(err, context.Canceled): a source is free
+	// to translate a cancelled query into its own error class, and the
+	// disconnect is knowable here without guessing which one it picked.
+	//
+	// The accepted cost, stated rather than silent: a genuine source or write
+	// failure that RACES a disconnect is reported as nil. That is the right
+	// trade — the request is over either way, and a real outage is visible on
+	// every other stream and in the tailer. It does not extend to a failure
+	// with the client still connected: that one can be a real fault and stays
+	// an error.
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
+}
+
+// deliver is the three phases of a stream: the client's starting state, the
+// catch-up to now, then live. It is split out of Serve for one reason — every
+// way out of it passes through the disconnect translation above, including
+// the phase Task 9 adds.
+func (s *Streamer) deliver(ctx context.Context, st *stream, sub *Subscription, req StreamRequest) error {
 	if err := s.prime(ctx, st, req); err != nil {
 		return err
 	}
@@ -169,7 +199,10 @@ func (s *Streamer) prime(ctx context.Context, st *stream, req StreamRequest) err
 	if req.HasLastID {
 		oldest, err := s.src.Oldest(ctx)
 		if err != nil {
-			return fmt.Errorf("oldest retained event: %w", err)
+			// The phase, not the port: an EventSource names itself and what
+			// it was doing (app: realtime oldest event: …), so repeating the
+			// noun here would only stutter.
+			return fmt.Errorf("stream prime: %w", err)
 		}
 		// Deliberately conservative by one. A lossless resume only needs
 		// everything above LastEventID to still be retained — LastEventID+1
@@ -185,7 +218,7 @@ func (s *Streamer) prime(ctx context.Context, st *stream, req StreamRequest) err
 	}
 	snap, err := s.src.Snapshot(ctx, req.Filter)
 	if err != nil {
-		return fmt.Errorf("snapshot: %w", err)
+		return fmt.Errorf("stream prime: %w", err)
 	}
 	// Each event is its own frame. The snapshot is the most recent N matching
 	// events, ascending, for a per-run stream and for the attention stream
@@ -214,7 +247,7 @@ func (s *Streamer) replay(ctx context.Context, st *stream, f Filter) error {
 		// zero that would make every page look like "caught up".
 		page, err := s.src.Replay(ctx, f, st.cursor, s.cfg.ReplayBatch)
 		if err != nil {
-			return fmt.Errorf("replay after %d: %w", st.cursor, err)
+			return fmt.Errorf("stream replay from %d: %w", st.cursor, err)
 		}
 		before := st.cursor
 		for _, e := range page {
