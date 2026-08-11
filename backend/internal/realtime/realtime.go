@@ -21,6 +21,23 @@ import (
 // never an enumeration that rots as kinds are added.
 var attentionPrefixes = []string{"gate.", "publish.", "run."}
 
+// AttentionKindPatterns is attentionPrefixes as SQL LIKE patterns, for the
+// EventSource implementation to push the kind test down into the query.
+//
+// It exists so the prefix list has ONE definition. The snapshot and replay
+// queries must select exactly what Matches selects: filtering in Go after a
+// LIMIT would truncate a page that happened to be all non-attention rows,
+// and a second hand-written prefix list in SQL would rot the moment a
+// namespace is added here. None of the prefixes contains a LIKE
+// metacharacter, so appending '%' is the whole translation.
+func AttentionKindPatterns() []string {
+	out := make([]string, 0, len(attentionPrefixes))
+	for _, p := range attentionPrefixes {
+		out = append(out, p+"%")
+	}
+	return out
+}
+
 // Event is one streamable observation. It mirrors a run_events row; the
 // id is commit-ordered (allocated under the run_event_counter lock), which
 // is what makes it usable as both a cursor and a dedup key.
