@@ -354,6 +354,111 @@ Read against the tree at `7e7947e` before dispatching. Recorded in full at the t
 breaks no arch rule — `internal/identity/service.go:103` sets the precedent with
 `tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", …)`.
 
+Task 5: fix round 1/5 (3 addressed, 0 open — unfalsifiable eviction-path deregistration, a false
+  `break` comment, untested `Hub.Close` idempotence; commit `143038f`..`8c4bfc1`)
+Task 5: complete (commits 2d4b288..8c4bfc1, review clean after 1 fix round) and **GATED:
+  `GATE PASS … 8c4bfc1`, 11 lanes resolved unnarrowed.** Gated twice — once at `143038f` before
+  review, once at the fix sha.
+Task 5: implemented at `143038f`; **GATED BEFORE REVIEW: `GATE PASS … 143038f`, 11 lanes
+  resolved unnarrowed.** Review: spec ✅, quality approved, 0 Critical, 1 Important, 4 Minor.
+Task 5: **INTERFACE PRODUCED FOR TASKS 8/9/11** — `NewHub(HubConfig{SubscriberQueue int}) *Hub`,
+  `(*Hub).Subscribe(Filter) *Subscription`, `(*Hub).Publish([]Event)` (the tailer's sink),
+  `(*Hub).Close()`, `(*Subscription).C() <-chan Event`, `(*Subscription).Close(CloseReason)`,
+  `(*Subscription).Err() error`. `CloseReason` is a named string type that **implements `error`**,
+  so `errors.Is` matches a reason by value; `CloseSlowConsumer` and `CloseShutdown` exist,
+  `ErrSlowConsumer` is an alias of the former and is **the only `Err*` alias there will be**.
+  All of it in `hub.go` — no `subscription.go`, contra the plan's File Structure section.
+Task 5: **the re-review re-ran the mutation rather than reading the fix** — mutant A (delete
+  `h.remove(s)` from the eviction path) reddens the new assertion and ONLY it, the other eight
+  tests still passing, which is exactly the silent-leak profile the finding described. It also
+  checked the assertion sits BEFORE the test's explicit `Close`, or it would have been satisfied
+  by the path `TestHub_UnsubscribeRemovesFromRegistry` already covers.
+Task 5: **finding 3's guard is deliberately unfalsifiable against today's code and that is
+  correct.** No mutation of the current `Hub.Close` reddens on the second call — the re-review
+  answered the right question instead ("does it catch the fault class?") with mutant C, a
+  `Hub.Close` that panics when called twice: it is the only test in the file that fails, because
+  every other test closes at most once. Keep this distinction for future test-shaped findings.
+Task 5: controller edit to `task-5-report.md` — the report's "Anything in the brief I found
+  wrong" section still ended "The `break` is load-bearing", one line away from the frame that
+  made it true (the plan's sketch). Added the qualifying clause myself; the report is read by
+  later implementers and that sentence contradicted the corrected section 260 lines above.
+Task 5: **the reviewer ran its own mutants** (`go test -race -overlay` against an unmodified
+  tree) rather than trusting the report, and found what the implementer's three did not: the
+  Important finding below. It also confirmed the implementer's three mutations were honest.
+Task 5: **the mutex is the panic guard, NOT the `break`.** Both the implementer's comment
+  (`hub.go:108-111`) and its report claimed the post-eviction `break` prevents a send on a
+  closed channel. Demonstrably false — `continue` passes all nine tests, because `offer`
+  re-checks `closed` under `s.mu`. The `break` is a performance property. Corrected in the fix
+  round; **Tasks 8/9 must not inherit the wrong mental model of what makes this safe.**
+Task 5: controller rulings on the implementer's three questions (the reviewer concurred with
+  all three independently):
+  1. **Keep both `ErrSlowConsumer` and `CloseSlowConsumer`** — the plan names the sentinel.
+     **Task 9's `CloseForbidden` is a const and nothing else; no `ErrForbidden`.** `CloseReason`
+     implements `error`, so `errors.Is` matches a reason by value and a new reason is one line.
+  2. **No `*slog.Logger` in the hub.** Eviction is a real operational signal but adding a
+     logger changes a constructor Task 12 calls — **Task 11 decides**, deliberately.
+  3. **`Hub.Close()` is NOT synchronous with an in-flight `Publish`** and must not be made so —
+     a wait there defeats the one rule this task exists to enforce. See the Task 11
+     carry-forward below.
+Task 5: **CARRY-FORWARD TO TASK 11 — the shutdown order gains a step the plan does not have.**
+  The plan says "cancel the tailer's context and close the hub before `srv.Shutdown`". That is
+  not sufficient: `Hub.Close()` returning does not mean the tailer has stopped calling the
+  sink. Correct order is **cancel tailer → WAIT for `Run` to return → `Hub.Close()` →
+  `srv.Shutdown`**. `Tailer.Run` returns an error and `tailer_test.go`'s `startTailer` already
+  demonstrates waiting on it. Also: `config.Realtime.SubscriberQueue` wires straight into
+  `HubConfig.SubscriberQueue`, and a zero is safe (falls back to 256).
+Task 5: **CARRY-FORWARD TO TASK 8** — `Err()` is meaningful only AFTER `C()` has closed; read
+  it after the drain. A handler that returns without `Close` is the one leak the hub cannot
+  prevent, and `Subscribe`'s doc says so. `Filter` precedence (RunID wins; neither selector set
+  selects nothing) must be rejected at the HTTP edge, not relied on.
+Task 5: **CARRY-FORWARD TO TASK 9** — `CloseForbidden CloseReason = "…"` is the entire change.
+  **First reason wins on close**, so a subscription already evicted keeps `CloseSlowConsumer`
+  even if the handler then closes it — deliberate: the client must know to resume from
+  `Last-Event-ID`.
+Task 5: minor (deferred): `Subscribe` is never exercised concurrently with `Publish`/`Close` —
+  every test subscribes serially. Cannot deadlock today (the one `h.mu → s.mu` nesting is on a
+  subscription no other goroutine can reach yet), but a future task that closed a *registered*
+  subscription while holding `h.mu` would create a real cycle and no test would notice.
+Task 5: minor (deferred → Task 11): eviction is invisible to operators. A client losing its
+  stream to a full queue is the signal that a queue is mistuned or a client is pathological,
+  and only the client that lost the stream can currently observe it.
+
+### Task 5 pre-flight (controller, 2026-08-11, session 58) — SIX findings, all in the brief
+
+Read against the tree at `1ed903a`/`2d4b288` before dispatching. Recorded in full as a
+CONTROLLER PRE-FLIGHT block at the top of `task-5-brief.md` that overrides the plan text.
+BASE for the review package is **`2d4b288`**.
+
+1. **PLAN DEFECT — the `Publish` sketch panics.** After `h.evict(s, CloseSlowConsumer)`
+   closes `s.ch`, the inner `for _, e := range evs` loop continues and executes
+   `case s.ch <- e:` again → send on a closed channel. Plan Test 2 (queue 4, 1000 events)
+   trips it on event 6. Must stop delivering to a subscriber the instant it is evicted.
+2. **HAZARD the plan does not mention — `Publish` (tailer goroutine) races
+   `Subscription.Close` (handler goroutine, Task 8) on the same channel.** A non-blocking
+   send racing `close(ch)` is a panic, not a data race, so `-race` may not flag it. Required:
+   check-and-send under the subscription's own mutex, closed under the same mutex (safe
+   because the send is non-blocking). Added a test beyond the plan's five.
+3. **PLAN GAP — `(*Hub).Close()` is missing from Task 5's interface list but Task 11 requires
+   it** ("close the hub before `srv.Shutdown`") and Task 11's file list is `internal/app`
+   only, so it cannot add it. **Ruling: land `Hub.Close()` here**, with `CloseShutdown`, plus
+   the Subscribe-after-Close case — a request racing shutdown must not get a live
+   subscription whose channel never closes, which is the exact hang Task 11 exists to prevent.
+4. **The `CloseReason`/`Err()` contract is cross-task and underspecified.** Task 9 adds
+   `CloseForbidden`; Task 8 reads the reason to pick a terminal frame. Required shape: named
+   type, `Err()` nil while open then an `errors.Is`-matchable error identifying the reason,
+   `ErrSlowConsumer` as a package-level sentinel by that exact name, adding a reason is one
+   line. Representation left to the implementer.
+5. **File-structure conflict:** the plan's File Structure section (line 55) lists a separate
+   `realtime/subscription.go`; Task 5's file list does not. Ruling: everything in `hub.go`,
+   per the task's own file list.
+6. **`HubConfig.SubscriberQueue int`**, named to match `config.Realtime.SubscriberQueue`
+   (`subscriber_queue`, default 256) which Task 11 wires straight in; same default when <= 0,
+   following the `NewTailer` defaults ruling. Plus the two carry-forwards already on record:
+   the `tailer_test.go` package-scope collision list, and the goimports grouping trap.
+
+Also corrected in the brief: plan Test 5's "assert via a counter" (made concrete as a registry
+check), and a note that `backend:test` already runs `-race` in the Taskfile recipe.
+
 ### RESOLVED — the Docker picture was misdiagnosed; the daemon was simply DOWN
 
 Controller-verified 2026-08-11, session 57. **The Docker daemon was not running** (the
