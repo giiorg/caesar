@@ -159,6 +159,19 @@ func TestHub_EvictedSubscriberReportsWhy(t *testing.T) {
 		t.Fatalf("Err() after eviction = %v, want %v", err, ErrSlowConsumer)
 	}
 
+	// Evicting must unregister, not merely close. Publish is synchronous, so
+	// by the time it has returned the registry is already final. A hub that
+	// closed the channel and kept the entry fails silently — nothing panics
+	// and nothing is misdelivered, because offer's closed check absorbs it —
+	// it just accumulates one dead entry per slow client, walked on every
+	// batch for the life of the process.
+	if registryHas(h, s) {
+		t.Error("an evicted subscription is still in the registry")
+	}
+	if got := registryLen(h); got != 0 {
+		t.Errorf("registry holds %d subscription(s) after the only one was evicted, want 0", got)
+	}
+
 	// Closed exactly once: the handler's own Close lands on an already-evicted
 	// subscription on every disconnect, and must neither double-close the
 	// channel nor rewrite the reason the client is about to be told.
@@ -271,6 +284,9 @@ func TestHub_CloseTerminatesEverySubscription(t *testing.T) {
 	h := NewHub(HubConfig{SubscriberQueue: 4})
 	subs := []*Subscription{h.Subscribe(f), h.Subscribe(f), h.Subscribe(f)}
 
+	// Twice: Task 11 can plausibly reach shutdown from more than one path, and
+	// a double-close panic is an expensive thing to discover at shutdown.
+	h.Close()
 	h.Close()
 
 	for i, s := range subs {

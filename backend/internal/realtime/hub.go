@@ -26,7 +26,9 @@ const (
 func (r CloseReason) Error() string { return "realtime: " + string(r) }
 
 // ErrSlowConsumer is CloseSlowConsumer under the name error-handling code
-// reaches for. Matching either with errors.Is is the same test.
+// reaches for. Matching either with errors.Is is the same test. It is the only
+// alias there will be: the CloseReason constants above are the canonical
+// sentinels, and a reason added later gets no Err* alias of its own.
 var ErrSlowConsumer error = CloseSlowConsumer
 
 // HubConfig tunes fan-out. A zero config is usable.
@@ -106,9 +108,14 @@ func (h *Hub) Publish(evs []Event) {
 				continue
 			}
 			// The subscription is finished — evicted by this very send, or
-			// closed by its own handler while we were walking the batch.
-			// Either way it is done receiving, and continuing to send to it
-			// would be a send on a closed channel.
+			// closed by its own handler while we were walking the batch. Drop
+			// it and move to the next target.
+			//
+			// What forbids a send on a closed channel is offer's closed check
+			// under the subscription's mutex, NOT this break: continuing the
+			// batch would be safe, merely wasteful. The break is here to skip
+			// the rest of the batch — up to Batch-1 further Matches calls and
+			// the write-lock churn of re-removing an entry already gone.
 			h.remove(s)
 			break
 		}
