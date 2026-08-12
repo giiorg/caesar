@@ -957,8 +957,14 @@ func TestServe_DropsEventsOutsideRefreshedScope(t *testing.T) {
 	f := Filter{Attention: true, Scope: Scope{Projects: []uuid.UUID{kept, lost}}}
 	rec, cancel, errc := startServe(t, s, StreamRequest{Filter: f})
 
-	// One completed re-check means follow holds the narrowed scope: the
-	// assignment happens on the same goroutine before it can receive again.
+	// stubGrants counts on ENTRY, so this says follow is at or past the resolve
+	// — not that the resolve returned. That is still enough, and for a reason
+	// worth stating because the weaker one is so easy to write instead: follow
+	// is a single goroutine, the count can only be raised from inside its
+	// re-check case, and it cannot receive from sub.C() until that case has
+	// returned and assigned the new scope. So anything published after this
+	// observation is judged against the narrowed scope, whatever the ordering
+	// inside the resolve itself.
 	eventually(t, func() bool { return grants.callCount() > 0 }, "the first grant re-check")
 	hub.Publish([]Event{
 		hubEvent(1, lost, run, "run.started"),
@@ -1002,6 +1008,8 @@ func TestServe_ClosesPerRunStreamOnAForbiddenEvent(t *testing.T) {
 
 	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
 
+	// At or past the resolve, which is all this needs — see the same wait in
+	// TestServe_DropsEventsOutsideRefreshedScope for why that suffices.
 	eventually(t, func() bool { return grants.callCount() > 0 }, "the first grant re-check")
 	hub.Publish([]Event{hubEvent(1, proj, run, "run.started")})
 
@@ -1143,4 +1151,113 @@ func TestNewStreamer_PanicsOnANilGrantResolver(t *testing.T) {
 		}
 	}()
 	NewStreamer(NewHub(HubConfig{}), &streamSource{}, nil, StreamerConfig{})
+}
+
+// slowFirstPage makes the first Replay call outlast several re-check intervals,
+// so the SECOND page boundary is guaranteed to find the ticker fired. It is the
+// only way to drive the catch-up re-check from a test: the ticker belongs to
+// deliver and nothing outside it can be signalled.
+//
+// The duration is settle — eight intervals — for exactly the reason settle
+// exists (tailer_test): at eight, "a tick landed" is a fact rather than a race
+// with the next one. A real catch-up outlasting a 30s interval is the ordinary
+// case this models, not a contrivance: replay pages until the client is caught
+// up, and Serve's own comment says that is expected to be long.
+func slowFirstPage() func() {
+	return sync.OnceFunc(func() { time.Sleep(settle) })
+}
+
+// Catch-up is the phase with no bound of its own — it runs as long as the
+// client is behind and it reads up to the CURRENT head — so a revocation
+// landing mid-replay must stop it there. Re-checking only once the stream went
+// live would leave the window at "however long catch-up took, plus
+// GrantRecheck", and would keep emitting rows committed after the revocation.
+func TestServe_ClosesWhenGrantRevokedDuringCatchUp(t *testing.T) {
+	t.Parallel()
+	proj, run := uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	retained := make([]Event, 0, 6)
+	for id := int64(1); id <= 6; id++ {
+		retained = append(retained, hubEvent(id, proj, run, "run.started"))
+	}
+	src := &streamSource{
+		snapshot: Snapshot{Watermark: Watermark{EventID: 0}},
+		retained: retained,
+	}
+	src.onReplay = slowFirstPage()
+	grants := &stubGrants{steps: []grantStep{{scope: Scope{}}}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       2,
+	})
+
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+
+	if err := waitServe(t, errc); !errors.Is(err, CloseForbidden) {
+		t.Fatalf("Serve() with the grant revoked mid-catch-up = %v, want %v", err, CloseForbidden)
+	}
+	// Page one only. Ids 3-6 were still retained and still matched the filter
+	// the stream opened with; nothing but the re-check stopped them.
+	if diff := cmp.Diff([]int64{1, 2}, rec.ids(t)); diff != "" {
+		t.Errorf("ids on the wire (-want +got):\n%s", diff)
+	}
+	if _, replays := src.calls(); len(replays) != 1 {
+		t.Errorf("Replay called %d time(s) after the revocation, want 1: the pager kept paging", len(replays))
+	}
+	if got := rec.written(); !strings.HasSuffix(got, forbiddenOnTheWire) {
+		t.Errorf("stream did not end with the terminal frame:\n%q", got)
+	}
+}
+
+// The residue of finding 4's rule, pinned rather than assumed. A per-run stream
+// whose project leaves a scope that is still otherwise populated has no empty
+// scope to close on: replay simply stops returning its rows, because the
+// refreshed scope goes into the next page's Filter.
+//
+// What ends it is the hub's deliberately stale subscription filter. Serve never
+// mutates that filter, so the tailer keeps delivering this run's events into
+// follow — where the per-run denial closes the stream. This test is the whole
+// chain: rows 3-6 withheld by SQL during catch-up, then one live event closing
+// it. The chain has a gap, stated on Serve: a run that emits nothing further
+// leaves the connection open and idle, showing the client nothing.
+func TestServe_PerRunStreamNarrowedMidCatchUpClosesOnTheNextEvent(t *testing.T) {
+	t.Parallel()
+	proj, other, run := uuid.New(), uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	retained := make([]Event, 0, 6)
+	for id := int64(1); id <= 6; id++ {
+		retained = append(retained, hubEvent(id, proj, run, "run.started"))
+	}
+	src := &streamSource{retained: retained}
+	src.onReplay = slowFirstPage()
+	// Non-empty, so the idle close cannot fire: the principal keeps a grant,
+	// just not this run's.
+	grants := &stubGrants{steps: []grantStep{{scope: Scope{Projects: []uuid.UUID{other}}}}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       2,
+	})
+
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+
+	// A raised count means the pager reached its second boundary, which means
+	// the subscription has existed since before the snapshot. Publishing now is
+	// safe whatever the resolve is doing: the event waits in the queue and is
+	// judged by follow, which cannot run until replay has returned.
+	eventually(t, func() bool { return grants.callCount() > 0 }, "the catch-up re-check")
+	hub.Publish([]Event{hubEvent(7, proj, run, "run.started")})
+
+	if err := waitServe(t, errc); !errors.Is(err, CloseForbidden) {
+		t.Fatalf("Serve() on a per-run stream narrowed mid-catch-up = %v, want %v", err, CloseForbidden)
+	}
+	// Page one, and nothing after it: ids 3-6 were excluded by the next page's
+	// Filter, and id 7 by follow's scope test on its way to the close.
+	if diff := cmp.Diff([]int64{1, 2}, rec.ids(t)); diff != "" {
+		t.Errorf("ids on the wire (-want +got):\n%s", diff)
+	}
+	if got := rec.written(); !strings.HasSuffix(got, forbiddenOnTheWire) {
+		t.Errorf("stream did not end with the terminal frame:\n%q", got)
+	}
 }

@@ -42,6 +42,12 @@ type Writer struct {
 	// lastWrite is when bytes last went to the client — connect, event or
 	// heartbeat. Heartbeat consults it so that a busy stream is never padded
 	// with comments: the Writer owns idleness, and Serve just ticks.
+	//
+	// One writer does not update it: Task 9's terminal frame, which goes
+	// straight to w and flushes via Flush below. That is deliberate and
+	// unobservable — the frame is the last thing the stream ever writes, so no
+	// later Heartbeat exists to be misled by a stale clock. A caller that used
+	// Flush for a NON-terminal write would have to revisit this.
 	lastWrite time.Time
 }
 

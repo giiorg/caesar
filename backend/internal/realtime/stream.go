@@ -59,9 +59,15 @@ type StreamerConfig struct {
 	HeartbeatInterval time.Duration
 	// ReplayBatch caps one catch-up page.
 	ReplayBatch int
-	// GrantRecheck is how often a live stream re-resolves its principal's
-	// scope, so a grant revoked after the stream opened still reaches it. It
-	// is therefore also the worst-case delay before a revocation takes effect.
+	// GrantRecheck is how often a stream re-resolves its principal's scope, so
+	// a grant revoked after the stream opened still reaches it. Catch-up
+	// re-checks before each page and the live loop on a ticker, so this bounds
+	// the staleness window across BOTH phases rather than only the live one —
+	// which matters because catch-up is the phase with no bound of its own.
+	//
+	// The bound is on when a revocation is ACTED ON, not on when every stream
+	// it affects has closed: a per-run stream over a run that emits nothing
+	// further has no event to be denied and stays open, idle. See Serve.
 	GrantRecheck time.Duration
 }
 
@@ -136,6 +142,15 @@ type StreamRequest struct {
 //   - the write or source error otherwise — including a re-check that failed
 //     often enough to end the stream, which is a fault and not a denial.
 //
+// One revocation does NOT end here, and the shape of the gap is worth knowing.
+// A per-run stream whose project leaves a scope that is still otherwise
+// populated can only be closed by an event it must deny (see follow), so if
+// that run emits nothing further the connection stays open and idle. No denied
+// byte reaches the client — replay's Filter and follow's scope test both refuse
+// them — but nothing reaps the socket either, and the client's own reconnect is
+// what eventually fails authorization at the handler. Closing it outright needs
+// the run's project, which a Filter does not carry.
+//
 // Only the first error can still become an HTTP status. Once NewWriter has
 // returned, the response is committed 200 forever, which is why Tasks 9 and
 // 10 speak of a "403-shaped terminal frame" rather than a 403.
@@ -193,15 +208,113 @@ func (s *Streamer) Serve(ctx context.Context, w http.ResponseWriter, req StreamR
 // deliver is the three phases of a stream: the client's starting state, the
 // catch-up to now, then live. It is split out of Serve for one reason — every
 // way out of it passes through the disconnect translation above, including
-// the phase Task 9 adds.
+// the grant re-check's two ways out.
 func (s *Streamer) deliver(ctx context.Context, st *stream, sub *Subscription, req StreamRequest) error {
+	// The re-check spans catch-up AND live, so it is owned here rather than by
+	// either phase. See recheck for why that matters.
+	rc := s.newRecheck(req)
+	defer rc.tick.Stop()
+
+	// prime gets no re-check of its own, and the earlier silence on that point
+	// is what let the same gap go unnoticed in replay. It is ONE query, issued
+	// immediately after the handler resolved this scope to build the Filter,
+	// and it has no interior boundary to re-check at. A tick that lands while
+	// it runs is not lost: the ticker is already running and the first replay
+	// boundary — the very next thing that happens — consumes it.
 	if err := s.prime(ctx, st, req); err != nil {
 		return err
 	}
-	if err := s.replay(ctx, st, req.Filter); err != nil {
+	if err := s.replay(ctx, st, rc, req); err != nil {
 		return err
 	}
-	return s.follow(ctx, st, sub, req)
+	return s.follow(ctx, st, sub, rc, req)
+}
+
+// recheck is the grant re-check: the ticker, the last scope known to be real,
+// and the consecutive-failure count.
+//
+// It is owned by deliver and spans catch-up AND live, which is the whole reason
+// it is a type rather than three locals in follow. Catch-up is the long phase
+// (see replay and Serve), so a re-check that only began once the stream went
+// live would leave the staleness window at "however long catch-up took, plus
+// GrantRecheck" — and the bounded window is the security property the interval
+// buys. Worse, replay reads up to the CURRENT head, so a stale scope there
+// emits rows committed after the revocation.
+//
+// One goroutine — deliver's — touches it, so nothing here is locked.
+type recheck struct {
+	grants GrantResolver
+	userID uuid.UUID
+	tick   *time.Ticker
+	// scope is the last scope known to be real. It starts at the Filter's own
+	// rather than at a resolve of its own: the handler resolved exactly this
+	// scope moments ago to build the Filter, so an eager re-resolve would put a
+	// database round-trip on every stream open to re-learn what it was just
+	// told. The first tick is the earliest anything can have changed.
+	scope Scope
+	// failures is the run of CONSECUTIVE resolver failures, reset by any
+	// success. See maxGrantFailures for why a run rather than a lifetime.
+	failures int
+}
+
+func (s *Streamer) newRecheck(req StreamRequest) *recheck {
+	return &recheck{
+		grants: s.grants,
+		userID: req.UserID,
+		tick:   time.NewTicker(s.cfg.GrantRecheck),
+		scope:  req.Filter.Scope,
+	}
+}
+
+// due reports whether the interval has elapsed since the last check, without
+// blocking. It is how the catch-up phase re-checks: a select case is not
+// available to a pager that must keep paging, and polling here costs a round
+// trip per PAGE — the plan's "before each delivery batch" — not per event,
+// which is the pressure follow's ticker case exists to avoid.
+func (r *recheck) due() bool {
+	select {
+	case <-r.tick.C:
+		return true
+	default:
+		return false
+	}
+}
+
+// refresh re-resolves the principal and reports whether the stream must END. A
+// nil error means carry on, possibly against a narrowed r.scope; a non-nil one
+// is what Serve returns, and the terminal frame has already gone out by then.
+func (r *recheck) refresh(ctx context.Context, st *stream) error {
+	next, err := r.grants.ScopeFor(ctx, r.userID)
+	if err != nil {
+		r.failures++
+		if r.failures < maxGrantFailures {
+			// Keep the last known scope and try again next tick.
+			return nil
+		}
+		// Out of tolerance: fail closed. The client gets the same frame a
+		// revocation would send — the stream is over either way and the status
+		// was committed long ago — but the caller gets the RESOLVER's error,
+		// not CloseForbidden. Saying "not authorized" when the truth is "we
+		// could not ask" is the same false statement closeClientGone exists to
+		// avoid, and it would hand Task 10 a routine revocation and a
+		// grants-store outage under one label. Hence writeForbidden here and
+		// closeForbidden everywhere else: the asymmetry is deliberate.
+		if werr := st.writeForbidden(); werr != nil {
+			return werr
+		}
+		return fmt.Errorf("stream grant re-check: %w", err)
+	}
+	r.failures = 0
+	r.scope = next
+	// An empty scope matches nothing and never will again, so no event can
+	// arrive to reveal it: this is the only thing that can close an IDLE
+	// stream, and it covers both stream shapes at once. A deactivated principal
+	// resolves to exactly this — an empty Scope with a nil error — so
+	// deactivation lands here too.
+	if r.scope.empty() {
+		return st.closeForbidden()
+	}
+	return nil
 }
 
 // stream is one request's writing state: the Writer, and the cursor that
@@ -240,18 +353,30 @@ func (st *stream) send(e Event) error {
 
 // writeForbidden puts the terminal frame on the wire and reports only whether
 // that write itself failed. What the STREAM then returns is the caller's to
-// decide: a revocation and a resolver outage look identical to the client —
-// the stream is over either way — and must not look identical in the logs.
+// decide: a revocation and a resolver outage look identical to the client — the
+// stream is over either way — and must not look identical in the logs. Only the
+// outage path calls it directly; everything else wants closeForbidden.
 //
 // It writes to the ResponseWriter directly and flushes by hand. That is what
 // Writer.Flush was built for (sse.go) and this is its only caller; the frame is
-// stream policy rather than codec, so it does not become a Writer method.
+// stream policy rather than codec, so it does not become a Writer method. The
+// Writer's last-write clock is deliberately not touched — see sse.go.
 func (st *stream) writeForbidden() error {
 	if _, err := fmt.Fprint(st.wr.w, forbiddenFrame); err != nil {
 		return fmt.Errorf("write forbidden frame: %w", err)
 	}
 	st.wr.Flush()
 	return nil
+}
+
+// closeForbidden ends the stream because authorization was checked and denied:
+// the frame, then CloseForbidden. A failed frame write wins, because then the
+// client got nothing and the write error is the truer report.
+func (st *stream) closeForbidden() error {
+	if err := st.writeForbidden(); err != nil {
+		return err
+	}
+	return CloseForbidden
 }
 
 // prime writes the client's starting state — a fresh snapshot, or nothing at
@@ -303,8 +428,24 @@ func (s *Streamer) prime(ctx context.Context, st *stream, req StreamRequest) err
 // A long replay keeps the live queue filling and may get this subscriber
 // evicted as a slow consumer. That is the design working rather than a bug:
 // the client reconnects with Last-Event-ID and makes progress each time.
-func (s *Streamer) replay(ctx context.Context, st *stream, f Filter) error {
+//
+// It re-checks grants BEFORE EACH PAGE, which is where the interval's promise
+// of a bounded staleness window is actually kept: this loop runs for as long as
+// the client is behind, it reads up to the current head, and a revocation
+// landing mid-catch-up would otherwise be ignored for the whole of it — while
+// rows committed after the revocation went out. The refreshed scope goes into
+// the NEXT page's Filter rather than re-filtering the page just written: every
+// predicate is in SQL (Task 7), so pushing it down is both the cheaper and the
+// only non-duplicated place to apply it.
+func (s *Streamer) replay(ctx context.Context, st *stream, rc *recheck, req StreamRequest) error {
+	f := req.Filter
 	for {
+		if rc.due() {
+			if err := rc.refresh(ctx, st); err != nil {
+				return err
+			}
+			f.Scope = rc.scope
+		}
 		// Always the configured batch — never a bare literal, and never the
 		// zero that would make every page look like "caught up".
 		page, err := s.src.Replay(ctx, f, st.cursor, s.cfg.ReplayBatch)
@@ -343,35 +484,31 @@ func (s *Streamer) replay(ctx context.Context, st *stream, f Filter) error {
 // write — intended, and fine at the 20s default; anyone tightening a proxy
 // idle timeout below 2*hb needs to meet that fact here.
 //
-// Grants are re-resolved on a SECOND ticker and never per event: the per-event
-// work is a pure in-memory scope test, so a busy stream costs no database round
-// trips at all. The obvious objection — that a busy stream would then never get
-// round to re-checking — does not hold: select picks uniformly at random among
-// ready cases, so a saturated event channel cannot starve the ticker.
+// Grants get the re-check ticker's OWN select case, and never a test per event:
+// the per-event work is a pure in-memory scope test, so a busy stream costs no
+// database round trips at all. The obvious objection — that a busy stream would
+// then never get round to re-checking — does not hold: select picks uniformly
+// at random among ready cases, so a saturated event channel cannot starve the
+// ticker.
 //
-// The refreshed scope is NOT pushed back into the subscription's filter.
-// Hub.Publish reads that field on the tailer goroutine while holding no
+// Two consequences of that case, both stated rather than left to be found.
+// First, ScopeFor is called synchronously here, so a slow grants store stops
+// event delivery for the length of the round trip and the subscription's queue
+// absorbs the backlog — at the 256-deep default, a slow enough store can evict
+// a client as a slow consumer for a reason that is nothing to do with the
+// client. Accepted: the alternative is a second goroutine and a scope handoff,
+// which costs more than it saves at a 30s interval.
+//
+// Second, the refreshed scope is NOT pushed back into the subscription's
+// filter. Hub.Publish reads that field on the tailer goroutine while holding no
 // subscription lock (hub.go), so writing it here is an unsynchronized
 // concurrent write — a data race, whatever the detector happens to observe on
-// any one run. The consequence, stated rather than left to be discovered:
-// events the refreshed scope denies still occupy queue slots and can still get
-// this client evicted as a slow consumer. Accepted — a filter mutator needs
-// hub-side locking and buys nothing this task needs.
-func (s *Streamer) follow(ctx context.Context, st *stream, sub *Subscription, req StreamRequest) error {
+// any one run. So events the refreshed scope denies still occupy queue slots
+// and can still get this client evicted. Accepted for the same reason: a filter
+// mutator needs hub-side locking and buys nothing this task needs.
+func (s *Streamer) follow(ctx context.Context, st *stream, sub *Subscription, rc *recheck, req StreamRequest) error {
 	tick := time.NewTicker(s.cfg.HeartbeatInterval)
 	defer tick.Stop()
-	recheck := time.NewTicker(s.cfg.GrantRecheck)
-	defer recheck.Stop()
-
-	// The last scope known to be real. It starts at the Filter's own rather
-	// than at a resolve of its own: the handler resolved exactly this scope
-	// moments ago to build the Filter, so an eager re-resolve would put a
-	// database round-trip on every stream open to re-learn what it was just
-	// told. The first tick is the earliest anything can have changed.
-	scope := req.Filter.Scope
-	// Consecutive re-check failures. Reset on any success — see
-	// maxGrantFailures for why the cap counts a run rather than a lifetime.
-	failures := 0
 
 	for {
 		select {
@@ -389,7 +526,7 @@ func (s *Streamer) follow(ctx context.Context, st *stream, sub *Subscription, re
 			// Matches would conflate "this principal may no longer see the
 			// project" with "the selector rejects it", and the two have
 			// opposite outcomes right below.
-			if !scope.allows(e.ProjectID) {
+			if !rc.scope.allows(e.ProjectID) {
 				// A per-run stream's entire subject just left the principal's
 				// grants, so there is nothing left for it to show: end it.
 				//
@@ -397,12 +534,13 @@ func (s *Streamer) follow(ctx context.Context, st *stream, sub *Subscription, re
 				// the only form the rule can take. "The scope no longer covers
 				// this run's project" is not computable without an event: a
 				// Filter carries a RunID and never that run's project, and an
-				// admin's per-run Filter carries no project id at all.
+				// admin's per-run Filter carries no project id at all. The
+				// residue that leaves is real and documented on Serve: a per-run
+				// stream over an already-quiescent run keeps an idle connection
+				// open after the revocation. It shows the client nothing — every
+				// path denies — but nothing ends it either.
 				if req.Filter.RunID != nil {
-					if err := st.writeForbidden(); err != nil {
-						return err
-					}
-					return CloseForbidden
+					return st.closeForbidden()
 				}
 				// An attention stream keeps going — the rest of its scope is
 				// still live. Nothing was written, so the cursor does not move:
@@ -416,39 +554,9 @@ func (s *Streamer) follow(ctx context.Context, st *stream, sub *Subscription, re
 			if err := st.wr.Heartbeat(); err != nil {
 				return err
 			}
-		case <-recheck.C:
-			next, err := s.grants.ScopeFor(ctx, req.UserID)
-			if err != nil {
-				failures++
-				if failures < maxGrantFailures {
-					// Keep the last known scope and try again next tick.
-					continue
-				}
-				// Out of tolerance: fail closed. The client gets the same frame
-				// a revocation would send — the stream is over either way and
-				// the status was committed long ago — but the caller gets the
-				// RESOLVER's error, not CloseForbidden. Saying "not authorized"
-				// when the truth is "we could not ask" is the same false
-				// statement closeClientGone exists to avoid, and it would hand
-				// Task 10 a routine revocation and a grants-store outage under
-				// one label.
-				if werr := st.writeForbidden(); werr != nil {
-					return werr
-				}
-				return fmt.Errorf("stream grant re-check: %w", err)
-			}
-			failures = 0
-			scope = next
-			// An empty scope matches nothing and never will again, so no event
-			// can arrive to reveal it: this is the only thing that can close an
-			// IDLE stream, and it covers both stream shapes at once. A
-			// deactivated principal resolves to exactly this — an empty Scope
-			// with a nil error — so deactivation lands here too.
-			if scope.empty() {
-				if err := st.writeForbidden(); err != nil {
-					return err
-				}
-				return CloseForbidden
+		case <-rc.tick.C:
+			if err := rc.refresh(ctx, st); err != nil {
+				return err
 			}
 		}
 	}
