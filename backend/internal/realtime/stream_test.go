@@ -152,6 +152,59 @@ func (s *streamSource) calls() (snapshots int, replays []replayCall) {
 	return s.snapshotCalls, slices.Clone(s.replayCalls)
 }
 
+// grantStep is one scripted answer from stubGrants: a scope, or the failure
+// that stood in for one. A step with a non-nil err yields no scope at all,
+// which is what a resolver that could not reach the database does.
+type grantStep struct {
+	scope Scope
+	err   error
+}
+
+// stubGrants is the GrantResolver Serve re-consults on the re-check ticker.
+//
+// steps are consumed one per call and the LAST one repeats forever, so a test
+// scripts the transition it cares about and never has to count the ticks that
+// land afterwards. No script at all is the permissive resolver idleStreamer
+// wants: every id-asserting test in this file runs through it and must not
+// depend on grants.
+//
+// It is called from Serve's goroutine while the test goroutine reads
+// callCount, so every field is behind the mutex — and it honours its context,
+// because Task 8's finding was rooted in a fake that ignored one, which made a
+// whole class of defect structurally invisible rather than merely uncovered.
+type stubGrants struct {
+	mu    sync.Mutex
+	steps []grantStep
+	calls int
+}
+
+var _ GrantResolver = (*stubGrants)(nil)
+
+func (g *stubGrants) ScopeFor(ctx context.Context, _ uuid.UUID) (Scope, error) {
+	g.mu.Lock()
+	g.calls++
+	step := grantStep{scope: Scope{All: true}}
+	if len(g.steps) > 0 {
+		step = g.steps[min(g.calls, len(g.steps))-1]
+	}
+	g.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Scope{}, fmt.Errorf("stubGrants.ScopeFor: %w", err)
+	}
+	if step.err != nil {
+		return Scope{}, step.err
+	}
+	return step.scope, nil
+}
+
+// callCount is how many times the stream has re-resolved so far. It is named
+// away from streamSource.calls only because both fakes live in one package.
+func (g *stubGrants) callCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls
+}
+
 // streamRecorder is a concurrency-safe http.ResponseWriter + http.Flusher.
 // Serve runs in a goroutine in every test here while the test reads what it
 // has written; sseRecorder (sse_test) appends to an unguarded slice over an
@@ -245,10 +298,15 @@ func runFilter(run, project uuid.UUID) Filter {
 }
 
 // idleStreamer is the configuration for tests that assert on ids: a heartbeat
-// far beyond the test's lifetime, so no comment ever interleaves with the
-// frames, and a batch each test sets deliberately.
+// AND a grant re-check far beyond the test's lifetime, so neither a comment nor
+// a scope change ever interleaves with the frames, and a batch each test sets
+// deliberately. The resolver is permissive and, at an hour, never consulted.
 func idleStreamer(hub *Hub, src EventSource, batch int) *Streamer {
-	return NewStreamer(hub, src, StreamerConfig{HeartbeatInterval: time.Hour, ReplayBatch: batch})
+	return NewStreamer(hub, src, &stubGrants{}, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      time.Hour,
+		ReplayBatch:       batch,
+	})
 }
 
 // startServe runs Serve in the background, as the HTTP server does, and hands
@@ -632,6 +690,11 @@ func TestServe_ReturnsNilWhenTheClientLeavesDuringCatchUp(t *testing.T) {
 // an over-pin objection, deliberately, so that a future batching change has to
 // renegotiate the guarantee rather than quietly acquire it. This is the other
 // end of that chain: without it, an st.wr.Flush() added to send is invisible.
+//
+// The live event is load-bearing and was added when the first legitimate
+// Flush() caller arrived. Ending on the snapshot alone leaves follow — the loop
+// most likely to acquire a stray flush — entirely uncovered here: a Flush()
+// added to its event case survived this test verbatim.
 func TestServe_AddsNoFlushOfItsOwn(t *testing.T) {
 	t.Parallel()
 	proj, run := uuid.New(), uuid.New()
@@ -643,16 +706,24 @@ func TestServe_AddsNoFlushOfItsOwn(t *testing.T) {
 		},
 		retained: []Event{hubEvent(2, proj, run, "run.started")},
 	}
-	src.onSnapshot = func() { hub.Close() }
+	src.onSnapshot = func() {
+		// Queued now, drained by follow after the close: a closed channel still
+		// yields what it was buffering.
+		hub.Publish([]Event{hubEvent(3, proj, run, "run.started")})
+		hub.Close()
+	}
 
 	rec, _, errc := startServe(t, idleStreamer(hub, src, 10), StreamRequest{Filter: runFilter(run, proj)})
 
 	if err := waitServe(t, errc); !errors.Is(err, CloseShutdown) {
 		t.Fatalf("Serve() = %v, want %v", err, CloseShutdown)
 	}
+	if diff := cmp.Diff([]int64{1, 2, 3}, rec.ids(t)); diff != "" {
+		t.Errorf("ids on the wire (-want +got):\n%s", diff)
+	}
 	// NewWriter's connect flush, then exactly one write and one flush per
 	// frame — nothing else. The heartbeat is an hour away and cannot appear.
-	want := []string{"flush", "write", "flush", "write", "flush"}
+	want := []string{"flush", "write", "flush", "write", "flush", "write", "flush"}
 	if diff := cmp.Diff(want, rec.opLog()); diff != "" {
 		t.Errorf("write/flush interleaving (-want +got):\n%s", diff)
 	}
@@ -666,7 +737,13 @@ func TestServe_HeartbeatsWhileIdle(t *testing.T) {
 	proj, run := uuid.New(), uuid.New()
 	hub := NewHub(HubConfig{SubscriberQueue: 8})
 	src := &streamSource{}
-	s := NewStreamer(hub, src, StreamerConfig{HeartbeatInterval: testPoll, ReplayBatch: 10})
+	// GrantRecheck is spelled out rather than defaulted: a default that merely
+	// happens not to fire inside this test is not a guarantee that it will not.
+	s := NewStreamer(hub, src, &stubGrants{}, StreamerConfig{
+		HeartbeatInterval: testPoll,
+		GrantRecheck:      time.Hour,
+		ReplayBatch:       10,
+	})
 
 	rec, cancel, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
 
@@ -677,12 +754,12 @@ func TestServe_HeartbeatsWhileIdle(t *testing.T) {
 	}
 }
 
-// A zero StreamerConfig is what an unset config section hands over, and both
-// of its zeroes fail silently rather than loudly: a zero HeartbeatInterval
-// PANICS time.NewTicker on the first request served, and a zero ReplayBatch
-// reaches Replay, which answers a non-positive limit with an empty page — a
-// stream that opens, writes its snapshot and then never catches up, with
-// nothing logged anywhere to say so.
+// A zero StreamerConfig is what an unset config section hands over, and every
+// one of its zeroes fails silently rather than loudly: a zero
+// HeartbeatInterval or GrantRecheck PANICS time.NewTicker on the first request
+// served, and a zero ReplayBatch reaches Replay, which answers a non-positive
+// limit with an empty page — a stream that opens, writes its snapshot and then
+// never catches up, with nothing logged anywhere to say so.
 func TestServe_ZeroConfigIsUsable(t *testing.T) {
 	t.Parallel()
 	proj, run := uuid.New(), uuid.New()
@@ -696,9 +773,12 @@ func TestServe_ZeroConfigIsUsable(t *testing.T) {
 	}
 	src.onSnapshot = func() { hub.Close() }
 
-	s := NewStreamer(hub, src, StreamerConfig{})
+	s := NewStreamer(hub, src, &stubGrants{}, StreamerConfig{})
 	if s.cfg.HeartbeatInterval != defaultHeartbeatInterval {
 		t.Errorf("HeartbeatInterval = %v, want the default %v", s.cfg.HeartbeatInterval, defaultHeartbeatInterval)
+	}
+	if s.cfg.GrantRecheck != defaultGrantRecheck {
+		t.Errorf("GrantRecheck = %v, want the default %v", s.cfg.GrantRecheck, defaultGrantRecheck)
 	}
 
 	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
@@ -816,4 +896,251 @@ func TestServe_StopsWhenReplayCannotAdvance(t *testing.T) {
 	if got := rec.ids(t); len(got) != 0 {
 		t.Errorf("ids on the wire = %v, want none", got)
 	}
+}
+
+// forbiddenOnTheWire is the terminal frame spelled out, deliberately as a
+// literal rather than as the constant Serve writes: a test that compared the
+// implementation against itself would pass whatever bytes the implementation
+// drifted to, and these bytes are a wire contract Task 10 documents.
+const forbiddenOnTheWire = "event: forbidden\ndata: {\"error\":\"forbidden\"}\n\n"
+
+// Revocation must END a stream, not merely stop new events from matching. An
+// IDLE stream has no event to test anything against, so the empty scope is the
+// only thing that can close it — and the empty scope is exactly what a revoked
+// or deactivated principal resolves to.
+func TestServe_ClosesWhenGrantRevoked(t *testing.T) {
+	t.Parallel()
+	proj, run := uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	grants := &stubGrants{steps: []grantStep{
+		{scope: Scope{Projects: []uuid.UUID{proj}}},
+		{scope: Scope{}},
+	}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       10,
+	})
+
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+
+	if err := waitServe(t, errc); !errors.Is(err, CloseForbidden) {
+		t.Fatalf("Serve() after the grant was revoked = %v, want %v", err, CloseForbidden)
+	}
+	// The whole body, not a substring: nothing was streamed before the frame
+	// and there is NO id: line in it. Ids on the wire are the client's resume
+	// point, and a client that adopted this one would resume from a position
+	// that never named an event.
+	if diff := cmp.Diff(forbiddenOnTheWire, rec.written()); diff != "" {
+		t.Errorf("wire bytes (-want +got):\n%s", diff)
+	}
+}
+
+// The attention stream survives a narrowing: the rest of the scope is still
+// live, so an event from a project that left it is dropped and the stream
+// carries on. The hub is NOT told about the new scope — Serve does not mutate
+// a subscription's filter, because Publish reads it on the tailer goroutine —
+// so both events really do arrive and follow is what decides between them.
+func TestServe_DropsEventsOutsideRefreshedScope(t *testing.T) {
+	t.Parallel()
+	kept, lost, run := uuid.New(), uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	grants := &stubGrants{steps: []grantStep{{scope: Scope{Projects: []uuid.UUID{kept}}}}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       10,
+	})
+
+	f := Filter{Attention: true, Scope: Scope{Projects: []uuid.UUID{kept, lost}}}
+	rec, cancel, errc := startServe(t, s, StreamRequest{Filter: f})
+
+	// One completed re-check means follow holds the narrowed scope: the
+	// assignment happens on the same goroutine before it can receive again.
+	eventually(t, func() bool { return grants.callCount() > 0 }, "the first grant re-check")
+	hub.Publish([]Event{
+		hubEvent(1, lost, run, "run.started"),
+		hubEvent(2, kept, run, "run.started"),
+	})
+
+	// Waiting for the KEPT event is what makes this deterministic without a
+	// settle window: events are delivered and consumed in id order, so once 2
+	// is on the wire, 1 has already been decided.
+	eventually(t, func() bool { return slices.Contains(rec.ids(t), int64(2)) }, "the kept project's event")
+	if diff := cmp.Diff([]int64{2}, rec.ids(t)); diff != "" {
+		t.Errorf("ids on the wire (-want +got):\n%s", diff)
+	}
+
+	// And the stream is still serving: a narrowing is not a close.
+	cancel()
+	if err := waitServe(t, errc); err != nil {
+		t.Fatalf("Serve() on an attention stream that only narrowed = %v, want nil", err)
+	}
+}
+
+// A per-run stream is the opposite case: its whole subject just left the
+// principal's grants, so there is nothing left for it to show and it ends.
+//
+// The refreshed scope here is NON-empty — the principal still holds another
+// project — so the idle close cannot fire and only the event can end this
+// stream. That is deliberate: "the run's project left the scope" is not
+// computable without an event, because a Filter carries a RunID and never that
+// run's project.
+func TestServe_ClosesPerRunStreamOnAForbiddenEvent(t *testing.T) {
+	t.Parallel()
+	proj, other, run := uuid.New(), uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	grants := &stubGrants{steps: []grantStep{{scope: Scope{Projects: []uuid.UUID{other}}}}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       10,
+	})
+
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+
+	eventually(t, func() bool { return grants.callCount() > 0 }, "the first grant re-check")
+	hub.Publish([]Event{hubEvent(1, proj, run, "run.started")})
+
+	if err := waitServe(t, errc); !errors.Is(err, CloseForbidden) {
+		t.Fatalf("Serve() on a per-run stream whose project left the scope = %v, want %v", err, CloseForbidden)
+	}
+	// The whole body: the event that triggered the close never reached the
+	// client, which is the point of checking before writing.
+	if diff := cmp.Diff(forbiddenOnTheWire, rec.written()); diff != "" {
+		t.Errorf("wire bytes (-want +got):\n%s", diff)
+	}
+}
+
+// A resolver failure is not a permissions change. Closing on one would make
+// every database hiccup look like a revocation to every open stream at once.
+//
+// Four blips in eight checks is more failures than the cap, but never three in
+// a row: this pins BOTH that a blip is tolerated and that a success resets the
+// count, which is what stops a long-lived stream from accumulating unrelated
+// hiccups until it trips the cap.
+func TestServe_ResolverBlipsDoNotCloseTheStream(t *testing.T) {
+	t.Parallel()
+	proj, run := uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	boom := errors.New("grants: connection refused")
+	live := Scope{Projects: []uuid.UUID{proj}}
+	script := []grantStep{
+		{err: boom},
+		{scope: live},
+		{err: boom},
+		{scope: live},
+		{err: boom},
+		{scope: live},
+		{err: boom},
+		{scope: live},
+	}
+	grants := &stubGrants{steps: script}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       10,
+	})
+
+	rec, cancel, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+
+	eventually(t, func() bool { return grants.callCount() >= len(script) }, "the scripted blips to run out")
+	hub.Publish([]Event{hubEvent(1, proj, run, "run.started")})
+	eventually(t, func() bool { return slices.Contains(rec.ids(t), int64(1)) }, "an event after the blips")
+
+	cancel()
+	if err := waitServe(t, errc); err != nil {
+		t.Fatalf("Serve() after transient resolver failures = %v, want nil", err)
+	}
+}
+
+// A resolver that never answers leaves the stream running on a scope nobody
+// can confirm — the fail-open the re-check exists to close. So the tolerance
+// is bounded, and past the bound the stream ends.
+//
+// It ends as a FAULT, not as a denial: nothing denied this principal, we could
+// not ask. Reporting CloseForbidden here would put "not authorized" in the
+// logs when the truth is "the grants store is down", and hand Task 10 a
+// routine revocation and a real outage under one label.
+func TestServe_ClosesAfterSustainedResolverFailure(t *testing.T) {
+	t.Parallel()
+	proj, run := uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	boom := errors.New("grants: connection refused")
+	grants := &stubGrants{steps: []grantStep{{err: boom}}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       10,
+	})
+
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+
+	err := waitServe(t, errc)
+	if !errors.Is(err, boom) {
+		t.Fatalf("Serve() after a sustained resolver outage = %v, want it to wrap %v", err, boom)
+	}
+	if errors.Is(err, CloseForbidden) {
+		t.Errorf("Serve() = %v, want it NOT to report %v: authorization was never checked, only unreachable", err, CloseForbidden)
+	}
+	if got := grants.callCount(); got != maxGrantFailures {
+		t.Errorf("resolver called %d time(s) before the stream ended, want exactly %d", got, maxGrantFailures)
+	}
+	// The client is told the same thing either way — the stream is over and a
+	// status is long since committed — even though the log is not.
+	if diff := cmp.Diff(forbiddenOnTheWire, rec.written()); diff != "" {
+		t.Errorf("wire bytes (-want +got):\n%s", diff)
+	}
+}
+
+// The handler resolved this exact scope moments ago to build the Filter, so
+// the first tick is the earliest a re-check can tell anyone anything new. An
+// eager resolve at the top of follow would put a database round-trip on every
+// stream open for an answer nothing has had time to change.
+func TestServe_DoesNotResolveGrantsBeforeTheFirstTick(t *testing.T) {
+	t.Parallel()
+	proj, run := uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	grants := &stubGrants{}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      time.Hour,
+		ReplayBatch:       10,
+	})
+
+	rec, cancel, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+
+	// A live event on the wire is proof the stream reached follow — where an
+	// eager resolve would live — and got past its first iteration.
+	eventually(t, func() bool { return registryLen(hub) == 1 }, "the stream to subscribe")
+	hub.Publish([]Event{hubEvent(1, proj, run, "run.started")})
+	eventually(t, func() bool { return slices.Contains(rec.ids(t), int64(1)) }, "a live event on the wire")
+
+	if got := grants.callCount(); got != 0 {
+		t.Errorf("resolver called %d time(s) before the first re-check tick, want 0", got)
+	}
+	cancel()
+	if err := waitServe(t, errc); err != nil {
+		t.Fatalf("Serve() on a client disconnect = %v, want nil", err)
+	}
+}
+
+// A Streamer with no resolver never re-checks anything, which is precisely the
+// fail-open this task closes — and it fails silently, as a stream that simply
+// keeps working. Refusing at construction turns it into one panic at process
+// start instead of one per request, inside an HTTP handler goroutine.
+func TestNewStreamer_PanicsOnANilGrantResolver(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		if recover() == nil {
+			t.Error("NewStreamer with a nil GrantResolver returned normally, want a panic")
+		}
+	}()
+	NewStreamer(NewHub(HubConfig{}), &streamSource{}, nil, StreamerConfig{})
 }

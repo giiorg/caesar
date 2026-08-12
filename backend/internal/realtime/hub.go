@@ -11,6 +11,11 @@ const defaultSubscriberQueue = 256
 // CloseReason says why a subscription ended, and IS the error the subscription
 // reports: the values are comparable, so errors.Is matches a reason by value
 // and a new reason costs exactly one const and nothing else.
+//
+// Every reason a caller can OBSERVE is in the block below. One more lives in
+// stream.go — Serve's own deferred tidy-up close — and is unexported precisely
+// because nobody ever reads it; the set is split across two files, and this is
+// the line that says so.
 type CloseReason string
 
 const (
@@ -21,6 +26,12 @@ const (
 
 	// CloseShutdown: the process is going away.
 	CloseShutdown CloseReason = "hub shut down"
+
+	// CloseForbidden: a grant re-check found the principal may no longer see
+	// this stream (stream.go). It is reported ONLY where authorization was
+	// checked and denied — never where the resolver could not be reached,
+	// which is a fault and reports itself as one.
+	CloseForbidden CloseReason = "not authorized"
 )
 
 func (r CloseReason) Error() string { return "realtime: " + string(r) }

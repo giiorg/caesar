@@ -69,6 +69,11 @@ func (s Scope) allows(project uuid.UUID) bool {
 	return s.All || slices.Contains(s.Projects, project)
 }
 
+// empty reports the scope that matches nothing and never will again — what a
+// revoked or deactivated principal resolves to. It is the one thing that can
+// end an IDLE stream, where there is no event to test allows against.
+func (s Scope) empty() bool { return !s.All && len(s.Projects) == 0 }
+
 // Filter selects the events one subscription receives. Exactly one of
 // RunID (per-run stream) or Attention (global stream) is set.
 type Filter struct {
