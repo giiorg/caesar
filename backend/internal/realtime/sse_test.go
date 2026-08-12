@@ -273,3 +273,21 @@ func TestWriter_RejectsNonFlusher(t *testing.T) {
 		t.Errorf("NewWriter() on a non-Flusher returned %v, want nil", w)
 	}
 }
+
+// A rejected writer has to be handed back the way it was found. The headers go
+// on BEFORE the flush — the flush is what sends them — so the constructor
+// discovers it cannot stream only after announcing that it will, and the
+// caller then renders problem+json on this very ResponseWriter
+// (realtime/api.handleStreamAttention). Content-Type gets overwritten there;
+// Cache-Control, Connection and X-Accel-Buffering would not, and would ride
+// out on an error response describing a stream that never opened.
+func TestWriter_TakesItsHeadersBackWhenItCannotFlush(t *testing.T) {
+	t.Parallel()
+	w := &plainResponseWriter{header: http.Header{}}
+	if _, err := NewWriter(w, time.Minute, time.Now); err == nil {
+		t.Fatal("NewWriter() on a non-Flusher returned nil error, want an error")
+	}
+	if len(w.header) != 0 {
+		t.Errorf("rejected writer left %v behind, want an untouched header map", w.header)
+	}
+}

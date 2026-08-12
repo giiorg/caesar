@@ -833,6 +833,14 @@ func TestServe_RejectsANonFlusher(t *testing.T) {
 	if err == nil {
 		t.Fatal("Serve() on a non-Flusher returned nil, want an error")
 	}
+	// The HTTP surfaces branch on this and nothing else. It is the only ending
+	// where the status is still theirs to choose, and every other one — a write
+	// failure, CloseForbidden, CloseSlowConsumer, CloseShutdown — happens over a
+	// committed 200 where calling httpx.Problem would append a problem document
+	// to the SSE body. See Serve.
+	if !errors.Is(err, ErrNotStarted) {
+		t.Errorf("Serve() error = %v, want it to wrap ErrNotStarted", err)
+	}
 	if got := registryLen(hub); got != 0 {
 		t.Errorf("registry holds %d subscription(s) after a rejected stream, want 0", got)
 	}
@@ -1095,6 +1103,13 @@ func TestServe_ClosesAfterSustainedResolverFailure(t *testing.T) {
 	}
 	if errors.Is(err, CloseForbidden) {
 		t.Errorf("Serve() = %v, want it NOT to report %v: authorization was never checked, only unreachable", err, CloseForbidden)
+	}
+	// Nor ErrNotStarted. This stream started, wrote and then failed, and a
+	// surface that read this as "nothing committed" would answer a 500 over the
+	// bytes already on the wire — the mirror of the silent-200 bug the sentinel
+	// exists to fix.
+	if errors.Is(err, ErrNotStarted) {
+		t.Errorf("Serve() = %v, want it NOT to wrap %v: the 200 was committed before this failure", err, ErrNotStarted)
 	}
 	if got := grants.callCount(); got != maxGrantFailures {
 		t.Errorf("resolver called %d time(s) before the stream ended, want exactly %d", got, maxGrantFailures)

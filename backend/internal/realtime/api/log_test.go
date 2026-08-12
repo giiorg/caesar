@@ -32,6 +32,14 @@ func TestLogStreamEnd(t *testing.T) {
 		{"a wrapped reason still matches", fmt.Errorf("serve: %w", realtime.CloseForbidden), "INFO"},
 		{"a write failure is a fault", errors.New("write stream frame 3: broken pipe"), "ERROR"},
 		{
+			// Answered as a 500 as well, but the 500 says nothing and the access
+			// log records only a status: this line is where the cause is written
+			// down at all.
+			"a stream that never opened is a fault",
+			fmt.Errorf("%w: realtime: response writer cannot flush: %w", realtime.ErrNotStarted, errors.New("not supported")),
+			"ERROR",
+		},
+		{
 			"a re-check out of tolerance is a fault, not a denial",
 			fmt.Errorf("stream grant re-check: %w", errors.New("grants store unreachable")),
 			"ERROR",

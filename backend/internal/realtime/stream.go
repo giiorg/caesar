@@ -2,6 +2,7 @@ package realtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -42,6 +43,25 @@ const maxGrantFailures = 3
 // frame (sse.go). These bytes are wire contract alongside StreamFrame rather
 // than an implementation detail, and Task 10 documents both.
 const forbiddenFrame = "event: forbidden\ndata: {\"error\":\"forbidden\"}\n\n"
+
+// ErrNotStarted marks the one way out of Serve that has NOT committed a
+// response. Every other ending — a write failure, a source failure,
+// CloseForbidden, CloseSlowConsumer, CloseShutdown — happens over a 200 that
+// NewWriter fixed long before, and there the only honest report is bytes in the
+// body plus a log line.
+//
+// It exists because an HTTP surface cannot tell the two apart from the error
+// value otherwise, and guessing wrong is expensive in both directions: read a
+// committed stream as "not started" and a problem document gets appended to the
+// SSE body; read a stream that never opened as committed and the endpoint
+// answers a bare 200 with no content, which is exactly what a working but idle
+// stream looks like. That silence is the failure mode spec §4's realtime
+// surfaces exist to avoid, and it is what both surfaces did before this
+// sentinel — see realtime/api.handleStreamAttention.
+//
+// Match it with errors.Is; the cause is wrapped alongside it and is what the
+// log should carry.
+var ErrNotStarted = errors.New("realtime: stream not started")
 
 // closeClientGone is the reason Serve's own deferred Close carries. It is
 // unexported and never observed by anyone: a subscription does not outlive
@@ -132,6 +152,10 @@ type StreamRequest struct {
 // Serve streams to w until the client disconnects, the subscription ends or a
 // write fails. It returns:
 //
+//   - ErrNotStarted, wrapping the cause, when the response writer cannot be
+//     turned into a stream. THE ONLY ENDING THAT HAS COMMITTED NOTHING: w is
+//     untouched — no status, no body, not even a header (sse.go) — so the
+//     caller still owns the response and must answer with a real status.
 //   - nil when ctx is done, WHEREVER the stream had got to. A disconnect is
 //     how an SSE request normally ends, and Task 10 must not log every closed
 //     tab as a fault.
@@ -151,9 +175,10 @@ type StreamRequest struct {
 // what eventually fails authorization at the handler. Closing it outright needs
 // the run's project, which a Filter does not carry.
 //
-// Only the first error can still become an HTTP status. Once NewWriter has
-// returned, the response is committed 200 forever, which is why Tasks 9 and
-// 10 speak of a "403-shaped terminal frame" rather than a 403.
+// Only the first error can still become an HTTP status, and ErrNotStarted is
+// how a caller recognizes it. Once NewWriter has returned successfully the
+// response is committed 200 forever, which is why Tasks 9 and 10 speak of a
+// "403-shaped terminal frame" rather than a 403.
 func (s *Streamer) Serve(ctx context.Context, w http.ResponseWriter, req StreamRequest) error {
 	// The Writer FIRST. It is the one failure that can happen before the 200
 	// is committed, it reads no events — so building it first cannot miss one
@@ -162,7 +187,10 @@ func (s *Streamer) Serve(ctx context.Context, w http.ResponseWriter, req StreamR
 	// below, and that is what the ordering test pins.
 	wr, err := NewWriter(w, s.cfg.HeartbeatInterval, nil)
 	if err != nil {
-		return err
+		// The ONLY return that is still a status. Tagged rather than left as a
+		// bare wrapped error so the surfaces can branch on it — see
+		// ErrNotStarted for what each wrong guess costs.
+		return fmt.Errorf("%w: %w", ErrNotStarted, err)
 	}
 
 	// SUBSCRIBE BEFORE READING ANYTHING. From this instant every matching

@@ -26,7 +26,19 @@ const eventStreamType = "text/event-stream"
 // getting it, while a browser's EventSource sends exactly "text/event-stream"
 // and is never in doubt.
 //
-// The comma split is not RFC-complete: a quoted parameter value containing a
+// Two ways this is deliberately not a full RFC 9110 negotiator, both of which
+// the rules above would otherwise read as covering.
+//
+// RELATIVE PREFERENCE IS IGNORED. Only q=0 is read, as a refusal; every other
+// weight is treated as "yes". So "application/json;q=0.9,
+// text/event-stream;q=0.1" streams, even though the client ranked JSON first.
+// Ordering the ranges would mean scoring the JSON branch too — and "*/*"
+// against an endpoint with two representations has no defensible winner —
+// which is a negotiator, not the single-question test finding 9 asks for. No
+// EventSource sends a weighted Accept, and a client that does is asking for
+// something this endpoint has never offered.
+//
+// The comma split is not RFC-complete either: a quoted parameter value with a
 // comma would be split through the middle. No Accept header in practice
 // carries one, and the halves then fail to parse — so the failure lands on the
 // JSON branch, which is the safe side.

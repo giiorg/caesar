@@ -142,6 +142,14 @@ type altResponse struct {
 // CI-failing). contracts is not a bounded context and may see both, so this is
 // the only place in the tree that can hold the pairing. It is the same reason
 // requestOverrides above exists, and the entry is registered by the same key.
+//
+// That key is the BARE operation ID, matched against every context's table at
+// once, so it assumes IDs are unique process-wide. They are the document's
+// operationId and have to be — but nothing here enforces it, and a second table
+// declaring "listRunEvents" would silently be given an SSE representation it
+// never asked for. requestOverrides has the identical shape and exposure; a
+// guard, if one is ever wanted, belongs to both and to Build's loop rather than
+// to this table.
 var altResponses = map[string][]altResponse{
 	"listRunEvents": {{Response: realtime.StreamFrame{}, ContentType: "text/event-stream"}},
 }

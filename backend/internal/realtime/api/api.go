@@ -123,22 +123,41 @@ func (a *API) handleStreamAttention(w http.ResponseWriter, r *http.Request, sess
 		return
 	}
 
-	// From here the response belongs to the Streamer, and by the time this
-	// returns the status has been 200 for as long as the stream lasted. What
-	// it reports can only go to the log.
+	// From here the response belongs to the Streamer — with ONE exception, and
+	// it is the reason the exception is named rather than guessed at. Serve can
+	// fail before it has committed anything, when the writer it was handed
+	// cannot be flushed through its wrapper chain, and it reports that as
+	// ErrNotStarted. That case is still a status, and it must be one: a stream
+	// that could not open and answers a bare 200 is byte-for-byte what a
+	// working stream with nothing to say yet looks like, so the failure would
+	// never be seen. Every OTHER ending arrives over a committed 200 and can
+	// only go to the log — calling Problem on those would append a problem
+	// document to the SSE body, which is strictly worse than saying nothing.
 	err = a.streams.Serve(r.Context(), w, realtime.StreamRequest{
 		Filter:      realtime.AttentionFilter(scope),
 		UserID:      sess.UserID,
 		LastEventID: lastID,
 		HasLastID:   hasLastID,
 	})
+	if errors.Is(err, realtime.ErrNotStarted) {
+		// Unclassified, so httpx.Problem makes it a 500 and suppresses the
+		// detail: "cannot flush" names a server-side wiring fault and is for
+		// the log line below, not for the client.
+		httpx.Problem(w, r, err)
+	}
 	logStreamEnd(r.Context(), a.log, err,
 		slog.String("stream", "attention"),
 		slog.String("user_id", sess.UserID.String()))
 }
 
 // logStreamEnd records how one stream ended, at the level the ending deserves.
-// Serve has five shapes and only one of them is a fault:
+// Serve has six shapes and two of them are faults:
+//
+//   - ErrNotStarted — the stream never opened. A wiring fault, error level, and
+//     the caller has already turned it into a 500. Logged as well as answered
+//     because the 500 carries no detail and the access log carries no reason;
+//     the cause wrapped in here is the only place "cannot flush" is written
+//     down.
 //
 //   - nil — the request's context was done, which for an SSE request normally
 //     means the client disconnected. SILENT: AccessLog already writes a line
@@ -147,11 +166,15 @@ func (a *API) handleStreamAttention(w http.ResponseWriter, r *http.Request, sess
 //     failure RACING a disconnect also comes back nil and is therefore
 //     swallowed here; that trade was made there, not here, and this cannot
 //     undo it — the two are indistinguishable by the time they arrive.
+//
 //   - CloseSlowConsumer — the client fell behind and was evicted. Expected
 //     traffic: it reconnects with Last-Event-ID and loses nothing.
+//
 //   - CloseShutdown — the process is going away.
+//
 //   - CloseForbidden — a revocation was acted on. Routine; a security event,
 //     not an outage, and logging it as one would train a reader to ignore it.
+//
 //   - anything else — a write or source failure, or a grant re-check that
 //     failed often enough to end the stream. The only error-level case.
 //

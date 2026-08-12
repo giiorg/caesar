@@ -23,6 +23,9 @@ func TestAcceptsEventStream(t *testing.T) {
 		{"explicitly refused", "application/json, text/event-stream;q=0", false},
 		{"explicitly refused, decimal", "application/json, text/event-stream;q=0.0", false},
 		{"weighted but wanted", "application/json;q=0.1, text/event-stream;q=0.9", true},
+		// Documented and deliberate rather than accidental: any weight above
+		// zero is a yes, so the client's ranking loses. See acceptsEventStream.
+		{"outranked by JSON and still a stream", "application/json;q=0.9, text/event-stream;q=0.1", true},
 		{"tiny weight still counts", "text/event-stream;q=0.001", true},
 		{"unparseable weight is a refusal", "text/event-stream;q=later", false},
 		{"an unparseable range is skipped, not fatal", "🙂, text/event-stream", true},

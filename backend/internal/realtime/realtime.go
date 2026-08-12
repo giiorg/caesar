@@ -95,11 +95,20 @@ func RunFilter(runID uuid.UUID, s Scope) Filter {
 // AttentionFilter is the global attention stream within scope.
 //
 // It and RunFilter exist so that the ambiguous combinations are not something
-// a handler can reach for. Both set is a per-run stream wearing the attention
+// a handler reaches for. Both set is a per-run stream wearing the attention
 // stream's clothes, and NEITHER set selects nothing at all — a stream that
-// opens, writes not one event and heartbeats until the client gives up. A
-// runtime check at the HTTP edge would catch the second; a constructor makes
-// both unreachable from the surfaces that matter, and does it at compile time.
+// opens, writes not one event and heartbeats until the client gives up.
+//
+// What that buys is narrower than it looks, and the gap is the point. Filter's
+// fields are exported, so `Filter{RunID: &id, Attention: true}` is legal Go and
+// nothing here can stop it: the constructors make the two bad shapes
+// unreachable THROUGH THEM, not unrepresentable. That holds only while every
+// caller uses one — and the per-run Filter has no caller inside this package,
+// so the guarantee rests entirely on the adapter Task 11 writes in internal/app
+// calling RunFilter instead of writing the literal. Review is the only thing
+// enforcing it. A runtime check in Matches could close the gap for real, and
+// was not added: it would have to choose a behaviour for a filter that is
+// already a programming error, and every choice is silent.
 func AttentionFilter(s Scope) Filter {
 	return Filter{Attention: true, Scope: s}
 }

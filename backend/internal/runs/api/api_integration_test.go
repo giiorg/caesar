@@ -31,6 +31,9 @@ import (
 	"github.com/giiorg/caesar/backend/internal/runs/fake"
 )
 
+// patience bounds a request that could stream. See get.
+const patience = 5 * time.Second
+
 // fakePorts implements the authn ports and GrantSource without identity:
 // runs tests may never import the identity context (arch law). Real
 // wiring is exercised by the app e2e (Task 12).
@@ -342,9 +345,21 @@ func (h *harness) do(t *testing.T, method, path, token string, body any) *http.R
 // get is do for a request whose HEADERS are the subject: no body, no
 // Content-Type of its own, and whatever Accept or Last-Event-ID the caller
 // wants tested.
+//
+// It carries a deadline and do does not, and the asymmetry is the whole reason
+// it is written out here. This is the only helper that can reach the streaming
+// branch, and a real stream handler RETURNS ONLY WHEN THE CLIENT GOES AWAY.
+// Nothing hangs today because fakeStreamServer answers and returns — but the
+// moment Task 11 puts the live Streamer behind that port, a negotiation test
+// without a deadline stops being a test and becomes a suite timeout with no
+// name on it. The deadline turns "it never answered" into a named failure at
+// patience. The neighbouring realtime/api package has the same helper for the
+// same reason.
 func (h *harness) get(t *testing.T, path, token string, headers http.Header) *http.Response {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, h.srv.URL+path, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), patience)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.srv.URL+path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +373,7 @@ func (h *harness) get(t *testing.T, path, token string, headers http.Header) *ht
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("GET %s: %v", path, err)
 	}
 	t.Cleanup(func() { resp.Body.Close() })
 	return resp

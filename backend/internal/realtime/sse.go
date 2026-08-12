@@ -56,6 +56,17 @@ type Writer struct {
 	lastWrite time.Time
 }
 
+// sseHeaders is what makes a response a stream. It is one table rather than
+// four Set calls so that NewWriter's undo below cannot drift out of step with
+// its do — the pair is the whole reason it exists.
+var sseHeaders = map[string]string{
+	"Content-Type":  "text/event-stream",
+	"Cache-Control": "no-cache",
+	// Hop-by-hop and ignored by HTTP/2; harmless and mandated over HTTP/1.1.
+	"Connection":        "keep-alive",
+	"X-Accel-Buffering": "no",
+}
+
 // NewWriter takes over w as an SSE stream: headers written and flushed
 // immediately, before any event, because the flush is what defeats proxy
 // buffering and tells the client the stream is live. See Writer for the
@@ -71,19 +82,36 @@ type Writer struct {
 // The header-time flush IS the check. ResponseController reports "not
 // supported" for a writer nothing in its chain can flush, so the one flush
 // this constructor has to do anyway answers the question, and there is no
-// second, weaker test to disagree with it.
+// second, weaker test to disagree with it. The cost of checking that way is
+// that the headers are already on when the answer arrives, so a rejection
+// removes them again and hands w back untouched: nothing written, no status
+// chosen, an empty header map. Serve's caller depends on exactly that — see
+// realtime.ErrNotStarted.
 func NewWriter(w http.ResponseWriter, hb time.Duration, clock func() time.Time) (*Writer, error) {
 	if clock == nil {
 		clock = time.Now
 	}
 	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	// Hop-by-hop and ignored by HTTP/2; harmless and mandated over HTTP/1.1.
-	h.Set("Connection", "keep-alive")
-	h.Set("X-Accel-Buffering", "no")
+	for k, v := range sseHeaders {
+		h.Set(k, v)
+	}
 	rc := http.NewResponseController(w)
 	if err := rc.Flush(); err != nil {
+		// Take them back. The headers HAVE to go on before the flush — the
+		// flush is what sends them — so the rejection path is reached with the
+		// response already announcing a stream, and the caller then renders
+		// problem+json on this same writer (realtime/api). Problem overwrites
+		// Content-Type and nothing else, which would leave Cache-Control,
+		// Connection and X-Accel-Buffering describing a stream that never
+		// existed.
+		//
+		// Del, not save-and-restore: no middleware in this process sets any of
+		// these before a handler runs (httpx sets only X-Correlation-ID), so
+		// there is nothing of anyone else's to clobber. A chain that grows one
+		// has to meet this line.
+		for k := range sseHeaders {
+			h.Del(k)
+		}
 		return nil, fmt.Errorf("realtime: response writer cannot flush: %w", err)
 	}
 	return &Writer{w: w, rc: rc, hb: hb, clock: clock, lastWrite: clock()}, nil

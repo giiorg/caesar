@@ -156,6 +156,16 @@ type harness struct {
 // difference between a working endpoint and one that buffers forever.
 func newHarness(t *testing.T, streams *realtime.Streamer, grants realtime.GrantResolver) *harness {
 	t.Helper()
+	return newHarnessBehind(t, streams, grants)
+}
+
+// newHarnessBehind is newHarness with extra middleware between the real chain
+// and the handler — INNERMOST, so what it hands the handler is the last word on
+// what the response writer can do.
+func newHarnessBehind(
+	t *testing.T, streams *realtime.Streamer, grants realtime.GrantResolver, inner ...httpx.Middleware,
+) *harness {
+	t.Helper()
 	user := authn.Principal{UserID: uuid.New(), Email: "watcher@example.com", Role: authn.RoleMember}
 	auth := fakeAuth{sessions: map[string]authn.AuthSession{
 		sessionToken: {Principal: user, SessionID: uuid.New()},
@@ -163,8 +173,9 @@ func newHarness(t *testing.T, streams *realtime.Streamer, grants realtime.GrantR
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	mux := http.NewServeMux()
 	httpx.Mount(mux, realtimeapi.Operations(realtimeapi.New(streams, auth, grants, log)))
-	srv := httptest.NewServer(httpx.Chain(mux,
-		httpx.WithCorrelationID, httpx.AccessLog(log), httpx.CheckOrigin("http://caesar.test")))
+	srv := httptest.NewServer(httpx.Chain(mux, append([]httpx.Middleware{
+		httpx.WithCorrelationID, httpx.AccessLog(log), httpx.CheckOrigin("http://caesar.test"),
+	}, inner...)...))
 	t.Cleanup(srv.Close)
 	return &harness{srv: srv, user: user}
 }
@@ -432,5 +443,52 @@ func TestStreamAttention_UnwiredDependenciesAre500(t *testing.T) {
 				t.Errorf("problem status = %d, want 500", pd.Status)
 			}
 		})
+	}
+}
+
+// hideFlusher is a middleware that hands the handler a writer nothing in its
+// chain can flush. Unlike httpx.AccessLog's wrapper it exposes no Unwrap, so
+// http.ResponseController cannot reach the flusher underneath — the exact fault
+// Task 6's type assertion used to create for EVERY request in this process.
+func hideFlusher(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(unflushable{w}, r)
+	})
+}
+
+// unflushable promotes Header, Write and WriteHeader off the embedded
+// interface and nothing else: no Flush, no Unwrap.
+type unflushable struct{ http.ResponseWriter }
+
+// The one failure inside Serve that happens BEFORE the 200 is committed. The
+// surface has to answer it with a real status: a stream that could not open and
+// returns a bare 200 with no body is indistinguishable from a working stream
+// that has nothing to say yet, which is the silent dead endpoint spec §4 exists
+// to prevent — and the sibling per-run surface answers 500 for the same fault.
+//
+// The response also has to be a clean problem+json. NewWriter announces a
+// stream in the header map before it can discover it cannot flush one, and
+// those headers must not survive onto the error.
+func TestStreamAttention_AWriterThatCannotFlushIsA500(t *testing.T) {
+	t.Parallel()
+	src := &fakeSource{}
+	grants := &fakeGrants{scope: realtime.Scope{All: true}}
+	h := newHarnessBehind(t, newStreamer(src, grants), grants, hideFlusher)
+
+	resp := h.open(t, sessionToken, nil)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	if pd := problemOf(t, resp); pd.Status != http.StatusInternalServerError {
+		t.Errorf("problem status = %d, want 500", pd.Status)
+	}
+	for _, name := range []string{"Cache-Control", "Connection", "X-Accel-Buffering"} {
+		if got := resp.Header.Get(name); got != "" {
+			t.Errorf("%s = %q on the error response, want it taken back with the rest of the stream headers", name, got)
+		}
+	}
+	// And it never got as far as reading anything to stream.
+	if _, snapshots, _ := src.seen(); snapshots != 0 {
+		t.Errorf("snapshots = %d, want none", snapshots)
 	}
 }
