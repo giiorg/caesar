@@ -1878,3 +1878,189 @@ Task 12: finding 13 ACCEPTED rather than hardened, with reasons: the log parse i
   so this task did not double the exposure as I claimed; hardening needs a test-only seam on
   `runServe` (the shape `queryGate` already refused on an earlier plan); and the log line is
   production behaviour an operator depends on. Reasonable — **the review should still weigh it.**
+Task 12: REVIEWED (Opus 5, session 61, package `review-dd1b94a..6016635.diff`), report at
+  `task-12-review.md`. **Spec ✅ compliant — all fourteen pre-flight findings verified against
+  source, not against the report. Task quality APPROVED.** One Important, six Minor.
+  The reviewer independently CONFIRMED all three of the implementer's accepted concerns from the
+  code (not the report): row 2 is absorbed by `send`'s cursor guard at `stream.go:409-419`; row 3
+  is unfalsifiable on a fresh open because `prime` sets `st.cursor = max(cursor, watermark)`,
+  while the resume branch sets `st.cursor = req.LastEventID` and skips the snapshot — so the
+  two-subscriber `ReplayBatch: 1` fix is *the only* shape that reddens it; and the per-run
+  narrowing is load-bearing (`follow` closes a per-run stream outright at `stream.go:608`, and a
+  denied per-run replay page never advances the cursor, so a re-grant DOES backfill).
+  **The README was checked claim by claim against the producing code and holds** — all six knobs
+  and defaults against `config.go` `defaults()`, all six limitations, both quoted log strings,
+  and the `[hb, 2×hb)` heartbeat window arithmetic. That is the first time on this plan that a
+  load-bearing prose block survived a line-by-line read intact.
+Task 12: ⚠️ the reviewer could not run the Docker-backed tests, so the seven mutation OUTPUTS are
+  unreproduced — it verified each mutant's MECHANISM against source instead and found every
+  reported outcome consistent. Also flagged: the 700-830 KiB socket-chain margin is a macOS
+  loopback figure and the gate's integration lane is Linux; test 2 logs `the evicted client
+  received N of 256 frames` every run so it re-measures. **Read that N on the first CI run** —
+  if it approaches 256 the margin is gone and the test goes red over CORRECT production code.
+Task 12: finding 13 verdict — **"accept, no seam" STANDS** (the `runServe` hook is the shape
+  `queryGate` already refused, and the log line is production behaviour `awaitListening`'s
+  `:0`-suffix refusal deliberately guards). But the implementer's argument surveyed one
+  alternative and concluded the space was exhausted: `serve.go:248`'s message and
+  `awaitListening` are BOTH in package `app`, so an unexported const dedupes an existing literal
+  with no test-only production seam — the same pattern this plan already chose for
+  `AttentionKindPatterns` and `sseHeaders`. Closes the rename half only; the `addr` key is a
+  struct tag and cannot be a const. Folded into fix round 1 as Minor.
+Task 12: fix round 1/5 — dispatched FRESH (Opus 5); `task12-impl` died with session 60, so the
+  brief + report file carried the memory as the skill prescribes. Folded ALL SIX Minors and the
+  finding-13 const into the one round rather than leaving them for the final review.
+  Committed `44332db` (1 commit, 4 files, +148/-74). Every item addressed, none refused:
+  Important 1 (preburst comment) rewritten — the watched run's backlog IS contiguous and the gaps
+  come from the writer phase; Minor 2 now a loud guard on the `snapshot_events` coupling; Minor 3
+  `openStream` collapsed to a delegate of `openStreamFrom` (eight tests now share ONE open-time
+  contract); Minor 4 shared service construction; Minor 5 writer count COUNTED not divided (at
+  `writers = 9` the division expected 2 where 3 commit — a false failure); Minor 6 three slice
+  indexes fail with a reason instead of panicking; Minor 7 the `q` clause now names three refusing
+  cases (zero, negative, unparseable) because `accept.go:59-63` is `err != nil || weight <= 0` —
+  the review said two. Finding 13 TAKEN: `serve.go` gains `const msgListening`, the fixture
+  matches it quoted; the `addr` half cannot follow (struct tag) and the const's doc says so.
+Task 12: fix round 1 evidence — mutants were COPIES outside the repo via `-overlay`, applied by a
+  script that refuses unless each anchor matches exactly once; `git status --porcelain` empty
+  throughout. Whole `internal/app` integration package ok 37.2s; `-count=10 -race` over the seven
+  tests that reach the wire through the collapsed opener ok 67.1s, NO FLAKE; `backend:test`,
+  `backend:test:integration` and `contracts:check` all clean. Output pristine.
+Task 12: **the eviction margin now has a Linux-vs-macOS data point: `the evicted client received
+  25 of 256 frames`** — ~10x margin, consistent with the reported 700-830 KiB. Still worth reading
+  on the first CI run, but the alarm is much less likely than the review feared.
+Task 12: **`GATE PASS  caesar-10-realtime-sse @ 44332db` — 11 lanes resolved unnarrowed**, commit
+  stamped in the binary and in `caesar-git:dev`, contracts clean. Gated at the LITERAL sha on a
+  confirmed-clean tree with no reviewer in the worktree. Logs `/tmp/caesar-gate.ZvkcBb`.
+Task 12: re-review of fix round 1 (Opus 5, `review-e6ac0ec..44332db.diff`), report at
+  `task-12-rereview.md`. **ALL SEVEN FINDINGS + finding 13 ADDRESSED. No new Critical/Important
+  breakage.** The re-reviewer traced finding 1's replacement comment clause by clause against two
+  independent id measurements rather than accepting it — the "comment that fixes a false comment"
+  class finally converged, and it converged because the implementer DROPPED one of the reviewer's
+  suggested clauses ("the other three runs get a snapshot backlog of their own") as itself false:
+  no stream in the test opens on those runs. The reviewer withdrew the suggestion.
+Task 12: **the re-reviewer's own two prescriptions were BOTH weaker than what the implementer
+  built, and it said so.** (a) Finding 2's guard bound: the review proposed
+  `backlog + writers*perWriter + 1` = 361, which counts all eight writers against a run that
+  receives two — it would have refused a config band where the test is still correct, i.e. THE SAME
+  false-failure shape as finding 5, inside the finding that complained about it. The implementer
+  used `wantCount` (241), which also cannot drift from the final count check. (b) Finding 3's
+  direction of collapse: the base moved INTO the fixture file, not the reverse, so the fixture does
+  not depend on the newer file that depends on it. Finding 13's const verified against all four
+  disqualifying seam shapes — `runServe`'s signature unchanged, message byte-identical, no
+  test-only production element, and the test still merely OBSERVES the log line.
+  **That is the tenth and eleventh controller/reviewer item to be wrong with the implementer right.**
+Task 12: minor (deferred): `serve_realtime_integration_test.go:255-257` — `sseStream`'s doc still
+  says the deadline is the one "`openStream` set"; after the collapse `openStreamFrom` sets it and
+  `openStream` is one of two entry points. Introduced BY the fix; incomplete, not false.
+Task 12: minor (deferred, out of scope of the fix): `runs/api/accept.go:32` — the production doc
+  comment says "Only q=0 is read", the same narrowness finding 7 corrected in the README. The
+  README is now the MORE accurate of the two documents; `:60` also refuses a negative and an
+  unparseable `q`.
+Task 12: complete (commits dd1b94a..44332db, review clean after one fix round) — GATED at
+  `44332db`, 11 lanes unnarrowed. **ALL TWELVE TASKS NOW COMPLETE, REVIEWED AND GATED.**
+
+### FINAL WHOLE-BRANCH REVIEW (Opus 5, session 61) — `64de023..44332db`, 37 commits
+
+Report at `final-review.md`. **VERDICT: READY TO MERGE. Nothing Critical, nothing Important.**
+Eight Minors (M1-M8). Triage of the 26-item deferred queue: **0 must-fix, 22 fine to carry,
+3 mistaken as stated, 3 already resolved.**
+
+It verified rather than assumed, and this is what it checked outside the diff: `errors.Is(err,
+http.ErrNotSupported)` against `go1.26.5/src/net/http/responsecontroller.go:145-147`;
+`FlushError` writing the header first against `server.go:1724-1727`; context isolation via
+`go list -deps ./internal/realtime/...` (reaches only `platform/{authn,httpx,xerrors}`); every
+`h.mu`/`s.mu` pairing (no cycle exists); idempotency of all four `Close` paths; goroutine joins;
+`pgxpool.Close` not hanging a catching-up replay; and the README claim by claim a SECOND time.
+**Task 12: minor (deferred → NOW FIXED, see fix wave): M1-M8.**
+
+**M1 and M2 are new behavioural findings nobody saw in twelve tasks, both DEMONSTRATED under
+`go test -overlay` from a scratchpad outside the repo, both fail-closed:**
+  **M1** — a grant *ADDED* after a stream opens never reaches it. `Hub.Publish` filters on the
+  scope resolved at open time and `follow` deliberately never rewrites it (rewriting would race
+  the tailer). Revocation is acted on; ACQUISITION IS NOT, for the life of the connection. The
+  README's limitation 3 attributed the hole to the single cursor, which invites the reader to
+  conclude new events on a newly granted project flow — for a re-grant they do, for a FIRST-time
+  grant they never do.
+  **M2** — a `Last-Event-ID` ABOVE the head silences the stream permanently. `prime` validates
+  only against `Oldest()`, so the cursor sits above every id that will ever exist: 200, headers,
+  heartbeats, no data, nothing logged. Not reachable from a browser (`EventSource` echoes back an
+  id this server wrote) but reachable from a hand-rolled client and after any restore-from-backup
+  or re-seed of `run_event_counter` while clients hold higher ids.
+
+### FINAL-REVIEW FIX WAVE — M1-M8, one dispatch, two commits (session 61)
+
+Owner chose to land all eight Minors before merge rather than defer. Report at
+`final-fix-report.md`. **Status DONE, no refusals.** `77ead72` (code: M2 + M3 with tests) and
+`608db93` (prose: M1, M4a-d, M5, M6, M7, M8). The agent died on an API 529 AFTER writing its
+report — commits 17:12/17:15, report 17:18, failure 17:22 — so nothing was lost. Verified by
+compiler, not the language server: `BUILD_OK`, `go vet` clean (plain, tagged, and under the repo's
+own `-vettool`), whole unit suite `-race` clean, `git status` empty.
+**M2's shape: the re-snapshot, with `Head` read only inside the `>= oldest` branch** — the only
+branch whose outcome a head can change — so a too-old resume still costs one query and an ordinary
+resume costs two, once per stream OPENED, never per event. `Head` failure is a plain error, not
+tagged `ErrNotStarted`, so `StreamServer`'s narrow contract is untouched.
+
+**⚠️ M2's mutation 2 found a real gap in the FIRST version of its own test.** The test initially
+asserted only the above-head case, and a `LastEventID < head` mutant passed the WHOLE package —
+nothing pinned "exactly at the head resumes", which is the COMMON case (a caught-up client
+reconnects with exactly the head) and where re-snapshotting would re-send the entire backlog on
+every reconnect. The existing suite could not see it because
+`TestServe_DiscardsQueuedEventsAtOrBelowTheCursor` has an empty snapshot at watermark 10, so both
+paths leave the cursor at 10 and the outcomes coincide. Now a two-case table; both mutants redden.
+**This is the value of demanding the mutation on the fixer's OWN new test, not just on the code.**
+
+**THREE of the final review's prescriptions were adjusted because the prescribed wording was
+itself false — items 13, 14 and 15 of the reviewer/controller-wrong tally:**
+  1. **M1's suggested sentence "does not reach it at all" is false of CATCH-UP**, where `replay`
+     re-queries with the refreshed scope. The README now attributes the gap to live fan-out and
+     names catch-up as the exception.
+  2. **M3's reset condition "until a `Wait` succeeds" was too narrow** — on a quiet database a
+     HEALTHY waker only ever returns the poll deadline, so a nil-only reset would have silenced
+     every outage after the first. Reset is on any non-fault return. A real bug, avoided.
+  3. M5's "cannot be a compile-time reference in either direction" does not transfer to
+     `internal/app`, which does import `config`; the clause was dropped rather than restated.
+
+Fix wave: minor (deferred): `internal/app/realtimeports_test.go`'s `recordingSource.Head` returns
+  `(0, nil)` unconditionally, so a future test there that resumes would silently take the
+  re-snapshot path. Left alone deliberately (no test there resumes; direction is safe) but it is
+  **exactly the fake-more-capable-than-reality shape this branch has paid for** — the two fakes
+  that matter carry an explicit `head` whose zero fails loudly instead.
+Fix wave: NOT done, as directed: the open design question, and the review's recommendation 3
+  (write the hub's lock invariant into `hub.go`) — a real suggestion, outside M1-M8.
+
+### RE-REVIEW OF THE FIX WAVE (Opus 5) — `44332db..608db93`, report `final-fix-rereview.md`
+
+**ALL EIGHT ADDRESSED (M1-M8). No new Critical/Important breakage. READY TO MERGE. Nothing open.**
+`GATE PASS  caesar-10-realtime-sse @ 608db93` — 11 lanes resolved unnarrowed, contracts clean,
+logs `/tmp/caesar-gate.7pvybu`. Worktree untouched by the review; every mutation ran via
+`go test -overlay` against scratchpad copies.
+
+**The implementer was right on all three adjusted prescriptions, and the reviewer verified the
+hard one against PRODUCTION rather than the fake:** pgx v5.10.0's `normalizeTimeoutError` returns
+`&errTimeout{err: context.DeadlineExceeded}` with an `Unwrap` (`pgconn/errors.go:151-165`,
+`:191-207`), so a real poll deadline through `pgWaker.Wait` DOES match and DOES reset the flag.
+The review's prescribed nil-only reset would have wedged the flag on any quiet deployment and
+downgraded every later outage to `Debug` — **strictly worse than the finding it was fixing.**
+
+**M2's boundary independently mutated by the reviewer, both directions:** `<=`→`<` reddens only
+"exactly the head, resumed"; the bound removed reddens only "above the head, re-snapshotted". Both
+adjacent contracts intact — the single `ctx.Err()` funnel (`stream.go:273-275`), and `ErrNotStarted`
+has exactly one attachment site guarded on `http.ErrNotSupported`, unreachable from `prime`.
+
+**The fake question, settled with a demonstration:** `streamSource.head` and `fakeSource.head` are
+faithful because the real `Head` is `coalesce(max(id),0)` — zero-means-empty-table MATCHES
+production. An overlay forcing both to 0 reddens four resume tests. The fifth
+(`DiscardsQueuedEventsAtOrBelowTheCursor/a_caught-up_resume`) is insensitive by construction and the
+implementer disclosed that himself.
+**The reviewer DISAGREED with the implementer's own self-flag on `recordingSource.Head` and closed
+it rather than parking it:** `Oldest 0 / Head 0 / Snapshot empty / Replay nil` is a self-consistent
+EMPTY TABLE, and re-snapshotting a resume there is the CORRECT behaviour under this fix. That
+supersedes the "minor (deferred)" line recorded for it in the fix-wave block above.
+
+**Bonus the final review did not anticipate:** on an empty or restored `run_events` both `Oldest`
+and `Head` return 0, so M2's fix also un-silences that case — which is the restore-from-backup
+scenario that made M2 reachable in the first place.
+
+Fix wave: minor (deferred): `realtime/api/api.go:199-203` carries the same short ending list M4b
+  just fixed. Harmless — `logStreamEnd` below it is complete.
+Fix wave: minor (deferred, pre-existing): `defaults_test.go:17-22` says "legal" where no
+  import-boundary analyzer actually exists.
