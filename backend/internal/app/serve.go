@@ -24,6 +24,7 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/logging"
 	"github.com/giiorg/caesar/backend/internal/platform/pg"
 	"github.com/giiorg/caesar/backend/internal/platform/secrets"
+	realtimeapi "github.com/giiorg/caesar/backend/internal/realtime/api"
 	"github.com/giiorg/caesar/backend/internal/runs"
 	runsapi "github.com/giiorg/caesar/backend/internal/runs/api"
 	"github.com/giiorg/caesar/backend/internal/workflows"
@@ -162,7 +163,15 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
 		forgeSvc, publisher, principalSource{svc: svc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
-	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc))...)
+	// The nil StreamServer is Task 11's to replace: the adapter it needs does
+	// not exist until the hub, tailer and streamer have a lifecycle. Until
+	// then `Accept: text/event-stream` on the events endpoint answers 500
+	// rather than quietly falling back to the poll (runs/api).
+	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc, nil))...)
+	// Same nil, same task, for the same reason. identity.Service is the real
+	// authenticator and grant resolver here — only the Streamer is missing, so
+	// only the Streamer is nil.
+	ops = append(ops, realtimeapi.Operations(realtimeapi.New(nil, svc, realtimeGrants{svc: svc}, log))...)
 
 	// Plan 06: the real Docker runner when configured. Disabled by default —
 	// it needs a Docker daemon, built images and a writable data root, so the

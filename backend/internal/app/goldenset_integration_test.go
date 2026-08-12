@@ -143,7 +143,7 @@ func TestGoldenSet_MonthOneLoopThroughRealRoutes(t *testing.T) {
 	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc))
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, identitySvc, identitySvc, identitySvc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, identitySvc))...)
-	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc))...)
+	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil))...)
 	srv := httptest.NewServer(Routes(discard(), pool, ops, "http://caesar.test"))
 	t.Cleanup(srv.Close)
 
@@ -457,7 +457,7 @@ func newGoldenEnv(t *testing.T) *goldenEnv {
 	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc))
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, identitySvc, identitySvc, identitySvc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, identitySvc))...)
-	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc))...)
+	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil))...)
 	srv := httptest.NewServer(Routes(discard(), pool, ops, "http://caesar.test"))
 	t.Cleanup(srv.Close)
 

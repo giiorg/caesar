@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -20,15 +21,39 @@ type GrantSource interface {
 	GrantsForUser(ctx context.Context, userID uuid.UUID) ([]authn.Grant, error)
 }
 
+// StreamServer is runs/api's outbound seam to the realtime context.
+// runs must not import realtime (bounded contexts are peers), so app
+// wires realtime's splice in behind this interface — which is why nothing in
+// the signature names a realtime type.
+//
+// ServeRunStream blocks until the client goes away or the stream ends, and it
+// OWNS the response from the moment it writes: the first SSE frame commits the
+// 200 forever, and no status is available after that.
+//
+// So its error means exactly one thing: the stream failed BEFORE it committed
+// anything, and the caller may still answer with a real status. Every later
+// ending — a closed tab, a slow consumer, shutdown, a revocation acted on, a
+// write that failed — returns nil and is reported by the implementation, which
+// is the only side that can tell a routine ending from a fault (that reading
+// is realtime's close reasons, which runs must never name).
+type StreamServer interface {
+	ServeRunStream(ctx context.Context, w http.ResponseWriter, runID, userID uuid.UUID, lastEventID int64, hasLastID bool) error
+}
+
 type API struct {
 	svc    *runs.Service
 	auth   authn.SessionAuthenticator
 	authz  authn.Authorizer
 	grants GrantSource
+	// streams is nil wherever nothing wired it: internal/contracts builds this
+	// table with every dependency nil for metadata-only generation, and
+	// internal/app leaves it nil until Task 11 builds the streamer. What a nil
+	// one costs at request time is streamRunEvents' first check.
+	streams StreamServer
 }
 
-func New(svc *runs.Service, auth authn.SessionAuthenticator, authz authn.Authorizer, grants GrantSource) *API {
-	return &API{svc: svc, auth: auth, authz: authz, grants: grants}
+func New(svc *runs.Service, auth authn.SessionAuthenticator, authz authn.Authorizer, grants GrantSource, streams StreamServer) *API {
+	return &API{svc: svc, auth: auth, authz: authz, grants: grants, streams: streams}
 }
 
 // Operations is the spine's route table: mux registration (httpx.Mount)
@@ -76,7 +101,19 @@ func Operations(a *API) []httpx.Operation {
 			Handler: a.authenticated(a.handleGetRun),
 		},
 		{
-			Pattern: "GET /api/v1/runs/{id}/events", ID: "listRunEvents", Summary: "Poll a run's events after an id (view)",
+			Pattern: "GET /api/v1/runs/{id}/events", ID: "listRunEvents",
+			// One URL, two representations. The stream's frame schema is the
+			// SECOND response media type on this operation, declared in
+			// internal/contracts because it is a realtime type and runs may not
+			// name one; the poll's envelope below stays the primary.
+			Summary: "Poll a run's events after an id (view). " +
+				"With `Accept: text/event-stream` the same URL answers a server-sent stream " +
+				"instead — snapshot-then-deltas, resumed with Last-Event-ID — and every other " +
+				"Accept keeps this JSON poll. " +
+				"A stream whose principal loses access to the run ends with a terminal frame " +
+				"that carries NO id — `event: forbidden` with `data: {\"error\":\"forbidden\"}` " +
+				"— and then closes: the 200 is committed with the first byte, so a revocation " +
+				"can no longer be a 403.",
 			Response: RunEventsResponse{}, Status: http.StatusOK,
 			Handler: a.authenticated(a.handleListRunEvents),
 		},
@@ -406,9 +443,21 @@ func (a *API) handleListApprovals(w http.ResponseWriter, r *http.Request, sess a
 	httpx.JSON(w, http.StatusOK, out)
 }
 
+// handleListRunEvents answers this run's events either way the client asked
+// for them. The grant check comes FIRST and is shared: every answer the poll
+// gives a caller who may not see this run — 404 for an unknown id, 403 for one
+// outside their grants — the stream gives too, and neither branch can drift
+// from the other because there is only one check.
 func (a *API) handleListRunEvents(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
 	run, ok := a.runScoped(w, r, sess, authn.GrantView)
 	if !ok {
+		return
+	}
+	// Values, not Get: a client may legally split its Accept ranges across
+	// repeated headers, and Get would see only the first — which for a client
+	// that put its refusal in the second would be a stream it declined.
+	if acceptsEventStream(strings.Join(r.Header.Values("Accept"), ",")) {
+		a.streamRunEvents(w, r, sess, run.ID)
 		return
 	}
 	after, err := eventCursor(r)
@@ -427,6 +476,32 @@ func (a *API) handleListRunEvents(w http.ResponseWriter, r *http.Request, sess a
 		out.Events = append(out.Events, eventResponse(e))
 	}
 	httpx.JSON(w, http.StatusOK, out)
+}
+
+// streamRunEvents hands the request to the realtime context.
+//
+// It writes nothing itself. Everything it can still answer with a status
+// happens before the port is called, because the port's first frame commits
+// the 200 forever; after that the only thing left to report a returned error
+// to is the log, and the port has already done that where the close reasons
+// are in scope (see StreamServer).
+func (a *API) streamRunEvents(w http.ResponseWriter, r *http.Request, sess authn.AuthSession, runID uuid.UUID) {
+	// No port means nobody wired the realtime context, and a wiring omission
+	// must be LOUD. Falling back to the poll is the tempting alternative and
+	// the wrong one: the endpoint would look like it works and the streaming
+	// half would simply never exist, with nothing anywhere to say so.
+	if a.streams == nil {
+		httpx.Problem(w, r, xerrors.E(xerrors.ClassInternal, "realtime streaming is not wired"))
+		return
+	}
+	lastID, hasLastID, err := httpx.LastEventID(r)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	if err := a.streams.ServeRunStream(r.Context(), w, runID, sess.UserID, lastID, hasLastID); err != nil {
+		httpx.Problem(w, r, err)
+	}
 }
 
 // eventCursor reads the poll cursor; absent means "from the beginning".

@@ -400,7 +400,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Poll a run's events after an id (view)
+         * Poll a run's events after an id (view). With `Accept: text/event-stream` the same URL answers a server-sent stream instead — snapshot-then-deltas, resumed with Last-Event-ID — and every other Accept keeps this JSON poll. A stream whose principal loses access to the run ends with a terminal frame that carries NO id — `event: forbidden` with `data: {"error":"forbidden"}` — and then closes: the 200 is committed with the first byte, so a revocation can no longer be a 403.
          * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
          */
         get: operations["listRunEvents"];
@@ -426,6 +426,26 @@ export interface paths {
          * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
          */
         post: operations["decideGate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Server-sent stream of attention events (gates, publications, run lifecycle) on the projects the caller holds any grant on. Snapshot-then-deltas; resume with Last-Event-ID. Each frame's data: is one StreamFrame and its id: is the resume point. A stream whose principal loses access to what it shows ends with a terminal frame that carries NO id — `event: forbidden` with `data: {"error":"forbidden"}` — and then closes: the 200 is committed with the first byte, so a revocation can no longer be a 403.
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["streamAttention"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1013,6 +1033,17 @@ export interface components {
             title?: string;
             type?: string;
         };
+        RealtimeStreamFrame: {
+            /** Format: int64 */
+            id?: number;
+            kind?: string;
+            /** Format: date-time */
+            occurred_at?: string;
+            payload?: {
+                [key: string]: unknown;
+            } | null;
+            run_id?: components["schemas"]["UuidUUID"];
+        };
         RunsPolicySnapshot: {
             allow_self_approval?: boolean;
             /** Format: int64 */
@@ -1023,6 +1054,11 @@ export interface components {
             /** Format: int64 */
             wall_clock_ms?: number;
         };
+        /**
+         * Format: uuid
+         * @example 248df4b7-aa70-47b8-a036-33ac447e668d
+         */
+        UuidUUID: string;
         XerrorsFieldError: {
             field?: string;
             message?: string;
@@ -1967,7 +2003,10 @@ export interface operations {
                 /** @description return events with id greater than this */
                 after?: string;
             };
-            header?: never;
+            header?: {
+                /** @description id of the last frame received; the text/event-stream response resumes above it */
+                "Last-Event-ID"?: string;
+            };
             path: {
                 /** @description resource id (uuid) */
                 id: string;
@@ -1983,6 +2022,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApiRunEventsResponse"];
+                    "text/event-stream": components["schemas"]["RealtimeStreamFrame"];
                 };
             };
             /** @description Bad Request */
@@ -2034,6 +2074,38 @@ export interface operations {
             };
             /** @description Conflict */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    streamAttention: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description id of the last frame received; the stream resumes above it */
+                "Last-Event-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": components["schemas"]["RealtimeStreamFrame"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };

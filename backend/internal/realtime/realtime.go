@@ -76,10 +76,32 @@ func (s Scope) empty() bool { return !s.All && len(s.Projects) == 0 }
 
 // Filter selects the events one subscription receives. Exactly one of
 // RunID (per-run stream) or Attention (global stream) is set.
+//
+// Build one with RunFilter or AttentionFilter rather than by hand. Two of the
+// four combinations of those fields are wrong in ways nothing downstream can
+// report — see Matches — and the constructors are the only shapes an HTTP
+// surface should be able to produce.
 type Filter struct {
 	RunID     *uuid.UUID
 	Attention bool
 	Scope     Scope
+}
+
+// RunFilter is one run's stream within scope.
+func RunFilter(runID uuid.UUID, s Scope) Filter {
+	return Filter{RunID: &runID, Scope: s}
+}
+
+// AttentionFilter is the global attention stream within scope.
+//
+// It and RunFilter exist so that the ambiguous combinations are not something
+// a handler can reach for. Both set is a per-run stream wearing the attention
+// stream's clothes, and NEITHER set selects nothing at all — a stream that
+// opens, writes not one event and heartbeats until the client gives up. A
+// runtime check at the HTTP edge would catch the second; a constructor makes
+// both unreachable from the surfaces that matter, and does it at compile time.
+func AttentionFilter(s Scope) Filter {
+	return Filter{Attention: true, Scope: s}
 }
 
 // Matches decides delivery. Scope is checked FIRST and unconditionally:
@@ -90,8 +112,9 @@ type Filter struct {
 // Selector precedence, for callers that build a Filter from request
 // parameters: RunID WINS. A Filter with both RunID and Attention set is a
 // per-run stream and the Attention flag is ignored; a Filter with neither
-// selects nothing at all, whatever its Scope. Reject the ambiguous
-// combination at the HTTP edge rather than relying on this order.
+// selects nothing at all, whatever its Scope. Neither is worth relying on:
+// RunFilter and AttentionFilter above are what a request-driven caller uses,
+// and neither can express either combination.
 func (f Filter) Matches(e Event) bool {
 	if !f.Scope.allows(e.ProjectID) {
 		return false

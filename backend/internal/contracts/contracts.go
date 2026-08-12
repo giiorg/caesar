@@ -16,6 +16,8 @@ import (
 	assetsapi "github.com/giiorg/caesar/backend/internal/assets/api"
 	identityapi "github.com/giiorg/caesar/backend/internal/identity/api"
 	"github.com/giiorg/caesar/backend/internal/platform/httpx"
+	"github.com/giiorg/caesar/backend/internal/realtime"
+	realtimeapi "github.com/giiorg/caesar/backend/internal/realtime/api"
 	runsapi "github.com/giiorg/caesar/backend/internal/runs/api"
 	workflowsapi "github.com/giiorg/caesar/backend/internal/workflows/api"
 )
@@ -85,11 +87,14 @@ type workflowVersionParams struct {
 	Version string `path:"version" description:"version number"`
 }
 
-// runEventsParams covers GET …/runs/{id}/events — one path parameter
-// plus the poll cursor, no body.
+// runEventsParams covers GET …/runs/{id}/events — one path parameter, the
+// poll cursor and the stream's resume header, no body. The endpoint answers
+// two media types (see altResponses) and each parameter belongs to one of
+// them: `after` pages the JSON poll, `Last-Event-ID` resumes the stream.
 type runEventsParams struct {
 	idParams
-	After string `query:"after" description:"return events with id greater than this"`
+	After       string `query:"after" description:"return events with id greater than this"`
+	LastEventID string `header:"Last-Event-ID" description:"id of the last frame received; the text/event-stream response resumes above it"`
 }
 
 // gateDecisionParams covers POST …/runs/{id}/gates/{node}/decision — two path
@@ -119,6 +124,28 @@ var requestOverrides = map[string]any{
 	"decideGate":             gateDecisionParams{},
 }
 
+// altResponse is a SECOND representation of an operation's success status:
+// another media type under the same code, with its own schema.
+type altResponse struct {
+	Response    any
+	ContentType string
+}
+
+// altResponses maps operation IDs onto the extra success media types they
+// answer with. Today that is one endpoint: GET …/runs/{id}/events serves the
+// JSON poll and, on `Accept: text/event-stream`, an SSE stream of frames.
+//
+// It lives here rather than on httpx.Operation — where route and contract are
+// otherwise the same value — for an architectural reason and not a
+// convenience: the frame schema is realtime.StreamFrame, and runs/api cannot
+// name a realtime type without breaking context isolation (internal/arch,
+// CI-failing). contracts is not a bounded context and may see both, so this is
+// the only place in the tree that can hold the pairing. It is the same reason
+// requestOverrides above exists, and the entry is registered by the same key.
+var altResponses = map[string][]altResponse{
+	"listRunEvents": {{Response: realtime.StreamFrame{}, ContentType: "text/event-stream"}},
+}
+
 // operationTables collects every context's route table with nil
 // dependencies — metadata only; handlers never run during generation.
 func operationTables() [][]httpx.Operation {
@@ -126,7 +153,8 @@ func operationTables() [][]httpx.Operation {
 		identityapi.Operations(identityapi.New(nil, 0, nil)),
 		assetsapi.Operations(assetsapi.New(nil, nil, nil, nil)),
 		workflowsapi.Operations(workflowsapi.New(nil, nil)),
-		runsapi.Operations(runsapi.New(nil, nil, nil, nil)),
+		runsapi.Operations(runsapi.New(nil, nil, nil, nil, nil)),
+		realtimeapi.Operations(realtimeapi.New(nil, nil, nil, nil)),
 	}
 }
 
@@ -158,6 +186,14 @@ func Build() ([]byte, error) {
 					openapi.WithContentType(contentTypeOf(op)))
 			} else {
 				oc.AddRespStructure(nil, openapi.WithHTTPStatus(op.Status))
+			}
+			// A second call on the SAME status ADDS a media type rather than
+			// replacing the first — verified against the reflector, and the
+			// whole reason content negotiation can be declared at all.
+			for _, alt := range altResponses[op.ID] {
+				oc.AddRespStructure(alt.Response,
+					openapi.WithHTTPStatus(op.Status),
+					openapi.WithContentType(alt.ContentType))
 			}
 			oc.AddRespStructure(httpx.ProblemDetails{},
 				openapi.WithHTTPStatus(http.StatusBadRequest),

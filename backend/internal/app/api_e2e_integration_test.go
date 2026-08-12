@@ -185,7 +185,7 @@ func TestAppRoutes_GateSurfaceIsReachableThroughTheRealMiddleware(t *testing.T) 
 		nil, nil, nil, nil, nil, nil, runs.Params{Snapshot: runs.DefaultSnapshot()})
 
 	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc))
-	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc))...)
+	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil))...)
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	srv := httptest.NewServer(app.Routes(log, pool, ops, "http://caesar.test"))
 	t.Cleanup(srv.Close)

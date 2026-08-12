@@ -116,9 +116,93 @@ func TestBuild_DocumentsTheErrorStatusesAnOperationDeclares(t *testing.T) {
 	}
 }
 
-// The existing document must not move when the field is merely added.
-// Every operation today is JSON, so adding the knob is a no-op on bytes.
-func TestBuild_UnchangedWhenNoOperationOptsIn(t *testing.T) {
+// contentTypes is the media-type set an operation's success response carries,
+// and the header parameters it declares — the two things Plan 10 added to this
+// document that nothing else in this file would notice.
+type opDoc struct {
+	OperationID string `json:"operationId"`
+	Parameters  []struct {
+		Name string `json:"name"`
+		In   string `json:"in"`
+	} `json:"parameters"`
+	Responses map[string]struct {
+		Content map[string]struct {
+			Schema struct {
+				Ref string `json:"$ref"`
+			} `json:"schema"`
+		} `json:"content"`
+	} `json:"responses"`
+}
+
+func buildPaths(t *testing.T) map[string]map[string]opDoc {
+	t.Helper()
+	raw, err := contracts.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Paths map[string]map[string]opDoc `json:"paths"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	return doc.Paths
+}
+
+// The negotiated endpoint answers two media types under ONE status, and the
+// document has to say so. If the SSE response replaced the poll's
+// application/json instead of joining it, every generated client would lose
+// the poll — which is the shipped contract, not the new thing.
+func TestBuild_DocumentsBothMediaTypesOnTheNegotiatedEventsEndpoint(t *testing.T) {
+	t.Parallel()
+	op := buildPaths(t)["/api/v1/runs/{id}/events"]["get"]
+	if op.OperationID != "listRunEvents" {
+		t.Fatalf("operationId = %q, want listRunEvents", op.OperationID)
+	}
+	ok200, ok := op.Responses["200"]
+	if !ok {
+		t.Fatalf("responses = %v, want a 200", sortedKeys(op.Responses))
+	}
+	if got := sortedKeys(ok200.Content); len(got) != 2 || got[0] != "application/json" || got[1] != "text/event-stream" {
+		t.Fatalf("200 media types = %v, want application/json and text/event-stream", got)
+	}
+	// Two media types describing the same schema would mean one of them is
+	// documenting the wrong body.
+	if a, b := ok200.Content["application/json"].Schema.Ref, ok200.Content["text/event-stream"].Schema.Ref; a == b {
+		t.Errorf("both media types point at %q; the poll's envelope and one stream frame are different shapes", a)
+	}
+
+	// The resume mechanism is invisible to a client that cannot see the header.
+	if !hasParam(op, "header", "Last-Event-ID") {
+		t.Errorf("parameters = %+v, want a Last-Event-ID header", op.Parameters)
+	}
+}
+
+func TestBuild_DocumentsTheAttentionStream(t *testing.T) {
+	t.Parallel()
+	op := buildPaths(t)["/api/v1/stream"]["get"]
+	if op.OperationID != "streamAttention" {
+		t.Fatalf("operationId = %q, want streamAttention", op.OperationID)
+	}
+	if got := sortedKeys(op.Responses["200"].Content); len(got) != 1 || got[0] != "text/event-stream" {
+		t.Errorf("200 media types = %v, want only text/event-stream", got)
+	}
+	if !hasParam(op, "header", "Last-Event-ID") {
+		t.Errorf("parameters = %+v, want a Last-Event-ID header", op.Parameters)
+	}
+}
+
+func hasParam(op opDoc, in, name string) bool {
+	for _, p := range op.Parameters {
+		if p.In == in && p.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// The regen-diff gate in one test: what Build produces is what is committed.
+func TestBuild_MatchesTheCommittedDocument(t *testing.T) {
 	t.Parallel()
 	raw, err := contracts.Build()
 	if err != nil {

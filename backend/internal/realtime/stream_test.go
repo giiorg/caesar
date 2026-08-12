@@ -291,10 +291,10 @@ func (r *streamRecorder) ids(t *testing.T) []int64 {
 	return out
 }
 
-// runFilter is a per-run subscription scoped to one project — the shape both
-// HTTP surfaces build.
+// runFilter is a per-run subscription scoped to one project — the shape the
+// per-run HTTP surface builds, through the same constructor it uses.
 func runFilter(run, project uuid.UUID) Filter {
-	return Filter{RunID: &run, Scope: Scope{Projects: []uuid.UUID{project}}}
+	return RunFilter(run, Scope{Projects: []uuid.UUID{project}})
 }
 
 // idleStreamer is the configuration for tests that assert on ids: a heartbeat

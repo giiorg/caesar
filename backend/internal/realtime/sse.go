@@ -2,7 +2,6 @@ package realtime
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -35,10 +34,16 @@ type StreamFrame struct {
 // on this stream can become an HTTP error response — that is why Tasks 9 and
 // 10 speak of a "403-shaped terminal frame" rather than a 403 status.
 type Writer struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	hb      time.Duration
-	clock   func() time.Time
+	w http.ResponseWriter
+	// rc reaches Flush THROUGH the middleware wrappers. A type assertion to
+	// http.Flusher does not: httpx.AccessLog hands every handler a wrapper
+	// that records the status and exposes the real writer via Unwrap, which is
+	// the contract http.ResponseController reads and a type assertion ignores.
+	// Asserting made every SSE endpoint a silent empty 200 in the assembled
+	// process while passing every test that used a bare recorder.
+	rc    *http.ResponseController
+	hb    time.Duration
+	clock func() time.Time
 	// lastWrite is when bytes last went to the client — connect, event or
 	// heartbeat. Heartbeat consults it so that a busy stream is never padded
 	// with comments: the Writer owns idleness, and Serve just ticks.
@@ -57,15 +62,17 @@ type Writer struct {
 // consequence — the 200 is committed here.
 //
 // hb is the idle interval Heartbeat enforces; clock feeds it (pass time.Now
-// outside tests; nil defaults to it). A w that does not implement
-// http.Flusher is rejected outright: an unflushable stream buffers every
-// frame and delivers none, with no symptom but silence. That is a server-side
-// wiring fault, not an API error — it never crosses the boundary as itself.
+// outside tests; nil defaults to it). A w that cannot be flushed — through its
+// Unwrap chain, not merely by itself — is rejected outright: an unflushable
+// stream buffers every frame and delivers none, with no symptom but silence.
+// That is a server-side wiring fault, not an API error — it never crosses the
+// boundary as itself.
+//
+// The header-time flush IS the check. ResponseController reports "not
+// supported" for a writer nothing in its chain can flush, so the one flush
+// this constructor has to do anyway answers the question, and there is no
+// second, weaker test to disagree with it.
 func NewWriter(w http.ResponseWriter, hb time.Duration, clock func() time.Time) (*Writer, error) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return nil, errors.New("realtime: response writer does not implement http.Flusher")
-	}
 	if clock == nil {
 		clock = time.Now
 	}
@@ -75,8 +82,11 @@ func NewWriter(w http.ResponseWriter, hb time.Duration, clock func() time.Time) 
 	// Hop-by-hop and ignored by HTTP/2; harmless and mandated over HTTP/1.1.
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
-	flusher.Flush()
-	return &Writer{w: w, flusher: flusher, hb: hb, clock: clock, lastWrite: clock()}, nil
+	rc := http.NewResponseController(w)
+	if err := rc.Flush(); err != nil {
+		return nil, fmt.Errorf("realtime: response writer cannot flush: %w", err)
+	}
+	return &Writer{w: w, rc: rc, hb: hb, clock: clock, lastWrite: clock()}, nil
 }
 
 // WriteEvent emits e as one frame and flushes it: id: is what the browser
@@ -108,7 +118,9 @@ func (wr *Writer) WriteEvent(e Event) error {
 	if _, err := fmt.Fprintf(wr.w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Kind, data); err != nil {
 		return fmt.Errorf("write stream frame %d: %w", e.ID, err)
 	}
-	wr.flusher.Flush()
+	if err := wr.rc.Flush(); err != nil {
+		return fmt.Errorf("flush stream frame %d: %w", e.ID, err)
+	}
 	wr.lastWrite = wr.clock()
 	return nil
 }
@@ -125,7 +137,9 @@ func (wr *Writer) Heartbeat() error {
 	if _, err := fmt.Fprint(wr.w, ": hb\n\n"); err != nil {
 		return fmt.Errorf("write heartbeat: %w", err)
 	}
-	wr.flusher.Flush()
+	if err := wr.rc.Flush(); err != nil {
+		return fmt.Errorf("flush heartbeat: %w", err)
+	}
 	wr.lastWrite = wr.clock()
 	return nil
 }
@@ -133,4 +147,8 @@ func (wr *Writer) Heartbeat() error {
 // Flush pushes anything buffered to the client. WriteEvent and Heartbeat
 // already flush their own bytes, so this exists for callers that write to
 // the underlying ResponseWriter directly — Task 9's terminal frame.
-func (wr *Writer) Flush() { wr.flusher.Flush() }
+//
+// It reports nothing, and its one caller is why: the terminal frame is the
+// last thing the stream ever writes, and the write itself has already been
+// reported. A flush that fails after it has nothing left to change.
+func (wr *Writer) Flush() { _ = wr.rc.Flush() }

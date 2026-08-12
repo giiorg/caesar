@@ -43,6 +43,42 @@ func (p *plainResponseWriter) Header() http.Header         { return p.header }
 func (p *plainResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
 func (p *plainResponseWriter) WriteHeader(int)             {}
 
+// middlewareWriter is the shape a handler is ACTUALLY handed in this process:
+// httpx.AccessLog wraps the ResponseWriter to record the status, and its
+// wrapper does not implement http.Flusher — it exposes the writer that does
+// through Unwrap, which is the contract http.ResponseController reads.
+type middlewareWriter struct{ inner *sseRecorder }
+
+func (m *middlewareWriter) Header() http.Header         { return m.inner.Header() }
+func (m *middlewareWriter) Write(p []byte) (int, error) { return m.inner.Write(p) }
+func (m *middlewareWriter) WriteHeader(code int)        { m.inner.WriteHeader(code) }
+func (m *middlewareWriter) Unwrap() http.ResponseWriter { return m.inner }
+
+// A type assertion to http.Flusher is not how a middleware-wrapped writer is
+// reached, and asserting instead of asking the ResponseController made every
+// SSE endpoint in this process a silent empty 200: NewWriter refused the
+// writer, Serve returned before committing anything, and the handler had
+// nothing left to say.
+func TestWriter_FlushesThroughAMiddlewareWrapper(t *testing.T) {
+	t.Parallel()
+	inner := newSSERecorder()
+	w, err := NewWriter(&middlewareWriter{inner: inner}, time.Minute, time.Now)
+	if err != nil {
+		t.Fatalf("NewWriter() on a wrapped writer error = %v, want nil", err)
+	}
+	if err := w.WriteEvent(hubEvent(1, uuid.New(), uuid.New(), "run.started")); err != nil {
+		t.Fatalf("WriteEvent() error = %v, want nil", err)
+	}
+	// The flushes have to reach the writer that can actually flush, not stop
+	// at the wrapper.
+	if diff := cmp.Diff([]string{"flush", "write", "flush"}, inner.ops); diff != "" {
+		t.Errorf("ops seen by the unwrapped writer (-want +got):\n%s", diff)
+	}
+	if !strings.Contains(inner.Body.String(), "id: 1\n") {
+		t.Errorf("body = %q, want the frame", inner.Body.String())
+	}
+}
+
 // The stream headers and their flush belong to NewWriter, before any event
 // exists to write: flushing is what commits the 200 and defeats proxy
 // buffering, and a client behind a buffering tier sees nothing at all until
