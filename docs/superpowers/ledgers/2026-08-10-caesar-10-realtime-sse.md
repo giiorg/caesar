@@ -1,5 +1,109 @@
 # SDD ledger — plan: docs/superpowers/plans/2026-08-10-caesar-10-realtime-sse.md
 
+> **HANDOFF 2026-08-12 (session 60) — ALL TWELVE TASKS IMPLEMENTED. RESUME AT THE TASK 12 REVIEW.**
+> This block supersedes every handoff below it; they are kept only for their reasoning.
+>
+> Worktree `/Users/sofo/Projects/caesar/repos/caesar/.claude/worktrees/caesar-10-realtime-sse`,
+> branch `caesar-10-realtime-sse`, last CODE commit **`6016635`**, clean tree.
+> `main` untouched at `64de023`. **Verify with `git log` before acting on any of this.**
+>
+> **Tasks 1-11 complete, reviewed and GATED. Task 12 is implemented and GATED but NOT REVIEWED** —
+> the session was paused on context, not on a problem.
+>
+> Gated shas, all 11 lanes unnarrowed: Task 3 `78a4346` · 4 `1ed903a` · 5 `8c4bfc1` · 6 `510d9bb` ·
+> 7 `ceadbaf` · 8 `9108992`+`8f1a133` · 9 `3ebfb89`+`aa04f0a` · 10 `bb9e4e6`+`fc52b57`+`00030da` ·
+> 11 `17e76b7`+`80579d9`+`01c4038` · 12 `6016635`.
+>
+> ## THE NEXT THREE THINGS, IN ORDER
+>
+> **1. Review Task 12** (`task-12-brief.md`, report at `task-12-report.md`, BASE **`dd1b94a`**).
+> It is filed DONE_WITH_CONCERNS with four concerns, all substantive — see the Task 12 entries at
+> the bottom of this file. Two of the brief's mutation rows could not redden anything and were
+> replaced; my eviction estimate was out by three orders of magnitude; and one README limitation
+> was narrowed. **Also weigh finding 13 (port discovery by log-line parsing), which the implementer
+> accepted rather than hardened, with reasons I find fair but did not adjudicate.**
+>
+> **2. Then the FINAL WHOLE-BRANCH REVIEW** — most capable model, `MERGE_BASE = git merge-base main
+> HEAD`, using `superpowers:requesting-code-review`'s `code-reviewer.md`. It has a real queue:
+>
+> - **Task 9 minors:** a false "can only be raised from inside `follow`" comment in
+>   `stream_test.go`; the bound-precision wording at `stream.go:62-71`.
+> - **Task 10 minors:** `stream.go:75`'s "Nothing in this tree implements `FlushError`" (falsified
+>   by `deadPeerWriter` in the same commit); `ErrNotStarted`'s "every other ending" list omitting
+>   the untagged flush; an "empty header map" claim that holds only because no caller sets headers.
+> - **Task 11 minors:** `realtimeports.go:64-67` and `defaults_test.go:28-31` overstate why that
+>   tie-back is special; and a `Warn` when the shutdown wait runs long (new behaviour, deliberately
+>   not folded into a fix round).
+> - **THE ONE OPEN DESIGN QUESTION:** a per-run stream whose project is revoked while the principal
+>   keeps other grants can only be closed by an event it must deny, so over a QUIESCENT run it
+>   stays open and idle forever. Confidentiality-safe (nothing denied reaches the client);
+>   liveness only. **It is solvable** — `runScoped` (`runs/api/api.go:252-272`) already loads the
+>   run's task and authorizes against `task.ProjectID`, so feeding that through `ServeRunStream`
+>   would close it. I ruled it out of Tasks 10 and 12 to keep them reviewable. **The footgun if
+>   you build it: a field a caller forgets is `uuid.Nil`, which no scope allows, so every per-run
+>   stream would close on its first re-check.** Sofo's call.
+>
+> **3. Then `superpowers:finishing-a-development-branch`.**
+>
+> ## WHAT THE PLAN DID NOT KNOW — still live
+>
+> **NEVER add an `id <= watermark` predicate** to the snapshot's events query. It would make the
+> isolation level irrelevant and silently un-falsify Task 7's acceptance test. Only a comment
+> guards it.
+>
+> **The contract seam takes ONE response schema per content type.** Task 10's `altResponses` map in
+> `contracts` (mirroring `requestOverrides`) is what gives `listRunEvents` both `application/json`
+> and `text/event-stream`; `httpx.Operation` is deliberately untouched. A second SSE frame shape
+> cannot be reflected as a type, which is why the 403-shaped terminal frame is documented in prose.
+>
+> **`runsapi.StreamServer`'s contract is narrower than `realtime.Serve`'s** — *error ⟹ nothing
+> committed*. `realtime.ErrNotStarted` is the discriminator and is narrowed to exactly
+> `http.ErrNotSupported`. An adapter that FORWARDS `Serve`'s error writes a problem document into a
+> committed SSE body, and `fakeStreamServer` cannot catch it.
+>
+> ## METHOD — what earned its keep over twelve tasks
+>
+> 1. **Pre-flight every brief against the real source before dispatching.** Defects found per task:
+>    6, 8, 11, 13, 21, 17, 12, 14. Several were plan defects that would have shipped.
+> 2. **Demand a demonstrated mutation, never an assertion** — and hold your OWN mutants to it.
+>    **Four tasks' named acceptance mutations proved nothing as written (7, 8, 9, 12).**
+> 3. **Name `go test -overlay` as the mechanism** in every review dispatch, require scratch copies
+>    OUTSIDE the repo, and forbid codegen explicitly. `git status` stayed empty all session.
+> 4. **Never gate while a reviewer works the worktree, and never commit during a gate run.**
+>    Gate every commit yourself, at a LITERAL sha — `scripts/gate` refused once this session on a
+>    sha that did not exist, which is exactly what it is for. Passing `HEAD` would have hidden it.
+> 5. **Give every subagent a report FILE.** Chat replies arrive late, out of order, or not at all;
+>    four subagents went idle without reporting and one direct `SendMessage` retrieved each one.
+> 6. **Ask questions instead of asserting answers.** The single most productive thing this session:
+>    framing an untested suspicion as a question surfaced the quiescent-run residue that my own
+>    framing hid.
+>
+> ## THE TWO PATTERNS TO DISTRUST
+>
+> **A confident written explanation of *why something is safe* has been exactly backwards seven
+> times**, each time appearing in BOTH the source and the report. And on Tasks 10 and 11, **a
+> comment written to FIX a false comment was itself false in every round** — the class does not
+> converge through fix rounds, which is why the residue above is routed to a fresh whole-branch
+> read instead.
+>
+> **AND DISTRUST THE CONTROLLER.** **Nine of my items have now been wrong and the implementer was
+> right every time** — including a finding that prescribed a CI-failing arch violation, a shutdown
+> bound that would have moved the hang rather than removed it, and two mutation rows that could not
+> redden anything. Ask for reasons, not compliance; give every implementer an explicit licence to
+> dissent.
+>
+> ⚠️ **The editor's language server produces FALSE compile errors on this worktree — SIX times this
+> session**, while `go build`, `go vet` and the full gate were clean. Verify with the compiler.
+>
+> **Durability:** this directory is GITIGNORED. Mirrored to the tracked
+> `docs/superpowers/ledgers/2026-08-10-caesar-10-realtime-sse.md` and copied whole to
+> `/Users/sofo/Projects/caesar/sdd-backups/plan10-latest/`. Verified byte-identical at this handoff.
+
+---
+
+> **SUPERSEDED — session 59's handoff said RESUME AT TASK 9; Tasks 9-12 are now implemented.
+> Kept only for its carry-forward reasoning.**
+>
 > **HANDOFF 2026-08-11 (session 59) — RESUME AT TASK 9.** This block supersedes the session-58
 > and session-57 handoffs below it, which are kept only for the Docker/gate operational notes.
 >
@@ -1690,3 +1794,87 @@ Task 11: **complete (commits `8c4d969`..`01c4038`, review Approved on the FIRST 
   `17e76b7` before review, `80579d9` and `01c4038` after each round.
 Task 11: **the realtime stack now runs as one process against a real database.** NOTIFY → tailer →
   hub → splice → codec → socket is exercised end to end under `-race` on `postgres:18-alpine`.
+
+---
+
+### Task 12 pre-flight (controller, 2026-08-12, session 60) — FOURTEEN findings, all in the brief
+
+Read against the tree at `dd1b94a` before dispatching. Recorded in full as a CONTROLLER
+PRE-FLIGHT block at the top of `task-12-brief.md`. BASE for the review package is **`dd1b94a`**.
+Pre-flight found 6, 8, 11, 13, 21, 17, 12 and 14 defects across the eight tasks it ran on.
+
+Task 12: **"no holes" MUST NOT mean contiguous ids** — `run_events.id` is a single GLOBAL counter,
+  so one run's ids are a subsequence with arbitrary gaps, and with 8 writers over 4 runs those gaps
+  are the normal case. The assertion is SET EQUALITY between ids received for run R and ids
+  committed for run R, plus strictly ascending and no duplicates. **A contiguity check would fail
+  on correct behaviour** — the most likely way to write this test wrong.
+Task 12: `SubscriberQueue` must be raised for test 1 via `bootServe`'s `tune` hook, or eviction
+  silently becomes the thing under test instead of gaplessness. Eviction-and-resume is test 2's
+  job and wants the opposite.
+Task 12: the eviction MECHANISM spelled out so the implementer does not fight it — a client that
+  stops reading fills the socket buffer, so `Serve` blocks inside `WriteEvent` while the hub queue
+  fills and evicts with `CloseSlowConsumer`; **`Serve` only notices when the write unblocks**, i.e.
+  when the client reads again. Nothing prunes `run_events`, so `Oldest` never forces a re-snapshot
+  and the resume is lossless.
+Task 12: test 3 must commit the project-B events BEFORE the stream opens or "including during
+  replay" is not exercised at all — one path tested, three reported.
+Task 12: **the docs are SIX knobs, not the plan's "from Task 2"** (which means Task 11).
+  `snapshot_events` was added during Task 11 and appears in no earlier list.
+Task 12: **THE README MUST CARRY EVERY LIMITATION THE PLAN DISCOVERED**, not just the
+  process-local one the plan names. All five are real, all confidentiality-safe, all already
+  documented in code: process-local fan-out; the per-run/quiescent-run stream that cannot close on
+  partial revocation (**the plan's one open design question — document, do not fix**); the
+  revoke-then-re-grant permanent hole during catch-up; the true staleness window
+  (`grant_recheck` + one in-flight page, and up to 3× while the resolver is failing); what a client
+  sees on eviction and that reconnecting is correct; and the 403-shaped terminal frame.
+  **Writing only the good news would be the same failure as a false safety comment, at
+  documentation scale.**
+Task 12: row 10 gets `**done** — 2026-08-10-caesar-10-realtime-sse.md` matching rows 02-05 (no
+  backticks); **NO operator-smoke dependency** unlike rows 07 and 08, and no manual checklist is to
+  be invented for it.
+Task 12: finding 1 is the collision-and-reuse list — Task 11's fixture (`bootServe` with its
+  `tune` hook, `openStream`, `sseStream.await/rest/awaitLive`, `appendRuntimeEvent`,
+  `seedRealtimeRun`, `realtimeTestConfig`, `login`, `shutdown`, `testPassword`) is exactly what
+  this task needs and must be REUSED, not rebuilt. `runs.AppendEventsForTest` is unreachable from
+  `internal/app`, which is why `appendRuntimeEvent` exists.
+Task 12: **finding 13 is the last chance on the port-discovery fragility** — `awaitListening`
+  parses a production log line's exact message text and `addr` key; Task 11 accepted it with four
+  dependents and this task doubles that to eight. Harden via a seam or accept with a reason;
+  silence is not an option.
+Task 12: `-count=10 -race` required, and **a flake is a real bug** — not to be fixed by loosening
+  an assertion, adding a sleep or widening a timeout.
+Task 12: implementer dispatched on Opus 5 at BASE `dd1b94a`, with a seven-row mutation table and an
+  explicit licence to dissent.
+
+Task 12: implemented at `6016635` — 4 tests in `internal/app/realtime_e2e_integration_test.go`,
+  plus the README section and the roadmap row. Filed **DONE_WITH_CONCERNS**. **GATED BEFORE REVIEW
+  on a confirmed-clean tree: `GATE PASS … 6016635`, 11 lanes resolved unnarrowed, contracts clean.**
+  **`-count=10 -race` on the four tests: ok, 46.3s, NO FLAKE.** Integration lanes really ran
+  (Docker Desktop 29.6.2, `postgres:18-alpine`, real socket); full `backend:test:integration` ok
+  (`internal/app 52.098s`). **Review NOT dispatched — session paused here at the user's request.**
+Task 12: ⚠️⚠️ **TWO OF MY SEVEN MUTATION ROWS COULD NOT REDDEN ANYTHING, both demonstrated green
+  rather than argued.** The eighth and ninth controller errors on this plan.
+  (a) Row 2 ("deliver each live event twice") is absorbed by `send`'s cursor guard — doubling
+  delivery in `Hub.Publish` left it green 3/3. Replaced with a faithful wire-level duplicate, which
+  reddens.
+  (b) Row 3 ("remove `send`'s `e.ID <= st.cursor` guard") does not redden the test the plan
+  describes, because **`prime` jumps a fresh open's cursor to the snapshot watermark, so a
+  fresh-open stream cannot falsify the dedup guard at all** — demonstrated green. Test 1 now runs
+  TWO subscribers (one fresh, one resuming) with `ReplayBatch: 1` and the load started before the
+  opens; the mutant is then red 5/5. **This is the fourth task whose named acceptance mutation
+  proved nothing as written (7, 8, 9, 12) — and the first where the pre-flight author was the one
+  who wrote the useless mutation.**
+Task 12: **my finding 5 understated the eviction burst by ~3 orders of magnitude.** A stopped
+  client absorbs ~700-830 KiB before `Serve` blocks — not one `SubscriberQueue` of events. Test 2
+  pins `SO_RCVBUF` and uses an 8 MiB burst, and logs the measured margin every run so a future
+  kernel or buffer change shows up as a number rather than a flake.
+Task 12: **finding 10's third limitation was NARROWED by the implementer, and the narrowing is the
+  interesting part.** The revoke-then-re-grant permanent hole is the ATTENTION stream's, in catch-up
+  AND live; **a per-run stream cannot reach it** — denied catch-up does not advance the cursor, and
+  a denied live event closes the stream outright. The README states the narrowed version. I had
+  written the broad claim into the brief from Task 10's re-review without checking which stream
+  shape it applies to.
+Task 12: finding 13 ACCEPTED rather than hardened, with reasons: the log parse is in ONE function
+  so this task did not double the exposure as I claimed; hardening needs a test-only seam on
+  `runServe` (the shape `queryGate` already refused on an earlier plan); and the log line is
+  production behaviour an operator depends on. Reasonable — **the review should still weigh it.**
