@@ -1203,7 +1203,8 @@ cookie and both scoped to what the caller may see:
   is what asks for the stream, and `text/event-stream;q=0` — which names
   it in order to refuse it — takes the poll, as do an absent header,
   `*/*` and any unrelated type. Relative weights are otherwise ignored:
-  only a zero is read.
+  the only weight that changes the answer is a refusing one — a zero, a
+  negative, or a `q` that does not parse at all.
 
 Each frame is `id:` / `event:` / `data:`, where `event:` is the run event
 kind and `data:` is one compact JSON `StreamFrame` (`id`, `run_id`,

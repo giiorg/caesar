@@ -21,6 +21,7 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/authn"
 	"github.com/giiorg/caesar/backend/internal/platform/clock"
 	"github.com/giiorg/caesar/backend/internal/platform/config"
+	"github.com/giiorg/caesar/backend/internal/platform/httpx"
 	"github.com/giiorg/caesar/backend/internal/platform/testdb"
 	"github.com/giiorg/caesar/backend/internal/runs"
 )
@@ -100,12 +101,16 @@ func bootServe(t *testing.T, tune func(*config.Config)) *servedProcess {
 // there rather than from the config because the config says :0 — the port is
 // the operating system's answer and the log line is where runServe writes it
 // down.
+//
+// The message is serve.go's own msgListening const, so a rename moves both
+// sides at once. Quoted, because it is a JSON string field and not prose.
 func (p *servedProcess) awaitListening(t *testing.T) string {
 	t.Helper()
+	want := `"` + msgListening + `"`
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		for _, line := range strings.Split(p.log.String(), "\n") {
-			if !strings.Contains(line, `"http server listening"`) {
+			if !strings.Contains(line, want) {
 				continue
 			}
 			var rec struct {
@@ -199,9 +204,25 @@ func realtimeTestConfig(dbURL string) config.Config {
 	return cfg
 }
 
-// openStream opens an SSE stream and returns a reader over its frames. The
-// returned cancel ends the request, which is how a client disconnects.
+// openStream opens an SSE stream as an ordinary first-time client: the default
+// HTTP client, no Last-Event-ID. The returned cancel ends the request, which is
+// how a client disconnects.
 func openStream(t *testing.T, p *servedProcess, path, token string, life time.Duration) (*sseStream, context.CancelFunc) {
+	t.Helper()
+	return openStreamFrom(t, p, path, token, "", http.DefaultClient, life)
+}
+
+// openStreamFrom is the whole open-time contract, in ONE place: the Accept
+// header that asks for a stream, the session cookie, the two assertions every
+// caller wants (200 and the content type), and a request deadline that bounds
+// every later wait on the returned stream.
+//
+// It takes the two things only some callers vary — Last-Event-ID, omitted when
+// empty, and the client, because a test about a slow reader needs its own
+// buffers — so that a check added here reaches all of them.
+func openStreamFrom(t *testing.T, p *servedProcess, path, token, lastEventID string,
+	c *http.Client, life time.Duration,
+) (*sseStream, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), life)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+path, nil)
@@ -211,7 +232,10 @@ func openStream(t *testing.T, p *servedProcess, path, token string, life time.Du
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cookie", authn.SessionCookie+"="+token)
-	resp, err := http.DefaultClient.Do(req)
+	if lastEventID != "" {
+		req.Header.Set(httpx.LastEventIDHeader, lastEventID)
+	}
+	resp, err := c.Do(req)
 	if err != nil {
 		cancel()
 		t.Fatalf("open %s: %v", path, err)
@@ -277,11 +301,18 @@ func (s *sseStream) awaitLive(t *testing.T) {
 // the same NOTIFY every other writer uses.
 func appendRuntimeEvent(t *testing.T, pool *pgxpool.Pool, runID uuid.UUID, kind string) {
 	t.Helper()
+	appendEventPayload(t, pool, runID, kind, map[string]any{"note": "task 11"})
+}
+
+// appendEventPayload is the same write with the payload of the caller's
+// choosing, which is the one thing a test has a reason to vary — see
+// appendPaddedEvent, whose payload SIZE is the point.
+func appendEventPayload(t *testing.T, pool *pgxpool.Pool, runID uuid.UUID, kind string, payload map[string]any) {
+	t.Helper()
 	svc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		nil, nil, nil, nil, nil, nil, runs.Params{})
 	if err := svc.AppendRuntimeEvent(context.Background(),
-		runs.AttemptRef{RunID: runID, NodeID: "build", Attempt: 1}, kind,
-		map[string]any{"note": "task 11"}); err != nil {
+		runs.AttemptRef{RunID: runID, NodeID: "build", Attempt: 1}, kind, payload); err != nil {
 		t.Fatalf("append %s: %v", kind, err)
 	}
 }

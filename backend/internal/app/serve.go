@@ -87,6 +87,17 @@ func probeWritable(dir string) error {
 	return nil
 }
 
+// msgListening is logged once the listener is bound, and it is where the port
+// is written down: with addr ":0" the configured address is not the address,
+// so an operator — and the integration fixture's awaitListening — reads the
+// real one from this line. Named once so that renaming the message is a single
+// edit the fixture follows, rather than eight integration tests going red over
+// a string.
+//
+// Only the message can be shared this way. The "addr" key below is read back
+// through a struct tag, and a struct tag cannot be a const.
+const msgListening = "http server listening"
+
 // runServe boots the control plane: connect, migrate (advisory-locked),
 // serve HTTP until ctx is cancelled, then drain within the shutdown timeout.
 func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
@@ -245,7 +256,7 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("http server listening", "addr", ln.Addr().String(), "version", buildinfo.Version)
+		log.Info(msgListening, "addr", ln.Addr().String(), "version", buildinfo.Version)
 		errCh <- srv.Serve(ln)
 	}()
 

@@ -3,7 +3,6 @@
 package app
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"net"
@@ -20,11 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/giiorg/caesar/backend/internal/identity"
-	"github.com/giiorg/caesar/backend/internal/platform/audit"
-	"github.com/giiorg/caesar/backend/internal/platform/authn"
-	"github.com/giiorg/caesar/backend/internal/platform/clock"
 	"github.com/giiorg/caesar/backend/internal/platform/config"
-	"github.com/giiorg/caesar/backend/internal/platform/httpx"
 	"github.com/giiorg/caesar/backend/internal/realtime"
 	"github.com/giiorg/caesar/backend/internal/runs"
 )
@@ -35,9 +30,10 @@ import (
 // together, and none of them is observable in any one of those pieces.
 //
 // The fixture is serve_realtime_integration_test.go's — bootServe, openStream,
-// sseStream, appendRuntimeEvent, realtimeTestConfig — and this file adds only
-// what those cannot express: a client that stops reading, a Last-Event-ID
-// header, and reading a stream's ids out to a stopping point.
+// openStreamFrom, sseStream, appendRuntimeEvent, realtimeTestConfig — and this
+// file adds only what those cannot express: a client whose receive buffer is
+// small enough to stop reading in, and reading a stream's ids out to a stopping
+// point.
 
 // awaitFrames reads until a frame of kind stop has gone by, returning every id
 // seen on the way — INCLUDING that frame's own, because WriteEvent writes the
@@ -171,13 +167,7 @@ func awaitLog(t *testing.T, p *servedProcess, want string) {
 // TestStream_SlowClientIsEvictedAndResumes for why the size is load-bearing.
 func appendPaddedEvent(t *testing.T, pool *pgxpool.Pool, runID uuid.UUID, kind string, pad int) {
 	t.Helper()
-	svc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
-		nil, nil, nil, nil, nil, nil, runs.Params{})
-	if err := svc.AppendRuntimeEvent(context.Background(),
-		runs.AttemptRef{RunID: runID, NodeID: "build", Attempt: 1}, kind,
-		map[string]any{"pad": strings.Repeat("x", pad)}); err != nil {
-		t.Fatalf("append padded %s: %v", kind, err)
-	}
+	appendEventPayload(t, pool, runID, kind, map[string]any{"pad": strings.Repeat("x", pad)})
 }
 
 // clientReadBuffer is the kernel receive buffer boundedReadClient reads
@@ -218,43 +208,6 @@ func boundedReadClient(t *testing.T) *http.Client {
 	}
 	t.Cleanup(tr.CloseIdleConnections)
 	return &http.Client{Transport: tr}
-}
-
-// openStreamFrom is openStream with the one header a resuming client sends —
-// Last-Event-ID, omitted when empty — and the client of the caller's choosing.
-// Everything else, including bounding every wait by the request deadline, is
-// openStream's contract and is repeated here rather than shared because that
-// opener's signature belongs to Task 11's four tests.
-func openStreamFrom(t *testing.T, p *servedProcess, path, token, lastEventID string,
-	c *http.Client, life time.Duration,
-) (*sseStream, context.CancelFunc) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), life)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+path, nil)
-	if err != nil {
-		cancel()
-		t.Fatal(err)
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cookie", authn.SessionCookie+"="+token)
-	if lastEventID != "" {
-		req.Header.Set(httpx.LastEventIDHeader, lastEventID)
-	}
-	resp, err := c.Do(req)
-	if err != nil {
-		cancel()
-		t.Fatalf("open %s: %v", path, err)
-	}
-	t.Cleanup(func() { _ = resp.Body.Close() })
-	if resp.StatusCode != http.StatusOK {
-		cancel()
-		t.Fatalf("open %s: status = %d", path, resp.StatusCode)
-	}
-	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
-		cancel()
-		t.Fatalf("open %s: Content-Type = %q", path, got)
-	}
-	return &sseStream{sc: bufio.NewScanner(resp.Body)}, cancel
 }
 
 // TestStream_NoGapsUnderConcurrentWriters is what the whole plan exists to
@@ -302,9 +255,23 @@ func TestStream_NoGapsUnderConcurrentWriters(t *testing.T) {
 		writers   = 8
 		loadRuns  = 4
 		perWriter = 20
-		// Committed on the OTHER runs before anything opens, so the watched
-		// run's ids are a sparse subsequence of the global counter rather than
-		// a contiguous block — which is what "no holes" has to mean here.
+		// Committed on the OTHER runs, and in full BEFORE the watched run's
+		// backlog, so the table deterministically holds foreign rows below
+		// this run's lowest id (which is 16, not 1, at these numbers). Two
+		// things rest on that. The run-scoped snapshot and replay queries are
+		// asked to filter from their very first row rather than being
+		// accidentally right over a table that holds nothing else; and the
+		// resumed stream's Last-Event-ID is a real offset into the counter.
+		// Without it, whether any foreign row existed by the time the streams
+		// opened would be a race against the writers below.
+		//
+		// It is NOT what makes this run's ids sparse — committing in full
+		// first is exactly what stops it interleaving, so the backlog is one
+		// CONTIGUOUS block (16..215 at these numbers). The gaps come from the
+		// concurrent writer phase further down, which interleaves four runs
+		// into the one counter; one observed run carried on 216, 217, 219,
+		// 220, 223, 224, 227 …, and the ids missing there are the other three
+		// runs'.
 		preburst = 5
 		// And on the watched run, deep, because it is what the resumed stream
 		// has to page through: the replay query filters by run, so this run's
@@ -316,11 +283,46 @@ func TestStream_NoGapsUnderConcurrentWriters(t *testing.T) {
 		// The one kind no writer uses, so a reader has a stopping point it can
 		// recognize without knowing any id in advance.
 		sentinelKind = runs.EventRunSucceeded
+		// Which of the seeded runs is the one both subscribers watch.
+		watchedRun = 0
 	)
+	// Which run writer w commits into, named once because the count below has to
+	// agree with the loop that uses it.
+	runFor := func(w int) int { return w % loadRuns }
+	// Every writer runFor sends to the watched run, COUNTED rather than divided:
+	// (writers/loadRuns) is right only while writers is a multiple of loadRuns,
+	// and at writers = 9 it would expect two while writers 0, 4 and 8 all commit
+	// there — a false failure over correct behaviour, which is the one direction
+	// an assertion must never be wrong in.
+	watchedWriters := 0
+	for w := range writers {
+		if runFor(w) == watchedRun {
+			watchedWriters++
+		}
+	}
+	// The backlog, then those writers, then the sentinel: what run_events must
+	// hold for the watched run once the test is over.
+	wantCount := backlog + watchedWriters*perWriter + 1
+
 	ctx := context.Background()
 	p := bootServe(t, func(cfg *config.Config) {
 		cfg.Realtime.SubscriberQueue = 4096
 		cfg.Realtime.ReplayBatch = 1
+		// The fresh stream reaches this run's OLDEST id only through its
+		// snapshot — prime takes the most recent snapshot_events matching rows
+		// and then jumps the cursor to that snapshot's watermark, so anything
+		// older is below the cursor and is never replayed. Set equality against
+		// the WHOLE committed set therefore holds only while the snapshot window
+		// is at least as wide as what this test commits for the run. Asserted
+		// rather than commented, because what it otherwise produces is a red
+		// gaplessness test over correct production code.
+		if cfg.Realtime.SnapshotEvents < wantCount {
+			t.Fatalf("snapshot_events is %d and this test commits %d events for the "+
+				"watched run: the fresh stream would legitimately open above the run's "+
+				"oldest id and its set equality below would fail on correct behaviour. "+
+				"Raise the knob or shrink the load, and do not weaken the assertion",
+				cfg.Realtime.SnapshotEvents, wantCount)
+		}
 	})
 	if _, err := p.svc.Bootstrap(ctx, "root@example.com", testPassword); err != nil {
 		t.Fatal(err)
@@ -329,31 +331,50 @@ func TestStream_NoGapsUnderConcurrentWriters(t *testing.T) {
 	for i := range seeded {
 		seeded[i] = seedRealtimeRun(ctx, t, p.pool, fmt.Sprintf("load-%d", i))
 	}
-	// Committed BEFORE either stream opens, so the SNAPSHOT carries them: the
-	// splice is what is under test, and a stream whose backlog is empty
-	// exercises only its live half.
-	for _, r := range seeded[1:] {
+	// Both loops commit BEFORE either stream opens, so the watched run's backlog
+	// is what its SNAPSHOT carries: the splice is what is under test, and a
+	// stream whose backlog is empty exercises only its live half.
+	for i, r := range seeded {
+		if i == watchedRun {
+			continue
+		}
 		for range preburst {
 			appendRuntimeEvent(t, p.pool, r.runID, runs.EventPhaseMaterialized)
 		}
 	}
 	for range backlog {
-		appendRuntimeEvent(t, p.pool, seeded[0].runID, runs.EventPhaseMaterialized)
+		appendRuntimeEvent(t, p.pool, seeded[watchedRun].runID, runs.EventPhaseMaterialized)
 	}
 	token := p.login(t, "root@example.com")
 
-	watched := seeded[0]
+	watched := seeded[watchedRun]
 	path := "/api/v1/runs/" + watched.runID.String() + "/events"
+	// The backlog as the table holds it, asserted before anything indexes into
+	// it: nothing has been committed for this run except those appends, so an
+	// answer that is not exactly the backlog is the seeding having failed, and
+	// it says so here instead of panicking one line below. The second clause is
+	// not redundant — it is what keeps that index safe if backlog is ever set
+	// to zero.
+	seededIDs := committedEventIDs(ctx, t, p.pool, watched.runID)
+	if len(seededIDs) != backlog || len(seededIDs) == 0 {
+		t.Fatalf("the watched run's backlog is %d events, want %d and at least one: the "+
+			"seeding above did not commit what it set out to, and every assertion below "+
+			"is over the wrong set", len(seededIDs), backlog)
+	}
 	// This run's lowest id, which is as far back as a resume can usefully start
 	// and so the longest catch-up available. Last-Event-ID resumes STRICTLY
 	// above it, so the resumed stream owes everything except this one event.
-	oldest := committedEventIDs(ctx, t, p.pool, watched.runID)[0]
+	oldest := seededIDs[0]
 
 	// THE LOAD STARTS FIRST, and that ordering is what puts commits inside every
 	// phase of both splices rather than only after them: the snapshot's
 	// transaction runs mid-load, and so does every page of the resumed stream's
 	// catch-up. Opening first — which reads tidier — leaves catch-up over a
 	// table nobody is writing to, finished before the first writer commits.
+	//
+	// It is also what makes the watched run's ids SPARSE: eight writers over
+	// four runs interleave four runs' commits into the one counter, so from here
+	// on this run holds a subsequence of it with arbitrary gaps.
 	kinds := []string{
 		runs.EventPhaseStarted, runs.EventPhaseSucceeded,
 		runs.EventPhaseLogTruncated, runs.EventPhaseEgressDenied,
@@ -367,7 +388,7 @@ func TestStream_NoGapsUnderConcurrentWriters(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := range perWriter {
-				appendRuntimeEvent(t, p.pool, seeded[w%loadRuns].runID, kinds[i%len(kinds)])
+				appendRuntimeEvent(t, p.pool, seeded[runFor(w)].runID, kinds[i%len(kinds)])
 			}
 		}()
 	}
@@ -394,9 +415,6 @@ func TestStream_NoGapsUnderConcurrentWriters(t *testing.T) {
 	// Only now, with every writer finished and the sentinel the last thing
 	// committed, is the table's answer final.
 	committed := committedEventIDs(ctx, t, p.pool, watched.runID)
-	// The backlog, then the writers whose index is congruent to this run, then
-	// the sentinel. Two writers per run at these numbers.
-	wantCount := backlog + (writers/loadRuns)*perWriter + 1
 	if len(committed) != wantCount {
 		t.Fatalf("run_events holds %d events for the watched run, want %d: a writer "+
 			"committed less than it set out to, and the streams would agree with it",
@@ -552,6 +570,15 @@ func TestStream_ScopedToGrants(t *testing.T) {
 	appendRuntimeEvent(t, p.pool, runA.runID, runs.EventGateWaiting)
 	backlogA := committedEventIDs(ctx, t, p.pool, runA.runID)
 	backlogB := committedEventIDs(ctx, t, p.pool, runB.runID)
+	// Two events each, as appended. Every phase below takes its stopping point
+	// from the LAST project-A id, so a short answer here has to fail with a
+	// reason rather than panic on the index — and a missing project-B id would
+	// take a forbidden event out of the set being watched for.
+	if len(backlogA) != 2 || len(backlogB) != 2 {
+		t.Fatalf("the backlog is %d events on project A and %d on project B, want 2 and 2: "+
+			"the appends above did not commit what they set out to, and the phases below "+
+			"would be watching the wrong ids", len(backlogA), len(backlogB))
+	}
 	forbidden := make(map[int64]bool, len(backlogB))
 	for _, id := range backlogB {
 		forbidden[id] = true
@@ -578,6 +605,10 @@ func TestStream_ScopedToGrants(t *testing.T) {
 	appendRuntimeEvent(t, p.pool, runB.runID, runs.EventPublishPushed)
 	appendRuntimeEvent(t, p.pool, runA.runID, runs.EventPublishPushed)
 	liveA := committedEventIDs(ctx, t, p.pool, runA.runID)
+	if len(liveA) != len(backlogA)+1 {
+		t.Fatalf("project A holds %d events after the live append, want %d: the event this "+
+			"phase reads up to never committed", len(liveA), len(backlogA)+1)
+	}
 	for _, id := range committedEventIDs(ctx, t, p.pool, runB.runID) {
 		forbidden[id] = true
 	}
