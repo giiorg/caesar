@@ -26,9 +26,11 @@ import (
 // internal/app.startRealtime for why it is not ReplayBatch.
 //
 // A SIXTH copy of a config.Realtime default exists outside this package —
-// internal/app.defaultSnapshotEvents — and is deliberately not listed here.
-// It has a tie-back of its own, and a stronger one, because internal/app is
-// free to import config and this package is not.
+// internal/app.defaultSnapshotEvents — and is deliberately not listed here. It
+// has a tie-back of its own, and a stronger one:
+// TestNewRealtimeEventSource_ZeroTakesTheConfiguredDefault asserts through the
+// CONSTRUCTOR, so it also proves the defaulting path, where the table below
+// only compares the literals.
 func TestDefaults_MatchConfigRealtime(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "caesar.json")
 	if err := os.WriteFile(path, []byte(`{"database": {"url": "postgres://x"}}`), 0o600); err != nil {

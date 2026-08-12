@@ -253,8 +253,8 @@ func openStreamFrom(t *testing.T, p *servedProcess, path, token, lastEventID str
 }
 
 // sseStream reads one client's frames. Every wait is bounded by the request
-// deadline openStream set, so a stream that goes quiet ends the scan instead
-// of parking the test.
+// deadline openStreamFrom set — openStream is one of its callers — so a stream
+// that goes quiet ends the scan instead of parking the test.
 type sseStream struct {
 	sc   *bufio.Scanner
 	seen []string

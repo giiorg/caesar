@@ -75,7 +75,9 @@ func (s Scope) allows(project uuid.UUID) bool {
 func (s Scope) empty() bool { return !s.All && len(s.Projects) == 0 }
 
 // Filter selects the events one subscription receives. Exactly one of
-// RunID (per-run stream) or Attention (global stream) is set.
+// RunID (per-run stream) or Attention (global stream) SHOULD be set: the
+// constructors below are what make that so, and Matches states what the other
+// two combinations do rather than pretending they cannot be built.
 //
 // Build one with RunFilter or AttentionFilter rather than by hand. Two of the
 // four combinations of those fields are wrong in ways nothing downstream can

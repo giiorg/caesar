@@ -29,8 +29,9 @@ const eventStreamType = "text/event-stream"
 // Two ways this is deliberately not a full RFC 9110 negotiator, both of which
 // the rules above would otherwise read as covering.
 //
-// RELATIVE PREFERENCE IS IGNORED. Only q=0 is read, as a refusal; every other
-// weight is treated as "yes". So "application/json;q=0.9,
+// RELATIVE PREFERENCE IS IGNORED. The only weights read are the refusing ones —
+// a zero, a negative, or a q that does not parse at all; every other weight is
+// treated as "yes". So "application/json;q=0.9,
 // text/event-stream;q=0.1" streams, even though the client ranked JSON first.
 // Ordering the ranges would mean scoring the JSON branch too — and "*/*"
 // against an endpoint with two representations has no defensible winner —

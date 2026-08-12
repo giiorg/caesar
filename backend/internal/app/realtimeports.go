@@ -61,10 +61,13 @@ var _ realtime.EventSource = realtimeEventSource{}
 // called with one in the boot tests, which is exactly the caller that would
 // never notice.
 //
-// This IS a second copy of config's default, which is why it is the one such
-// copy with a tie-back that runs — TestNewRealtimeEventSource_ZeroTakesTheConfiguredDefault.
-// The five in internal/realtime cannot have one in either direction (see that
-// package's defaults_test); this package already imports config, so it can.
+// This IS a second copy of config's default, and its tie-back is
+// TestNewRealtimeEventSource_ZeroTakesTheConfiguredDefault, which asserts
+// through this CONSTRUCTOR: it fails both when either end of the duplicated 500
+// moves alone and when the defaulting is dropped. The five copies in
+// internal/realtime have a tie-back of their own, that package's defaults_test,
+// which compares literals and says there why a test is the strongest tie
+// available to it.
 const defaultSnapshotEvents = 500
 
 func newRealtimeEventSource(pool *pgxpool.Pool, snapshotEvents int) realtimeEventSource {

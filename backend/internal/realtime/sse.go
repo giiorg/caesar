@@ -87,9 +87,12 @@ var sseHeaders = map[string]string{
 // removes them again.
 //
 // TWO FAILURES COME OUT OF HERE AND THEY ARE NOT INTERCHANGEABLE. An
-// unsupported flush touched nothing: no status, no body, an empty header map,
-// and Serve tags it ErrNotStarted so a surface can still answer with a real
-// one. A flush that was SUPPORTED and failed — the peer hung up between the
+// unsupported flush touched nothing: no status, no body, and none of the stream
+// headers left behind (the Del loop below — the map itself is not empty in the
+// assembled process, where httpx has already set X-Correlation-ID). Serve tags
+// it ErrNotStarted so a surface can still answer with a real status.
+//
+// A flush that was SUPPORTED and failed — the peer hung up between the
 // request and the first byte — wrote the 200 first, because that is what
 // net/http's FlushError does on its way to the socket; the header removal below
 // is then a tidy-up of a map nobody will read again rather than a promise the

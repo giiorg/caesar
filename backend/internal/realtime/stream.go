@@ -51,7 +51,10 @@ const forbiddenFrame = "event: forbidden\ndata: {\"error\":\"forbidden\"}\n\n"
 // response. Every other ending — a write failure, a source failure,
 // CloseForbidden, CloseSlowConsumer, CloseShutdown — happens over a 200 that
 // NewWriter fixed long before, and there the only honest report is bytes in the
-// body plus a log line.
+// body plus a log line. The sixth is NewWriter's own untagged flush failure:
+// committed too, but over a 200 net/http wrote on its way to discovering the
+// peer had gone, so there is no client left to write to and the log line is the
+// whole report (realtime/api.serve).
 //
 // It exists because an HTTP surface cannot tell the two apart from the error
 // value otherwise, and guessing wrong is expensive in both directions: read a
@@ -75,9 +78,11 @@ const forbiddenFrame = "event: forbidden\ndata: {\"error\":\"forbidden\"}\n\n"
 //
 // The residual case, stated because it is not covered: a hand-written wrapper
 // implementing FlushError could fail without writing and would go untagged,
-// costing a silent 200. Nothing in this tree implements FlushError, and the
-// mistake falls on the side that never writes over a committed body — which is
-// the side to fall on.
+// costing a silent 200. Nothing in the production tree implements FlushError;
+// the one writer in this package that does — sse_test.go's deadPeerWriter —
+// mimics net/http and writes the header first, so it is no counter-example to
+// the residual. And the mistake falls on the side that never writes over a
+// committed body, which is the side to fall on.
 //
 // Match it with errors.Is; the cause is wrapped alongside it and is what the
 // log should carry.

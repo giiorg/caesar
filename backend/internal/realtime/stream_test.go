@@ -1100,14 +1100,15 @@ func TestServe_DropsEventsOutsideRefreshedScope(t *testing.T) {
 	f := Filter{Attention: true, Scope: Scope{Projects: []uuid.UUID{kept, lost}}}
 	rec, cancel, errc := startServe(t, s, StreamRequest{Filter: f})
 
-	// stubGrants counts on ENTRY, so this says follow is at or past the resolve
-	// — not that the resolve returned. That is still enough, and for a reason
-	// worth stating because the weaker one is so easy to write instead: follow
-	// is a single goroutine, the count can only be raised from inside its
-	// re-check case, and it cannot receive from sub.C() until that case has
-	// returned and assigned the new scope. So anything published after this
-	// observation is judged against the narrowed scope, whatever the ordering
-	// inside the resolve itself.
+	// stubGrants counts on ENTRY, so this says the stream is at or past its
+	// first resolve — not that the resolve returned. That is still enough, and
+	// for a reason worth stating because the weaker one is so easy to write
+	// instead: the count can only be raised from inside a re-check, in replay
+	// or in follow, and both of those run on deliver's single goroutine — so
+	// follow cannot receive from sub.C() until the re-check has returned and
+	// assigned the new scope. So anything published after this observation is
+	// judged against the narrowed scope, whatever the ordering inside the
+	// resolve itself.
 	eventually(t, func() bool { return grants.callCount() > 0 }, "the first grant re-check")
 	hub.Publish([]Event{
 		hubEvent(1, lost, run, "run.started"),

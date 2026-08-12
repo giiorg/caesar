@@ -1288,10 +1288,14 @@ showing but keeps other grants, the stream can only be ended by an event
 it must deny — so if that run emits nothing further, the connection
 stays open and idle indefinitely. No denied byte reaches the client, and
 the client's own reconnect fails authorization at the handler; but
-nothing reaps the socket. A `Filter` carries the run id and never the
-run's project, which is why the stream cannot be closed outright. Losing
-*every* grant is different and does close it: an empty scope matches
-nothing and is the one thing a re-check can act on without an event.
+nothing reaps the socket. Nothing *will*, either: the heartbeat ticker
+runs regardless of scope, so the connection keeps producing `: hb`
+comments and no proxy idle timeout culls it — the first instinct, "an
+idle timeout will clean this up", is wrong here. A `Filter` carries the
+run id and never the run's project, which is why the stream cannot be
+closed outright. Losing *every* grant is different and does close it: an
+empty scope matches nothing and is the one thing a re-check can act on
+without an event.
 
 **A revoke-then-re-grant can leave a permanent hole in one stream.** The
 cursor is a single high-water mark, so once a narrowed scope has
@@ -1301,6 +1305,17 @@ below the cursor forever: a re-grant never backfills them and
 stored is above them. This is reachable on the attention stream, whose
 scope can narrow *partially*, in catch-up and live alike. It is inherent
 to one cursor per stream, not a bug in the re-check.
+
+**A grant *added* after a stream opened does not reach that stream.**
+Fan-out filters on the scope the stream was opened with, and that scope
+is never rewritten — rewriting it would race the tailer's own goroutine —
+so a live event on a newly granted project is dropped before the stream
+ever sees it, for the whole life of the connection. The re-check acts on
+a grant *lost*; it does not act on one *gained*, and the fix is to
+reconnect. It is fail-closed, so this is freshness and not disclosure.
+The one exception is catch-up: a stream still paging its way to the
+present queries each page with the refreshed scope, so a widening that
+lands during catch-up does take effect for those pages.
 
 **The revocation staleness window is `grant_recheck` plus one in-flight
 replay page** — catch-up re-checks before each page and the live loop on
