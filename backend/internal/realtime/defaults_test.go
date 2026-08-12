@@ -24,6 +24,11 @@ import (
 // defaultBatch is absent on purpose: TailerConfig.Batch is how many rows one
 // read of the table takes and has no config.Realtime knob at all. See
 // internal/app.startRealtime for why it is not ReplayBatch.
+//
+// A SIXTH copy of a config.Realtime default exists outside this package —
+// internal/app.defaultSnapshotEvents — and is deliberately not listed here.
+// It has a tie-back of its own, and a stronger one, because internal/app is
+// free to import config and this package is not.
 func TestDefaults_MatchConfigRealtime(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "caesar.json")
 	if err := os.WriteFile(path, []byte(`{"database": {"url": "postgres://x"}}`), 0o600); err != nil {

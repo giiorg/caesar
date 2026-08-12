@@ -49,12 +49,28 @@ type realtimeEventSource struct {
 // drift from surviving until production wiring.
 var _ realtime.EventSource = realtimeEventSource{}
 
-// newRealtimeEventSource takes the backlog size rather than defaulting a zero
-// to something. It deliberately holds no fallback constant: 500 already lives
-// in config.defaults() and is validated positive by config.Load, and a second
-// copy here would be a sixth duplicated realtime default with no tie-back —
-// the one shape internal/realtime's defaults_test exists to prevent.
+// defaultSnapshotEvents is how many recent events a snapshot carries when the
+// caller passes nothing usable, and it exists for the same reason NewHub,
+// NewTailer and NewStreamer each default theirs: a zero here does not fail, it
+// SUCCEEDS QUIETLY WITH NOTHING. It reaches the queries as LIMIT 0, so every
+// stream opens on an empty backlog and the client is told the run has no
+// history — no error, no log line, nothing to notice.
+//
+// config.Load rejects a non-positive snapshot_events, so a configured process
+// cannot get here. A hand-built config.Config can, and does: runServe is
+// called with one in the boot tests, which is exactly the caller that would
+// never notice.
+//
+// This IS a second copy of config's default, which is why it is the one such
+// copy with a tie-back that runs — TestNewRealtimeEventSource_ZeroTakesTheConfiguredDefault.
+// The five in internal/realtime cannot have one in either direction (see that
+// package's defaults_test); this package already imports config, so it can.
+const defaultSnapshotEvents = 500
+
 func newRealtimeEventSource(pool *pgxpool.Pool, snapshotEvents int) realtimeEventSource {
+	if snapshotEvents <= 0 {
+		snapshotEvents = defaultSnapshotEvents
+	}
 	return realtimeEventSource{pool: pool, snapshotEvents: rowLimit(snapshotEvents)}
 }
 
@@ -433,15 +449,18 @@ func runTailer(ctx context.Context, t runLoop) (<-chan struct{}, <-chan error) {
 // connection does not drain on its own.
 //
 // Step 2 is the ONE UNBOUNDED wait in that path — Close below carries its own
-// deadline, srv.Shutdown carries ShutdownTimeout — and it is left unbounded on
-// purpose. A deadline here could only abandon the goroutine and go on to close
-// a connection it may be reading at that instant, and a pgx Conn is documented
-// as unsafe for concurrent use; Stop cannot tell a tailer stuck in Wait from
-// one stuck in a drain, so it cannot tell which it would be abandoning. Nor
-// would it bound Stop: a tailer stuck inside Wait is holding the waker's mutex,
-// which step 3 takes, so the hang would move one line down and read as a bound
-// that is not one. What does bound this is that every blocking call in the
-// tailer's loop takes the context step 1 has just cancelled.
+// deadline, srv.Shutdown carries ShutdownTimeout — and a deadline on it is
+// left out because it would not bound anything. What it is NOT is a race:
+// every use of the waker's connection is under w.mu and Close takes that
+// mutex, so abandoning the wait cannot reach a connection mid-read. What it
+// does is MOVE THE HANG, and both hangs are worse than this one. A tailer
+// stuck inside Wait is holding w.mu, so step 3 blocks there instead. A tailer
+// stuck in a drain is holding a pooled connection, so runServe's deferred
+// pool.Close blocks instead — pgxpool.Close blocks until every connection is
+// returned. Either way the deadline buys a shutdown path that READS bounded
+// and is not, one frame further from the cause. What does bound this is that
+// every blocking call in the tailer's loop takes the context step 1 has just
+// cancelled.
 //
 // What the wait is NOT for: a Publish racing Hub.Close is already safe
 // whichever order they land in. Publish collects its targets under the hub's

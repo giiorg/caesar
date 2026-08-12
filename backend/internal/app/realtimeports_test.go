@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/giiorg/caesar/backend/internal/platform/config"
 	"github.com/giiorg/caesar/backend/internal/realtime"
 	realtimeapi "github.com/giiorg/caesar/backend/internal/realtime/api"
 )
@@ -264,5 +267,34 @@ func TestServeRunStream_ErrNotStartedStillReachesTheCaller(t *testing.T) {
 	}
 	if w.body.Len() != 0 {
 		t.Errorf("body = %q, want empty", w.body.String())
+	}
+}
+
+// A zero SnapshotEvents must not reach the queries. It would arrive as
+// LIMIT 0, and a stream that opens on an empty backlog is indistinguishable
+// from a run with no history — the failure succeeds. config.Load rejects a
+// non-positive value, so this is about the callers that never went through
+// Load: runServe takes a config.Config, and the boot tests hand it one built
+// by hand.
+//
+// It is also the tie-back for defaultSnapshotEvents, which is a second copy of
+// config's own default. Asserting the RESULT rather than the constant is
+// deliberate: this fails both when the defaulting is removed and when either
+// end of the duplicated 500 moves alone, and it needs no compile-time
+// reference to survive.
+func TestNewRealtimeEventSource_ZeroTakesTheConfiguredDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "caesar.json")
+	if err := os.WriteFile(path, []byte(`{"database": {"url": "postgres://x"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := rowLimit(cfg.Realtime.SnapshotEvents)
+	if got := newRealtimeEventSource(nil, 0).snapshotEvents; got != want {
+		t.Errorf("a zero backlog size became LIMIT %d, want the configured default %d: "+
+			"zero opens every stream on an empty backlog and reports nothing", got, want)
 	}
 }
