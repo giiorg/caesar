@@ -1208,3 +1208,255 @@ Task 9: **the method that found the most this task was asking a question instead
   question surfaced the quiescent-run residue that my own framing hid. Had I asserted it, it would
   have shipped as a confident false safety claim — the pattern that has now bitten this plan three
   times.
+
+---
+
+### Task 10 pre-flight (controller, 2026-08-12, session 60) — SEVENTEEN findings, all in the brief
+
+Read against the tree at `94cd5d1` before dispatching. Recorded in full as a CONTROLLER
+PRE-FLIGHT block at the top of `task-10-brief.md` that overrides the plan text. BASE for the
+review package is **`94cd5d1`**. Pre-flight has now found 6, 8, 11, 13, 21 and 17 defects on the
+last six tasks.
+
+Task 10: **THE PLAN CONTAINS AN ACCEPTANCE CHECK THAT CANNOT PASS AS WRITTEN.** Its Step 5 says
+  "if `listRunEvents`'s `application/json` response disappeared, the negotiation is declared wrong
+  — both must be present". But `contracts.Build` calls `oc.AddRespStructure` for the success
+  response exactly ONCE (`contracts.go:155-161`) with `WithContentType(contentTypeOf(op))`, and
+  `contentTypeOf` returns either `application/json` or the single `ResponseContentType` override;
+  `httpx.Operation` carries one `Response` and one content type. Setting the override on
+  `listRunEvents` REPLACES the JSON response rather than adding to it. **The seam must be extended
+  — an additional-responses list on `Operation` plus a loop in `Build` — and the implementer must
+  verify EMPIRICALLY that the reflector merges two content types under one status rather than
+  overwriting, and STOP if it overwrites.** Third task on this plan whose stated acceptance
+  evidence was broken as written (Tasks 7 and 8 were the others), and the first where it is the
+  contract rather than a test.
+Task 10: **the per-run handler already holds the run's project id — Task 9's residue IS solvable
+  here — and I ruled NOT to solve it in this task.** `runScoped` (`runs/api/api.go:252-272`) loads
+  the run, loads its task and authorizes against `task.ProjectID`, so feeding it through
+  `ServeRunStream` would close the quiescent-run liveness gap. Rejected for Task 10 because it
+  needs a matching change inside `realtime`'s re-check path plus tests and mutations, and this
+  task already extends the contract seam, changes a five-call-site constructor, creates a package
+  and adds content negotiation. **Two unrelated risks in one task is how a task stops being
+  reviewable.** The gap is confidentiality-safe and documented in three places in the code.
+  **→ FINAL REVIEW must route it; it is the one open design question left by Task 9.**
+Task 10: **a nil `StreamServer` must NOT panic at construction — the OPPOSITE of Task 9's nil
+  ruling, and the reason is concrete**: `contracts.go:129` deliberately builds
+  `runsapi.New(nil, nil, nil, nil)` for metadata-only generation and the two integration tests
+  will pass nil too. The check moves to request time and must be LOUD (500), never a silent
+  fall-through to the JSON poll. Same principle as Task 9, opposite mechanism — worth noticing
+  that the precedent did not transfer.
+Task 10: `runsapi.New` gains a parameter and has FIVE call sites, two of them integration tests
+  (`contracts.go:129`, `serve.go:165`, `api_e2e_integration_test.go:188`,
+  `goldenset_integration_test.go:146` and `:460`).
+Task 10: **do NOT redeclare `StreamFrame`.** `realtime.StreamFrame` (`sse.go:21-27`) already has
+  the five fields and its own doc says Task 10 reflects THIS type so the bytes cannot drift — a
+  parallel DTO in `realtime/api/dto.go` is exactly that drift. Which probably leaves `dto.go` with
+  nothing to hold: **do not create an empty file because the plan's file list names one.**
+Task 10: the ambiguous-`Filter` obligation resolved against a runtime check — both handlers build
+  the Filter in code, so no request can produce the ambiguous combination and a check would be
+  DEAD CODE. Preferred: constructors in `realtime` that cannot express it. Minimum: a test per
+  handler. The risk being guarded is a later edit, not user input.
+Task 10: **there is no Accept parser in this tree** — `mime.ParseMediaType` parses one media type,
+  not a list, and the only `"Accept"` hits in `internal/` are outbound forge headers. Absent,
+  `*/*`, or non-matching Accept MUST take the JSON branch or the poll's contract breaks.
+Task 10: **the plan's `ServeRunStream` signature carries no `Scope`, and never says who resolves
+  it.** The `internal/app` adapter must call `ScopeFor` before building the `StreamRequest`;
+  `realtimeGrants` already satisfies `realtime.GrantResolver` (`realtimeports.go:267-285`). Asked
+  as a QUESTION rather than prescribed: what does a client get when `ScopeFor` fails at stream
+  open? That is the ONE point where a real HTTP status is still available — `NewWriter` has not
+  run, so the response is not committed. Everything after is stuck at 200.
+Task 10: header params pinned precisely — `requestStructure` (`contracts.go:185-198`) returns
+  `op.Request` unchanged for a path without `{id}`, so `/api/v1/stream` declares `Last-Event-ID`
+  via its `Request:` struct with NO `requestOverrides` entry; `listRunEvents` has `{id}` so its
+  header field goes in the existing `runEventsParams`, already registered at `contracts.go:118`.
+Task 10: **scope boundary against Task 11 ruled explicitly** — this task creates the packages, the
+  port, the negotiation and the contract entries, and touches `internal/app` only as far as it
+  must to COMPILE (nil at `serve.go:165`, with a comment naming Task 11). Between the two tasks
+  the SSE branch answers 500, which is honest. `realtime/api.New` wants a `*realtime.Streamer`
+  that does not exist at boot until Task 11 builds it — **stop and report rather than half-doing
+  Task 11.**
+Task 10: also carried — document Task 9's terminal frame in prose on both stream operations (the
+  seam expresses one schema per content type, so a second frame shape cannot be reflected as a
+  type); five return shapes of `Serve` each need a log-level decision, matched with `errors.Is`
+  against the `CloseReason` constants and never by string; `Serve` returns nil rather than
+  `CloseShutdown` when a disconnect races hub close, so no shutdown guarantee may rest on the
+  return value; and streaming tests must FAIL rather than HANG — this package has hung its own
+  suite to the timeout twice.
+Task 10: implementer dispatched on Opus 5 at BASE `94cd5d1`, with an eight-row mutation table and
+  an explicit licence to dissent.
+
+Task 10: implemented at `bb9e4e6` — 20 files, +1611/-41, spanning `realtime/api` (new),
+  `runs/api`, `contracts`, `platform/httpx`, `internal/app` and — beyond the plan's file list —
+  `realtime/sse.go`, `realtime/realtime.go`, `realtime/stream_test.go`. Filed
+  **DONE_WITH_CONCERNS**. **GATED BEFORE REVIEW on a confirmed-clean tree: `GATE PASS … bb9e4e6`,
+  11 lanes resolved unnarrowed, contracts clean.** Review in flight.
+Task 10: ⚠️⚠️ **THE IMPLEMENTER REPORTS A LATENT CRITICAL IN TASK 6 THAT EVERY GATE MISSED.**
+  `NewWriter` type-asserted `http.Flusher`, and `httpx.AccessLog`'s response wrapper is not one —
+  so **both of this task's endpoints would have answered an empty 200 with `Content-Length: 0`**
+  in the real process. It says it probed this before touching anything and mutation-reverted to
+  demonstrate the empty 200, then fixed it with `http.NewResponseController`. **It passed Tasks 6,
+  8 and 9 and every gate because no test ever put a real middleware wrapper between the codec and
+  the recorder** — the fakes went straight to an `httptest`-style recorder that IS a Flusher.
+  A whole class of integration defect that unit fakes cannot see. **Unverified by the controller;
+  the review is dispatched to falsify it independently, and to decide whether the fix loosened
+  what Tasks 6/8/9 pinned on construction-time Flusher rejection and the exact op-log.**
+Task 10: **MY PRE-FLIGHT FINDING 1's MECHANISM WAS IMPOSSIBLE — the sixth controller error, and
+  this one is my own two findings colliding.** Finding 1 said to extend `httpx.Operation` with an
+  additional-response list carrying a `Response any`; finding 10 said `runs` must not import
+  `realtime`. Declaring the alternate response ON the `listRunEvents` operation, which lives in
+  `runs/api`, requires `runs/api` to NAME `realtime.StreamFrame` — a CI-failing arch violation.
+  I wrote both findings and did not connect them. The implementer demonstrated the violation by
+  running the REAL arch test over an overlay of exactly what I prescribed, then put an
+  `altResponses` map in `contracts` mirroring the existing `requestOverrides` and left
+  `httpx.Operation` untouched. `contracts` already imports every api package, so it can name the
+  type freely. **The requirement finding 1 encoded still had to be met and the reflector DOES
+  merge: both content types now sit under 200 on `listRunEvents`.**
+Task 10: the implementer flagged one mutation row it could NOT run — the per-run half of the
+  ambiguous-`Filter` row, because the per-run `Filter` is built by Task 11's adapter. It ran the
+  faithful mirror on the attention filter and **reported the gap rather than faking it**. Same
+  standard as Task 8's discarded mutant: evidence that does not prove the claim is not evidence.
+Task 10: findings 4 and 15 honoured — no adapter, no Streamer, two commented `nil`s in `serve.go`.
+  Carry-forward the implementer raises for TASK 11: satisfy `runsapi.StreamServer` structurally
+  from `realtimeapi.API` so the ScopeFor / filter-construction / log-classification logic is not
+  written twice.
+
+Task 10: review at `bb9e4e6` — **spec ✅ COMPLIANT** (all 17 findings honoured or deviated with a
+  demonstrated counterfactual, no scope creep against the two "do NOT build this here" rulings),
+  quality "Needs fixes": 0 Critical, 2 Important, 6 Minor. `git status` left empty.
+Task 10: **THE TASK 6 FLUSH DEFECT IS CONFIRMED INDEPENDENTLY, AND THE FIX LOOSENED NOTHING.**
+  `statusRecorder` embeds the ResponseWriter INTERFACE and defines only `WriteHeader`/`Unwrap`
+  (`middleware.go:74-86`), so `w.(http.Flusher)` is necessarily false — the diagnosis is exact.
+  Removing the new flush check reddens BOTH `TestWriter_RejectsNonFlusher` and
+  `TestServe_RejectsANonFlusher` (the latter at its deadline, not hanging), and the Task 6/8/9
+  op-log pins are unchanged. **A latent Critical that survived three tasks, three reviews and
+  every gate, because no test put a real middleware wrapper between the codec and the recorder.**
+  The lesson generalises past this bug: **a fake that is MORE capable than the real collaborator
+  hides exactly the defects integration exists to find** — Task 8's fake ignored its context and
+  hid a whole class; Task 10's recorder was a Flusher when the real chain is not.
+Task 10: the `altResponses` substitute for my broken finding 1 is **SOUND** — `arch/rules.go:21`
+  puts `contracts` in `nonContext`, both media types sit under 200, `ApiRunEventsResponse` intact.
+  Leaving `httpx.Operation` untouched was right.
+Task 10: **IMPORTANT I1 — the two surfaces disagree on the one failure that can still be a status.**
+  `Serve` has exactly one pre-commit failure (`NewWriter`); on it the attention endpoint answers a
+  bare **200 with `Content-Length: 0`** while the per-run path answers 500. Demonstrated by
+  re-introducing Task 6's type assertion: `TestStreamAttention_SetsStreamHeaders` fails on
+  Content-Length while the STATUS assertion still passes. The silent dead endpoint spec §4 exists
+  to prevent, on one of the two surfaces — the same failure mode the `sse.go` fix just closed one
+  layer down. Its comment ("by the time this returns the status has been 200") contradicts
+  `stream.go:154-156`. **Non-trivial to fix: the handler cannot tell pre- from post-commit from
+  the error value, and calling `httpx.Problem` over a committed 200 would append a problem
+  document to the SSE body — strictly worse.** Sketched a sentinel option and explicitly invited a
+  better shape rather than prescribing, my prescriptions having now been wrong six times.
+Task 10: **IMPORTANT I2 — `AttentionFilter`'s doc claims a compile-time guarantee it does not
+  have.** `Filter`'s fields are exported, so an ambiguous filter is still legal Go, and the per-run
+  one is HAND-BUILT in `internal/app` by Task 11 — exactly finding 7's "later edit" risk. Fifth
+  instance on this plan of a confident safety claim that is false.
+Task 10: four Minors promoted into fix round 1 on the established basis (cheap, on lines already
+  being edited, and in the classes this plan has been burned by). **M2 is the highest-value one:
+  the runs-side streaming integration tests carry NO request deadline and cannot hang today only
+  because `fakeStreamServer` returns immediately — the moment Task 11 puts something blocking
+  behind that port they hang to the suite timeout instead of failing.** Plus M1 (the new
+  `NewWriter` failure path leaves SSE headers behind for the following `httpx.Problem` to
+  inherit), M3 (the Accept doc reads as exhaustive but ignores relative `q` weights), M4
+  (`altResponses`'s comment explains where it lives, not what its key assumes).
+Task 10: ⚠️ **M5 CARRIED TO THE TASK 11 BRIEF — a trap the implementer's own suggestion walks
+  into.** `runsapi.StreamServer`'s contract is *error ⟹ nothing committed*; `realtime.Serve`'s is
+  wider — it returns errors for post-commit endings too (write/source, `CloseForbidden`,
+  `CloseSlowConsumer`, `CloseShutdown`). The report's §11 suggestion (satisfy `StreamServer`
+  structurally from `realtimeapi.API`) **becomes a bug if the adapter forwards `Serve`'s error
+  verbatim**: `streamRunEvents` would then call `httpx.Problem` over a committed 200 and append a
+  problem document to the SSE body. `fakeStreamServer` writes nothing when `err` is set, so
+  NOTHING IN THIS SUITE CAN CATCH IT. **Task 11 must translate, not forward.**
+Task 10: M6 noted only — one summary line in the report overstates `RunFilter`'s callers; §2(b)
+  discloses it plainly. Nothing to do.
+
+Task 10: fix round 1/5 at `fc52b57` (6 addressed, 0 open — silent 200 on the attention surface,
+  the false compile-time claim, leaked SSE headers, the missing test deadline, the Accept doc, the
+  `altResponses` key assumption; commits `bb9e4e6`..`fc52b57`). **GATED: `GATE PASS … fc52b57`,
+  11 lanes resolved unnarrowed, on a confirmed-clean tree.** Scoped re-review dispatched after.
+Task 10: **the implementer chose a better shape than I sketched for I1** — a `realtime.ErrNotStarted`
+  sentinel tagging `Serve`'s one pre-commit failure, with the CAUSE WRAPPED alongside it rather
+  than returned bare, because the 500 carries no detail and AccessLog no reason, so the wrap is
+  the only place "cannot flush" is written down anywhere. Re-review verified: no `errors.Is` site
+  in the tree is broken by the wrap, and the log line really is the only surviving record.
+Task 10: it re-ran **ALL ELEVEN round-1 mutation rows rebuilt from current source**, plus six new
+  ones. One row's output CHANGED (m11: the reverted flush check now yields 500 instead of the
+  silent 200) and it argued the change is the fix working. **I asked the re-review to check that
+  rather than accept it — a mutant whose output changes after a refactor is either evidence the
+  fix landed or evidence the pin moved, and the two look identical in a report.** Verdict: the fix
+  landed; the mutant still reddens on the test's FIRST assertion.
+Task 10: ⚠️⚠️ **THE SENTINEL WAS WRONG FOR EXACTLY THE CASE TASK 11 WILL DEPEND ON IT FOR — and
+  the re-review found it by running a real server against an RST client.** `ResponseController.Flush`
+  dispatches to `FlushError` first, and `(*http.response).FlushError` calls `WriteHeader(200)`
+  BEFORE it can fail (`net/http/server.go:1724`); the probe produced `write: broken pipe` AND
+  `superfluous response.WriteHeader call` in one run. So the fix's own new prose ("committed
+  nothing" / "`w` untouched", `stream.go:155-158`, `sse.go:85-89`) is FALSE on that branch — the
+  **fifth** confident safety claim on this plan to be backwards, and the first written by a fix for
+  a previous one.
+Task 10: **I escalated it above the re-review's Minor scoping, and the reason is the coupling, not
+  today's impact.** Today it is bounded to peers already gone, so no live SSE body can be corrupted
+  and the cost is log noise. But the implementer stated the sentinel "is also the discriminator
+  M5's Task 11 adapter needs", and M5 is precisely *error ⟹ nothing committed*. A sentinel that
+  also matches a POST-commit flush failure hands Task 11 a discriminator that lies, and
+  `streamRunEvents` would then write a problem document into a committed SSE body — **the exact
+  bug M5 exists to prevent, reintroduced through the mechanism meant to prevent it, and
+  uncatchable by `fakeStreamServer`.** Fix round 2 ruled: tag only
+  `errors.Is(err, http.ErrNotSupported)`, which is precisely "the chain cannot flush" and the only
+  case where nothing was written. Keep returning the error either way — a broken pipe at connect
+  time must still end the request; only the TAGGING narrows. This makes the sentence TRUE rather
+  than merely softer.
+Task 10: second round-2 item — `realtime.go:105` claims `RunFilter` "has no caller inside this
+  package" while `stream_test.go:297` calls it. Substance holds, wording is checkably false.
+Task 10: ⚠️ the LSP produced FALSE compile errors a FOURTH time, claiming `ErrNotStarted` undefined
+  at `fc52b57` while `go build ./...` and `go vet` exited 0 and the full gate passed.
+
+Task 10: fix round 2/5 at `00030da` (2 addressed, 0 open — the over-wide `ErrNotStarted` tag and
+  the false `RunFilter` caller claim; commits `fc52b57`..`00030da`). **GATED: `GATE PASS …
+  00030da`, 11 lanes resolved unnarrowed, on a confirmed-clean tree.**
+Task 10: **the narrowing was verified against the ACTUAL go1.26.5 GOROOT, not reasoned about** —
+  `responsecontroller.go:47-62` has four exits, `:145-147` is `fmt.Errorf("%w", ErrNotSupported)`,
+  `server.go:1724-1727` writes the header before `FlushError` can fail, `Flusher` cannot error and
+  an unwrap-nil falls to default. So `ErrNotSupported` is exactly the nothing-written case AND the
+  only error `ResponseController` can produce for an unflushable chain. Both directions are
+  falsifiable: widening the tag back reddens only the new negative pin; dropping the tag through
+  the real path reddens the 500 pin.
+Task 10: **the implementer declared a residual IN THE CODE rather than only in the report** — a
+  wrapper implementing `FlushError` could fail without writing and go untagged, costing a silent
+  200. Its own framing is the valuable part: **the remaining mistake now falls on the side that
+  never writes over a committed body.** That is the right direction for an error to lean.
+Task 10: **it also reported a MUTATION IT LOST, as a loss.** m11's mutant invents its own error, so
+  the narrowed tag correctly declines it and the surface is a silent 200 again — round 1's line
+  "reintroduce the Task 6 defect and you get a 500" no longer holds under that mutant. The
+  re-review rebuilt m11 independently (8 failures, silent empty 200, exactly as declared) and
+  confirmed **the pin did NOT move**: a new row removes the tag through the real `ErrNotSupported`
+  path and reddens the 500 pin. **A weakening pin and a working fix produce the same green suite;
+  the only thing that separated them here was rebuilding the mutant.**
+Task 10: the re-review SHARPENED a correct conclusion reached by a partly wrong argument — the
+  implementer justified not re-running 8 rows by "arch law", which covers 7 of them
+  (`go list -deps -test ./internal/runs/api/` links zero realtime packages, stronger than arch
+  law), but **`./internal/contracts` DOES link both realtime and realtime/api**; that row is safe
+  because `Build` never reaches `Serve` and the schema did not move, not by arch law.
+Task 10: three deferred minors, all wording, no behavioural defect:
+  (a) `stream.go:75` "Nothing in this tree implements `FlushError`" is falsified by
+  `deadPeerWriter` at `sse_test.go:318` — **added by the same commit**. The substance holds: no
+  PRODUCTION writer implements it (`httpx.statusRecorder` has only `WriteHeader`+`Unwrap`), and
+  the test helper writes the header so the residual instance still does not exist.
+  (b) `ErrNotStarted`'s opening "every other ending" list omits the untagged flush failure.
+  (c) an "empty header map" claim that holds only because no caller sets headers before `Serve`.
+  → all three to the final review.
+Task 10: **PATTERN WORTH NAMING — a comment written to FIX a false comment has itself been false
+  in three consecutive rounds.** Round 1's fix introduced the "committed nothing" prose that round
+  2 had to narrow; round 2's fix introduced the `FlushError` claim now deferred. The class is not
+  converging through fix rounds, which is the argument for routing (a)-(c) to the whole-branch
+  review — a fresh read of the finished files — rather than iterating the same loop a fourth time.
+Task 10: **I closed the loop here rather than opening round 3, and the distinction from round 2 is
+  the test I used.** Round 2's item had a BEHAVIOURAL consequence and a downstream consumer (Task
+  11's discriminator); these three have neither. Wording that overstates in a direction which does
+  not mislead about safety is a final-review item, not a round.
+
+Task 10: **complete (commits `94cd5d1`..`00030da`, review clean after 2 fix rounds) and GATED:
+  `GATE PASS … 00030da`, 11 lanes resolved unnarrowed, on a confirmed-clean tree.** Gated three
+  times — `bb9e4e6` before review, `fc52b57` and `00030da` after each fix round.
+Task 10: **the task's biggest yield was not the endpoints — it was a latent Critical in Task 6**
+  that three tasks, three reviews and every gate had missed, found because the implementer probed
+  the real middleware chain before writing code.
