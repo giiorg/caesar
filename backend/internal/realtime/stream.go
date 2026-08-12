@@ -446,8 +446,8 @@ func (st *stream) closeForbidden() error {
 }
 
 // prime writes the client's starting state — a fresh snapshot, or nothing at
-// all for a resume whose tail is still retained — and leaves st.cursor at the
-// point replay must continue from.
+// all for a resume whose position the source can still continue from — and
+// leaves st.cursor at the point replay must continue from.
 func (s *Streamer) prime(ctx context.Context, st *stream, req StreamRequest) error {
 	if req.HasLastID {
 		oldest, err := s.src.Oldest(ctx)
@@ -465,8 +465,30 @@ func (s *Streamer) prime(ctx context.Context, st *stream, req StreamRequest) err
 		// order, and it is the direction to keep. Nothing prunes run_events
 		// today, so the else branch is unreachable in production.
 		if req.LastEventID >= oldest {
-			st.cursor = req.LastEventID
-			return nil
+			// And BELOW the head as well as above the floor. A Last-Event-ID
+			// above every id that will ever be written puts the cursor above
+			// them too, and send then discards every event forever: the client
+			// gets a 200, the stream headers, no snapshot and nothing but
+			// heartbeats — indistinguishable from a working idle stream, which
+			// is the silence ErrNotStarted exists to keep off this surface. No
+			// browser produces one (EventSource echoes back an id this server
+			// wrote), but a hand-rolled client can, and so can restoring
+			// run_events from a backup while clients hold higher ids.
+			//
+			// Re-snapshotting is the same degradation direction as the too-old
+			// branch above: one duplicated backlog rather than a silent
+			// nothing. The round trip is paid HERE rather than next to Oldest
+			// because this is the only branch whose outcome it can change — the
+			// too-old case re-snapshots either way — and it costs once per
+			// stream opened, never per event.
+			head, err := s.src.Head(ctx)
+			if err != nil {
+				return fmt.Errorf("stream prime: %w", err)
+			}
+			if req.LastEventID <= head {
+				st.cursor = req.LastEventID
+				return nil
+			}
 		}
 	}
 	snap, err := s.src.Snapshot(ctx, req.Filter)

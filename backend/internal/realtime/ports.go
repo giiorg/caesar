@@ -45,6 +45,10 @@ type EventSource interface {
 	// Head is the current maximum event id. It seeds the tailer's startup
 	// cursor, so that a process starting up follows what happens next
 	// rather than replaying the whole table into the hub.
+	//
+	// It also bounds a resume from above: a Last-Event-ID above the head
+	// would put a stream's cursor above every id that will ever be written,
+	// so prime re-snapshots instead of opening a permanently silent stream.
 	Head(ctx context.Context) (int64, error)
 }
 

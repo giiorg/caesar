@@ -160,6 +160,68 @@ func (w *fakeWaker) Wait(ctx context.Context) error {
 	}
 }
 
+// outageWaker is the LISTEN connection DOWN: Wait fails immediately, which is
+// the shape pgWaker takes when it cannot dial or its connection has just
+// dropped (app/realtimeports.go). fakeWaker cannot express that — its Wait
+// only ever answers a signal or the deadline — and teaching it to would let a
+// test script mixtures nothing produces, so this is a second waker rather than
+// a taught one.
+//
+// Healed, it blocks until the caller's deadline and returns that, because a
+// live LISTEN over a quiet database returns nothing else.
+type outageWaker struct {
+	mu    sync.Mutex
+	err   error
+	waits int
+}
+
+var _ Waker = (*outageWaker)(nil)
+
+func newOutageWaker(err error) *outageWaker { return &outageWaker{err: err} }
+
+func (w *outageWaker) Wait(ctx context.Context) error {
+	w.mu.Lock()
+	w.waits++
+	err := w.err
+	w.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// setErr breaks or heals the waker while the tailer is running. A nil err is
+// healthy.
+func (w *outageWaker) setErr(err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.err = err
+}
+
+// count is how many waits have STARTED. Counting on entry is what makes
+// "count reached n+2" mean a wait that began after a heal has also returned,
+// since Run waits one at a time.
+func (w *outageWaker) count() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.waits
+}
+
+// wakeLines counts realtime.tailer.wake lines at one level, read out of the
+// TextHandler output these tests already capture — so the level asserted is
+// the one the handler wrote rather than one inferred from the code.
+func wakeLines(lb *logBuf, level slog.Level) int {
+	n := 0
+	for _, line := range strings.Split(lb.String(), "\n") {
+		if strings.Contains(line, "level="+level.String()) &&
+			strings.Contains(line, "msg=realtime.tailer.wake") {
+			n++
+		}
+	}
+	return n
+}
+
 // collector is the hub's stand-in. It records ids, because what the tailer
 // promises is which ids reach the sink in which order.
 type collector struct {
@@ -249,7 +311,7 @@ func eventually(t *testing.T, cond func() bool, what string) {
 //
 // Cleanup cancels and waits, so every test here also asserts that its tailer
 // shuts down.
-func startTailer(t *testing.T, src *fakeSource, w *fakeWaker, sink func([]Event), cfg TailerConfig, log *slog.Logger) (context.CancelFunc, <-chan error) {
+func startTailer(t *testing.T, src *fakeSource, w Waker, sink func([]Event), cfg TailerConfig, log *slog.Logger) (context.CancelFunc, <-chan error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
@@ -408,6 +470,57 @@ func TestTailer_SurvivesSourceError(t *testing.T) {
 	case err := <-errc:
 		t.Fatalf("Run returned on a transient Since error: %v", err)
 	default:
+	}
+}
+
+// A sustained LISTEN outage must be reported ONCE rather than once per poll
+// interval: at the 2s default that is ~1800 identical lines an hour, and they
+// bury the lines that matter during exactly the incident someone is reading
+// the log for. The condition is already being handled correctly meanwhile —
+// the poll fallback is what carries correctness — so the first line is the
+// news and the rest only repeat it. They still have to be THERE, at Debug, and
+// a later outage has to be news again.
+func TestTailer_ReportsAWakerOutageOnceUntilItRecovers(t *testing.T) {
+	t.Parallel()
+	src := newSource(1)
+	w := newOutageWaker(errors.New("listen connection dropped"))
+	c, lb := &collector{}, &logBuf{}
+	startTailer(t, src, w, c.sink, pollingCfg(), newLogger(lb))
+
+	// Several intervals of a waker that fails every time. The wait is on the
+	// TOTAL, at either level, so that a build which warns every interval gets
+	// here and fails the split below rather than timing out on a Debug line it
+	// never writes.
+	eventually(t, func() bool {
+		return wakeLines(lb, slog.LevelWarn)+wakeLines(lb, slog.LevelDebug) >= 3
+	}, "the outage to be reported several times")
+	if got := wakeLines(lb, slog.LevelWarn); got != 1 {
+		t.Errorf("%d Warn lines during ONE outage, want exactly 1:\n%s", got, lb.String())
+	}
+	// And the repeats are still recorded rather than dropped: an outage that
+	// stops being visible entirely is the opposite failure.
+	if got := wakeLines(lb, slog.LevelDebug); got < 2 {
+		t.Errorf("%d Debug lines during ONE outage, want the repeats at Debug:\n%s", got, lb.String())
+	}
+	// The waker's own error is on the line, not merely the fact of a failure.
+	if s := lb.String(); !strings.Contains(s, "listen connection dropped") {
+		t.Errorf("the waker's error was not logged; log was:\n%s", s)
+	}
+
+	// Healed. A wait that STARTS after this cannot fault, and its return is
+	// what ends the run of failures.
+	w.setErr(nil)
+	started := w.count()
+	eventually(t, func() bool { return w.count() >= started+2 }, "a wait that did not fault")
+	if got := wakeLines(lb, slog.LevelWarn); got != 1 {
+		t.Fatalf("%d Warn lines before the second outage, want 1:\n%s", got, lb.String())
+	}
+
+	// And the next outage is news again rather than another Debug line.
+	w.setErr(errors.New("listen connection dropped again"))
+	eventually(t, func() bool { return wakeLines(lb, slog.LevelWarn) > 1 }, "the second outage to warn")
+	if got := wakeLines(lb, slog.LevelWarn); got != 2 {
+		t.Errorf("%d Warn lines across TWO outages, want exactly 2:\n%s", got, lb.String())
 	}
 }
 

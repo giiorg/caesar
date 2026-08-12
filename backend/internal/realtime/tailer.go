@@ -62,6 +62,10 @@ type Tailer struct {
 	cfg    TailerConfig
 	log    *slog.Logger
 	cursor int64
+	// wakeFailed is whether the CURRENT run of waker failures has already
+	// been reported. Only Run's goroutine touches it, so it is not locked.
+	// See wait for why a run is reported once rather than per interval.
+	wakeFailed bool
 }
 
 // NewTailer builds the follow loop. sink must not block — see Tailer.
@@ -148,12 +152,36 @@ func (t *Tailer) wait(ctx context.Context) {
 	waitCtx, cancel := context.WithTimeout(ctx, t.cfg.PollFallback)
 	defer cancel()
 	err := t.waker.Wait(waitCtx)
-	if err == nil || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		// The wake-up path is working: either a notification arrived, or the
+		// waker spent the whole interval blocked on it. A LATER failure is
+		// news again, so end the run.
+		//
+		// The deadline counts as working, not only the notification: a healthy
+		// but quiet database returns nothing else for as long as it stays
+		// quiet, so resetting on nil alone would leave the flag set forever
+		// after one outage and log every future outage at Debug.
+		t.wakeFailed = false
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	// A waker that fails immediately — a dropped LISTEN connection — would
 	// spin this loop, so serve out the rest of the interval. Reads keep
 	// happening meanwhile; only the wake-up is degraded.
-	t.log.Warn("realtime.tailer.wake", "error", err)
+	//
+	// One Warn per RUN of failures, then Debug. At the 2s default a sustained
+	// outage writes ~1800 identical lines an hour, which buries the lines that
+	// matter during exactly the incident someone is reading the log for — and
+	// the condition is being handled: the poll fallback is what carries
+	// correctness while the wake-up is down (see PollFallback). The first line
+	// is what says the outage started; the rest only say it has not ended.
+	if t.wakeFailed {
+		t.log.Debug("realtime.tailer.wake", "error", err)
+	} else {
+		t.wakeFailed = true
+		t.log.Warn("realtime.tailer.wake", "error", err)
+	}
 	<-waitCtx.Done()
 }

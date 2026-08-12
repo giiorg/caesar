@@ -43,6 +43,10 @@ type fakeSource struct {
 	// one page, so the splice reads it as caught up and goes live.
 	replay []realtime.Event
 	oldest int64
+	// head is the table's highest id, which the splice reads on a resume to
+	// bound the resume point from above. The zero is an empty table, so a
+	// resume test that leaves it unset re-snapshots instead of resuming.
+	head int64
 
 	filters       []realtime.Filter
 	snapshotCalls int
@@ -77,15 +81,20 @@ func (s *fakeSource) Replay(_ context.Context, f realtime.Filter, after int64, l
 	return out, nil
 }
 
-// Since and Head belong to the tailer, which no HTTP surface touches. They
-// refuse rather than answer, so a caller that reaches them fails loudly
-// instead of being taught a behaviour nothing needs.
+// Since belongs to the tailer, which no HTTP surface touches. It refuses
+// rather than answers, so a caller that reaches it fails loudly instead of
+// being taught a behaviour nothing needs.
 func (s *fakeSource) Since(context.Context, int64, int) ([]realtime.Event, error) {
 	return nil, errors.New("fakeSource: Since is the tailer's, not a stream's")
 }
 
+// Head is the tailer's too, but a resume reads it as well: the splice refuses
+// a Last-Event-ID above the head rather than opening a stream whose cursor
+// nothing can ever exceed.
 func (s *fakeSource) Head(context.Context) (int64, error) {
-	return 0, errors.New("fakeSource: Head is the tailer's, not a stream's")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.head, nil
 }
 
 func (s *fakeSource) Oldest(context.Context) (int64, error) {
@@ -354,6 +363,7 @@ func TestStreamAttention_ResumesFromLastEventID(t *testing.T) {
 			Watermark: realtime.Watermark{EventID: 2},
 		},
 		replay: []realtime.Event{attentionEvent(6, project, run, "gate.decided")},
+		head:   6,
 	}
 	grants := &fakeGrants{scope: realtime.Scope{Projects: []uuid.UUID{project}}}
 	h := newHarness(t, newStreamer(src, grants), grants)

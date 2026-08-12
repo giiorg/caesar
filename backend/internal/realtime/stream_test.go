@@ -37,6 +37,15 @@ type streamSource struct {
 	// regardless of after: a source that cannot advance. Only the spin-guard
 	// test sets it.
 	brokenPage []Event
+	// head is the highest id the table holds — what prime compares a resume
+	// point against. It is a field of its own rather than the maximum of
+	// retained, because a snapshot's watermark can sit above everything this
+	// fake still has to replay and a derived head would then contradict it.
+	//
+	// The zero is an EMPTY table, so a resume test that forgets to set one
+	// re-snapshots rather than resuming: loud, and in the direction prime
+	// degrades anyway.
+	head int64
 
 	snapshotErr error
 	replayErr   error
@@ -135,15 +144,19 @@ func (s *streamSource) Oldest(context.Context) (int64, error) {
 	return s.oldest, s.oldestErr
 }
 
-// The splice follows the hub, never the table: these two are the tailer's and
-// a fake that answered them would invite a test to assert against invented
-// behaviour.
+// The splice follows the hub and never the table, so Since is the tailer's
+// alone: a fake that answered it would invite a test to assert against
+// invented behaviour.
 func (s *streamSource) Since(context.Context, int64, int) ([]Event, error) {
 	return nil, xerrors.NotImplemented("streamSource.Since")
 }
 
+// Head is answered, because prime reads it on a resume to bound the resume
+// point from above.
 func (s *streamSource) Head(context.Context) (int64, error) {
-	return 0, xerrors.NotImplemented("streamSource.Head")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.head, nil
 }
 
 func (s *streamSource) calls() (snapshots int, replays []replayCall) {
@@ -472,6 +485,7 @@ func TestServe_ResumesFromLastEventID(t *testing.T) {
 		snapshot: Snapshot{Events: retained, Watermark: Watermark{EventID: 7}},
 		retained: retained,
 		oldest:   1,
+		head:     7,
 	}
 	src.onReplay = sync.OnceFunc(func() { hub.Close() })
 
@@ -528,6 +542,7 @@ func TestServe_ResnapshotsWhenLastIDTooOld(t *testing.T) {
 				},
 				retained: []Event{hubEvent(22, proj, run, "run.started")},
 				oldest:   10,
+				head:     22,
 			}
 			closeOnce := sync.OnceFunc(func() { hub.Close() })
 			src.onSnapshot, src.onReplay = closeOnce, closeOnce
@@ -544,6 +559,83 @@ func TestServe_ResnapshotsWhenLastIDTooOld(t *testing.T) {
 			snapshots, _ := src.calls()
 			if got := snapshots > 0; got != tt.wantSnapshot {
 				t.Errorf("Snapshot called %d time(s); wantSnapshot = %v", snapshots, tt.wantSnapshot)
+			}
+		})
+	}
+}
+
+// A Last-Event-ID ABOVE the head is the other end of the retention question
+// and gets the same answer: re-snapshot. Trusting it puts the cursor above
+// every id that will ever be written, so send discards all of them and the
+// client gets a 200, the stream headers and heartbeats — which is exactly what
+// a working idle stream looks like. Not reachable from a browser, whose
+// EventSource echoes back an id this server wrote; reachable from a
+// hand-rolled client, and operationally by restoring run_events while clients
+// hold higher ids.
+//
+// The boundary is a case of its own because it is the COMMON one: a client
+// that is fully caught up reconnects with exactly the head, and a bound that
+// re-snapshotted there would re-send the whole backlog on every such
+// reconnect. Both cases are above the retention floor, so the too-old branch
+// cannot be what decides either.
+func TestServe_BoundsAResumeAtTheHead(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		lastID        int64
+		wantSnapshots int
+		wantIDs       []int64
+		wantReplays   []replayCall
+	}{
+		{
+			name:        "exactly the head, resumed",
+			lastID:      21,
+			wantIDs:     nil,
+			wantReplays: []replayCall{{After: 21, Limit: 10}},
+		},
+		{
+			name:          "above the head, re-snapshotted",
+			lastID:        1_000_000,
+			wantSnapshots: 1,
+			// A duplicated backlog rather than a stream that writes nothing at
+			// all, and the cursor comes from the snapshot rather than from the
+			// client's impossible id.
+			wantIDs:     []int64{20, 21},
+			wantReplays: []replayCall{{After: 20, Limit: 10}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			proj, run := uuid.New(), uuid.New()
+			hub := NewHub(HubConfig{SubscriberQueue: 8})
+			src := &streamSource{
+				snapshot: Snapshot{
+					Events:    []Event{hubEvent(20, proj, run, "run.started")},
+					Watermark: Watermark{EventID: 20},
+				},
+				retained: []Event{hubEvent(21, proj, run, "run.started")},
+				oldest:   10,
+				head:     21,
+			}
+			closeOnce := sync.OnceFunc(func() { hub.Close() })
+			src.onSnapshot, src.onReplay = closeOnce, closeOnce
+
+			req := StreamRequest{Filter: runFilter(run, proj), LastEventID: tt.lastID, HasLastID: true}
+			rec, _, errc := startServe(t, idleStreamer(hub, src, 10), req)
+
+			if err := waitServe(t, errc); !errors.Is(err, CloseShutdown) {
+				t.Fatalf("Serve() = %v, want %v", err, CloseShutdown)
+			}
+			if diff := cmp.Diff(tt.wantIDs, rec.ids(t)); diff != "" {
+				t.Errorf("ids on the wire (-want +got):\n%s", diff)
+			}
+			snapshots, replays := src.calls()
+			if snapshots != tt.wantSnapshots {
+				t.Errorf("Snapshot called %d time(s), want %d", snapshots, tt.wantSnapshots)
+			}
+			if diff := cmp.Diff(tt.wantReplays, replays); diff != "" {
+				t.Errorf("replay pages (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -583,6 +675,9 @@ func TestServe_DiscardsQueuedEventsAtOrBelowTheCursor(t *testing.T) {
 			src := &streamSource{
 				snapshot: Snapshot{Watermark: Watermark{EventID: 10}},
 				oldest:   1,
+				// The table ends exactly where the client's resume point is,
+				// which is what "already caught up" means here.
+				head: 10,
 			}
 			publish := sync.OnceFunc(func() {
 				hub.Publish([]Event{
