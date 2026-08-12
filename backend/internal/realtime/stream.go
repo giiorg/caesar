@@ -59,6 +59,23 @@ const forbiddenFrame = "event: forbidden\ndata: {\"error\":\"forbidden\"}\n\n"
 // surfaces exist to avoid, and it is what both surfaces did before this
 // sentinel — see realtime/api.handleStreamAttention.
 //
+// IT IS NOT "NewWriter FAILED". NewWriter fails two ways and only one of them
+// has written nothing; Serve tags accordingly, and the distinction is in
+// net/http rather than here. ResponseController.Flush has exactly four exits
+// (responsecontroller.go): it hands off to FlushError, or to Flush, or unwraps
+// and loops, or returns ErrNotSupported. The stdlib's own FlushError writes the
+// header BEFORE it flushes — `if !w.wroteHeader { w.WriteHeader(StatusOK) }`,
+// server.go — so an error from THAT branch, a dead peer at connect time, means
+// the 200 is already chosen and a later WriteHeader is the "superfluous
+// response.WriteHeader call" warning. ErrNotSupported is the only exit that
+// touched nothing.
+//
+// The residual case, stated because it is not covered: a hand-written wrapper
+// implementing FlushError could fail without writing and would go untagged,
+// costing a silent 200. Nothing in this tree implements FlushError, and the
+// mistake falls on the side that never writes over a committed body — which is
+// the side to fall on.
+//
 // Match it with errors.Is; the cause is wrapped alongside it and is what the
 // log should carry.
 var ErrNotStarted = errors.New("realtime: stream not started")
@@ -152,10 +169,16 @@ type StreamRequest struct {
 // Serve streams to w until the client disconnects, the subscription ends or a
 // write fails. It returns:
 //
-//   - ErrNotStarted, wrapping the cause, when the response writer cannot be
-//     turned into a stream. THE ONLY ENDING THAT HAS COMMITTED NOTHING: w is
-//     untouched — no status, no body, not even a header (sse.go) — so the
-//     caller still owns the response and must answer with a real status.
+//   - ErrNotStarted, wrapping the cause, when nothing in w's Unwrap chain can
+//     flush. THE ONLY ENDING THAT HAS COMMITTED NOTHING: w is untouched — no
+//     status, no body, not even a header (sse.go) — so the caller still owns
+//     the response and must answer with a real status. Narrowly this one
+//     failure and not "the constructor failed": see ErrNotStarted.
+//   - the flush error, UNTAGGED, when the writer could flush but the flush
+//     failed — the peer went away before the stream got started. net/http
+//     writes the 200 before it can discover that, so this ending is committed
+//     like all the others below and the caller must not answer it with a
+//     status. Nothing was subscribed or read either way.
 //   - nil when ctx is done, WHEREVER the stream had got to. A disconnect is
 //     how an SSE request normally ends, and Task 10 must not log every closed
 //     tab as a fault.
@@ -187,10 +210,22 @@ func (s *Streamer) Serve(ctx context.Context, w http.ResponseWriter, req StreamR
 	// below, and that is what the ordering test pins.
 	wr, err := NewWriter(w, s.cfg.HeartbeatInterval, nil)
 	if err != nil {
-		// The ONLY return that is still a status. Tagged rather than left as a
-		// bare wrapped error so the surfaces can branch on it — see
-		// ErrNotStarted for what each wrong guess costs.
-		return fmt.Errorf("%w: %w", ErrNotStarted, err)
+		// Tagged rather than left as a bare wrapped error so the surfaces can
+		// branch on it — see ErrNotStarted for what each wrong guess costs.
+		//
+		// ErrNotSupported and NOT "NewWriter returned an error", because those
+		// are different sets. Nothing in the chain can flush is the only
+		// constructor failure that wrote nothing; a flush that failed because
+		// the peer is already gone went out over a 200 net/http had written on
+		// its way to finding the socket dead. Tagging that one would let a
+		// surface put problem+json on top of a committed response, which is the
+		// bug this sentinel exists to prevent.
+		if errors.Is(err, http.ErrNotSupported) {
+			return fmt.Errorf("%w: %w", ErrNotStarted, err)
+		}
+		// Still an error, still ends the request — just not the caller's to
+		// answer with a status.
+		return err
 	}
 
 	// SUBSCRIBE BEFORE READING ANYTHING. From this instant every matching

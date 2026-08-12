@@ -1,6 +1,7 @@
 package realtime
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -289,5 +290,52 @@ func TestWriter_TakesItsHeadersBackWhenItCannotFlush(t *testing.T) {
 	}
 	if len(w.header) != 0 {
 		t.Errorf("rejected writer left %v behind, want an untouched header map", w.header)
+	}
+}
+
+// errDeadPeer is what a flush gets once the client has gone.
+var errDeadPeer = errors.New("write tcp 127.0.0.1:1->127.0.0.1:2: write: broken pipe")
+
+// deadPeerWriter is the OTHER way NewWriter's flush fails, and the reason
+// ErrNotStarted cannot simply mean "NewWriter failed".
+//
+// It flushes through FlushError because that is the interface
+// http.ResponseController reaches for FIRST (responsecontroller.go), and it is
+// the one *http.response itself implements. The stdlib's version writes the
+// header before it flushes, so by the time an error like this exists the 200 is
+// already chosen — which is why this writer records the WriteHeader and the
+// test below asserts it happened.
+type deadPeerWriter struct {
+	header http.Header
+	// wroteHeader mirrors *http.response's own field: once true, a second
+	// WriteHeader is the "superfluous response.WriteHeader call" warning.
+	wroteHeader bool
+}
+
+func (d *deadPeerWriter) Header() http.Header       { return d.header }
+func (d *deadPeerWriter) Write([]byte) (int, error) { return 0, errDeadPeer }
+func (d *deadPeerWriter) WriteHeader(int)           { d.wroteHeader = true }
+func (d *deadPeerWriter) FlushError() error         { d.WriteHeader(http.StatusOK); return errDeadPeer }
+
+// The negative direction of the sentinel, and the one that matters most: a
+// flush that fails because the PEER is gone has already committed the response,
+// so it must never be reported as "nothing started". A caller that took it that
+// way would write problem+json over a live 200.
+func TestWriter_ADeadPeerIsNotAnUnsupportedFlush(t *testing.T) {
+	t.Parallel()
+	w := &deadPeerWriter{header: http.Header{}}
+	_, err := NewWriter(w, time.Minute, time.Now)
+	if err == nil {
+		t.Fatal("NewWriter() on a dead peer returned nil error, want an error")
+	}
+	if !errors.Is(err, errDeadPeer) {
+		t.Errorf("NewWriter() error = %v, want it to wrap the flush failure", err)
+	}
+	if errors.Is(err, http.ErrNotSupported) {
+		t.Errorf("NewWriter() error = %v, want it NOT to look like an unsupported flush", err)
+	}
+	// The premise the whole distinction rests on, asserted rather than assumed.
+	if !w.wroteHeader {
+		t.Error("the flush did not write a header, so this writer is not modelling *http.response")
 	}
 }

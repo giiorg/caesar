@@ -84,9 +84,18 @@ var sseHeaders = map[string]string{
 // this constructor has to do anyway answers the question, and there is no
 // second, weaker test to disagree with it. The cost of checking that way is
 // that the headers are already on when the answer arrives, so a rejection
-// removes them again and hands w back untouched: nothing written, no status
-// chosen, an empty header map. Serve's caller depends on exactly that — see
-// realtime.ErrNotStarted.
+// removes them again.
+//
+// TWO FAILURES COME OUT OF HERE AND THEY ARE NOT INTERCHANGEABLE. An
+// unsupported flush touched nothing: no status, no body, an empty header map,
+// and Serve tags it ErrNotStarted so a surface can still answer with a real
+// one. A flush that was SUPPORTED and failed — the peer hung up between the
+// request and the first byte — wrote the 200 first, because that is what
+// net/http's FlushError does on its way to the socket; the header removal below
+// is then a tidy-up of a map nobody will read again rather than a promise the
+// response is clean. Serve leaves that one untagged, deliberately. Which is
+// which is decided there and spelled out on realtime.ErrNotStarted, because the
+// reason lives in net/http and not here.
 func NewWriter(w http.ResponseWriter, hb time.Duration, clock func() time.Time) (*Writer, error) {
 	if clock == nil {
 		clock = time.Now
@@ -109,6 +118,12 @@ func NewWriter(w http.ResponseWriter, hb time.Duration, clock func() time.Time) 
 		// these before a handler runs (httpx sets only X-Correlation-ID), so
 		// there is nothing of anyone else's to clobber. A chain that grows one
 		// has to meet this line.
+		//
+		// Unconditional, though only the unsupported-flush branch can still
+		// benefit: on the dead-peer branch the header has already gone into the
+		// write chain and this map is no longer what anyone serializes. Not
+		// worth a condition to skip a map delete, but worth not claiming it
+		// undoes something there.
 		for k := range sseHeaders {
 			h.Del(k)
 		}

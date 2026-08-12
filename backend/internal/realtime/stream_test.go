@@ -849,6 +849,46 @@ func TestServe_RejectsANonFlusher(t *testing.T) {
 	}
 }
 
+// The same constructor failing the OTHER way. A dead peer at connect time is
+// still an error and still ends the request — but net/http wrote the 200 on its
+// way to discovering the pipe was broken (see ErrNotStarted), so tagging it
+// would hand the surfaces a licence to write problem+json over a committed
+// response. That is the exact bug the sentinel exists to prevent, arriving
+// through the sentinel.
+func TestServe_DoesNotTagAFlushThatAlreadyCommitted(t *testing.T) {
+	t.Parallel()
+	proj, run := uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- idleStreamer(hub, src, 10).Serve(
+			ctx,
+			&deadPeerWriter{header: http.Header{}},
+			StreamRequest{Filter: runFilter(run, proj)},
+		)
+	}()
+
+	err := waitServe(t, errc)
+	if !errors.Is(err, errDeadPeer) {
+		t.Fatalf("Serve() on a dead peer = %v, want it to wrap the flush failure", err)
+	}
+	if errors.Is(err, ErrNotStarted) {
+		t.Errorf("Serve() = %v, want it NOT to wrap %v: net/http committed the 200 before the flush failed", err, ErrNotStarted)
+	}
+	// It still ends the same way a rejected stream does — the request is over,
+	// and nothing subscribed or read on the way out.
+	if got := registryLen(hub); got != 0 {
+		t.Errorf("registry holds %d subscription(s), want 0", got)
+	}
+	if snapshots, _ := src.calls(); snapshots != 0 {
+		t.Errorf("Snapshot called %d time(s), want 0", snapshots)
+	}
+}
+
 // Every return path unsubscribes, including the ones that are nobody's normal
 // case. A write failure is the client that vanished mid-frame.
 func TestServe_ClosesTheSubscriptionOnAWriteError(t *testing.T) {
