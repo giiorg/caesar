@@ -963,3 +963,248 @@ and verifies the named worktree is at it, so the commit must exist BEFORE the ga
 The plan's "Gate and commit" steps are to be executed as commit → gate → fix-and-amend if
 red → re-gate.
 
+
+---
+
+### Task 9 pre-flight (controller, 2026-08-12, session 60) — TWENTY-ONE findings, all in the brief
+
+Read against the tree at `fc007e0` before dispatching. Recorded in full as a CONTROLLER
+PRE-FLIGHT block at the top of `task-9-brief.md` that overrides the plan text. BASE for the
+review package is **`fc007e0`**. Pre-flight has now found 6, 8, 11, 13 and 21 defects on the last
+five tasks.
+
+Task 9: **the plan's per-run close condition is NOT COMPUTABLE** — a new defect, not on the
+  handoff's list. The plan says close when the refreshed scope "no longer covers that run's
+  project", but `Filter` carries `RunID` and never the run's project (`realtime.go:74-78`), and an
+  admin's per-run Filter is `Scope{All:true}` with no project id at all. `Serve` cannot learn a
+  run's project until an event for it arrives. Replaced with the computable rule: close on an
+  EMPTY refreshed scope (the only thing that can close an idle per-run stream, and it covers both
+  shapes); on a per-run stream also close on the first event the refreshed scope denies; on an
+  attention stream drop that event and keep streaming.
+
+Task 9: **the handoff's known trap confirmed and then WIDENED.** The plan's test 3 ("a transient
+  resolver error keeps the last known scope and retries") is not merely wrong about
+  `ClassNotFound` — kept as written it is a FAIL-OPEN: a resolver failing indefinitely leaves the
+  stream running on a scope nobody can confirm, in the one task whose purpose is failing closed.
+  Ruled: `maxGrantFailures = 3` consecutive failures → terminal frame + **the wrapped resolver
+  error**, not `CloseForbidden`. 90s at the 30s default.
+Task 9: **deliberately NOT classifying `xerrors.ClassNotFound` as terminal**, against the
+  handoff's item 2. Verified there is no user-deletion path in the codebase (no `DeleteUser`, no
+  `DELETE FROM users`); deactivation returns `Scope{}` with a **nil** error
+  (`realtimeports.go:288-290`), which is already the one-interval close. The failure cap closes
+  the unknown-user case anyway AND covers failure modes a class test misses (a resolver stuck on
+  `ClassInternal`). Importing `xerrors` into `realtime` for an error-class contract
+  `GrantResolver` does not document and no fake here could verify buys nothing. **Revisit if a
+  later task adds user deletion.**
+Task 9: `CloseForbidden CloseReason = "not authorized"`, and it means authorization was CHECKED
+  and denied — never the resolver-outage path. Putting "not authorized" in the data when the truth
+  is "we could not ask" is the same false statement `closeClientGone` exists to avoid, and it
+  would hand Task 10 a routine revocation and a real fault under one label. **Ruled into
+  `hub.go`'s const block** — that block calls itself "the canonical sentinels" and anticipates the
+  addition; `closeClientGone` stays in `stream.go` with a one-line pointer added to hub.go, which
+  closes the Task 8 carry-forward.
+Task 9: **must NOT mutate `Subscription.filter`** to push the new scope into the hub — `Publish`
+  reads `s.filter` on the tailer goroutine holding no subscription lock (`hub.go:105`), so it is a
+  race `-race` will flag. Accepted consequence, to be stated in a comment: denied events still
+  occupy queue slots and can still evict the client as a slow consumer.
+Task 9: a dropped event must **not advance `st.cursor`** — the cursor is the client's
+  Last-Event-ID, and advancing past an event it never saw makes a later resume skip real events.
+Task 9: **no resolve before the first tick** (start from `req.Filter.Scope`; the handler resolved
+  it moments ago) and **re-resolve in the ticker case ONLY**, never per event — the per-event work
+  is a pure in-memory `allows` test. Both pinned by tests.
+Task 9: terminal frame pinned to the byte: `event: forbidden\ndata: {"error":"forbidden"}\n\n`,
+  via `fmt.Fprint(st.wr.w, …)` + `st.wr.Flush()` — exactly what `sse.go:127-130` built `Flush` for,
+  and still its only caller. **No `id:` line**: ids on the wire are the client's resume point and
+  this is not an event. No new method on `sse.go` — the frame is stream policy, not codec.
+Task 9: `NewStreamer` gains the resolver as its third parameter and **PANICS on a nil one**.
+  Silently never re-checking is the exact fail-open the task closes, and a nil interface would
+  otherwise panic per-request in a handler goroutine rather than once at process start. Precedent:
+  `contracts.go:196`, `workflows/graph.go:145`, `pg/migrate.go:25`. Three call sites, all in
+  `stream_test.go` (251, 669, 699); nothing in `internal/app` builds a Streamer yet.
+Task 9: `defaultGrantRecheck = 30s`, **verified against `task-11-config-section.patch`** rather
+  than guessed, and defaulted in `NewStreamer` because `time.NewTicker` panics on <= 0.
+Task 9: the Task 8 deferred minor with a live consumer is folded in — `TestServe_AddsNoFlushOfItsOwn`
+  never reaches `follow`, the exact function this task edits, so it is extended (one live event
+  before `hub.Close()`, `want` gains `"write","flush"`) BEFORE a legitimate `Writer.Flush()` caller
+  is added.
+Task 9: the brief carries an executable **mutation table — eight rows, one per test-shaped
+  claim** — each to be run through `go test -overlay` from a scratch dir outside the repo with the
+  real output pasted into the report. Same standard as Task 8: a mutant that reddens the wrong
+  assertion is not evidence.
+Task 9: implementer dispatched on Opus 5 at BASE `fc007e0`, with an explicit licence to dissent.
+
+Task 9: implemented at `3ebfb89` — `stream.go` +196, `stream_test.go` +353, `hub.go` +11,
+  `realtime.go` +5. **GATED BEFORE REVIEW on a confirmed-clean tree: `GATE PASS … 3ebfb89`,
+  11 lanes resolved unnarrowed, contracts clean.** Review in flight.
+Task 9: the implementer reports **all 21 pre-flight findings honoured**, and it ran the eight-row
+  mutation table plus **three mutations of its own** for behaviours the table left unpinned — the
+  `failures = 0` reset, `CloseForbidden` vs the wrapped resolver error on the outage path, and the
+  absent `id:` line on the terminal frame.
+Task 9: **FINDING 14 VERIFIED AS A COUNTERFACTUAL RATHER THAN ASSUMED.** It overlaid the m7
+  mutant (a stray `Flush()` in `follow`'s event case) together with the PRE-Task-9 form of
+  `TestServe_AddsNoFlushOfItsOwn` and the pin PASSED. Task 8's deferred minor was exactly right,
+  and the extension is what makes m7 fail. That deferred minor is now closed.
+Task 9: ⚠️ **MY FINDING 7's PRESCRIPTION WAS RIGHT AND ITS STATED REASON WAS WRONG — the fourth
+  controller error on this plan.** I wrote that a dropped event must not advance `st.cursor`
+  because "the cursor is what the client stores as Last-Event-ID". It is not: `st.cursor` is
+  per-`Serve` state that dies with the stream, and the client's resume point is the last `id:`
+  line that actually reached the wire. Within `follow` the cursor only gates `e.ID <= st.cursor`
+  and live ids ascend strictly, so advancing it on a drop is unobservable in every direction —
+  which is also why no mutation for it exists. The implementer **implemented the prescription and
+  refused the justification**, writing the factual reason into the comment instead. That is the
+  right call for a package whose comments are load-bearing, and it is exactly the behaviour the
+  dissent licence exists to produce.
+Task 9: two more comments softened after the implementer failed to falsify them — finding 6's
+  "`-race` WILL flag it" (the race is real; whether the detector observes it on a given run is
+  not guaranteed) and finding 12's kind-collision claim, now cited to `internal/runs/events.go:18-43`,
+  which defines every kind, rather than to `realtime.go`, which lists only the three attention
+  prefixes. **Pattern worth keeping: the implementer weakened three claims it could not prove
+  rather than inheriting the controller's confidence.**
+Task 9: **finding 19 earned its place immediately** — `task backend:lint` rejected a tree that
+  `go build`, `go vet` AND `go test -race` all passed (gofumpt, one element per line in a
+  multi-line composite literal, `stream_test.go:1033`). Third distinct way the lint lane has
+  caught what the compiler cannot on this plan.
+Task 9: ⚠️ the LSP produced FALSE compile errors a THIRD time — 11 of them at `3ebfb89`, all
+  holding the pre-Task-9 `NewStreamer` signature against the new call sites. `go build ./...` and
+  `go vet ./internal/realtime/...` both exited 0 and the gate passed. **This is now a reliable
+  property of this worktree, not an anomaly.**
+
+Task 9: review at `3ebfb89` — spec ❌ (one missing requirement), quality "Needs fixes": 0 Critical,
+  1 Important, 4 Minor, 3 cannot-verify. All 21 pre-flight findings verified honoured against the
+  CODE (file:line for each, not the report), all eight mutation rows checked out, and the reviewer
+  left `git status` empty, running its own probes through `go test -overlay` from a scratch dir.
+Task 9: **THE IMPORTANT FINDING IS THE CONTROLLER'S PRE-FLIGHT GAP, NOT THE IMPLEMENTER'S ERROR.**
+  The re-check ticker lives only in `follow`; `prime` and `replay` never re-resolve, so the
+  staleness window is `catch-up duration + GrantRecheck` rather than `GrantRecheck` — and replay
+  reads up to the CURRENT HEAD, so it emits rows committed AFTER the revocation. The owner's
+  locked ruling (plan pre-flight finding 8) bought exactly that bound: "on an interval and before
+  each delivery batch … bounded by the re-check interval and must be configurable." A replay page
+  is the most literal delivery batch in the design — `ReplayBatch`'s own doc calls it a batch.
+  **My finding 9 forbade a per-EVENT poll and was silent on replay pages**, so the plan text stood
+  there and the implementer built exactly what the brief said. I had considered this boundary at
+  pre-flight, ruled to keep the re-check in `follow`, and then wrote NEITHER the ruling NOR the
+  boundary comment into the brief — so the code shipped two docs asserting a bound it does not
+  deliver. **A pre-flight ruling that stays in the controller's head is not a ruling.**
+Task 9: my deferral reasoning was also weak on the merits — I told myself the window was bounded
+  by catch-up, which is itself bounded by slow-consumer eviction. Eviction bounds the QUEUE, not
+  the replay duration, and it only fires if live events keep arriving.
+Task 9: **all three implementer dissents RATIFIED INDEPENDENTLY by the reviewer**, finding 7's
+  included: `st.cursor` is per-`Serve` state that never crosses the wire, so advancing it on a
+  drop cannot make a later resume skip events — a resume comes from the client's `Last-Event-ID`
+  header. Four controller items have now been wrong on this plan.
+Task 9: the reviewer ran a mutation nobody asked for — the **opposite direction** of the security
+  branch (`if req.Filter.RunID != nil` → `if true`, i.e. over-closing attention streams). It
+  reddens the attention-drop test on the right assertion. The table pinned the branch against
+  under-closing only; it is now falsifiable both ways.
+Task 9: ⚠️ the review's three cannot-verify items, all resolved by the controller, none a gap.
+  (a) "must be configurable" — verified against `task-11-config-section.patch`:
+  `GrantRecheck Duration \`json:"grant_recheck"\``, default 30s, validated positive, matching
+  `defaultGrantRecheck`. (b) a deactivated principal resolves to `Scope{}` with a **nil** error
+  (`realtimeports.go:289-291`), so deactivation lands on the empty-scope close. (c) documenting
+  the terminal frame beside `StreamFrame` is a **Task 10** obligation, not a Task 9 gap.
+Task 9: **all four Minors PROMOTED into fix round 1**, on a different basis from Task 8's two
+  (which were demonstrated-green mutants). Here the basis is: every one is a one-or-two-line
+  change on lines the Important fix already touches, and three of the four are the
+  load-bearing-comment-that-misstates-why class this plan has been burned by. (a) a test comment
+  claims "one COMPLETED re-check" when `stubGrants` increments on ENTRY — the test is sound for
+  the adjacent reason, but this is the exact false-safety pattern the implementer refused three
+  times in round 1. (b) `sse.go:41-44` enumerates how bytes reach the client as "connect, event or
+  heartbeat" and `writeForbidden` is now a fourth way. (c) the four-line close block is verbatim
+  twice and the replay-boundary close makes it three — which is what tips it. (d) `ScopeFor` is
+  called synchronously inside the select, so a slow grants store stops delivery and the queue
+  absorbs the backlog; the sentence belongs beside the queue-slot consequence already documented.
+Task 9: fix round 1 dispatched to the ORIGINAL implementer with an open question rather than an
+  assertion — does a per-run stream whose project is revoked MID-REPLAY still terminate, and by
+  what mechanism? My suspicion (the hub's deliberately-stale filter keeps delivering that run's
+  live events into `follow`, where the per-run denial closes it) is UNTESTED and framed as a
+  question precisely because three such explanations have been backwards. Also required: re-run
+  the WHOLE eight-row table after the refactor, since hoisting state out of `follow` touches every
+  path and a table validated before a refactor is not evidence about the code after it.
+
+Task 9: fix round 1/5 at `aa04f0a` (5 addressed per the implementer, 0 open — catch-up re-check,
+  false determinism comment, `sse.go` under-describing itself, the duplicated close block, the
+  synchronous-resolve consequence; commits `3ebfb89`..`aa04f0a`). **GATED AT THE FIX SHA on a
+  confirmed-clean tree: `GATE PASS … aa04f0a`, 11 lanes resolved unnarrowed, contracts clean.**
+  Gated twice — `3ebfb89` before review, `aa04f0a` after the fix round. Scoped re-review of
+  `3ebfb89..aa04f0a` dispatched afterwards, never during.
+Task 9: **the whole mutation table was RE-ANCHORED AND RE-RUN against the refactored code** —
+  14 mutants including the reviewer's own r1 and the two new ones, none surviving. Required
+  because hoisting the ticker/scope/failure state out of `follow` into `deliver` touches every
+  path, and a table validated before a refactor is not evidence about the code after it.
+Task 9: **the implementer deviated from my #1 shape and is right again.** I listed "per-run
+  denied → close" as a replay-boundary outcome; it is not computable there — no event, and
+  `Filter` carries no project id. The boundary does empty→close plus scope push-down; the per-run
+  close stays in `follow`. This is the SAME defect as my own pre-flight finding 4, which I wrote
+  correctly for the general case and then forgot when specifying the fix.
+Task 9: **A NEW RESIDUE, FOUND BY ASKING A QUESTION INSTEAD OF ASSERTING AN ANSWER.** I asked
+  whether a per-run stream revoked mid-replay still terminates and said my suspected mechanism was
+  untested. Answer: **only if that run emits at least one more event.** The mechanism I suspected
+  is right and is now pinned end to end (rows withheld by the narrowed Filter during catch-up,
+  then one live event closes it; a separate mutant pins the SQL push-down independently) — but on
+  a QUIESCENT run step 4 never happens and the connection stays open, idle, indefinitely.
+  Confidentiality holds (replay's Filter and follow's scope test both refuse every denied row);
+  liveness does not. **Had I asserted my suspicion instead of asking, this would have shipped as a
+  confident false safety claim — the exact pattern that has bitten this plan three times.**
+Task 9: the residue is UNCLOSABLE in this task's vocabulary — it needs the run's project id, which
+  no `Filter` carries and which an admin's per-run Filter cannot supply. The implementer refused
+  the obvious workaround (remember the last written event's project) because it fails for a stream
+  that has never seen an event and would read as if it closed the whole gap. **CONTROLLER ROUTING:
+  carried to TASK 10, not deferred for convenience** — Task 10 builds `StreamRequest` and is the
+  only place where "the handler knows the run's project" is a fact rather than a hope. Task 10's
+  pre-flight must weigh adding a run-project field against its footgun: a field Task 10 forgets to
+  set is `uuid.Nil`, which no scope allows, so every per-run stream would close on its first
+  re-check. Documented in three places in the code today.
+
+Task 9: scoped re-review of `3ebfb89..aa04f0a` — **all 5 findings ADDRESSED, no Critical or
+  Important breakage in the fix diff.** `git status` left empty; probes run through `go test
+  -overlay` from a scratch dir.
+Task 9: **the re-review did not take the re-anchored mutation table on trust — it wrote two of its
+  own** and both reproduced the implementer's m12/m13 line for line (deleting the whole
+  `if rc.due(){}` block leaks ids 3-6 and yields 4 Replay calls; deleting only `f.Scope = rc.scope`
+  reddens the per-run test alone). That is what makes "re-anchored after the refactor" evidence
+  rather than a claim.
+Task 9: **the deviation was ratified independently and sharpened** — `Filter` never carries a run's
+  project (`realtime.go:79-83`), so my own pre-flight finding 4 says the per-run close is not
+  computable without an event, and my #1 prescription contradicted my own finding. "Nothing
+  enforced is lost, only where it fires" was VERIFIED, not accepted: the per-run close is
+  byte-identical and still in `follow`, and the boundary only ADDS the empty-scope close and the
+  row withholding. Strictly greater enforcement, no scenario where the old code closed and the new
+  one does not.
+Task 9: **the residue's confidentiality claim HOLDS, traced rather than argued** — every
+  post-refresh write path checked, and the push-down verified REAL IN PRODUCTION via `scopeArgs`
+  (`app/realtimeports.go:135-160`), not merely in the fake. One qualification the `Serve` sentence
+  does not carry: during the 1-2 tolerated resolver failures the stale scope is deliberately kept,
+  so denied bytes can go out for up to `(maxGrantFailures-1) × GrantRecheck`. True by design —
+  finding 10's blip tolerance — and the sentence sits in a successful-refresh paragraph.
+Task 9: three deferred minors from the re-review, all documentation, no behavioural defect:
+  (a) `stream_test.go:962-964` — the new comment says the call count "can only be raised from
+  inside `follow`'s re-check case"; after the hoist `replay`'s boundary can raise it too. FALSE
+  statement, but in a test comment, and the load-bearing reason (the queue argument) is stated
+  correctly in the sibling test. → final review.
+  (b) `stream.go:432-439` — revoke-then-re-grant during catch-up leaves a PERMANENT gap: the
+  cursor advances past SQL-withheld rows, so a later re-grant never backfills them and
+  Last-Event-ID resume cannot recover them. Inherent to a single high-water cursor and not fixable
+  without breaking the strictly-ascending-ids invariant; the live path has the same shape. → TASK
+  12, which owns the docs step.
+  (c) `stream.go:62-71` — the true worst case is `GrantRecheck + one in-flight page`, and with
+  tolerated resolver failures `maxGrantFailures × GrantRecheck + one page`. → final review.
+Task 9: **I nearly opened fix round 2 over (c) and did not, because I read the actual doc text
+  instead of the reviewer's summary of it.** I had inferred the doc asserted a bound 3× tighter
+  than reality — an operator-facing security claim, which would have justified a round. It does
+  not: it says GrantRecheck "bounds the staleness window across BOTH phases", which is true, and
+  the paragraph beneath it already carves out the per-run/quiescent exception honestly. **Separate
+  a reviewer's observation from its inference, and from your own** — the same lesson that cost a
+  session earlier on this project.
+
+Task 9: **complete (commits `fc007e0`..`aa04f0a`, review clean after 1 fix round) and GATED:
+  `GATE PASS … aa04f0a`, 11 lanes resolved unnarrowed, on a confirmed-clean tree.**
+Task 9: **the dissent licence paid for itself three times in one task** — the implementer refused
+  finding 7's false justification while implementing its prescription, refused my #1 shape's
+  uncomputable per-run clause, and softened two claims it could not falsify. Every refusal was
+  independently ratified by a reviewer. **Four controller items have now been wrong on this plan,
+  and the implementer was right every time.**
+Task 9: **the method that found the most this task was asking a question instead of asserting an
+  answer.** My per-run/mid-replay suspicion was correct but incomplete, and framing it as a
+  question surfaced the quiescent-run residue that my own framing hid. Had I asserted it, it would
+  have shipped as a confident false safety claim — the pattern that has now bitten this plan three
+  times.
