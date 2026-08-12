@@ -34,12 +34,6 @@ import (
 // runs and realtime are bounded contexts and never import each other.
 var _ runsapi.StreamServer = (*realtimeapi.API)(nil)
 
-// defaultSnapshotEvents is how many recent events a snapshot carries when
-// nobody configured a limit. A zero would make every stream open on an empty
-// backlog, which is a worse failure than a large one: the client would
-// believe the run has no history.
-const defaultSnapshotEvents = 500
-
 // realtimeEventSource implements realtime.EventSource over the runs store.
 // It lives here because realtime is a bounded context and never imports
 // runs; this is the composition root, the one place that sees both.
@@ -55,10 +49,12 @@ type realtimeEventSource struct {
 // drift from surviving until production wiring.
 var _ realtime.EventSource = realtimeEventSource{}
 
+// newRealtimeEventSource takes the backlog size rather than defaulting a zero
+// to something. It deliberately holds no fallback constant: 500 already lives
+// in config.defaults() and is validated positive by config.Load, and a second
+// copy here would be a sixth duplicated realtime default with no tie-back —
+// the one shape internal/realtime's defaults_test exists to prevent.
 func newRealtimeEventSource(pool *pgxpool.Pool, snapshotEvents int) realtimeEventSource {
-	if snapshotEvents <= 0 {
-		snapshotEvents = defaultSnapshotEvents
-	}
 	return realtimeEventSource{pool: pool, snapshotEvents: rowLimit(snapshotEvents)}
 }
 
@@ -436,6 +432,17 @@ func runTailer(ctx context.Context, t runLoop) (<-chan struct{}, <-chan error) {
 // than this method's: Shutdown waits for active connections and an SSE
 // connection does not drain on its own.
 //
+// Step 2 is the ONE UNBOUNDED wait in that path — Close below carries its own
+// deadline, srv.Shutdown carries ShutdownTimeout — and it is left unbounded on
+// purpose. A deadline here could only abandon the goroutine and go on to close
+// a connection it may be reading at that instant, and a pgx Conn is documented
+// as unsafe for concurrent use; Stop cannot tell a tailer stuck in Wait from
+// one stuck in a drain, so it cannot tell which it would be abandoning. Nor
+// would it bound Stop: a tailer stuck inside Wait is holding the waker's mutex,
+// which step 3 takes, so the hang would move one line down and read as a bound
+// that is not one. What does bound this is that every blocking call in the
+// tailer's loop takes the context step 1 has just cancelled.
+//
 // What the wait is NOT for: a Publish racing Hub.Close is already safe
 // whichever order they land in. Publish collects its targets under the hub's
 // read lock and releases it before delivering; offer re-checks the closed
@@ -514,9 +521,10 @@ func (w *pgWaker) Wait(ctx context.Context) error {
 		// is the one case it does not close the connection over (pgconn's
 		// DeadlineContextWatcherHandler and peekMessage). The LISTEN therefore
 		// stands — which matters, because otherwise every poll interval would
-		// cost a reconnect. TestPGWaker_IsWokenByAnOrdinaryAppend takes a
-		// deadline first and is woken on the SAME connection afterwards, so
-		// that is demonstrated rather than assumed.
+		// cost a reconnect. TestPGWaker_IsWokenByAnOrdinaryAppend holds the
+		// waker across TWO deadlines and asserts the same BACKEND PID
+		// throughout — the wake-up alone would not show it, because a waker
+		// that redialled would re-issue LISTEN and be woken just the same.
 		//
 		// Only a read that failed for another reason has broken it.
 		if ctx.Err() != nil {

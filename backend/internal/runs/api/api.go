@@ -46,8 +46,8 @@ type API struct {
 	authz  authn.Authorizer
 	grants GrantSource
 	// streams is nil wherever nothing wired it: internal/contracts builds this
-	// table with every dependency nil for metadata-only generation, and
-	// internal/app leaves it nil until Task 11 builds the streamer. What a nil
+	// table with every dependency nil for metadata-only generation and never
+	// runs a handler. internal/app passes the live realtime surface. What a nil
 	// one costs at request time is streamRunEvents' first check.
 	streams StreamServer
 }

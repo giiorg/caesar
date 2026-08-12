@@ -349,12 +349,13 @@ func (h *harness) do(t *testing.T, method, path, token string, body any) *http.R
 // It carries a deadline and do does not, and the asymmetry is the whole reason
 // it is written out here. This is the only helper that can reach the streaming
 // branch, and a real stream handler RETURNS ONLY WHEN THE CLIENT GOES AWAY.
-// Nothing hangs today because fakeStreamServer answers and returns — but the
-// moment Task 11 puts the live Streamer behind that port, a negotiation test
-// without a deadline stops being a test and becomes a suite timeout with no
-// name on it. The deadline turns "it never answered" into a named failure at
-// patience. The neighbouring realtime/api package has the same helper for the
-// same reason.
+// Nothing hangs in THIS suite, because fakeStreamServer answers and returns —
+// but the port now carries the live Streamer in internal/app, so the shape
+// under test is one that does not return, and a negotiation test without a
+// deadline is one substituted double away from a suite timeout with no name on
+// it. The deadline turns "it never answered" into a named failure at patience.
+// The neighbouring realtime/api package has the same helper for the same
+// reason.
 func (h *harness) get(t *testing.T, path, token string, headers http.Header) *http.Response {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), patience)

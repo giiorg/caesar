@@ -407,6 +407,15 @@ func TestServe_ARevokedStreamEndsWithoutAProblemDocumentInItsBody(t *testing.T) 
 // nothing measures. The two sides share runs.EventsChannel so they cannot
 // disagree; this is the other half — proof that the name they share is the
 // one the database actually delivers on.
+//
+// It also pins the SECOND claim Wait's poll-deadline branch makes: that a read
+// which ended in a timeout leaves the connection — and therefore the LISTEN —
+// intact, so a poll interval does not cost a reconnect. The wake-up alone
+// cannot show that. A waker that redialled after every deadline would still be
+// woken, because the redial re-issues LISTEN before the append lands. Only the
+// backend PID separates the two, so the PID is what is asserted, and it is
+// asserted across TWO deadlines: a redial that happened inside the first Wait
+// would already be the only connection anything outside it could see.
 func TestPGWaker_IsWokenByAnOrdinaryAppend(t *testing.T) {
 	ctx := context.Background()
 	dbURL := testdb.NewURL(t)
@@ -420,13 +429,16 @@ func TestPGWaker_IsWokenByAnOrdinaryAppend(t *testing.T) {
 	waker := newPGWaker(dbURL, discard())
 	t.Cleanup(func() { _ = waker.Close() })
 
-	// One Wait that times out first: it is what establishes the LISTEN, and a
-	// waker that never connected would answer the real notification from a
-	// connection it opened afterwards, which proves nothing about the name.
-	warm, cancelWarm := context.WithTimeout(ctx, 2*time.Second)
-	defer cancelWarm()
-	if err := waker.Wait(warm); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("warm-up Wait = %v, want a deadline", err)
+	// Waits that time out before any append: the first is what establishes the
+	// LISTEN — a waker that never connected would answer the real notification
+	// from a connection it opened afterwards, which proves nothing about the
+	// name — and the second is the observable one, holding the connection
+	// across a deadline with the test watching.
+	listening := deadlineWait(t, waker, 2*time.Second)
+	if again := deadlineWait(t, waker, 500*time.Millisecond); again != listening {
+		t.Fatalf("a poll deadline moved the listener from backend %d to %d: the timeout "+
+			"did not leave the connection intact, so every poll interval costs a "+
+			"reconnect and a re-LISTEN", listening, again)
 	}
 
 	woken := make(chan error, 1)
@@ -450,4 +462,36 @@ func TestPGWaker_IsWokenByAnOrdinaryAppend(t *testing.T) {
 	case <-time.After(25 * time.Second):
 		t.Fatal("a committed append never woke the listener")
 	}
+
+	if woke := wakerPID(t, waker); woke != listening {
+		t.Errorf("the wake-up arrived on backend %d but the warm-up listened on %d: "+
+			"the notification was delivered to a connection opened after the "+
+			"deadlines, not to the one that had been listening across them", woke, listening)
+	}
+}
+
+// deadlineWait runs one Wait that is expected to reach its deadline — what a
+// poll interval with no notification does — and reports the backend the waker
+// is left holding.
+func deadlineWait(t *testing.T, w *pgWaker, d time.Duration) uint32 {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	if err := w.Wait(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait = %v, want a deadline", err)
+	}
+	return wakerPID(t, w)
+}
+
+// wakerPID is the server-side session the waker currently holds. Taken under
+// the waker's own mutex, so it is ordered against an in-flight Wait rather
+// than relying on the caller having waited for one.
+func wakerPID(t *testing.T, w *pgWaker) uint32 {
+	t.Helper()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.conn == nil {
+		t.Fatal("the waker holds no connection")
+	}
+	return w.conn.PgConn().PID()
 }

@@ -40,11 +40,12 @@ type API struct {
 // the peer contexts, whose nil services would panic just the same.
 //
 // Two of them are checked at request time rather than left to panic, and the
-// asymmetry is deliberate: the Streamer and the GrantResolver are the ones
-// internal/app can legitimately be mid-way through wiring, so a request finds
-// them missing and says so (handleStreamAttention). A nil authenticator is not
-// a state any wiring passes through, and it is not checked here for the same
-// reason the peer packages do not check theirs.
+// asymmetry is deliberate: the Streamer and the GrantResolver are the two a
+// stream cannot open without, and a stream is the one surface here whose
+// failure can be mistaken for success, so their absence is named in a 500
+// rather than left to a recovered panic (handleStreamAttention). The
+// authenticator is not checked, for the same reason the peer packages do not
+// check theirs.
 func New(streams *realtime.Streamer, auth authn.SessionAuthenticator, grants realtime.GrantResolver, log *slog.Logger) *API {
 	return &API{streams: streams, auth: auth, grants: grants, log: log}
 }
@@ -103,9 +104,11 @@ func (a *API) handleStreamAttention(w http.ResponseWriter, r *http.Request, sess
 	// A dependency this surface cannot work without is a WIRING omission, and
 	// the one thing it must never do is look like a working endpoint —
 	// answering an empty stream would hide the omission behind a 200 nobody
-	// would think to question. internal/app leaves the Streamer nil until
-	// Task 11 builds the hub, tailer and streamer, so this branch is the live
-	// answer between these two tasks rather than a defensive nicety.
+	// would think to question. internal/app now passes a live Streamer, so
+	// what this guards is the OTHER constructor New documents: the
+	// metadata-only table internal/contracts builds with every dependency nil.
+	// That one never serves a request — and this is what says so if it ever
+	// does.
 	if a.streams == nil || a.grants == nil {
 		httpx.Problem(w, r, xerrors.E(xerrors.ClassInternal, "realtime streaming is not wired"))
 		return
