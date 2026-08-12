@@ -43,6 +43,22 @@ const (
 	EventPublishHalted        = "publish.halted"
 )
 
+// EventsChannel is the LISTEN/NOTIFY channel a committed append wakes.
+//
+// It is exported for ONE reason: the listening half lives in internal/app
+// (the realtime tailer's waker) and a disagreement between the two names is
+// completely silent. NOTIFY on a channel nobody listens to succeeds, the
+// tailer falls back to polling, every test still passes, and the only symptom
+// is up to one poll interval of extra latency that no assertion measures.
+// One definition, consumed by both sides, is what makes that unrepresentable
+// rather than merely unlikely.
+//
+// A channel name cannot be a query parameter — NOTIFY takes an identifier —
+// so the statement below is built by concatenation. That is safe here and
+// only here: this is an untyped string constant, so the SQL is fixed at
+// compile time and no caller can reach it.
+const EventsChannel = "caesar_run_events"
+
 // Event is one observation appended in the same tx as its state change.
 type Event struct {
 	RunID         uuid.UUID
@@ -95,8 +111,9 @@ func appendEvents(ctx context.Context, tx pgx.Tx, now time.Time, evs []Event) er
 	// that exist. The payload is empty on purpose: LISTEN/NOTIFY is a
 	// wake-up signal and never the data (locked decision §2) — the tailer
 	// re-reads from its own cursor and a lost notification costs latency,
-	// never correctness.
-	if _, err := tx.Exec(ctx, `NOTIFY caesar_run_events`); err != nil {
+	// never correctness. The channel name is EventsChannel and never a literal
+	// — see there for what a second spelling would cost.
+	if _, err := tx.Exec(ctx, "NOTIFY "+EventsChannel); err != nil {
 		return fmt.Errorf("runs: notify run events: %w", err)
 	}
 	return nil

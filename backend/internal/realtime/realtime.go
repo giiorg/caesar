@@ -103,13 +103,12 @@ func RunFilter(runID uuid.UUID, s Scope) Filter {
 // fields are exported, so `Filter{RunID: &id, Attention: true}` is legal Go and
 // nothing here can stop it: the constructors make the two bad shapes
 // unreachable THROUGH THEM, not unrepresentable. That holds only while every
-// caller uses one — and RunFilter's only caller today is this package's own
-// test (stream_test.go), so no production code exercises the guarantee at all
-// yet. It rests entirely on the adapter Task 11 writes in internal/app calling
-// RunFilter instead of writing the literal, and review is the only thing
-// enforcing that. A runtime check in Matches could close the gap for real, and
-// was not added: it would have to choose a behaviour for a filter that is
-// already a programming error, and every choice is silent.
+// caller uses one. Both production callers do — realtime/api's
+// handleStreamAttention and its ServeRunStream, which is the per-run adapter
+// internal/app wires into runs/api — and review is the only thing enforcing
+// it for the next one. A runtime check in Matches could close the gap for
+// real, and was not added: it would have to choose a behaviour for a filter
+// that is already a programming error, and every choice is silent.
 func AttentionFilter(s Scope) Filter {
 	return Filter{Attention: true, Scope: s}
 }

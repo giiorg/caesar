@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
+
 	"github.com/giiorg/caesar/backend/internal/platform/authn"
 	"github.com/giiorg/caesar/backend/internal/platform/httpx"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
@@ -133,31 +135,93 @@ func (a *API) handleStreamAttention(w http.ResponseWriter, r *http.Request, sess
 	// never be seen. Every OTHER ending arrives over a committed 200 and can
 	// only go to the log — calling Problem on those would append a problem
 	// document to the SSE body, which is strictly worse than saying nothing.
-	err = a.streams.Serve(r.Context(), w, realtime.StreamRequest{
+	if err := a.serve(r.Context(), w, realtime.StreamRequest{
 		Filter:      realtime.AttentionFilter(scope),
 		UserID:      sess.UserID,
 		LastEventID: lastID,
 		HasLastID:   hasLastID,
-	})
-	if errors.Is(err, realtime.ErrNotStarted) {
+	}, slog.String("stream", "attention"), slog.String("user_id", sess.UserID.String())); err != nil {
 		// Unclassified, so httpx.Problem makes it a 500 and suppresses the
 		// detail: "cannot flush" names a server-side wiring fault and is for
-		// the log line below, not for the client.
+		// the log line serve already wrote, not for the client.
 		httpx.Problem(w, r, err)
 	}
-	logStreamEnd(r.Context(), a.log, err,
-		slog.String("stream", "attention"),
-		slog.String("user_id", sess.UserID.String()))
+}
+
+// ServeRunStream is runs/api.StreamServer: the per-run stream, reached from
+// the runs endpoint that already owns that URL. internal/app wires it in and
+// asserts the signature, because runs and realtime are peers and neither may
+// name the other.
+//
+// It is a method on this API rather than a second implementation in
+// internal/app so that both surfaces share serve below and logStreamEnd —
+// writing the ErrNotStarted branch and the six-shape classification a second
+// time is how two surfaces that must agree stop agreeing.
+//
+// What it does NOT do is authenticate or check the run: runs/api has already
+// resolved the run, checked the view grant and read Last-Event-ID, and hands
+// the results in. What it does do is resolve the principal's SCOPE, which is
+// realtime's own question and the last thing here that can still be an HTTP
+// status.
+func (a *API) ServeRunStream(ctx context.Context, w http.ResponseWriter,
+	runID, userID uuid.UUID, lastEventID int64, hasLastID bool,
+) error {
+	// Same wiring omission, same refusal to look like a working endpoint, as
+	// handleStreamAttention. Returned rather than rendered: the caller owns
+	// the response until the stream commits it.
+	if a.streams == nil || a.grants == nil {
+		return xerrors.E(xerrors.ClassInternal, "realtime streaming is not wired")
+	}
+	scope, err := a.grants.ScopeFor(ctx, userID)
+	if err != nil {
+		return err
+	}
+	// RunFilter, never a Filter literal. Two of the four combinations of
+	// RunID and Attention are wrong in ways nothing downstream can report,
+	// and realtime.AttentionFilter names this exact call site as the risk.
+	return a.serve(ctx, w, realtime.StreamRequest{
+		Filter:      realtime.RunFilter(runID, scope),
+		UserID:      userID,
+		LastEventID: lastEventID,
+		HasLastID:   hasLastID,
+	}, slog.String("stream", "run"),
+		slog.String("run_id", runID.String()),
+		slog.String("user_id", userID.String()))
+}
+
+// serve runs one stream and TRANSLATES how it ended into what a caller that
+// still owns the response may do about it. Both surfaces go through here, and
+// the translation is the reason it exists.
+//
+// Serve's error set is wider than an HTTP surface's: it reports post-commit
+// endings — a write failure, a source failure, CloseForbidden,
+// CloseSlowConsumer, CloseShutdown, a grant re-check that failed often enough
+// to end the stream — as errors too, because the caller inside realtime wants
+// to know. Over HTTP those are not answerable: NewWriter committed the 200
+// with the stream headers, and rendering problem+json on top of it appends a
+// problem document to the SSE body, which is strictly worse than saying
+// nothing.
+//
+// So exactly one error comes back out: ErrNotStarted, the one ending that
+// wrote nothing at all. Everything else is logged at the level it deserves
+// and reported as nil.
+func (a *API) serve(ctx context.Context, w http.ResponseWriter, req realtime.StreamRequest, attrs ...slog.Attr) error {
+	err := a.streams.Serve(ctx, w, req)
+	logStreamEnd(ctx, a.log, err, attrs...)
+	if errors.Is(err, realtime.ErrNotStarted) {
+		return err
+	}
+	return nil
 }
 
 // logStreamEnd records how one stream ended, at the level the ending deserves.
 // Serve has six shapes and two of them are faults:
 //
 //   - ErrNotStarted — the stream never opened. A wiring fault, error level, and
-//     the caller has already turned it into a 500. Logged as well as answered
-//     because the 500 carries no detail and the access log carries no reason;
-//     the cause wrapped in here is the only place "cannot flush" is written
-//     down.
+//     the only ending serve hands back for a caller to turn into a 500. Logged
+//     as well as answered because the 500 carries no detail and the access log
+//     carries no reason; the cause wrapped in here is the only place "cannot
+//     flush" is written down.
 //
 //   - nil — the request's context was done, which for an SSE request normally
 //     means the client disconnected. SILENT: AccessLog already writes a line

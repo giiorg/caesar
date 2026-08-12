@@ -6,6 +6,9 @@ import "sync"
 // config.Realtime.SubscriberQueue's default. An honest zero would evict every
 // subscriber on its first event — a total failure with no symptom but empty
 // streams — so a zero config is usable rather than broken, as TailerConfig is.
+//
+// It is the SECOND definition of that number, and defaults_test.go is what
+// keeps the two equal.
 const defaultSubscriberQueue = 256
 
 // CloseReason says why a subscription ended, and IS the error the subscription

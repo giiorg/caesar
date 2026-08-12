@@ -14,10 +14,19 @@ const (
 	// defaultPollFallback is the interval a zero TailerConfig follows the
 	// table at. A zero value here would be a hot loop, so the config has a
 	// floor rather than an honest zero.
+	//
+	// It repeats config.Realtime.PollFallback's default; defaults_test.go
+	// keeps the two equal.
 	defaultPollFallback = 2 * time.Second
 
 	// defaultBatch caps one read. A zero value would ask the source for
 	// nothing at all and follow the table forever without moving.
+	//
+	// Unlike every other default here it repeats NOTHING: there is no
+	// config.Realtime knob for it. It is the tailer's own read size, shared
+	// by the whole process, and config.Realtime.ReplayBatch — which happens
+	// to be 500 too — is one CLIENT's catch-up page. Wiring one into the
+	// other would look right and tie two unrelated knobs to one number.
 	defaultBatch = 500
 )
 

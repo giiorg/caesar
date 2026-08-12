@@ -3,5 +3,13 @@
   "database": {"url": "postgres://caesar:caesar@localhost:5432/caesar_dev?sslmode=disable"},
   "log": {"level": "debug"},
   "security": {"master_key": "dev:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
-  "forge": {"publish_work_dir": "/tmp/caesar-publish"}
+  "forge": {"publish_work_dir": "/tmp/caesar-publish"},
+  "realtime": {
+    "heartbeat_interval": "20s",
+    "poll_fallback": "2s",
+    "grant_recheck": "30s",
+    "subscriber_queue": 256,
+    "replay_batch": 500,
+    "snapshot_events": 500
+  }
 }

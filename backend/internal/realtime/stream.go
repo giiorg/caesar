@@ -15,6 +15,9 @@ const (
 	// config.Realtime's defaults, repeated here because a zero StreamerConfig
 	// must be usable rather than broken — the same ruling NewTailer and NewHub
 	// follow. What each zero costs is spelled out on NewStreamer.
+	//
+	// Being a second definition of a configured number is what defaults_test.go
+	// exists for: it fails when either end moves alone.
 	defaultHeartbeatInterval = 20 * time.Second
 	defaultReplayBatch       = 500
 	defaultGrantRecheck      = 30 * time.Second
