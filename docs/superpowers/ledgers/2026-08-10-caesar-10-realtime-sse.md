@@ -1460,3 +1460,233 @@ Task 10: **complete (commits `94cd5d1`..`00030da`, review clean after 2 fix roun
 Task 10: **the task's biggest yield was not the endpoints — it was a latent Critical in Task 6**
   that three tasks, three reviews and every gate had missed, found because the implementer probed
   the real middleware chain before writing code.
+
+---
+
+### Task 11 pre-flight (controller, 2026-08-12, session 60) — TWELVE findings, all in the brief
+
+Read against the tree at `8c4d969` before dispatching. Recorded in full as a CONTROLLER
+PRE-FLIGHT block at the top of `task-11-brief.md` that overrides the plan text. BASE for the
+review package is **`8c4d969`**. Pre-flight has found 6, 8, 11, 13, 21, 17 and 12 defects on the
+last seven tasks.
+
+Task 11: ⚠️ **THE WORST FAILURE SHAPE IN THIS TASK IS COMPLETELY SILENT.** The notify side is a
+  bare literal (`NOTIFY caesar_run_events`, `runs/events.go:99`) and the Waker will type `LISTEN
+  caesar_run_events` a second time. **If the two ever disagree, NOTHING FAILS**: the notification
+  goes nowhere, the tailer falls back to polling, every test still passes, and the only symptom is
+  up to `PollFallback` of extra latency that no assertion measures. Ruled: make it
+  single-definition structurally (`internal/app` may legally import `runs`, so an exported
+  constant consumed by both sides works) or prove a real NOTIFY wakes a real Waker — but the
+  literal must not be typed twice with nothing checking.
+Task 11: **`TailerConfig.Batch` deliberately gets NO config knob, and the trap is that wiring one
+  would look right.** `config.Realtime` has `replay_batch`, which is one CLIENT's catch-up page;
+  `TailerConfig.Batch` is the tailer's read size. **`defaultBatch` and `defaultReplayBatch` are
+  both 500** (`tailer.go:21`, `stream.go:18`), so feeding one into the other tests green and
+  quietly ties two unrelated knobs to one number.
+Task 11: **`Tailer.Run` can fail BEFORE it loops and the shape the plan says to copy swallows it.**
+  `Run` seeds its cursor from `src.Head` and its own godoc calls an unreadable head fatal — "the
+  caller should treat it as a failed startup" — but `go func() { defer close(done); _ = x.Run(ctx) }()`
+  (`serve.go:190`, `:201`) discards the error. A process whose tailer never started serves streams
+  that get a snapshot and then silence, forever, with nothing logged. Requirement stated (must not
+  be silent), shape left to the implementer, with a note that deviating from the runner's and
+  orchestrator's identical shape needs a reason.
+Task 11: **THE M5 TRAP CARRIED FROM TASK 10, now with its discriminator in place.**
+  `runsapi.StreamServer`'s contract is *error ⟹ nothing committed* (`runs/api/api.go:24-41`);
+  `Serve`'s is wider. An adapter that FORWARDS `Serve`'s error makes `streamRunEvents` call
+  `httpx.Problem` over a committed 200 and append a problem document to the SSE body.
+  `realtime.ErrNotStarted` is the discriminator and was narrowed in Task 10 round 2 to exactly
+  `http.ErrNotSupported`. **`fakeStreamServer` CANNOT catch this — it writes nothing when its
+  error is set — so a double that WRITES AND THEN ERRORS is required.**
+Task 11: ruled that `realtimeapi.API` satisfies `StreamServer` structurally, reusing the existing
+  `logStreamEnd` six-shape classification and the pre-commit ordering in `handleStreamAttention`
+  rather than writing either twice. **`realtime/api` must NOT import `runs/api`** (peer contexts),
+  so the compile-time assertion `var _ runsapi.StreamServer = (*realtimeapi.API)(nil)` goes in
+  `internal/app`, the only place that may name both.
+Task 11: **I flagged my OWN shutdown reasoning as unverified and asked the implementer to check it
+  before repeating it in a comment.** I claim the wait matters because the tailer goroutine
+  otherwise outlives `Serve` holding a dedicated connection nothing closes — and I explicitly do
+  NOT claim a race with `Hub.Close()`, because reading `hub.go`, `Publish` collects under `RLock`
+  and `offer` re-checks `closed` under the subscription's mutex. Also flagged: **`Hub.Close()`
+  does NOT end a stream still in `prime` or `replay`** — it closes the channel, which only
+  `follow` notices — so `Shutdown` can still wait on a catching-up stream, bounded by
+  `ShutdownTimeout`. Named in advance so a flaky shutdown test is not "fixed" by loosening it.
+Task 11: also carried — apply `task-11-config-section.patch` FIRST (the plan's brief never mentions
+  it exists); use `realtime.RunFilter` rather than a hand-built literal, since Task 10's I2 pinned
+  that `Filter`'s exported fields keep the ambiguous combination legal and named `internal/app` as
+  the "later edit" risk; the dedicated `*pgx.Conn` must be CLOSED on shutdown, which is the other
+  half of the wait; `realtimeports.go:31` credits Task 12 with the wiring and is wrong.
+Task 11: implementer dispatched on Opus 5 at BASE `8c4d969`, with a seven-row mutation table, four
+  open decisions to answer with reasons, and an explicit licence to dissent.
+
+Task 11: implemented at `17e76b7` — 14 files, +1384/-35. **GATED BEFORE REVIEW on a confirmed-clean
+  tree: `GATE PASS … 17e76b7`, 11 lanes resolved unnarrowed, contracts clean.**
+Task 11: **THE PLAN'S ACCEPTANCE EVIDENCE ACTUALLY RAN.** The integration lane booted a real
+  `postgres:18-alpine` via testcontainers under `-race` (internal/app 34s, internal/runs 65s) —
+  the first time any of this executed as an assembled process rather than in isolation. All seven
+  mutation rows executed and reddened the right assertion.
+Task 11: review — **spec PASS and quality APPROVED**, 0 Critical, 1 Important, 5 Minor. First task
+  on this plan to come back Approved on the first pass.
+Task 11: **all five of the implementer's judgement calls were checked individually and all five
+  stand.** (a) the sixth config knob `realtime.snapshot_events` is JUSTIFIED — finding 2 opened the
+  decision and the knob is symmetric with its five neighbours; tying it to `ReplayBatch` would mean
+  halving a page size silently halves everyone's backlog. (b) a fatal tailer start is CORRECT, with
+  blast radius verified boot-only: `Run`'s sole non-cancel exit is the `Head` seed and `drain` logs
+  and abandons thereafter, so no transient can kill a RUNNING process. (c) `runServe` binding its
+  own listener is Extra but a net improvement — `srv.Addr` is read only by `ListenAndServe` and the
+  empty-addr divergence is unreachable. (d) rate-limiting the waker's reconnect by the tailer's
+  poll interval is EQUIVALENT to a backoff, because `tailer.go:148` hands `Wait` a
+  PollFallback-bounded ctx. (e) my flagged-as-unverified publish/close reasoning is CORRECT,
+  verified independently against `hub.go` rather than inherited from either of us.
+Task 11: **the Important is the SIXTH false-evidence claim on this plan, and it is about a TEST.**
+  `realtimeports.go:517-519` says a test "demonstrates" the LISTEN connection survives a poll
+  deadline; the reviewer forced a redial after every deadline and **the test still PASSED in
+  3.34s**. The underlying pgconn behaviour is fine — only the evidence claim is false. Worth
+  naming because this implementer refused several such sentences about CODE today and one slipped
+  in about a test.
+Task 11: four Minors promoted. **M1 is the substantive one: the task created a SIXTH duplicated
+  default (`defaultSnapshotEvents = 500`) and silently exempted it from the tie-back it had just
+  built for finding 10** — and it is the easiest of the six to tie, because `defaults_test.go`'s
+  "neither import direction is legal" argument does not apply when `internal/app` already imports
+  `platform/config`. M2 and M3 are comments this commit made false (`realtime/api/api.go:106-108`
+  and `runs/api/api.go:50` plus a test comment) — all three say "until Task 11 builds the
+  streamer", and Task 11 is this commit. M4: **`<-rt.done` is the one UNBOUNDED wait in the
+  shutdown path and it runs before `shutdownCtx` exists** (`serve.go:277-278`) — theoretical since
+  pgx honours ctx, but if an in-flight `Since` ever ignored cancellation, shutdown would hang
+  FOREVER with the hub open and every SSE handler parked, which is strictly worse than the
+  `ShutdownTimeout` hang the whole ordering exists to prevent.
+Task 11: ⚠️ **M5 CARRIED TO THE TASK 12 BRIEF** — `awaitListening` discovers the port by parsing a
+  production log line's exact message text and JSON key. Bounded at 60s and fails loudly, but
+  renaming that message or the `addr` key breaks four integration tests for a reason unrelated to
+  realtime. **Task 12 builds its load-test fixture on this**, which is where returning the address
+  from a seam earns its cost.
+Task 11: also carried to Task 12 — **`runs.AppendEventsForTest` is NOT reachable from
+  `internal/app`** (it lives in a `_test.go` file), so the e2e test writes via
+  `runs.Service.AppendRuntimeEvent`. The load test will hit the same wall.
+Task 11: three ⚠️ cannot-verify items, none a gap: the lanes the controller and implementer ran;
+  `TailerConfig.Batch` being left defaulted has no observable behaviour and no test can pin it
+  (comments at both ends are the honest guard, and the implementer said so rather than claiming
+  coverage); and shutdown with a stream still in `prime`/`replay` is documented but untested —
+  correctly characterised, not covered.
+Task 11: ⚠️ the LSP produced FALSE compile errors a FIFTH time — a dozen undefined `store.Queries`
+  methods at `17e76b7` — while `go build ./...`, `go vet` and the full gate were all clean.
+
+Task 11: fix round 1/5 at `80579d9` (5 addressed — the false test-evidence claim, the sixth
+  duplicated default, three stale comments, the unbounded shutdown wait; commits
+  `17e76b7`..`80579d9`). **GATED: `GATE PASS … 80579d9`, 11 lanes resolved unnarrowed.**
+Task 11: ⚠️ **THE IMPLEMENTER REPORTED A SHA THAT DOES NOT EXIST — and the gate caught it by
+  REFUSING TO RUN.** It reported `3a9dcfa`; `git cat-file -t 3a9dcfa` says "Not a valid object
+  name" and the reflog shows exactly one commit with that subject and NO amend (`80579d9`). The
+  content was right; only the reference was wrong. **`scripts/gate` refused because it verifies the
+  named worktree is at the named sha** — precisely the failure it was written for, and the first
+  time on this plan it has fired. Had I passed `HEAD` instead of a literal, it would have gated
+  green and the report would still name a commit nobody could find. **A subagent-reported sha is
+  not evidence; only `git log` is** — the same lesson as verifying handoffs against git, one scale
+  down. The implementer was asked to correct the reference in the report and to touch nothing else.
+Task 11: **the implementer discarded its own first fix for I1 before shipping it.** Capturing the
+  backend PID only after the warm-up `Wait` PASSES under an eager-redial mutant, because the redial
+  happens inside that Wait. The shipped shape holds the waker across TWO deadlines and requires one
+  PID throughout; two mutants now redden it — dropping on deadline gives "the waker holds no
+  connection", dropping AND redialling eagerly gives "a poll deadline moved the listener from
+  backend 76 to 77".
+Task 11: **M1 answered by DELETION rather than by tie-back** — `defaultSnapshotEvents` was
+  unreachable (`Load` validates `>= 1`, every test call site passes an explicit positive), so the
+  duplication was removed instead of monitored. The right instinct: a guard that cannot fire is not
+  a guard.
+Task 11: it also fixed a stale comment **the review did not flag** — `realtime/api.New`'s own doc
+  made the same "mid-way through wiring" claim one paragraph above the branch that was flagged.
+Task 11: ⚠️ **M4 REFUSED, WITH A REASON THAT KILLS MY SUGGESTION OUTRIGHT.** I asked for the
+  unbounded `<-rt.done` to be bounded or documented. It documented and refused to bound, because a
+  bound is *dangerous in one case and false in the other*: abandoning the wait closes a pgx `Conn`
+  a live goroutine may still be reading (documented unsafe for concurrent use, `conn.go:65`) and
+  `Stop` cannot tell which state the tailer is in; and **a tailer stuck in `Wait` holds
+  `pgWaker.mu`, which the next step's `Close` takes — so the hang simply moves one line down.** My
+  bound would have fixed nothing while looking like it had. A real bound needs the waker
+  interruptible independently of its mutex, i.e. a `pgWaker` redesign, offered as a separate item.
+  **Seventh controller item wrong on this plan.**
+
+Task 11: **CORRECTION TO THE ENTRY ABOVE — the bad sha was NOT a transcription error, and the real
+  cause is better than my guess.** The implementer diagnosed it: after committing it ran
+  `git log -1 --format='%an <%ae>%n%n%B'`, which prints the author and the message and **no sha at
+  all**. It verified authorship and the absent AI trailer, then reported an identifier it had
+  never read. Nothing produced the string `3a9dcfa`. **That is I1 one level up — an evidence claim
+  with no evidence behind it, committed in the very round whose Important finding was exactly
+  that.** The right command was `git log -1 --format='%H %s'`. Also corrected: the REPORT never
+  contained the bad sha (it said only "on top of `17e76b7`"); the error lived solely in the chat
+  message, so the fix was an addition, not a substitution. **I inferred "mis-transcribed" from the
+  symptom and was wrong — separate a subagent's observation from your own inference too.**
+
+Task 11: scoped re-review of `17e76b7..80579d9` — I1, M1, M2, M3 **ADDRESSED**; M4
+  **REFUSED-AND-JUSTIFIED**. One Important and one Minor of new breakage, both in round 1's own
+  justifications. `git status` left empty.
+Task 11: **THE RE-REVIEW FALSIFIED HALF OF EACH OF ROUND 1's TWO ARGUMENTS — by probe, not by
+  argument.**
+  (a) **M4's refusal: lock half DEMONSTRATED, hazard half FALSE.** A probe parked a `Wait` on a
+  real database and `Close` blocked 3.30s until it returned — so "the hang moves one line down" is
+  real and my suggested bound would indeed have fixed nothing. But "abandoning closes a pgx `Conn`
+  a live goroutine may be reading" is impossible: every conn access is under `w.mu` and `Close`
+  takes it, **as `realtimeports.go:478-481` says in the same file**. Abandoning would cost another
+  hang (`pool.Close`), not a race. Conclusion right, stated mechanism wrong — the **seventh** false
+  safety claim on this plan and the **second written by a fix for a previous one**.
+  (b) **M1's "unreachable" was PARTLY WRONG.** `Load` validates `>= 1`, but `runServe` is called
+  with a hand-built `config.Config{}` (`serve_integration_test.go:39` → `serve.go:177`) and reaches
+  `newRealtimeEventSource` with 0. Probe: **0 events under watermark 3, versus 3 at 500.** Deleting
+  the guard left `SnapshotEvents` as the ONE realtime knob whose zero is broken rather than
+  defaulted — `NewHub`, `NewTailer` and `NewStreamer` all default a non-positive value with a
+  comment on why the zero fails SILENTLY. "No test sees it today" is the problem, not the
+  reassurance. **I endorsed the deletion; the endorsement was as wrong as the reasoning.**
+Task 11: I1's fix was verified BOTH WAYS by the re-reviewer's own mutant — it reddens the shipped
+  two-deadline PID test (backend 77→78) and **PASSES under the shape the implementer discarded**,
+  so the self-discard was correct on the merits.
+Task 11: **the `pgWaker` redesign is NOT warranted, and the reason is better than the offer.** Every
+  blocking call in `Tailer.Run` takes a context descended from the one `Stop` cancels
+  (`tailer.go:115,148-150,158`), so the wait is already bounded by cancellation. A `Warn` when the
+  wait runs long is the only thing worth adding — **carried to the FINAL REVIEW as new behaviour,
+  deliberately not folded into a fix round.**
+Task 11: fix round 2/5 dispatched — the false hazard sentence, and a zero `SnapshotEvents` that must
+  not silently yield empty snapshots. Also asked the implementer to make
+  `git log -1 --format='%H %s'` an explicit habit rather than a resolution, since its own diagnosis
+  of the phantom sha was that it reported an identifier it had never read.
+
+Task 11: fix round 2/5 at `01c4038` (2 addressed, 0 open — the false concurrent-use hazard and the
+  silently-broken zero `SnapshotEvents`; commits `80579d9`..`01c4038`). **GATED: `GATE PASS …
+  01c4038`, 11 lanes resolved unnarrowed.** Sha verified by the controller with
+  `git log -1 --format='%H %s'` before gating, after last round's phantom.
+Task 11: **the third attempt at the shutdown paragraph is the one that holds, and the re-review
+  checked BOTH hang shapes rather than the one cited.** Shape A: `Wait` holds `w.mu` across the
+  blocking read and `Close` takes it. Shape B: a drain reads via the pool
+  (`tailer.go:114` → `realtimeports.go:199`) and the deferred `pool.Close` at `serve.go:97` runs
+  LAST, LIFO after `rt.Stop` — citation verified verbatim at `pgxpool/pool.go:454-455` AND in the
+  implementation (`puddle pool.go:180` `destructWG.Wait`). **No third stuck state exists.** The
+  implementer's own diagnosis of its error: it reached for pgx's general "not safe for concurrent
+  usage" line instead of reading the mutual exclusion it had documented eleven lines above.
+Task 11: **the tie-back was verified in BOTH directions** — the re-reviewer ran the implementer's
+  mutant (app const → 250) AND wrote its own (`config.go:226` → 750); both RED. A tie-back tested
+  from one side only proves half of what it claims.
+Task 11: claim 3 verified by running the mutant rather than reasoning about it — deleting the guard
+  **compiles** (an unused const is legal Go) and fails at `realtimeports_test.go:297` with
+  "LIMIT 0, want 500". Asserting the RESULT rather than the constant is what makes it redden
+  instead of failing to build; a test that fails to compile under a mutation proves nothing.
+Task 11: the deliberately-omitted integration test is SOUND for what was asked —
+  `realtimeports_integration_test.go:464` pins constructor-arg→LIMIT against a real DB and the unit
+  test pins zero→500. The residual uncovered link (knob identity at `realtimeports.go:369`) cannot
+  reopen the finding, because every field is zero on that path so the guard fires regardless.
+Task 11: ⚠️ **the report's reason for not re-running m2-m9 was WRONG while its conclusion held** —
+  `bootServe` is called at `:293`, `:337` and `:369`, so m2 and m5's e2e half DO run through the
+  constructor. Inert at 500, so the conclusion stands. **Exactly the hazard named in the dispatch:
+  an anchor that still matches is not the same as a mutation that still proves its claim.**
+Task 11: two deferred minors, both comment/report level, no behavioural defect:
+  (a) `realtimeports.go:64-67` and `defaults_test.go:28-31` overstate why THIS tie-back is special
+  — the five in `internal/realtime` do have a running tie-back, and `defaults_test.go:8` imports
+  config itself, so "free to import config" separates production code only.
+  (b) the m2-m9 rationale above. → both to the final review.
+Task 11: **loop closed rather than a round 3, on the same test used at Task 10** — neither residual
+  has a behavioural consequence or a downstream consumer. And the pattern is now confirmed across
+  two tasks: **a justification written to correct a justification has been wrong in every round of
+  both**, so the class does not converge through fix rounds. A fresh read of the finished files at
+  the whole-branch review is the right instrument, not a fourth iteration.
+
+Task 11: **complete (commits `8c4d969`..`01c4038`, review Approved on the FIRST pass, clean after 2
+  fix rounds) and GATED: `GATE PASS … 01c4038`, 11 lanes resolved unnarrowed.** Gated three times —
+  `17e76b7` before review, `80579d9` and `01c4038` after each round.
+Task 11: **the realtime stack now runs as one process against a real database.** NOTIFY → tailer →
+  hub → splice → codec → socket is exercised end to end under `-race` on `postgres:18-alpine`.
