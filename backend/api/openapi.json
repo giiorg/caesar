@@ -1093,7 +1093,7 @@
     },
     "/api/v1/runs/{id}/events": {
       "get": {
-        "summary": "Poll a run's events after an id (view)",
+        "summary": "Poll a run's events after an id (view). With `Accept: text/event-stream` the same URL answers a server-sent stream instead — snapshot-then-deltas, resumed with Last-Event-ID — and every other Accept keeps this JSON poll. A stream whose principal loses access to the run ends with a terminal frame that carries NO id — `event: forbidden` with `data: {\"error\":\"forbidden\"}` — and then closes: the 200 is committed with the first byte, so a revocation can no longer be a 403.",
         "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
         "operationId": "listRunEvents",
         "parameters": [
@@ -1115,6 +1115,15 @@
               "description": "resource id (uuid)",
               "type": "string"
             }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "id of the last frame received; the text/event-stream response resumes above it",
+            "schema": {
+              "description": "id of the last frame received; the text/event-stream response resumes above it",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1124,6 +1133,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiRunEventsResponse"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/RealtimeStreamFrame"
                 }
               }
             }
@@ -1200,6 +1214,46 @@
           },
           "409": {
             "description": "Conflict",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stream": {
+      "get": {
+        "summary": "Server-sent stream of attention events (gates, publications, run lifecycle) on the projects the caller holds any grant on. Snapshot-then-deltas; resume with Last-Event-ID. Each frame's data: is one StreamFrame and its id: is the resume point. A stream whose principal loses access to what it shows ends with a terminal frame that carries NO id — `event: forbidden` with `data: {\"error\":\"forbidden\"}` — and then closes: the 200 is committed with the first byte, so a revocation can no longer be a 403.",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "streamAttention",
+        "parameters": [
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "id of the last frame received; the stream resumes above it",
+            "schema": {
+              "description": "id of the last frame received; the stream resumes above it",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/RealtimeStreamFrame"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3017,6 +3071,32 @@
         },
         "type": "object"
       },
+      "RealtimeStreamFrame": {
+        "properties": {
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": {},
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "run_id": {
+            "$ref": "#/components/schemas/UuidUUID"
+          }
+        },
+        "type": "object"
+      },
       "RunsPolicySnapshot": {
         "properties": {
           "allow_self_approval": {
@@ -3039,6 +3119,13 @@
           }
         },
         "type": "object"
+      },
+      "UuidUUID": {
+        "examples": [
+          "248df4b7-aa70-47b8-a036-33ac447e668d"
+        ],
+        "format": "uuid",
+        "type": "string"
       },
       "XerrorsFieldError": {
         "properties": {

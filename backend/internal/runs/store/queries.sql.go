@@ -1610,6 +1610,59 @@ func (q *Queries) ListArtifactsForRun(ctx context.Context, runID uuid.UUID) ([]L
 	return items, nil
 }
 
+const listAttentionEventsAfter = `-- name: ListAttentionEventsAfter :many
+SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id
+FROM run_events
+WHERE id > $1
+  AND kind LIKE ANY($2::text[])
+  AND ($3::bool OR project_id = ANY($4::uuid[]))
+ORDER BY id
+LIMIT $5
+`
+
+type ListAttentionEventsAfterParams struct {
+	After        int64
+	KindPatterns []string
+	AllProjects  bool
+	ProjectIds   []uuid.UUID
+	Lim          int32
+}
+
+// The global stream's replay page.
+func (q *Queries) ListAttentionEventsAfter(ctx context.Context, arg ListAttentionEventsAfterParams) ([]RunEvent, error) {
+	rows, err := q.db.Query(ctx, listAttentionEventsAfter,
+		arg.After,
+		arg.KindPatterns,
+		arg.AllProjects,
+		arg.ProjectIds,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RunEvent
+	for rows.Next() {
+		var i RunEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.ProjectID,
+			&i.Kind,
+			&i.Payload,
+			&i.OccurredAt,
+			&i.CorrelationID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listExpiredLeaseIDs = `-- name: ListExpiredLeaseIDs :many
 SELECT id FROM phase_runs WHERE status = 'running' AND leased_until <= now() LIMIT $1
 `
@@ -1838,6 +1891,109 @@ func (q *Queries) ListPublishIntentsForRun(ctx context.Context, runID uuid.UUID)
 	return items, nil
 }
 
+const listRecentAttentionEvents = `-- name: ListRecentAttentionEvents :many
+SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id
+FROM run_events
+WHERE kind LIKE ANY($1::text[])
+  AND ($2::bool OR project_id = ANY($3::uuid[]))
+ORDER BY id DESC
+LIMIT $4
+`
+
+type ListRecentAttentionEventsParams struct {
+	KindPatterns []string
+	AllProjects  bool
+	ProjectIds   []uuid.UUID
+	Lim          int32
+}
+
+// The global stream's snapshot. @kind_patterns comes from realtime's own
+// attention prefixes, so the SQL and Filter.Matches cannot drift apart.
+func (q *Queries) ListRecentAttentionEvents(ctx context.Context, arg ListRecentAttentionEventsParams) ([]RunEvent, error) {
+	rows, err := q.db.Query(ctx, listRecentAttentionEvents,
+		arg.KindPatterns,
+		arg.AllProjects,
+		arg.ProjectIds,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RunEvent
+	for rows.Next() {
+		var i RunEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.ProjectID,
+			&i.Kind,
+			&i.Payload,
+			&i.OccurredAt,
+			&i.CorrelationID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRecentRunEvents = `-- name: ListRecentRunEvents :many
+SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id
+FROM run_events
+WHERE run_id = $1
+  AND ($2::bool OR project_id = ANY($3::uuid[]))
+ORDER BY id DESC
+LIMIT $4
+`
+
+type ListRecentRunEventsParams struct {
+	RunID       uuid.UUID
+	AllProjects bool
+	ProjectIds  []uuid.UUID
+	Lim         int32
+}
+
+// A per-run snapshot: the most recent rows for one run, newest first, which
+// the caller reverses. Descending is what makes "most recent N" a LIMIT
+// rather than a full scan; it rides run_events_run_id_idx backwards.
+func (q *Queries) ListRecentRunEvents(ctx context.Context, arg ListRecentRunEventsParams) ([]RunEvent, error) {
+	rows, err := q.db.Query(ctx, listRecentRunEvents,
+		arg.RunID,
+		arg.AllProjects,
+		arg.ProjectIds,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RunEvent
+	for rows.Next() {
+		var i RunEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.ProjectID,
+			&i.Kind,
+			&i.Payload,
+			&i.OccurredAt,
+			&i.CorrelationID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunEventsAfter = `-- name: ListRunEventsAfter :many
 SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id FROM run_events WHERE run_id = $1 AND id > $2 ORDER BY id LIMIT $3
 `
@@ -1850,6 +2006,104 @@ type ListRunEventsAfterParams struct {
 
 func (q *Queries) ListRunEventsAfter(ctx context.Context, arg ListRunEventsAfterParams) ([]RunEvent, error) {
 	rows, err := q.db.Query(ctx, listRunEventsAfter, arg.RunID, arg.ID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RunEvent
+	for rows.Next() {
+		var i RunEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.ProjectID,
+			&i.Kind,
+			&i.Payload,
+			&i.OccurredAt,
+			&i.CorrelationID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunEventsForRunAfter = `-- name: ListRunEventsForRunAfter :many
+SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id
+FROM run_events
+WHERE run_id = $1
+  AND id > $2
+  AND ($3::bool OR project_id = ANY($4::uuid[]))
+ORDER BY id
+LIMIT $5
+`
+
+type ListRunEventsForRunAfterParams struct {
+	RunID       uuid.UUID
+	After       int64
+	AllProjects bool
+	ProjectIds  []uuid.UUID
+	Lim         int32
+}
+
+// A per-run replay page. ListRunEventsAfter is the same shape WITHOUT the
+// scope guard and serves the run-detail API, which authorizes at its own
+// edge; a stream authorizes per event, so it cannot share that query.
+func (q *Queries) ListRunEventsForRunAfter(ctx context.Context, arg ListRunEventsForRunAfterParams) ([]RunEvent, error) {
+	rows, err := q.db.Query(ctx, listRunEventsForRunAfter,
+		arg.RunID,
+		arg.After,
+		arg.AllProjects,
+		arg.ProjectIds,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RunEvent
+	for rows.Next() {
+		var i RunEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.ProjectID,
+			&i.Kind,
+			&i.Payload,
+			&i.OccurredAt,
+			&i.CorrelationID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunEventsSince = `-- name: ListRunEventsSince :many
+SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id
+FROM run_events
+WHERE id > $1
+ORDER BY id
+LIMIT $2
+`
+
+type ListRunEventsSinceParams struct {
+	After int64
+	Lim   int32
+}
+
+// The tailer's drain: everything past the cursor, filter-blind, because
+// fan-out is per subscriber.
+func (q *Queries) ListRunEventsSince(ctx context.Context, arg ListRunEventsSinceParams) ([]RunEvent, error) {
+	rows, err := q.db.Query(ctx, listRunEventsSince, arg.After, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
@@ -2501,6 +2755,49 @@ type MaxAttemptForNodeParams struct {
 func (q *Queries) MaxAttemptForNode(ctx context.Context, arg MaxAttemptForNodeParams) (int32, error) {
 	row := q.db.QueryRow(ctx, maxAttemptForNode, arg.RunID, arg.NodeID)
 	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const maxRunEventID = `-- name: MaxRunEventID :one
+
+SELECT coalesce(max(id), 0)::bigint FROM run_events
+`
+
+// The realtime read side (spec §4). Every one of these is consumed through
+// realtime.EventSource, implemented in internal/app; the realtime context
+// never sees this store. Three rules bind them all:
+//
+//   - ids are commit-ordered (allocated under the run_event_counter lock),
+//     so id order IS commit order and every cursor here rests on that;
+//   - the ASCENDING queries are ORDER BY id LIMIT n and never a truncation
+//     of another order — the tailer advances its cursor to the highest id it
+//     was handed, so a skipped lower id is stranded permanently;
+//   - the scope and kind predicates are the SQL spelling of
+//     realtime.Filter.Matches. Filtering after the LIMIT would silently
+//     truncate a page, so the guards live here and the kind patterns are
+//     passed in from realtime's own prefix list rather than repeated.
+//
+// @all_projects is the admin case: Scope.All means every project, which no
+// project-id list can express.
+// The current head: the watermark a snapshot is computed at, and the
+// tailer's startup cursor. 0 on an empty table.
+func (q *Queries) MaxRunEventID(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, maxRunEventID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const minRunEventID = `-- name: MinRunEventID :one
+SELECT coalesce(min(id), 0)::bigint FROM run_events
+`
+
+// The lowest retained id, which decides whether a Last-Event-ID is too old
+// to resume from. 0 on an empty table.
+func (q *Queries) MinRunEventID(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, minRunEventID)
+	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
 }

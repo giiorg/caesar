@@ -27,6 +27,7 @@ type Config struct {
 	Orchestrator Orchestrator `json:"orchestrator"`
 	Runner       Runner       `json:"runner"`
 	Forge        Forge        `json:"forge"`
+	Realtime     Realtime     `json:"realtime"`
 }
 
 type Server struct {
@@ -117,6 +118,45 @@ type Forge struct {
 	RequestTimeout Duration `json:"request_timeout"`
 }
 
+// Realtime tunes the SSE streams (spec §4). Heartbeat honours the tunnel's
+// idle timeout; SubscriberQueue bounds a slow client's cost — it is
+// disconnected rather than allowed to backpressure the tailer.
+//
+// Every default here is repeated as a literal inside internal/realtime, so
+// that a zero StreamerConfig/TailerConfig/HubConfig is usable rather than
+// broken. That is two definitions of one number and it is deliberate; what
+// keeps them equal is realtime's own defaults_test.go, which reads this
+// block. Move a number here and that test says so.
+type Realtime struct {
+	// HeartbeatInterval is how often an idle stream is padded with an SSE
+	// comment so the tunnel does not cull it.
+	HeartbeatInterval Duration `json:"heartbeat_interval"`
+	// PollFallback is how long the tailer waits for a LISTEN/NOTIFY wake-up
+	// before reading the table anyway. It is the worst-case latency of a
+	// notification that never arrived, and it is what carries correctness
+	// while the listener's connection is down — never disable it.
+	PollFallback Duration `json:"poll_fallback"`
+	// GrantRecheck is how often an open stream re-resolves its principal's
+	// scope, so it bounds how long a revoked grant keeps streaming.
+	GrantRecheck Duration `json:"grant_recheck"`
+	// SubscriberQueue is how many events one client may fall behind by
+	// before it is disconnected and told to resume from Last-Event-ID.
+	SubscriberQueue int `json:"subscriber_queue"`
+	// ReplayBatch caps ONE catch-up page — an I/O chunk size, invisible to a
+	// client except as the number of round trips its catch-up takes.
+	ReplayBatch int `json:"replay_batch"`
+	// SnapshotEvents is how much history a stream opens with: the most recent
+	// N matching events, before any catch-up.
+	//
+	// It is NOT ReplayBatch and must not be folded into it even though both
+	// default to 500. This one is what a client SEES on connect — a product
+	// decision about how far back a freshly opened view goes — while
+	// ReplayBatch is only how many rows one query fetches. Tying them would
+	// mean an operator who halved a page size silently halved everyone's
+	// backlog.
+	SnapshotEvents int `json:"snapshot_events"`
+}
+
 // minRunnerPids floors pids_limit well above a shell + agent's needs so an
 // operator can't accidentally starve the container's process table.
 // maxRunnerPids caps it (plan Global Constraints) so the process table can't
@@ -176,6 +216,14 @@ func defaults() Config {
 			GitLabCloneBaseURL: "https://gitlab.com",
 			PublishWorkDir:     "/var/lib/caesar/publish",
 			RequestTimeout:     Duration(30 * time.Second),
+		},
+		Realtime: Realtime{
+			HeartbeatInterval: Duration(20 * time.Second),
+			PollFallback:      Duration(2 * time.Second),
+			GrantRecheck:      Duration(30 * time.Second),
+			SubscriberQueue:   256,
+			ReplayBatch:       500,
+			SnapshotEvents:    500,
 		},
 	}
 }
@@ -355,6 +403,30 @@ func (c Config) validate() error {
 	}
 	if c.Forge.RequestTimeout.Std() <= 0 {
 		problems = append(problems, "forge.request_timeout must be positive")
+	}
+	// Realtime: each knob is a liveness property of a long-lived stream, and
+	// the failure of a zero is silent rather than loud — a zero heartbeat is
+	// a busy loop, a zero queue disconnects every subscriber on its first
+	// event, a zero replay batch never finishes catching up, and a zero
+	// snapshot opens every stream on an empty backlog, which reads to the
+	// client as a run with no history.
+	if c.Realtime.HeartbeatInterval.Std() <= 0 {
+		problems = append(problems, "realtime.heartbeat_interval must be positive")
+	}
+	if c.Realtime.PollFallback.Std() <= 0 {
+		problems = append(problems, "realtime.poll_fallback must be positive")
+	}
+	if c.Realtime.GrantRecheck.Std() <= 0 {
+		problems = append(problems, "realtime.grant_recheck must be positive")
+	}
+	if c.Realtime.SubscriberQueue < 1 {
+		problems = append(problems, "realtime.subscriber_queue must be positive")
+	}
+	if c.Realtime.ReplayBatch < 1 {
+		problems = append(problems, "realtime.replay_batch must be positive")
+	}
+	if c.Realtime.SnapshotEvents < 1 {
+		problems = append(problems, "realtime.snapshot_events must be positive")
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))

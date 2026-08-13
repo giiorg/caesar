@@ -1,0 +1,164 @@
+diff --git a/backend/caesar.dev.json b/backend/caesar.dev.json
+index f21e407..e8f861d 100644
+--- a/backend/caesar.dev.json
++++ b/backend/caesar.dev.json
+@@ -3,5 +3,12 @@
+   "database": {"url": "postgres://caesar:caesar@localhost:5432/caesar_dev?sslmode=disable"},
+   "log": {"level": "debug"},
+   "security": {"master_key": "dev:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+-  "forge": {"publish_work_dir": "/tmp/caesar-publish"}
++  "forge": {"publish_work_dir": "/tmp/caesar-publish"},
++  "realtime": {
++    "heartbeat_interval": "20s",
++    "poll_fallback": "2s",
++    "grant_recheck": "30s",
++    "subscriber_queue": 256,
++    "replay_batch": 500
++  }
+ }
+diff --git a/backend/internal/platform/config/config.go b/backend/internal/platform/config/config.go
+index 3023f56..90ff412 100644
+--- a/backend/internal/platform/config/config.go
++++ b/backend/internal/platform/config/config.go
+@@ -27,6 +27,7 @@ type Config struct {
+ 	Orchestrator Orchestrator `json:"orchestrator"`
+ 	Runner       Runner       `json:"runner"`
+ 	Forge        Forge        `json:"forge"`
++	Realtime     Realtime     `json:"realtime"`
+ }
+ 
+ type Server struct {
+@@ -117,6 +118,17 @@ type Forge struct {
+ 	RequestTimeout Duration `json:"request_timeout"`
+ }
+ 
++// Realtime tunes the SSE streams (spec §4). Heartbeat honours the tunnel's
++// idle timeout; SubscriberQueue bounds a slow client's cost — it is
++// disconnected rather than allowed to backpressure the tailer.
++type Realtime struct {
++	HeartbeatInterval Duration `json:"heartbeat_interval"`
++	PollFallback      Duration `json:"poll_fallback"`
++	GrantRecheck      Duration `json:"grant_recheck"`
++	SubscriberQueue   int      `json:"subscriber_queue"`
++	ReplayBatch       int      `json:"replay_batch"`
++}
++
+ // minRunnerPids floors pids_limit well above a shell + agent's needs so an
+ // operator can't accidentally starve the container's process table.
+ // maxRunnerPids caps it (plan Global Constraints) so the process table can't
+@@ -177,6 +189,13 @@ func defaults() Config {
+ 			PublishWorkDir:     "/var/lib/caesar/publish",
+ 			RequestTimeout:     Duration(30 * time.Second),
+ 		},
++		Realtime: Realtime{
++			HeartbeatInterval: Duration(20 * time.Second),
++			PollFallback:      Duration(2 * time.Second),
++			GrantRecheck:      Duration(30 * time.Second),
++			SubscriberQueue:   256,
++			ReplayBatch:       500,
++		},
+ 	}
+ }
+ 
+@@ -356,6 +375,25 @@ func (c Config) validate() error {
+ 	if c.Forge.RequestTimeout.Std() <= 0 {
+ 		problems = append(problems, "forge.request_timeout must be positive")
+ 	}
++	// Realtime: each knob is a liveness property of a long-lived stream, and
++	// the failure of a zero is silent rather than loud — a zero heartbeat is
++	// a busy loop, a zero queue disconnects every subscriber on its first
++	// event, a zero replay batch never finishes catching up.
++	if c.Realtime.HeartbeatInterval.Std() <= 0 {
++		problems = append(problems, "realtime.heartbeat_interval must be positive")
++	}
++	if c.Realtime.PollFallback.Std() <= 0 {
++		problems = append(problems, "realtime.poll_fallback must be positive")
++	}
++	if c.Realtime.GrantRecheck.Std() <= 0 {
++		problems = append(problems, "realtime.grant_recheck must be positive")
++	}
++	if c.Realtime.SubscriberQueue < 1 {
++		problems = append(problems, "realtime.subscriber_queue must be positive")
++	}
++	if c.Realtime.ReplayBatch < 1 {
++		problems = append(problems, "realtime.replay_batch must be positive")
++	}
+ 	if len(problems) > 0 {
+ 		return errors.New(strings.Join(problems, "; "))
+ 	}
+diff --git a/backend/internal/platform/config/config_test.go b/backend/internal/platform/config/config_test.go
+index 59bb5cc..ecb4e80 100644
+--- a/backend/internal/platform/config/config_test.go
++++ b/backend/internal/platform/config/config_test.go
+@@ -376,6 +376,71 @@ func TestConfig_ForgeDefaultsAndValidation(t *testing.T) {
+ 	})
+ }
+ 
++func TestConfig_RealtimeDefaultsAndValidation(t *testing.T) {
++	t.Run("defaults when block absent", func(t *testing.T) {
++		cfg, err := Load(writeFile(t, `{"database": {"url": "postgres://x"}}`))
++		if err != nil {
++			t.Fatal(err)
++		}
++		// heartbeat_interval is pinned at 20s because spec §4 makes ~20s the
++		// tunnel's idle obligation: raise it and idle streams get culled by
++		// the proxy, which reads to a client as a flapping connection.
++		want := Realtime{
++			HeartbeatInterval: Duration(20 * time.Second),
++			PollFallback:      Duration(2 * time.Second),
++			GrantRecheck:      Duration(30 * time.Second),
++			SubscriberQueue:   256,
++			ReplayBatch:       500,
++		}
++		if diff := cmp.Diff(want, cfg.Realtime); diff != "" {
++			t.Errorf("realtime defaults (-want +got):\n%s", diff)
++		}
++	})
++
++	t.Run("an explicit block round-trips", func(t *testing.T) {
++		body := `{"database": {"url": "postgres://x"}, "realtime": {` +
++			`"heartbeat_interval": "5s", "poll_fallback": "250ms", "grant_recheck": "1m", ` +
++			`"subscriber_queue": 32, "replay_batch": 100}}`
++		cfg, err := Load(writeFile(t, body))
++		if err != nil {
++			t.Fatal(err)
++		}
++		want := Realtime{
++			HeartbeatInterval: Duration(5 * time.Second),
++			PollFallback:      Duration(250 * time.Millisecond),
++			GrantRecheck:      Duration(time.Minute),
++			SubscriberQueue:   32,
++			ReplayBatch:       100,
++		}
++		if diff := cmp.Diff(want, cfg.Realtime); diff != "" {
++			t.Errorf("realtime block (-want +got):\n%s", diff)
++		}
++	})
++
++	t.Run("fails closed", func(t *testing.T) {
++		// Every knob here is a liveness property, and zero is the value a
++		// half-filled block produces: a zero heartbeat is a busy loop, a zero
++		// queue drops every subscriber on its first event.
++		tests := []struct{ name, block, wantErr string }{
++			{"zero heartbeat", `{"heartbeat_interval": "0s"}`, "realtime.heartbeat_interval"},
++			{"negative poll fallback", `{"poll_fallback": "-1s"}`, "realtime.poll_fallback"},
++			{"zero grant recheck", `{"grant_recheck": "0s"}`, "realtime.grant_recheck"},
++			{"zero subscriber queue", `{"subscriber_queue": 0}`, "realtime.subscriber_queue"},
++			{"negative replay batch", `{"replay_batch": -1}`, "realtime.replay_batch"},
++			{"unknown key inside realtime", `{"wat": 1}`, "unknown field"},
++		}
++		for _, tt := range tests {
++			t.Run(tt.name, func(t *testing.T) {
++				body := `{"database": {"url": "postgres://x"}, "realtime": ` + tt.block + `}`
++				_, err := Load(writeFile(t, body))
++				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
++					t.Fatalf("err = %v, want mention of %q", err, tt.wantErr)
++				}
++			})
++		}
++	})
++}
++
+ func TestStageEnvFromProcess_ForwardsOnlyTheGitAuthKeysThatAreSet(t *testing.T) {
+ 	t.Setenv("GIT_CONFIG_COUNT", "1")
+ 	t.Setenv("GIT_CONFIG_KEY_0", "http.extraheader")

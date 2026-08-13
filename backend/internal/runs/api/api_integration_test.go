@@ -6,12 +6,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +30,9 @@ import (
 	runsapi "github.com/giiorg/caesar/backend/internal/runs/api"
 	"github.com/giiorg/caesar/backend/internal/runs/fake"
 )
+
+// patience bounds a request that could stream. See get.
+const patience = 5 * time.Second
 
 // fakePorts implements the authn ports and GrantSource without identity:
 // runs tests may never import the identity context (arch law). Real
@@ -177,7 +182,58 @@ func seedUser(t *testing.T, pool *pgxpool.Pool, email string, role authn.Role) a
 	return authn.Principal{UserID: id, Email: email, Role: role}
 }
 
+// fakeStreamServer answers the outbound stream port. runs must never import
+// realtime (bounded contexts are peers), so this double writes SSE bytes of
+// its own rather than borrowing the real codec — which also keeps these tests
+// about NEGOTIATION and nothing else.
+type fakeStreamServer struct {
+	mu    sync.Mutex
+	calls []streamCall
+	// err is what the port reports. The port's contract is that an error means
+	// NOTHING was written yet, so this double writes nothing when err is set.
+	err error
+}
+
+type streamCall struct {
+	RunID       uuid.UUID
+	UserID      uuid.UUID
+	LastEventID int64
+	HasLastID   bool
+}
+
+func (f *fakeStreamServer) ServeRunStream(
+	_ context.Context, w http.ResponseWriter, runID, userID uuid.UUID, lastEventID int64, hasLastID bool,
+) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, streamCall{RunID: runID, UserID: userID, LastEventID: lastEventID, HasLastID: hasLastID})
+	err := f.err
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "id: 1\nevent: run.created\ndata: {\"id\":1}\n\n")
+	return nil
+}
+
+func (f *fakeStreamServer) served() []streamCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]streamCall(nil), f.calls...)
+}
+
 func newHarness(t *testing.T) *harness {
+	t.Helper()
+	return newHarnessWithStreams(t, &fakeStreamServer{})
+}
+
+// newHarnessWithStreams is newHarness with the outbound stream port supplied:
+// the negotiation tests need to see what the port was handed, and one of them
+// needs the port MISSING.
+func newHarnessWithStreams(t *testing.T, streams runsapi.StreamServer) *harness {
 	t.Helper()
 	ctx := context.Background()
 	pool := testdb.New(t)
@@ -255,7 +311,7 @@ func newHarness(t *testing.T) *harness {
 		fake.NewPublisher(nil), ports, runs.Params{Snapshot: runs.DefaultSnapshot()})
 
 	mux := http.NewServeMux()
-	httpx.Mount(mux, runsapi.Operations(runsapi.New(svc, h.ports, h.ports, h.ports)))
+	httpx.Mount(mux, runsapi.Operations(runsapi.New(svc, h.ports, h.ports, h.ports, streams)))
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	h.srv = httptest.NewServer(httpx.Chain(mux, httpx.WithCorrelationID, httpx.AccessLog(log), httpx.CheckOrigin("http://caesar.test")))
 	t.Cleanup(h.srv.Close)
@@ -281,6 +337,44 @@ func (h *harness) do(t *testing.T, method, path, token string, body any) *http.R
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+// get is do for a request whose HEADERS are the subject: no body, no
+// Content-Type of its own, and whatever Accept or Last-Event-ID the caller
+// wants tested.
+//
+// It carries a deadline and do does not, and the asymmetry is the whole reason
+// it is written out here. This is the only helper that can reach the streaming
+// branch, and a real stream handler RETURNS ONLY WHEN THE CLIENT GOES AWAY.
+// Nothing hangs in THIS suite, because fakeStreamServer answers and returns —
+// but the port now carries the live Streamer in internal/app, so the shape
+// under test is one that does not return, and a negotiation test without a
+// deadline is one substituted double away from a suite timeout with no name on
+// it. The deadline turns "it never answered" into a named failure at patience.
+// The neighbouring realtime/api package has the same helper for the same
+// reason.
+func (h *harness) get(t *testing.T, path, token string, headers http.Header) *http.Response {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), patience)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.srv.URL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Cookie", authn.SessionCookie+"="+token)
+	}
+	for k, vs := range headers {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
 	}
 	t.Cleanup(func() { resp.Body.Close() })
 	return resp
@@ -795,6 +889,179 @@ func TestRunsAPI_ListRunEventsPagesByID(t *testing.T) {
 			t.Errorf("errors = %+v, want one blaming after", pd.Errors)
 		}
 	})
+}
+
+// The poll's wire shape is a published contract, and content negotiation is
+// only allowed to ADD a branch to this endpoint. The assertion is the exact
+// bytes rather than "still decodes as JSON": only field names, field order and
+// the absence of new fields make a client's parser keep working, and only a
+// literal pins all three.
+func TestRunsAPI_ListRunEventsAcceptJSONStillPolls(t *testing.T) {
+	streams := &fakeStreamServer{}
+	h := newHarnessWithStreams(t, streams)
+	task := h.createTask(t, "admin-tok", "poll me")
+
+	resp := h.get(t, "/api/v1/runs/"+task.LatestRunID+"/events", "viewer-tok", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("events = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got runsapi.RunEventsResponse
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("body %q is not a RunEventsResponse: %v", raw, err)
+	}
+	if len(got.Events) != 1 {
+		t.Fatalf("events = %+v, want exactly the one run.created", got.Events)
+	}
+	// The id and the timestamp are the database's; the FIELD NAMES around them
+	// are what this test exists to pin, so they are literals here.
+	payload, err := json.Marshal(got.Events[0].Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurred, err := json.Marshal(got.Events[0].OccurredAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf(`{"events":[{"id":%d,"kind":"run.created","payload":%s,"occurred_at":%s}]}`,
+		got.Events[0].ID, payload, occurred)
+	if body := strings.TrimSpace(string(raw)); body != want {
+		t.Errorf("the poll response moved:\n got %s\nwant %s", body, want)
+	}
+	if calls := streams.served(); len(calls) != 0 {
+		t.Errorf("the poll reached the stream port: %+v", calls)
+	}
+}
+
+func TestRunsAPI_ListRunEventsAcceptEventStreamStreams(t *testing.T) {
+	streams := &fakeStreamServer{}
+	h := newHarnessWithStreams(t, streams)
+	task := h.createTask(t, "admin-tok", "stream me")
+
+	resp := h.get(t, "/api/v1/runs/"+task.LatestRunID+"/events", "viewer-tok", http.Header{
+		"Accept":        {"text/event-stream"},
+		"Last-Event-ID": {"12"},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "id: 1\n") {
+		t.Errorf("body = %q, want the stream's frames", body)
+	}
+
+	calls := streams.served()
+	if len(calls) != 1 {
+		t.Fatalf("stream port calls = %+v, want exactly one", calls)
+	}
+	wantRun, err := uuid.Parse(task.LatestRunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := streamCall{RunID: wantRun, UserID: h.viewer.UserID, LastEventID: 12, HasLastID: true}
+	if calls[0] != want {
+		t.Errorf("stream port call = %+v, want %+v", calls[0], want)
+	}
+}
+
+// A client that spells out that it does NOT want a stream must not be given
+// one — which is the whole reason the Accept header is parsed rather than
+// searched for a substring.
+func TestRunsAPI_ListRunEventsQZeroTakesJSON(t *testing.T) {
+	streams := &fakeStreamServer{}
+	h := newHarnessWithStreams(t, streams)
+	task := h.createTask(t, "admin-tok", "poll me too")
+
+	resp := h.get(t, "/api/v1/runs/"+task.LatestRunID+"/events", "viewer-tok", http.Header{
+		"Accept": {"application/json, text/event-stream;q=0"},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("events = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if got := decodeInto[runsapi.RunEventsResponse](t, resp); len(got.Events) != 1 {
+		t.Errorf("events = %+v, want the one run.created", got.Events)
+	}
+	if calls := streams.served(); len(calls) != 0 {
+		t.Errorf("a q=0 refusal still reached the stream port: %+v", calls)
+	}
+}
+
+// A missing stream port is a WIRING omission. Answering the poll instead would
+// make it invisible: the endpoint would look like it works, and the streaming
+// half would simply never exist.
+func TestRunsAPI_ListRunEventsWithoutAStreamServerIs500(t *testing.T) {
+	h := newHarnessWithStreams(t, nil)
+	task := h.createTask(t, "admin-tok", "unwired")
+	path := "/api/v1/runs/" + task.LatestRunID + "/events"
+
+	resp := h.get(t, path, "viewer-tok", http.Header{"Accept": {"text/event-stream"}})
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("unwired stream = %d, want 500", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want application/problem+json", got)
+	}
+	if pd := decodeInto[httpx.ProblemDetails](t, resp); pd.Status != http.StatusInternalServerError {
+		t.Errorf("problem status = %d, want 500", pd.Status)
+	}
+	// And the poll is untouched by the omission.
+	if got := h.get(t, path, "viewer-tok", nil); got.StatusCode != http.StatusOK {
+		t.Errorf("poll = %d, want 200", got.StatusCode)
+	}
+}
+
+// Negotiation happens INSIDE the authorized handler, so every answer the poll
+// gives for a run the caller may not see, the stream gives too.
+func TestRunsAPI_ListRunEventsStreamStillEnforcesTheGrant(t *testing.T) {
+	streams := &fakeStreamServer{}
+	h := newHarnessWithStreams(t, streams)
+	task := h.createTask(t, "admin-tok", "not yours")
+
+	resp := h.get(t, "/api/v1/runs/"+task.LatestRunID+"/events", "outsider-tok", http.Header{
+		"Accept": {"text/event-stream"},
+	})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("outsider stream = %d, want 403", resp.StatusCode)
+	}
+	if calls := streams.served(); len(calls) != 0 {
+		t.Errorf("an unauthorized stream reached the port: %+v", calls)
+	}
+}
+
+func TestRunsAPI_ListRunEventsRejectsAMalformedLastEventID(t *testing.T) {
+	streams := &fakeStreamServer{}
+	h := newHarnessWithStreams(t, streams)
+	task := h.createTask(t, "admin-tok", "bad resume")
+
+	resp := h.get(t, "/api/v1/runs/"+task.LatestRunID+"/events", "viewer-tok", http.Header{
+		"Accept":        {"text/event-stream"},
+		"Last-Event-ID": {"soon"},
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("junk resume = %d, want 400", resp.StatusCode)
+	}
+	pd := decodeInto[httpx.ProblemDetails](t, resp)
+	if len(pd.Errors) != 1 || pd.Errors[0].Field != "Last-Event-ID" {
+		t.Errorf("errors = %+v, want one blaming Last-Event-ID", pd.Errors)
+	}
+	if calls := streams.served(); len(calls) != 0 {
+		t.Errorf("a malformed resume reached the port: %+v", calls)
+	}
 }
 
 func TestAPI_GateDecisionRequiresApproveGrant(t *testing.T) {

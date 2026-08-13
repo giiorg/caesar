@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,6 +25,7 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/logging"
 	"github.com/giiorg/caesar/backend/internal/platform/pg"
 	"github.com/giiorg/caesar/backend/internal/platform/secrets"
+	realtimeapi "github.com/giiorg/caesar/backend/internal/realtime/api"
 	"github.com/giiorg/caesar/backend/internal/runs"
 	runsapi "github.com/giiorg/caesar/backend/internal/runs/api"
 	"github.com/giiorg/caesar/backend/internal/workflows"
@@ -84,6 +86,17 @@ func probeWritable(dir string) error {
 	}
 	return nil
 }
+
+// msgListening is logged once the listener is bound, and it is where the port
+// is written down: with addr ":0" the configured address is not the address,
+// so an operator — and the integration fixture's awaitListening — reads the
+// real one from this line. Named once so that renaming the message is a single
+// edit the fixture follows, rather than eight integration tests going red over
+// a string.
+//
+// Only the message can be shared this way. The "addr" key below is read back
+// through a struct tag, and a struct tag cannot be a const.
+const msgListening = "http server listening"
 
 // runServe boots the control plane: connect, migrate (advisory-locked),
 // serve HTTP until ctx is cancelled, then drain within the shutdown timeout.
@@ -162,7 +175,30 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
 		forgeSvc, publisher, principalSource{svc: svc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
-	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc))...)
+
+	// Realtime (spec §4): ONE tailer, ONE hub, ONE Streamer for the whole
+	// process, started before anything can serve a request against them.
+	//
+	// ONE grant resolver, for the same reason the forge endpoints are built
+	// once: it answers both "what may this principal see" at stream open and
+	// the re-check that runs for the life of every subscription, and the two
+	// answers diverging is a stream that shows what the opener was allowed
+	// rather than what the principal is allowed now.
+	streamGrants := realtimeGrants{svc: svc}
+	rt := startRealtime(ctx, pool, cfg.Database.URL, cfg.Realtime, streamGrants, log)
+	// On every return path. The shutdown block below calls it in its proper
+	// place and Stop is idempotent, so this only covers the early returns —
+	// where the alternative is a tailer goroutine and a dedicated database
+	// connection outliving the function that made them.
+	defer rt.Stop()
+
+	// ONE realtime surface behind two URLs. The attention stream is its own
+	// endpoint; the per-run stream is reached through the runs endpoint that
+	// already owns that URL, behind runs/api's StreamServer port, because runs
+	// and realtime are peers and neither may name the other.
+	streams := realtimeapi.New(rt.streamer, svc, streamGrants, log)
+	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc, streams))...)
+	ops = append(ops, realtimeapi.Operations(streams)...)
 
 	// Plan 06: the real Docker runner when configured. Disabled by default —
 	// it needs a Docker daemon, built images and a writable data root, so the
@@ -193,7 +229,9 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	go func() { defer close(orchDone); _ = orch.Run(ctx) }()
 
 	srv := &http.Server{
-		Addr:              cfg.Server.Addr,
+		// No Addr: Serve takes the listener below, and only ListenAndServe
+		// would read this field. Leaving it set would be a second answer to
+		// "which address is this" that nothing consults.
 		Handler:           Routes(log, pool, ops, cfg.Server.AppOrigin),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -201,19 +239,53 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		// long-lived responses.
 	}
 
+	// Bound the listener HERE rather than inside ListenAndServe, for two
+	// reasons. A port that cannot be bound is a boot failure and now reads as
+	// one, instead of arriving on errCh after the process has already claimed
+	// to be listening. And with the port left to the operating system —
+	// addr ":0", which the integration tests use so they never collide — the
+	// configured address is not the address, so the log line would otherwise
+	// record a port nothing is on.
+	ln, err := net.Listen("tcp", cfg.Server.Addr)
+	if err != nil {
+		return fmt.Errorf("http server: listen %s: %w", cfg.Server.Addr, err)
+	}
+	// Shutdown closes it on the ordinary path; this is for the returns that
+	// never get there.
+	defer func() { _ = ln.Close() }()
+
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("http server listening", "addr", cfg.Server.Addr, "version", buildinfo.Version)
-		errCh <- srv.ListenAndServe()
+		log.Info(msgListening, "addr", ln.Addr().String(), "version", buildinfo.Version)
+		errCh <- srv.Serve(ln)
 	}()
 
 	select {
 	case err := <-errCh:
 		return fmt.Errorf("http server: %w", err)
+	case err := <-rt.failed:
+		// A tailer that could not seed its cursor never started, and a process
+		// that serves streams which snapshot and then go silent forever is
+		// worse than one that exits — see runTailer.
+		return err
 	case <-ctx.Done():
 	}
 
 	log.Info("shutting down", "timeout", cfg.Server.ShutdownTimeout.Std().String())
+	// REALTIME FIRST, and this is the part that gets written the wrong way
+	// round. Shutdown waits for every active connection to finish, and an SSE
+	// connection does not finish on its own: it is a response that stays open
+	// until something ends it. Shutting the server down first would therefore
+	// wait out the whole ShutdownTimeout on every deploy with a stream open.
+	// Closing the hub ends those subscriptions, the handlers return, and
+	// Shutdown then completes promptly. Stop's own internal order is
+	// load-bearing too — see there.
+	//
+	// It does not close EVERY stream: one still in its snapshot or catch-up
+	// phase is not watching the subscription channel yet and only finds out
+	// when it reaches the live loop, so Shutdown can still wait on a
+	// catching-up client, bounded by ShutdownTimeout.
+	rt.Stop()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Std())
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

@@ -226,3 +226,63 @@ func TestAppendRuntimeEvent_OwnTxProjectScopedAndOrdered(t *testing.T) {
 		t.Errorf("outbox rows = %d, want 2", outbox)
 	}
 }
+
+// The wake-up signal pins both halves of its contract: a committed append
+// wakes a listener, and a rolled-back one does not. The second half is the
+// one worth having — a tailer woken for an event that never committed
+// would advance its cursor past a gap. The payload is asserted empty
+// because LISTEN/NOTIFY is a wake-up signal and never the data.
+func TestAppendEvents_NotifiesOnCommitOnly(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	_, runID := f.newRunRow(t, "running")
+
+	// The listener holds a connection of its own: a pooled one may be
+	// handed to another caller between LISTEN and the wait.
+	lc, err := f.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Release()
+	if _, err := lc.Exec(ctx, `LISTEN caesar_run_events`); err != nil {
+		t.Fatal(err)
+	}
+
+	appendOne := func(tx pgx.Tx) error {
+		return runs.AppendEventsForTest(ctx, tx, time.Now().UTC(), []runs.Event{
+			{RunID: runID, ProjectID: f.projectID, Kind: runs.EventRunStarted},
+		})
+	}
+
+	if err := pg.WithTx(ctx, f.pool, appendOne); err != nil {
+		t.Fatal(err)
+	}
+	wake, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	n, err := lc.Conn().WaitForNotification(wake)
+	if err != nil {
+		t.Fatalf("commit did not wake the listener: %v", err)
+	}
+	if n.Channel != "caesar_run_events" {
+		t.Errorf("channel = %q, want caesar_run_events", n.Channel)
+	}
+	if n.Payload != "" {
+		t.Errorf("payload = %q, want empty: the channel carries no data", n.Payload)
+	}
+
+	boom := errors.New("boom")
+	err = pg.WithTx(ctx, f.pool, func(tx pgx.Tx) error {
+		if err := appendOne(tx); err != nil {
+			return err
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("tx err = %v, want boom", err)
+	}
+	quiet, cancelQuiet := context.WithTimeout(ctx, time.Second)
+	defer cancelQuiet()
+	if n, err := lc.Conn().WaitForNotification(quiet); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("rolled-back append notified (%+v, err %v): the woken tailer would advance its cursor past a gap", n, err)
+	}
+}

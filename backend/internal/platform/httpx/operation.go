@@ -13,6 +13,11 @@ type Operation struct {
 	Request  any // zero value of the request body struct; nil = no body
 	Response any // zero value of the success response struct; nil = no body
 	Status   int // success status code
+	// ResponseContentType overrides the success response media type.
+	// Empty means "application/json". Set it for endpoints that do not
+	// answer with a JSON body — SSE streams declare "text/event-stream"
+	// so the published contract matches what the handler actually writes.
+	ResponseContentType string
 	// Errors are the additional non-2xx statuses this endpoint really answers
 	// with. 400 is documented on every operation; list only the extras. It
 	// lives here rather than in the generator because an endpoint's answer set

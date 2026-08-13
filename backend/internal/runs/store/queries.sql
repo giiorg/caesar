@@ -303,6 +303,85 @@ VALUES ($1, $2, $3, $4);
 -- name: ListRunEventsAfter :many
 SELECT * FROM run_events WHERE run_id = $1 AND id > $2 ORDER BY id LIMIT $3;
 
+-- The realtime read side (spec §4). Every one of these is consumed through
+-- realtime.EventSource, implemented in internal/app; the realtime context
+-- never sees this store. Three rules bind them all:
+--
+--   * ids are commit-ordered (allocated under the run_event_counter lock),
+--     so id order IS commit order and every cursor here rests on that;
+--   * the ASCENDING queries are ORDER BY id LIMIT n and never a truncation
+--     of another order — the tailer advances its cursor to the highest id it
+--     was handed, so a skipped lower id is stranded permanently;
+--   * the scope and kind predicates are the SQL spelling of
+--     realtime.Filter.Matches. Filtering after the LIMIT would silently
+--     truncate a page, so the guards live here and the kind patterns are
+--     passed in from realtime's own prefix list rather than repeated.
+--
+-- @all_projects is the admin case: Scope.All means every project, which no
+-- project-id list can express.
+
+-- name: MaxRunEventID :one
+-- The current head: the watermark a snapshot is computed at, and the
+-- tailer's startup cursor. 0 on an empty table.
+SELECT coalesce(max(id), 0)::bigint FROM run_events;
+
+-- name: MinRunEventID :one
+-- The lowest retained id, which decides whether a Last-Event-ID is too old
+-- to resume from. 0 on an empty table.
+SELECT coalesce(min(id), 0)::bigint FROM run_events;
+
+-- name: ListRunEventsSince :many
+-- The tailer's drain: everything past the cursor, filter-blind, because
+-- fan-out is per subscriber.
+SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id
+FROM run_events
+WHERE id > @after
+ORDER BY id
+LIMIT @lim;
+
+-- name: ListRecentRunEvents :many
+-- A per-run snapshot: the most recent rows for one run, newest first, which
+-- the caller reverses. Descending is what makes "most recent N" a LIMIT
+-- rather than a full scan; it rides run_events_run_id_idx backwards.
+SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id
+FROM run_events
+WHERE run_id = @run_id
+  AND (@all_projects::bool OR project_id = ANY(@project_ids::uuid[]))
+ORDER BY id DESC
+LIMIT @lim;
+
+-- name: ListRunEventsForRunAfter :many
+-- A per-run replay page. ListRunEventsAfter is the same shape WITHOUT the
+-- scope guard and serves the run-detail API, which authorizes at its own
+-- edge; a stream authorizes per event, so it cannot share that query.
+SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id
+FROM run_events
+WHERE run_id = @run_id
+  AND id > @after
+  AND (@all_projects::bool OR project_id = ANY(@project_ids::uuid[]))
+ORDER BY id
+LIMIT @lim;
+
+-- name: ListRecentAttentionEvents :many
+-- The global stream's snapshot. @kind_patterns comes from realtime's own
+-- attention prefixes, so the SQL and Filter.Matches cannot drift apart.
+SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id
+FROM run_events
+WHERE kind LIKE ANY(@kind_patterns::text[])
+  AND (@all_projects::bool OR project_id = ANY(@project_ids::uuid[]))
+ORDER BY id DESC
+LIMIT @lim;
+
+-- name: ListAttentionEventsAfter :many
+-- The global stream's replay page.
+SELECT id, run_id, project_id, kind, payload, occurred_at, correlation_id
+FROM run_events
+WHERE id > @after
+  AND kind LIKE ANY(@kind_patterns::text[])
+  AND (@all_projects::bool OR project_id = ANY(@project_ids::uuid[]))
+ORDER BY id
+LIMIT @lim;
+
 -- name: CountOutbox :one
 SELECT count(*) FROM outbox;
 

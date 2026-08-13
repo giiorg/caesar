@@ -1187,6 +1187,144 @@ that presents as `forge_unavailable` retries a vanished repository until
 the wall deadline with a pushed branch sitting orphaned behind it. It is a
 named residual on this plan, not a reason to keep row 08 open forever.
 
+## Realtime streams (Plan 10)
+
+Two server-sent-event endpoints, both authenticated by the session
+cookie and both scoped to what the caller may see:
+
+- `GET /api/v1/stream` — the **attention** stream: every `gate.*`,
+  `publish.*` and `run.*` event on the projects the caller holds *any*
+  grant on (an admin sees every project). Always a stream; nothing to
+  negotiate.
+- `GET /api/v1/runs/{id}/events` with `Accept: text/event-stream` — one
+  **run's** stream, needing `view` on that run's project. Without that
+  Accept the same URL keeps answering the JSON poll (`?after=<id>`), so
+  a client that never heard of streaming is unaffected. Naming the type
+  is what asks for the stream, and `text/event-stream;q=0` — which names
+  it in order to refuse it — takes the poll, as do an absent header,
+  `*/*` and any unrelated type. Relative weights are otherwise ignored:
+  the only weight that changes the answer is a refusing one — a zero, a
+  negative, or a `q` that does not parse at all.
+
+Each frame is `id:` / `event:` / `data:`, where `event:` is the run event
+kind and `data:` is one compact JSON `StreamFrame` (`id`, `run_id`,
+`kind`, `payload`, `occurred_at`). A stream opens with a snapshot — the
+most recent `snapshot_events` matching events, oldest first — then
+catches up to the present and goes live, with no gap and no duplicate at
+either seam. Events are committed under a counter row lock, so ids are
+commit-ordered and the ids reaching one client are **strictly
+ascending**: the last id it saw is the high-water mark of everything it
+has seen. They are not contiguous — `run_events.id` is one counter across
+every run, so one run's ids are a sparse subsequence of it.
+
+**Resuming.** `id:` is the resume point: send it back as `Last-Event-ID`
+and the stream continues strictly above it, with no snapshot and no
+repeat. A malformed or negative header is a 400. An id older than the
+oldest row still retained makes the server re-snapshot instead, which
+duplicates a backlog rather than skipping one — nothing prunes
+`run_events` today, so that branch is unreachable in this deployment,
+and a future retention sweeper is what would make it live.
+
+**Being disconnected is normal, and reconnecting is the fix rather than
+an error.** Each subscriber has a bounded queue, `subscriber_queue`
+deep. A client that cannot keep up fills it, and is then **evicted**:
+the tailer never waits on one slow client, because waiting would stall
+every stream in the process. What the client sees is simply the response
+ending — there is no frame explaining it, and the only record is the log
+line `sse stream ended` with reason `realtime: subscriber fell behind`,
+at info level because it is expected traffic and not a fault. The
+correct response is to reconnect with `Last-Event-ID`, which a browser's
+`EventSource` does on its own, and which loses nothing.
+
+**Heartbeats.** An idle stream is padded with the SSE comment `: hb`, so
+a tunnel does not cull it. The ticker is never reset, so the first
+comment after a stream goes quiet lands anywhere in
+[`heartbeat_interval`, 2 × `heartbeat_interval`) — a proxy idle timeout
+has to sit above **twice** the interval, not above the interval.
+
+**The 403-shaped terminal frame.** The 200 is committed with the first
+byte, so a stream that loses its authorization can no longer answer with
+a status. It writes `event: forbidden` with `data: {"error":"forbidden"}`
+and closes. The frame carries **no `id:` line** on purpose — it is not an
+event, and a client that adopted it as a resume point would store a
+position naming nothing. It is terminal: nothing follows it. It is also
+what a client is sent when the grant resolver has been unreachable for
+three consecutive re-checks, which is an outage rather than a denial;
+the client cannot tell those apart and the log can — `reason` then
+carries the resolver's error instead of `not authorized`.
+
+**Config**, under `realtime`, with the shipped defaults:
+
+- `heartbeat_interval` (`20s`) — the idle padding above.
+- `poll_fallback` (`2s`) — how long the single tailer waits for a
+  `LISTEN/NOTIFY` wake-up before reading the table anyway. It is the
+  worst-case latency of a notification that never arrived, and it is
+  what carries correctness while the listener's connection is down.
+  Never disable it.
+- `grant_recheck` (`30s`) — how often an open stream re-resolves its
+  principal's scope. See the staleness window below.
+- `subscriber_queue` (`256`) — how far one client may fall behind before
+  it is evicted.
+- `replay_batch` (`500`) — rows in one catch-up page. Invisible to a
+  client except as the number of round trips its catch-up takes.
+- `snapshot_events` (`500`) — how much history a stream opens with. Not
+  the same knob as `replay_batch` even though both default to 500: this
+  one is what a client *sees* on connect.
+
+### Limitations to know before you meet them
+
+**Fan-out is in-memory and per process.** A second caesar process does
+not receive the first's fan-out; it runs its own tailer over the same
+table and serves only the clients connected to it. That is correct — no
+event is lost — but it is not free: every process holds its own
+dedicated `LISTEN` connection and re-reads `run_events` for itself, so
+both scale with the process count, and nothing coordinates them. The
+monolith is the assumption (spec §4); scaling out horizontally means
+accepting that multiplication.
+
+**A per-run stream over a quiescent run does not close on a partial
+revocation.** If a principal loses the project a per-run stream is
+showing but keeps other grants, the stream can only be ended by an event
+it must deny — so if that run emits nothing further, the connection
+stays open and idle indefinitely. No denied byte reaches the client, and
+the client's own reconnect fails authorization at the handler; but
+nothing reaps the socket. Nothing *will*, either: the heartbeat ticker
+runs regardless of scope, so the connection keeps producing `: hb`
+comments and no proxy idle timeout culls it — the first instinct, "an
+idle timeout will clean this up", is wrong here. A `Filter` carries the
+run id and never the run's project, which is why the stream cannot be
+closed outright. Losing *every* grant is different and does close it: an
+empty scope matches nothing and is the one thing a re-check can act on
+without an event.
+
+**A revoke-then-re-grant can leave a permanent hole in one stream.** The
+cursor is a single high-water mark, so once a narrowed scope has
+withheld some rows and a later row is written, the withheld ones are
+below the cursor forever: a re-grant never backfills them and
+`Last-Event-ID` cannot recover them either, since the id the client
+stored is above them. This is reachable on the attention stream, whose
+scope can narrow *partially*, in catch-up and live alike. It is inherent
+to one cursor per stream, not a bug in the re-check.
+
+**A grant *added* after a stream opened does not reach that stream.**
+Fan-out filters on the scope the stream was opened with, and that scope
+is never rewritten — rewriting it would race the tailer's own goroutine —
+so a live event on a newly granted project is dropped before the stream
+ever sees it, for the whole life of the connection. The re-check acts on
+a grant *lost*; it does not act on one *gained*, and the fix is to
+reconnect. It is fail-closed, so this is freshness and not disclosure.
+The one exception is catch-up: a stream still paging its way to the
+present queries each page with the refreshed scope, so a widening that
+lands during catch-up does take effect for those pages.
+
+**The revocation staleness window is `grant_recheck` plus one in-flight
+replay page** — catch-up re-checks before each page and the live loop on
+a ticker, so a revocation is acted on within one interval, except that a
+page already being written finishes first. While the grant resolver
+itself is *failing* the window is up to **three times** `grant_recheck`:
+a blip is deliberately tolerated rather than read as a permissions
+change, and only a third consecutive failure ends the stream.
+
 ## Contracts
 
 `task contracts:gen` regenerates the OpenAPI document and the TS client

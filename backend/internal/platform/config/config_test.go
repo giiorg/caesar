@@ -376,6 +376,74 @@ func TestConfig_ForgeDefaultsAndValidation(t *testing.T) {
 	})
 }
 
+func TestConfig_RealtimeDefaultsAndValidation(t *testing.T) {
+	t.Run("defaults when block absent", func(t *testing.T) {
+		cfg, err := Load(writeFile(t, `{"database": {"url": "postgres://x"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// heartbeat_interval is pinned at 20s because spec §4 makes ~20s the
+		// tunnel's idle obligation: raise it and idle streams get culled by
+		// the proxy, which reads to a client as a flapping connection.
+		want := Realtime{
+			HeartbeatInterval: Duration(20 * time.Second),
+			PollFallback:      Duration(2 * time.Second),
+			GrantRecheck:      Duration(30 * time.Second),
+			SubscriberQueue:   256,
+			ReplayBatch:       500,
+			SnapshotEvents:    500,
+		}
+		if diff := cmp.Diff(want, cfg.Realtime); diff != "" {
+			t.Errorf("realtime defaults (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("an explicit block round-trips", func(t *testing.T) {
+		body := `{"database": {"url": "postgres://x"}, "realtime": {` +
+			`"heartbeat_interval": "5s", "poll_fallback": "250ms", "grant_recheck": "1m", ` +
+			`"subscriber_queue": 32, "replay_batch": 100, "snapshot_events": 50}}`
+		cfg, err := Load(writeFile(t, body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := Realtime{
+			HeartbeatInterval: Duration(5 * time.Second),
+			PollFallback:      Duration(250 * time.Millisecond),
+			GrantRecheck:      Duration(time.Minute),
+			SubscriberQueue:   32,
+			ReplayBatch:       100,
+			SnapshotEvents:    50,
+		}
+		if diff := cmp.Diff(want, cfg.Realtime); diff != "" {
+			t.Errorf("realtime block (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("fails closed", func(t *testing.T) {
+		// Every knob here is a liveness property, and zero is the value a
+		// half-filled block produces: a zero heartbeat is a busy loop, a zero
+		// queue drops every subscriber on its first event.
+		tests := []struct{ name, block, wantErr string }{
+			{"zero heartbeat", `{"heartbeat_interval": "0s"}`, "realtime.heartbeat_interval"},
+			{"negative poll fallback", `{"poll_fallback": "-1s"}`, "realtime.poll_fallback"},
+			{"zero grant recheck", `{"grant_recheck": "0s"}`, "realtime.grant_recheck"},
+			{"zero subscriber queue", `{"subscriber_queue": 0}`, "realtime.subscriber_queue"},
+			{"negative replay batch", `{"replay_batch": -1}`, "realtime.replay_batch"},
+			{"zero snapshot events", `{"snapshot_events": 0}`, "realtime.snapshot_events"},
+			{"unknown key inside realtime", `{"wat": 1}`, "unknown field"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				body := `{"database": {"url": "postgres://x"}, "realtime": ` + tt.block + `}`
+				_, err := Load(writeFile(t, body))
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want mention of %q", err, tt.wantErr)
+				}
+			})
+		}
+	})
+}
+
 func TestStageEnvFromProcess_ForwardsOnlyTheGitAuthKeysThatAreSet(t *testing.T) {
 	t.Setenv("GIT_CONFIG_COUNT", "1")
 	t.Setenv("GIT_CONFIG_KEY_0", "http.extraheader")
