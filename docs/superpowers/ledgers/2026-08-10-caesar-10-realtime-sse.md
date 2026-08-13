@@ -1,23 +1,46 @@
 # SDD ledger — plan: docs/superpowers/plans/2026-08-10-caesar-10-realtime-sse.md
 
-> **HANDOFF 2026-08-13 (session 61) — PLAN 10 IS COMPLETE AND OPEN AS PR #8. NOTHING IS
-> OUTSTANDING.** https://github.com/giiorg/caesar/pull/8 — `caesar-10-realtime-sse` → `main`,
-> 40 commits. This block supersedes every handoff below it; they are kept only for their reasoning.
+> **HANDOFF 2026-08-13 (session 62) — PLAN 10 IS COMPLETE AND OPEN AS PR #8. THE ONLY THING
+> OUTSTANDING IS CI ITSELF.** https://github.com/giiorg/caesar/pull/8 — `caesar-10-realtime-sse` →
+> `main`, 42 commits. This block supersedes every handoff below it; they are kept only for their
+> reasoning.
 >
 > Worktree `/Users/sofo/Projects/caesar/repos/caesar/.claude/worktrees/caesar-10-realtime-sse`,
-> tip **`7852a47`**, last CODE commit **`608db93`**, clean tree, pushed and in sync with origin.
-> `main` untouched at `64de023`. **Verify with `git log` before acting on any of this.**
+> tip **`c48357a`**, clean tree, pushed and in sync with origin. `main` untouched at `64de023`.
+> **Verify with `git log` before acting on any of this.**
 >
 > **All twelve tasks implemented, reviewed and GATED. The final whole-branch review found NOTHING
 > CRITICAL AND NOTHING IMPORTANT; its eight Minors were all fixed and re-reviewed before the PR
-> went up.** Three gate runs this session, all `GATE PASS` with 11 lanes unnarrowed: `44332db`,
-> `608db93`, and the tip `7852a47`.
+> went up.** Five gate runs, all `GATE PASS` with 11 lanes unnarrowed: `44332db`, `608db93`,
+> `7852a47`, `6075fee`, and the tip `c48357a`.
+>
+> ## THE GATE PASSED AND CI WENT RED TWICE, ON macOS-ONLY LUCK
+>
+> Both PR runs failed `TestStream_SlowClientIsEvictedAndResumes`, and no local gate could have seen
+> it: **the test gave BOTH its streams `boundedReadClient`, and a pinned 4 KiB receive buffer is
+> slow to READ as well as slow to fill.** The resume has to move everything the eviction cost it —
+> ~7 MiB of padded frames — back through that window. On a macOS loopback that is milliseconds
+> (`SetReadBuffer` there does not bite); on Linux it runs at ~37 KiB/s, so the resume died on its
+> 120s deadline while the eviction half had already spent ~80s draining.
+>
+> Measured, not inferred, and this is the method the next Linux-only red should copy: a 40-line
+> loopback program under `golang:alpine` timed 8 MiB through a pinned window at **3m40s vs 4ms on
+> macOS**, and then the WHOLE test, run in a Linux container against the host's Docker
+> (`-v /var/run/docker.sock`, `TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal`), reproduced CI
+> frame for frame — **83 of 256, the same number the runner logged** — and passed there once the
+> resume dialled `http.DefaultClient`. Fixed in `c48357a`; the evicted stream keeps its pinned
+> buffer (that is the premise) but its deadline is now 240s against a measured 71s drain, and the
+> drain time is logged beside the frame count.
+>
+> The absorb figure the ledger records below is macOS's. **Linux absorbs ~2.6 MiB, not 700-830
+> KiB**, so the 8 MiB burst is a ~3x margin there rather than an order of magnitude — still
+> guarded, because a burst that stops being enough fails loudly on `len(missed) == 0`.
 >
 > ## THE NEXT THING
 >
-> **Whatever review PR #8 attracts, then merge.** After that: `rm -rf` this workspace (the tracked
-> ledger is the record), release the worktree via the harness's workspace-exit tool, and delete the
-> branch. Nothing else on this plan is owed.
+> **Watch CI go green on `c48357a`, then whatever review PR #8 attracts, then merge.** After that:
+> `rm -rf` this workspace (the tracked ledger is the record), release the worktree via the
+> harness's workspace-exit tool, and delete the branch. Nothing else on this plan is owed.
 >
 > **THEN the one follow-up this plan deliberately deferred** — decided by sofo 2026-08-13, do NOT
 > re-litigate the shape: give a per-run stream the run's project id so partial revocation can close
@@ -1964,7 +1987,9 @@ Task 12: ⚠️⚠️ **TWO OF MY SEVEN MUTATION ROWS COULD NOT REDDEN ANYTHING,
 Task 12: **my finding 5 understated the eviction burst by ~3 orders of magnitude.** A stopped
   client absorbs ~700-830 KiB before `Serve` blocks — not one `SubscriberQueue` of events. Test 2
   pins `SO_RCVBUF` and uses an 8 MiB burst, and logs the measured margin every run so a future
-  kernel or buffer change shows up as a number rather than a flake.
+  kernel or buffer change shows up as a number rather than a flake. **Both numbers are macOS's,
+  and CI proved that mattered:** Linux absorbs ~2.6 MiB, and reading it back through the pinned
+  window runs at ~37 KiB/s, which is what reddened the PR twice (see the handoff at the top).
 Task 12: **finding 10's third limitation was NARROWED by the implementer, and the narrowing is the
   interesting part.** The revoke-then-re-grant permanent hole is the ATTENTION stream's, in catch-up
   AND live; **a per-run stream cannot reach it** — denied catch-up does not advance the cursor, and
