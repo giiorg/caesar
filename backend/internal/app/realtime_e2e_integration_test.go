@@ -184,6 +184,13 @@ const clientReadBuffer = 4096
 // explicitly, is what makes the amount a stopped client can absorb a number
 // this test bounds rather than one it hopes for.
 //
+// The same pin is why NOTHING ELSE may dial through it. A 4 KiB window is slow
+// in both directions: reading 8 MiB back through one takes 4 ms on a macOS
+// loopback and 3m40s on Linux (~37 KiB/s, measured on golang:alpine and matched
+// by the CI runner, which is where an earlier version of this test died on its
+// deadline). Only a stream that has to STALL may dial bounded; a stream that has
+// to move bytes dials with default buffers.
+//
 // One client per stream, because its transport pools connections and a
 // connection left holding an unread stream must never be reused for the resume.
 func boundedReadClient(t *testing.T) *http.Client {
@@ -454,10 +461,18 @@ func assertGapless(t *testing.T, what string, committed, got []int64) {
 // tailer and a stopped client — the socket is one too, and how big it is
 // belongs to the operating system, not to this test. boundedReadClient pins
 // the receiving end as far as it can be pinned; the padding covers the rest, by
-// making the burst 8 MiB, which is an order of magnitude past what the chain
-// has been measured absorbing (25 of 256 frames get through on a macOS
-// loopback, and the count is logged so the margin is re-measured on every run
-// rather than assumed).
+// making the burst 8 MiB, which is ~3x what the chain has been measured
+// absorbing (25 of 256 frames get through on a macOS loopback, 83 of 256 on a
+// Linux CI runner, whose send side autotunes higher). The count is logged so
+// the margin is re-measured on every run rather than assumed, and a burst that
+// stopped being enough fails on len(missed) == 0 below, saying so.
+//
+// ONLY THE EVICTED STREAM DIALS BOUNDED, and its deadline is minutes rather
+// than seconds because of it: everything the socket absorbed has to come back
+// through that 4 KiB window before the stream can end, which is ~74s of the
+// measured 2.6 MiB on a CI runner. The resume has nothing to prove about
+// buffering — it is about ids — so it dials with default buffers and moves the
+// same megabytes in milliseconds.
 //
 // Nothing prunes run_events today, so Oldest never forces a re-snapshot and the
 // resume is lossless by construction rather than by luck. A deployment that
@@ -477,7 +492,7 @@ func TestStream_SlowClientIsEvictedAndResumes(t *testing.T) {
 	token := p.login(t, "root@example.com")
 	path := "/api/v1/runs/" + seeded.runID.String() + "/events"
 
-	stream, cancel := openStreamFrom(t, p, path, token, "", boundedReadClient(t), 120*time.Second)
+	stream, cancel := openStreamFrom(t, p, path, token, "", boundedReadClient(t), 240*time.Second)
 	defer cancel()
 	// Live and caught up before the burst, so everything that follows is the
 	// live path meeting a client that stopped reading — and not a catch-up that
@@ -489,8 +504,11 @@ func TestStream_SlowClientIsEvictedAndResumes(t *testing.T) {
 	}
 
 	// Reading again is what lets Serve discover it was evicted.
+	drainStart := time.Now()
 	first := drainIDs(t, stream)
-	t.Logf("the evicted client received %d of %d frames before the stream ended", len(first), burst)
+	t.Logf("the evicted client received %d of %d frames before the stream ended, "+
+		"drained through its %d-byte window in %s",
+		len(first), burst, clientReadBuffer, time.Since(drainStart).Round(time.Millisecond))
 	if len(first) == 0 {
 		t.Fatal("the evicted stream delivered nothing, so there is no resume point and " +
 			"nothing below this line proves anything")
@@ -513,8 +531,10 @@ func TestStream_SlowClientIsEvictedAndResumes(t *testing.T) {
 			"not being tested", resumeFrom, committed)
 	}
 
+	// Default buffers, and a client that never held the evicted stream: see
+	// boundedReadClient for both halves of that.
 	resumed, cancelResume := openStreamFrom(t, p, path, token,
-		strconv.FormatInt(resumeFrom, 10), boundedReadClient(t), 120*time.Second)
+		strconv.FormatInt(resumeFrom, 10), http.DefaultClient, 120*time.Second)
 	defer cancelResume()
 	got := awaitIDs(t, resumed, missed[len(missed)-1])
 
