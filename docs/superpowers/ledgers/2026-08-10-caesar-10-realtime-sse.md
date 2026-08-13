@@ -1,7 +1,104 @@
 # SDD ledger — plan: docs/superpowers/plans/2026-08-10-caesar-10-realtime-sse.md
 
+> **HANDOFF 2026-08-13 (session 61) — PLAN 10 IS COMPLETE AND OPEN AS PR #8. NOTHING IS
+> OUTSTANDING.** https://github.com/giiorg/caesar/pull/8 — `caesar-10-realtime-sse` → `main`,
+> 40 commits. This block supersedes every handoff below it; they are kept only for their reasoning.
+>
+> Worktree `/Users/sofo/Projects/caesar/repos/caesar/.claude/worktrees/caesar-10-realtime-sse`,
+> tip **`7852a47`**, last CODE commit **`608db93`**, clean tree, pushed and in sync with origin.
+> `main` untouched at `64de023`. **Verify with `git log` before acting on any of this.**
+>
+> **All twelve tasks implemented, reviewed and GATED. The final whole-branch review found NOTHING
+> CRITICAL AND NOTHING IMPORTANT; its eight Minors were all fixed and re-reviewed before the PR
+> went up.** Three gate runs this session, all `GATE PASS` with 11 lanes unnarrowed: `44332db`,
+> `608db93`, and the tip `7852a47`.
+>
+> ## THE NEXT THING
+>
+> **Whatever review PR #8 attracts, then merge.** After that: `rm -rf` this workspace (the tracked
+> ledger is the record), release the worktree via the harness's workspace-exit tool, and delete the
+> branch. Nothing else on this plan is owed.
+>
+> **THEN the one follow-up this plan deliberately deferred** — decided by sofo 2026-08-13, do NOT
+> re-litigate the shape: give a per-run stream the run's project id so partial revocation can close
+> a QUIESCENT stream. `runScoped` (`runs/api/api.go`) already loads the run's task and authorizes
+> against `task.ProjectID`, so threading it costs one parameter and no new query; the re-check is
+> one line in `refresh`. **Build it as an UNEXPORTED field (`runProject uuid.UUID`) set only
+> through a required positional parameter on the one constructor — `RunFilter(runID, projectID,
+> scope)`.** Forgetting it is then a compile error rather than a `uuid.Nil`, which no scope allows
+> and which would otherwise close EVERY per-run stream on its first re-check. Because a literal
+> cannot set an unexported field, zero unambiguously means "not supplied", so the re-check falls
+> back to today's event-driven behaviour instead of denying — strictly additive in liveness, no
+> regression path. Cost: `cmp.Diff` over `Filter` values needs an exporter option in tests.
+>
+> ## WHAT THE FINAL REVIEW FOUND THAT TWELVE TASK REVIEWS DID NOT
+>
+> Both DEMONSTRATED under `go test -overlay`, both fail-closed, both now fixed:
+> **(1)** a `Last-Event-ID` ABOVE the head silenced a stream permanently — 200, headers,
+> heartbeats, no data, nothing logged; reachable after a restore-from-backup while clients hold
+> higher ids. Now bounded at `Head`, degrading to a re-snapshot.
+> **(2)** a grant *ADDED* after a stream opens never reaches it — fan-out filters on the open-time
+> scope, which `follow` deliberately never rewrites (rewriting would race the tailer). Revocation
+> is acted on; acquisition is not. Documented in the README.
+>
+> **And fixing (1) exposed a third, in the fix's OWN new test:** nothing pinned "exactly at the
+> head resumes" — the COMMON case — so a `<=`→`<` slip would have made every caught-up client
+> re-download its whole backlog on each reconnect, and the suite could not see it because the one
+> nearby test has an empty snapshot at watermark 10 where both paths coincide. **The rule earned:
+> a fix needs TWO mutations — the defect restored, and the fix's own boundary perturbed.**
+>
+> ## STILL-LIVE INVARIANTS — anyone touching this code needs these
+>
+> **NEVER add an `id <= watermark` predicate** to the snapshot's events query. It would make the
+> isolation level irrelevant and silently un-falsify Task 7's acceptance test. Only a comment
+> guards it.
+>
+> **`run_events.id` is a GLOBAL counter allocated under the `run_event_counter` row lock**, so id
+> order IS commit order — every cursor and dedup rests on it — but one run's ids are a subsequence
+> with arbitrary gaps. **A contiguity assertion fails on correct behaviour.**
+>
+> **The contract seam takes ONE response schema per content type.** `altResponses` in `contracts`
+> is what gives `listRunEvents` both `application/json` and `text/event-stream`; `httpx.Operation`
+> is deliberately untouched. A second SSE frame shape cannot be reflected, which is why the
+> 403-shaped terminal frame is documented in prose.
+>
+> **`runsapi.StreamServer`'s contract is narrower than `realtime.Serve`'s** — *error ⟹ nothing
+> committed*, discriminated by `ErrNotStarted` narrowed to exactly `http.ErrNotSupported`. An
+> adapter that FORWARDS `Serve`'s error writes a problem document into a committed SSE body, and
+> `fakeStreamServer` cannot catch it.
+>
+> ## THE DEFERRED QUEUE — triaged, 0 must-fix
+>
+> 26 items: **0 must-fix before merge, 22 fine to carry, 3 mistaken as stated, 3 already resolved.**
+> Plus two found by the last re-review: `realtime/api/api.go:199-203` carries the same short ending
+> list M4b fixed (harmless — `logStreamEnd` below it is complete), and `defaults_test.go:17-22`
+> (pre-existing) says "legal" where no import-boundary analyzer exists. The review's recommendation
+> 3 — write the hub's lock invariant into `hub.go` ("never close a *registered* subscription while
+> holding `h.mu`") — was deliberately left undone as outside M1-M8; it is cheaper than the
+> concurrency test that would otherwise be needed.
+>
+> ## METHOD — what held over twelve tasks and one final review
+>
+> Unchanged from the session-60 block below, plus: **the tally of controller- AND reviewer-authored
+> items that were WRONG while the implementer was RIGHT reached FIFTEEN**, six of them reviewers'.
+> Three were prescriptions inside the final review itself, one strictly worse than the finding it
+> fixed (resetting the wake-up flag only on a successful `Wait` would have wedged it on any quiet
+> deployment, since a healthy waker returns only the poll deadline). **Give every subagent an
+> explicit licence to dissent and cite the count.** One more, procedural: I reported a review file
+> missing when an earlier `cd` had moved my shell's cwd — **verify a "missing file" with an absolute
+> path before saying it.**
+>
+> **Durability:** this directory is GITIGNORED. Mirrored to the tracked
+> `docs/superpowers/ledgers/2026-08-10-caesar-10-realtime-sse.md` and copied whole to
+> `/Users/sofo/Projects/caesar/sdd-backups/plan10-latest/` (77 files). The workspace was NOT deleted
+> at the end of SDD, deliberately: PR feedback happens in this worktree.
+
+---
+
+> **SUPERSEDED — session 60's handoff said RESUME AT THE TASK 12 REVIEW; Task 12 is now reviewed,
+> the final review and its fix wave are done, and the branch is PR #8. Kept for its reasoning.**
+>
 > **HANDOFF 2026-08-12 (session 60) — ALL TWELVE TASKS IMPLEMENTED. RESUME AT THE TASK 12 REVIEW.**
-> This block supersedes every handoff below it; they are kept only for their reasoning.
 >
 > Worktree `/Users/sofo/Projects/caesar/repos/caesar/.claude/worktrees/caesar-10-realtime-sse`,
 > branch `caesar-10-realtime-sse`, last CODE commit **`6016635`**, clean tree.
