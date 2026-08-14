@@ -186,7 +186,20 @@ func (s *Service) HeartbeatCredentialLease(ctx context.Context, credentialID uui
 func (s *Service) TakeoverCredentialLease(ctx context.Context, credentialID uuid.UUID, attemptRef string) (CredentialLease, error) {
 	var lease CredentialLease
 	err := pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		row, err := store.New(tx).TakeoverLease(ctx, store.TakeoverLeaseParams{
+		q := store.New(tx)
+		// The credential row lock first, as everywhere in this aggregate —
+		// and load-bearing here for the reason ReleaseCredentialLease spells
+		// out: an acquire decides across several statements while holding it,
+		// and a takeover landing mid-decision slips past an epoch check that
+		// has already passed, handing the worker it supersedes the very epoch
+		// this call is claiming.
+		if _, err := q.LockCredential(ctx, credentialID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return xerrors.E(xerrors.ClassNotFound, "no such credential")
+			}
+			return fmt.Errorf("assets: lock credential: %w", err)
+		}
+		row, err := q.TakeoverLease(ctx, store.TakeoverLeaseParams{
 			CredentialID: credentialID, AttemptRef: attemptRef,
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -365,7 +378,25 @@ func (s *Service) recordSyncDiscarded(
 // only turn a healthy handover into a spurious error.
 func (s *Service) ReleaseCredentialLease(ctx context.Context, credentialID uuid.UUID, attemptRef string, epoch int64) error {
 	return pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		n, err := store.New(tx).ReleaseLease(ctx, store.ReleaseLeaseParams{
+		q := store.New(tx)
+		// The credential row lock opens every write in this aggregate, and
+		// this is the write that proved why. AcquireCredentialLease decides
+		// across three statements under that lock — held? by whom? re-bind —
+		// and a release that skipped the lock could delete the lease between
+		// two of them. The acquirer then read nothing where it had just been
+		// told somebody was there, and pgx.ErrNoRows left the aggregate as an
+		// unclassified, PERMANENT error: a run killed by the good news that
+		// the credential it wanted had come free.
+		if _, err := q.LockCredential(ctx, credentialID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// No credential, therefore no lease — the foreign key is ON
+				// DELETE RESTRICT. Nothing to conclude, and a conclusion that
+				// finds nothing to do has always been this method's no-op.
+				return nil
+			}
+			return fmt.Errorf("assets: lock credential: %w", err)
+		}
+		n, err := q.ReleaseLease(ctx, store.ReleaseLeaseParams{
 			CredentialID: credentialID, AttemptRef: attemptRef, Epoch: epoch,
 		})
 		if err != nil {

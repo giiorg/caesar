@@ -262,6 +262,227 @@ func TestAcquireCredentialLease_FencedAfterTakeover(t *testing.T) {
 	}
 }
 
+// The acquire learns "somebody holds it" from one statement and asks who in
+// the next. A holder that concludes in between must not kill the acquiring
+// run: the lease it wanted is now FREE, which is the friendliest possible
+// news, and the worst that may cost the caller is the wait it was about to
+// take anyway. Nothing here asserts WHICH of the two answers — a granted
+// lease or a busy — comes back, because both are honest under a race; what
+// it pins is that neither is an unclassified error, which the runner charges
+// as a permanent internal_error and kills the run over.
+func TestAcquireCredentialLease_ReleaseRacingTheAcquireNeverFailsTheRun(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, faults := newTestServiceWithFaults(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+	c, body := seedAuthFile(t, svc, admin, "codex-sub", "rt-1")
+
+	holder, _, err := svc.AcquireCredentialLease(ctx, c.ID, "holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The conclusion lands exactly between the contender's two statements.
+	// It runs on its own goroutine because a release that serializes behind
+	// the acquire the way it should BLOCKS here, and waiting for it inline
+	// would hang the test rather than pass it.
+	var releaseErr error
+	releaseDone := make(chan struct{})
+	releasedInWindow := false
+	faults.AfterQuery("AcquireLease", func() {
+		go func() {
+			defer close(releaseDone)
+			releaseErr = svc.ReleaseCredentialLease(context.Background(), c.ID, "holder", holder.Epoch)
+		}()
+		select {
+		case <-releaseDone: // committed inside the window — the race, reproduced
+			releasedInWindow = true
+		case <-time.After(time.Second): // still blocked — serialized, as it should be
+		}
+	})
+
+	lease, secret, err := svc.AcquireCredentialLease(ctx, c.ID, "contender")
+
+	select {
+	case <-releaseDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the injected release never finished: this test proved nothing")
+	}
+	if releaseErr != nil {
+		t.Fatalf("release = %v, want the holder to conclude cleanly", releaseErr)
+	}
+	// The mechanism, asserted directly rather than through its symptom: a
+	// lease mutation serializes behind the credential row lock the acquire
+	// holds from its first statement to its commit, so the window this test
+	// aims at is not a window at all.
+	if releasedInWindow {
+		t.Error("the release committed between the acquire's two statements: " +
+			"every lease mutation must serialize behind the credential row lock the acquire holds")
+	}
+
+	switch {
+	case err == nil:
+		// Granted: the contender must really hold it, with the bytes.
+		if lease.AttemptRef != "contender" || lease.Epoch != 1 {
+			t.Fatalf("granted lease = %+v, want contender at epoch 1", lease)
+		}
+		if !bytes.Equal(secret, body) {
+			t.Fatalf("granted snapshot = %q, want the stored auth.json", secret)
+		}
+		if _, _, _, held := leaseRow(t, pool, c.ID); !held {
+			t.Fatal("acquire returned a lease that is not in the table")
+		}
+	case errors.Is(err, assets.ErrLeaseBusy):
+		// Turned away: a zero-charge wait, and the retry a moment later walks
+		// into the free lease.
+		if xerrors.ClassOf(err) != xerrors.ClassConflict {
+			t.Fatalf("busy acquire class = %v, want conflict", xerrors.ClassOf(err))
+		}
+		if _, _, _, held := leaseRow(t, pool, c.ID); held {
+			t.Fatal("acquire was refused, yet the concluded lease is still in the table")
+		}
+	default:
+		t.Fatalf("acquire = %v (class %v), want either the lease or a classified busy — "+
+			"an unclassified error here is the permanent internal_error that kills the run",
+			err, xerrors.ClassOf(err))
+	}
+}
+
+// The same window, one statement later and with the opposite sign. The
+// idempotent re-acquire checks the epoch it read and then re-binds the
+// version; a takeover committing in between slips past a check that has
+// already passed, and the re-bind's RETURNING hands the superseded worker a
+// lease at the epoch recovery just claimed — two owners of a single-flight
+// lease, which is the one thing the epoch fence exists to prevent. The
+// takeover is not wrong to happen; it must simply not land mid-decision.
+func TestAcquireCredentialLease_TakeoverRacingTheReacquireNeverGrantsRecoverysEpoch(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, faults := newTestServiceWithFaults(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+	c, _ := seedAuthFile(t, svc, admin, "codex-sub", "rt-1")
+
+	if _, _, err := svc.AcquireCredentialLease(ctx, c.ID, "attempt-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A reconciler supersedes attempt-a exactly between the re-acquire's
+	// "who holds it" read and the re-bind that acts on the answer.
+	var takeoverErr error
+	takeoverDone := make(chan struct{})
+	tookOverInWindow := false
+	faults.AfterQuery("GetLease", func() {
+		go func() {
+			defer close(takeoverDone)
+			_, takeoverErr = svc.TakeoverCredentialLease(context.Background(), c.ID, "attempt-a")
+		}()
+		select {
+		case <-takeoverDone:
+			tookOverInWindow = true
+		case <-time.After(time.Second):
+		}
+	})
+
+	again, _, err := svc.AcquireCredentialLease(ctx, c.ID, "attempt-a")
+
+	select {
+	case <-takeoverDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the injected takeover never finished: this test proved nothing")
+	}
+	if takeoverErr != nil {
+		t.Fatalf("takeover = %v, want recovery to claim the lease cleanly", takeoverErr)
+	}
+	if tookOverInWindow {
+		t.Error("the takeover committed between the acquire's read and the write it decided on: " +
+			"every lease mutation must serialize behind the credential row lock the acquire holds")
+	}
+
+	// Whatever the acquire decided, it must not have handed back custody the
+	// reconciler already holds: either it was refused, or it got the lease at
+	// the epoch it actually checked.
+	if err != nil {
+		if !errors.Is(err, assets.ErrLeaseBusy) {
+			t.Fatalf("re-acquire = %v (class %v), want either the lease or a classified busy", err, xerrors.ClassOf(err))
+		}
+	} else if again.Epoch != 1 {
+		t.Fatalf("re-acquire handed back epoch %d — the epoch recovery took over at, to the worker "+
+			"recovery just superseded: both now believe they hold the same single-flight lease", again.Epoch)
+	}
+	if epoch, _, _, held := leaseRow(t, pool, c.ID); !held || epoch != 2 {
+		t.Fatalf("lease row = (epoch %d, held %v), want recovery holding it at epoch 2", epoch, held)
+	}
+}
+
+// Serializing the release is not enough on its own: it has to serialize in
+// the aggregate's ORDER, credential row before lease row. A release that
+// deleted first and locked afterwards would still be invisible until it
+// committed — MVCC hides an uncommitted delete, so the acquire above stays
+// green — while holding the lease row and waiting for the credential every
+// sync-back takes first. That is a lock cycle, and Postgres resolves cycles
+// by killing somebody: a spurious error on a path whose whole purpose here
+// is to stop producing spurious errors.
+func TestReleaseCredentialLease_LocksInTheAggregatesOrder(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, faults := newTestServiceWithFaults(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+	c, _ := seedAuthFile(t, svc, admin, "codex-sub", "rt-1")
+
+	lease, _, err := svc.AcquireCredentialLease(ctx, c.ID, "attempt-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshed := authJSON(t, "rt-2", 0)
+
+	// The other order, live: a sync-back commit starts while the release is
+	// mid-transaction. It takes the credential row first and the lease row
+	// second, so it can only wait — never form a cycle — against a release
+	// that took them in the same order.
+	var (
+		syncStatus assets.SyncStatus
+		syncErr    error
+	)
+	syncDone := make(chan struct{})
+	syncedInWindow := false
+	faults.AfterQuery("ReleaseLease", func() {
+		go func() {
+			defer close(syncDone)
+			syncStatus, syncErr = svc.CommitCredentialSync(
+				context.Background(), c.ID, "attempt-a", lease.Epoch, lease.SecretVersion, refreshed)
+		}()
+		select {
+		case <-syncDone:
+			syncedInWindow = true
+		// Long enough to outlast Postgres's deadlock detector (1s by
+		// default), so a cycle here is reported rather than merely waited on.
+		case <-time.After(3 * time.Second):
+		}
+	})
+
+	releaseErr := svc.ReleaseCredentialLease(ctx, c.ID, "attempt-a", lease.Epoch)
+
+	select {
+	case <-syncDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the injected sync-back never finished: this test proved nothing")
+	}
+	if releaseErr != nil {
+		t.Fatalf("release = %v, want a clean conclusion — a deadlock victim here is a lock-order inversion", releaseErr)
+	}
+	if syncErr != nil {
+		t.Fatalf("concurrent sync-back = %v, want it to wait for the release rather than deadlock against it", syncErr)
+	}
+	if syncedInWindow {
+		t.Error("the sync-back committed inside the release's transaction: it must queue behind the credential row lock")
+	}
+	// It waited, so it read the concluded world: the lease is gone, and the
+	// bytes of an attempt that no longer holds it are correctly not stored.
+	if syncStatus != assets.SyncFenced {
+		t.Errorf("sync-back after the release = %q, want fenced", syncStatus)
+	}
+	if _, _, _, held := leaseRow(t, pool, c.ID); held {
+		t.Fatal("the lease outlived its release")
+	}
+}
+
 // One attempt holds at most one credential lease, enforced by the unique
 // index on attempt_ref — the recovery lookup by attempt has to be
 // unambiguous.
@@ -699,5 +920,11 @@ func TestCredentialLease_UnknownCredential(t *testing.T) {
 	}
 	if _, err := svc.TakeoverCredentialLease(ctx, uuid.New(), "attempt-a"); xerrors.ClassOf(err) != xerrors.ClassNotFound {
 		t.Fatalf("takeover of a lease nobody holds = %v, want not found", err)
+	}
+	// A conclusion with nothing to conclude has always been a no-op, and the
+	// credential row lock the release now takes first must not promote it
+	// into an error the caller could do nothing about anyway.
+	if err := svc.ReleaseCredentialLease(ctx, uuid.New(), "attempt-a", 1); err != nil {
+		t.Fatalf("release against an unknown credential = %v, want a silent no-op", err)
 	}
 }
