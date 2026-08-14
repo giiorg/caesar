@@ -345,7 +345,13 @@ func TestStreamAttention_BuildsTheAttentionFilterAlone(t *testing.T) {
 		t.Fatal("the source was never asked for anything")
 	}
 	want := realtime.Filter{Attention: true, Scope: scope}
-	if diff := cmp.Diff(want, filters[0]); diff != "" {
+	// AllowUnexported rather than IgnoreUnexported, and the difference matters
+	// here. realtime.Filter carries an unexported runProject; ignoring it would
+	// still compile and still pass, while quietly dropping the assertion that
+	// an ATTENTION filter carries no run project at all — which is exactly the
+	// kind of thing this test exists to catch. Allowing it keeps the comparison
+	// total.
+	if diff := cmp.Diff(want, filters[0], cmp.AllowUnexported(realtime.Filter{})); diff != "" {
 		t.Errorf("filter (-want +got):\n%s", diff)
 	}
 }

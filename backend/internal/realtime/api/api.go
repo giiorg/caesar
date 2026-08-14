@@ -166,8 +166,14 @@ func (a *API) handleStreamAttention(w http.ResponseWriter, r *http.Request, sess
 // the results in. What it does do is resolve the principal's SCOPE, which is
 // realtime's own question and the last thing here that can still be an HTTP
 // status.
+//
+// projectID is the run's project, and it is handed in for the same reason: the
+// caller authorized against it moments ago, so asking for it again here would
+// be a second query for an answer runs/api already holds. It is what lets the
+// grant re-check end this stream when the project leaves the principal's scope
+// and the run itself has gone quiet (realtime.Filter.runProject).
 func (a *API) ServeRunStream(ctx context.Context, w http.ResponseWriter,
-	runID, userID uuid.UUID, lastEventID int64, hasLastID bool,
+	runID, projectID, userID uuid.UUID, lastEventID int64, hasLastID bool,
 ) error {
 	// Same wiring omission, same refusal to look like a working endpoint, as
 	// handleStreamAttention. Returned rather than rendered: the caller owns
@@ -182,8 +188,10 @@ func (a *API) ServeRunStream(ctx context.Context, w http.ResponseWriter,
 	// RunFilter, never a Filter literal. Two of the four combinations of
 	// RunID and Attention are wrong in ways nothing downstream can report,
 	// and realtime.AttentionFilter names this exact call site as the risk.
+	// The literal has a second cost here now: it cannot set runProject at all,
+	// so it would silently produce a stream that only a denied event can close.
 	return a.serve(ctx, w, realtime.StreamRequest{
-		Filter:      realtime.RunFilter(runID, scope),
+		Filter:      realtime.RunFilter(runID, projectID, scope),
 		UserID:      userID,
 		LastEventID: lastEventID,
 		HasLastID:   hasLastID,

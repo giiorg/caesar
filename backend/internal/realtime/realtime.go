@@ -87,11 +87,43 @@ type Filter struct {
 	RunID     *uuid.UUID
 	Attention bool
 	Scope     Scope
+	// runProject is the project the RunID's run belongs to. It is what lets a
+	// grant re-check end a per-run stream over a QUIESCENT run: "the scope no
+	// longer covers this run's project" is not otherwise computable, because
+	// the only other way to learn a run's project is from one of its events and
+	// a quiescent run supplies none.
+	//
+	// It is UNEXPORTED, and that is the safety argument rather than a matter of
+	// style. A Filter literal cannot set it, so on every literal it is the zero
+	// uuid — read as "not supplied", which falls back to the event-driven close
+	// in follow. The exported alternative inverts that failure: a hand-built
+	// literal would carry uuid.Nil, NO scope allows uuid.Nil, and the first
+	// re-check would close every per-run stream built that way. That is a
+	// silent deny, and a silent deny is the one outcome this rule may not have
+	// — so the field is shaped to make forgetting it degrade to today's
+	// behaviour instead of to a closed stream.
+	//
+	// RunFilter takes it POSITIONALLY for the other half: on the supported
+	// path, forgetting it is a compile error rather than a zero.
+	runProject uuid.UUID
 }
 
-// RunFilter is one run's stream within scope.
-func RunFilter(runID uuid.UUID, s Scope) Filter {
-	return Filter{RunID: &runID, Scope: s}
+// RunProject is the project the run belongs to, or the zero uuid on a Filter
+// that was not built by RunFilter.
+//
+// Read-only ON PURPOSE, and the asymmetry with the unexported field is the
+// point: what makes an exported field dangerous here is that a caller can SET
+// it wrongly, which no accessor can do. Without this, whether the adapter
+// actually threaded the project id is observable only inside this package —
+// and the wiring that could drop it spans three (runs/api → realtime/api →
+// here), so the assertion that matters would have nowhere to live.
+func (f Filter) RunProject() uuid.UUID { return f.runProject }
+
+// RunFilter is one run's stream within scope. projectID is the run's OWN
+// project — see Filter.runProject for why it is a parameter and not a field a
+// caller may fill in later.
+func RunFilter(runID, projectID uuid.UUID, s Scope) Filter {
+	return Filter{RunID: &runID, runProject: projectID, Scope: s}
 }
 
 // AttentionFilter is the global attention stream within scope.
@@ -102,9 +134,11 @@ func RunFilter(runID uuid.UUID, s Scope) Filter {
 // opens, writes not one event and heartbeats until the client gives up.
 //
 // What that buys is narrower than it looks, and the gap is the point. Filter's
-// fields are exported, so `Filter{RunID: &id, Attention: true}` is legal Go and
-// nothing here can stop it: the constructors make the two bad shapes
-// unreachable THROUGH THEM, not unrepresentable. That holds only while every
+// SELECTOR fields are exported, so `Filter{RunID: &id, Attention: true}` is
+// legal Go and nothing here can stop it: the constructors make the two bad
+// shapes unreachable THROUGH THEM, not unrepresentable. (runProject is the one
+// field held to a stricter standard, and it says there why the same gap was
+// not acceptable for it.) That holds only while every
 // caller uses one. Both production callers do — realtime/api's
 // handleStreamAttention and its ServeRunStream, which is the per-run adapter
 // internal/app wires into runs/api — and review is the only thing enforcing
