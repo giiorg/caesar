@@ -197,14 +197,18 @@ type StreamRequest struct {
 //   - the write or source error otherwise — including a re-check that failed
 //     often enough to end the stream, which is a fault and not a denial.
 //
-// One revocation does NOT end here, and the shape of the gap is worth knowing.
 // A per-run stream whose project leaves a scope that is still otherwise
-// populated can only be closed by an event it must deny (see follow), so if
-// that run emits nothing further the connection stays open and idle. No denied
-// byte reaches the client — replay's Filter and follow's scope test both refuse
-// them — but nothing reaps the socket either, and the client's own reconnect is
-// what eventually fails authorization at the handler. Closing it outright needs
-// the run's project, which a Filter does not carry.
+// populated ends at the next re-check, WITHOUT waiting for an event to deny
+// (refresh). That case used to be the one revocation this did not act on: the
+// close was reachable only through follow, follow needs an event to test, and a
+// run that has gone quiet supplies none — so the connection stayed open and
+// heartbeating for the rest of its life. What closes it now is the run's own
+// project, carried on the Filter (Filter.runProject).
+//
+// The gap survives in one shape, and it is the shape that cannot be built
+// through this package's constructors: a per-run Filter LITERAL carries no run
+// project, and falls back to the event-driven close. Deliberate — see refresh
+// for why a missing project must not be read as a denied one.
 //
 // Only the first error can still become an HTTP status, and ErrNotStarted is
 // how a caller recognizes it. Once NewWriter has returned successfully the
@@ -323,6 +327,10 @@ type recheck struct {
 	// database round-trip on every stream open to re-learn what it was just
 	// told. The first tick is the earliest anything can have changed.
 	scope Scope
+	// runProject is Filter.runProject, copied so refresh has it: a per-run
+	// stream ends when a refreshed scope stops covering it. NIL MEANS NOT
+	// SUPPLIED — never "a project that is denied" — and refresh says why.
+	runProject *uuid.UUID
 	// failures is the run of CONSECUTIVE resolver failures, reset by any
 	// success. See maxGrantFailures for why a run rather than a lifetime.
 	failures int
@@ -330,10 +338,11 @@ type recheck struct {
 
 func (s *Streamer) newRecheck(req StreamRequest) *recheck {
 	return &recheck{
-		grants: s.grants,
-		userID: req.UserID,
-		tick:   time.NewTicker(s.cfg.GrantRecheck),
-		scope:  req.Filter.Scope,
+		grants:     s.grants,
+		userID:     req.UserID,
+		tick:       time.NewTicker(s.cfg.GrantRecheck),
+		scope:      req.Filter.Scope,
+		runProject: req.Filter.runProject,
 	}
 }
 
@@ -383,6 +392,34 @@ func (r *recheck) refresh(ctx context.Context, st *stream) error {
 	// resolves to exactly this — an empty Scope with a nil error — so
 	// deactivation lands here too.
 	if r.scope.empty() {
+		return st.closeForbidden()
+	}
+	// And a per-run stream ends when the refreshed scope stops covering the run's
+	// OWN project, even though the scope is not empty and the run may be silent.
+	// This is the other close that needs no event, and it is the only one that
+	// can reach a per-run stream over a quiescent run: follow's per-run denial
+	// requires an event to test, and a run that has stopped emitting supplies
+	// none, so without this the connection outlived the revocation indefinitely.
+	//
+	// The nil check is NOT a guard for tidiness. Dereferencing unconditionally
+	// would panic; testing a stream that has no run project against the zero
+	// uuid instead — which is what a value-typed field would have forced — is
+	// the subtler failure, and the one worth naming. A scope denies the zero
+	// uuid unless it is All or explicitly lists it, so that version would close,
+	// on its first tick, most streams carrying no project at all, denying
+	// principals whose grants never changed.
+	//
+	// That is TWO populations, not one, and the second is the larger: per-run
+	// filters built as literals, and EVERY ATTENTION STREAM, which has no run
+	// project by construction. Dropping the guard was run as a mutant and both
+	// fail — TestServe_PerRunStreamWithoutARunProjectSurvivesANarrowing and
+	// TestServe_DropsEventsOutsideRefreshedScope. A missing project must degrade
+	// to the event-driven close, never to a denial.
+	//
+	// Nil and not a zero uuid, so that a run whose project genuinely IS the zero
+	// uuid — schema-valid, since projects.id has a default and no non-zero
+	// constraint — is still checked rather than silently exempted.
+	if r.runProject != nil && !r.scope.allows(*r.runProject) {
 		return st.closeForbidden()
 	}
 	return nil
@@ -623,15 +660,19 @@ func (s *Streamer) follow(ctx context.Context, st *stream, sub *Subscription, rc
 				// A per-run stream's entire subject just left the principal's
 				// grants, so there is nothing left for it to show: end it.
 				//
-				// This is the only close an event can trigger, and it is also
-				// the only form the rule can take. "The scope no longer covers
-				// this run's project" is not computable without an event: a
-				// Filter carries a RunID and never that run's project, and an
-				// admin's per-run Filter carries no project id at all. The
-				// residue that leaves is real and documented on Serve: a per-run
-				// stream over an already-quiescent run keeps an idle connection
-				// open after the revocation. It shows the client nothing — every
-				// path denies — but nothing ends it either.
+				// This is the only close an EVENT can trigger, and it is no
+				// longer the only form the rule can take: a Filter now carries
+				// the run's project, so refresh ends this stream on the re-check
+				// without needing an event at all. Which of the two gets there
+				// first does not matter — both write the same terminal frame —
+				// and for a filter built by RunFilter the re-check normally
+				// wins.
+				//
+				// What keeps this branch load-bearing is the filter that has NO
+				// run project: a hand-built literal, where refresh deliberately
+				// stands down rather than deny (see there). For those this is
+				// still the only close there is, which is why it is not
+				// simplified away.
 				if req.Filter.RunID != nil {
 					return st.closeForbidden()
 				}

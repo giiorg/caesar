@@ -224,8 +224,8 @@ func TestServeRunStream_TranslatesAnEndingThatAlreadyCommittedTheResponse(t *tes
 	api := newTestStreamAPI(src, slog.New(slog.NewJSONHandler(logBuf, nil)))
 
 	rec := httptest.NewRecorder()
-	runID, userID := uuid.New(), uuid.New()
-	err := api.ServeRunStream(context.Background(), rec, runID, userID, 0, false)
+	runID, projectID, userID := uuid.New(), uuid.New(), uuid.New()
+	err := api.ServeRunStream(context.Background(), rec, runID, projectID, userID, 0, false)
 	if err != nil {
 		t.Fatalf("ServeRunStream = %v, want nil: runs/api answers a non-nil error with "+
 			"httpx.Problem, and this response was committed 200 the moment the stream "+
@@ -244,11 +244,25 @@ func TestServeRunStream_TranslatesAnEndingThatAlreadyCommittedTheResponse(t *tes
 	if !strings.Contains(logBuf.String(), "connection refused") {
 		t.Errorf("the source failure was neither returned nor logged:\n%s", logBuf.String())
 	}
-	// realtime.RunFilter, never a literal: Filter's fields are exported and the
-	// combination with Attention also set is a per-run stream wearing the
-	// attention stream's clothes (realtime.AttentionFilter).
+	// realtime.RunFilter, never a literal: Filter's selector fields are exported
+	// and the combination with Attention also set is a per-run stream wearing
+	// the attention stream's clothes (realtime.AttentionFilter).
 	if src.filter.RunID == nil || *src.filter.RunID != runID || src.filter.Attention {
 		t.Errorf("filter = %+v, want a RunFilter over %s", src.filter, runID)
+	}
+	// And the project reached it. This is the assertion a Filter LITERAL would
+	// fail while every other check here still passed: runProject is unexported,
+	// so a literal leaves it nil, and nil is read as "not supplied" — the
+	// stream would serve correctly and simply never close on a partial
+	// revocation over a quiescent run. Nothing else in this process can see
+	// that, because the value crosses two package boundaries to get here.
+	got, ok := src.filter.RunProject()
+	if !ok {
+		t.Errorf("filter carries no run project at all: the adapter built a Filter " +
+			"literal, or dropped the id runs/api handed it")
+	} else if got != projectID {
+		t.Errorf("filter.RunProject() = %s, want %s: the run's project did not survive "+
+			"runs/api -> realtime/api -> the Filter", got, projectID)
 	}
 }
 
@@ -259,7 +273,7 @@ func TestServeRunStream_ErrNotStartedStillReachesTheCaller(t *testing.T) {
 	api := newTestStreamAPI(&recordingSource{}, discard())
 
 	w := &unflushableWriter{}
-	err := api.ServeRunStream(context.Background(), w, uuid.New(), uuid.New(), 0, false)
+	err := api.ServeRunStream(context.Background(), w, uuid.New(), uuid.New(), uuid.New(), 0, false)
 
 	if !errors.Is(err, realtime.ErrNotStarted) {
 		t.Fatalf("ServeRunStream = %v, want ErrNotStarted: nothing was written, so "+

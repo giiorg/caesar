@@ -646,6 +646,83 @@ func assertNoneForbidden(t *testing.T, phase string, got []int64, forbidden map[
 	}
 }
 
+// A per-run stream over a QUIESCENT run ends when its project leaves the
+// principal's grants — through the real chain, end to end, with nothing faked.
+//
+// Every layer below has a test of its own, and none of them can make this
+// claim. The unit tests drive realtime.Serve with a stubbed resolver, so they
+// assert what the code does when handed a narrowed scope, not that revoking a
+// grant produces one. runs/api's integration test sees the project id reach the
+// stream port, but its port is a double that never streams. Only here do a real
+// DeleteGrant, the real resolver reading the real tables, the real re-check
+// ticker and a real socket appear together.
+//
+// The two conditions that make it the case worth testing, both deliberate:
+//
+//   - The member KEEPS a grant on the other project. An empty scope closes any
+//     stream through a path that already worked, so revoking everything would
+//     pass without the run project existing at all.
+//   - NOTHING IS EVER APPENDED after the stream opens. The close that already
+//     worked needs an event to deny; this run supplies none, so an event here
+//     would let the old path take the credit for the new one's work.
+//
+// What it therefore fails on is the whole feature being absent — and, before
+// the run project reached the Filter, it fails by the request deadline expiring
+// on a stream that is still cheerfully heartbeating.
+func TestStream_PerRunStreamClosesWhenItsProjectIsRevoked(t *testing.T) {
+	ctx := context.Background()
+	p := bootServe(t, nil)
+	root, err := p.svc.Bootstrap(ctx, "root@example.com", testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watched := seedRealtimeRun(ctx, t, p.pool, "revoked-watched")
+	kept := seedRealtimeRun(ctx, t, p.pool, "revoked-kept")
+	actor := identity.Principal{UserID: root.ID, Email: root.Email, Role: identity.RoleAdmin}
+	member, err := p.svc.CreateUser(ctx, actor, "revoked@example.com", testPassword, identity.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, projectID := range []uuid.UUID{watched.projectID, kept.projectID} {
+		if err := p.svc.SetGrant(ctx, actor, projectID, member.ID, identity.GrantView); err != nil {
+			t.Fatal(err)
+		}
+	}
+	token := p.login(t, "revoked@example.com")
+
+	stream, cancel := openStream(t, p,
+		"/api/v1/runs/"+watched.runID.String()+"/events", token, 30*time.Second)
+	defer cancel()
+
+	// Past catch-up before the revocation, so what closes the stream is the
+	// re-check on a live connection and not a page boundary. Both are real
+	// closes; this is the one with no event anywhere near it.
+	stream.awaitLive(t)
+
+	if err := p.svc.DeleteGrant(ctx, actor, watched.projectID, member.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The terminal frame, and no event line before it: nothing was published,
+	// so a stream that wrote anything but heartbeats and this is a stream that
+	// leaked something it had already been told it may not show.
+	stream.await(t, "the forbidden frame after the grant was revoked", func(l string) bool {
+		return l == "event: forbidden"
+	})
+
+	// And the principal's OTHER grant survived it, which is what says the close
+	// was scoped to this run's project rather than a deactivation or an empty
+	// scope taking everything down with it.
+	grants, err := p.svc.GrantsForUser(ctx, member.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grants) != 1 || grants[0].ProjectID != kept.projectID {
+		t.Fatalf("grants after the revocation = %+v, want exactly the kept project %s: "+
+			"the stream must have closed on a PARTIAL revocation", grants, kept.projectID)
+	}
+}
+
 // TestStream_HeartbeatArrives pins the comment frame that keeps an idle tunnel
 // open, and the two things about it that are not the same claim: that it
 // REPEATS on the configured interval, and that the connection it padded is

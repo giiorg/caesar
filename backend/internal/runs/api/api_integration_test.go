@@ -196,16 +196,20 @@ type fakeStreamServer struct {
 
 type streamCall struct {
 	RunID       uuid.UUID
+	ProjectID   uuid.UUID
 	UserID      uuid.UUID
 	LastEventID int64
 	HasLastID   bool
 }
 
 func (f *fakeStreamServer) ServeRunStream(
-	_ context.Context, w http.ResponseWriter, runID, userID uuid.UUID, lastEventID int64, hasLastID bool,
+	_ context.Context, w http.ResponseWriter, runID, projectID, userID uuid.UUID, lastEventID int64, hasLastID bool,
 ) error {
 	f.mu.Lock()
-	f.calls = append(f.calls, streamCall{RunID: runID, UserID: userID, LastEventID: lastEventID, HasLastID: hasLastID})
+	f.calls = append(f.calls, streamCall{
+		RunID: runID, ProjectID: projectID, UserID: userID,
+		LastEventID: lastEventID, HasLastID: hasLastID,
+	})
 	err := f.err
 	f.mu.Unlock()
 	if err != nil {
@@ -970,7 +974,16 @@ func TestRunsAPI_ListRunEventsAcceptEventStreamStreams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := streamCall{RunID: wantRun, UserID: h.viewer.UserID, LastEventID: 12, HasLastID: true}
+	// ProjectID is the run's own project, and this is the only test that sees
+	// it travel the whole real path: an HTTP request, a run resolved from the
+	// database, its task read for the project, and the port handed the result.
+	// Everything nearer the port can be satisfied by a caller passing anything
+	// at all — a wrong project would be caught here and nowhere else, and a
+	// zero one would leave the stream unable to close on a partial revocation.
+	want := streamCall{
+		RunID: wantRun, ProjectID: h.projectID, UserID: h.viewer.UserID,
+		LastEventID: 12, HasLastID: true,
+	}
 	if calls[0] != want {
 		t.Errorf("stream port call = %+v, want %+v", calls[0], want)
 	}

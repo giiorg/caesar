@@ -1282,20 +1282,43 @@ both scale with the process count, and nothing coordinates them. The
 monolith is the assumption (spec §4); scaling out horizontally means
 accepting that multiplication.
 
-**A per-run stream over a quiescent run does not close on a partial
-revocation.** If a principal loses the project a per-run stream is
-showing but keeps other grants, the stream can only be ended by an event
-it must deny — so if that run emits nothing further, the connection
-stays open and idle indefinitely. No denied byte reaches the client, and
-the client's own reconnect fails authorization at the handler; but
-nothing reaps the socket. Nothing *will*, either: the heartbeat ticker
-runs regardless of scope, so the connection keeps producing `: hb`
-comments and no proxy idle timeout culls it — the first instinct, "an
-idle timeout will clean this up", is wrong here. A `Filter` carries the
-run id and never the run's project, which is why the stream cannot be
-closed outright. Losing *every* grant is different and does close it: an
-empty scope matches nothing and is the one thing a re-check can act on
-without an event.
+**A per-run stream closes on a partial revocation within one
+`grant_recheck`, even over a quiescent run.** If a principal loses the
+project a per-run stream is showing but keeps other grants, the next
+re-check ends the stream — no event required. This is worth stating
+because the obvious implementation cannot do it: the scope test needs
+something to test, and the only other way to learn a run's project is
+from one of its events, which a run that has gone quiet will never
+produce. What makes it work is that the run's project travels with the
+request — `runs/api` has already resolved and authorized against it — and
+is carried on the `Filter` for the life of the stream. Losing *every*
+grant closes it by a second, older route: an empty scope matches nothing.
+
+The one shape still without this is a per-run `Filter` built as a struct
+literal, which carries no run project and falls back to closing on the
+first event it must deny. That is deliberate, and the reasoning is worth
+knowing before anyone "tidies" it.
+
+The field is a *pointer*, and that is what makes omitting it safe: a
+literal leaves it nil, and the re-check reads nil as "not supplied" rather
+than as a project to deny. Had it been a plain `uuid.UUID`, omission would
+have produced the zero uuid — which a scope denies unless it is an admin's
+or explicitly lists zero — and streams built from a literal, along with
+attention streams, which have no run project at all, would have been
+closed on their first re-check with the principal's grants entirely
+intact. A liveness gap is the acceptable failure here; a silent denial is
+not.
+
+The pointer also keeps absence distinct from the project whose id happens
+to be all zeros. `projects.id` has a `uuidv7()` default but no non-zero
+constraint, so a zero project id is schema-valid through an import or
+hand-written SQL, and a zero-uuid sentinel would have exempted exactly
+that run's streams from the check while they carried on looking healthy.
+
+The field is *unexported* for a different failure the pointer does not
+cover: not omission but a wrong value. `RunFilter` is the only way to set
+it, and it takes the project the HTTP surface already resolved and
+authorized against, so no caller can substitute one nobody checked.
 
 **A revoke-then-re-grant can leave a permanent hole in one stream.** The
 cursor is a single high-water mark, so once a narrowed scope has

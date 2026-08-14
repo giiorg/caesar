@@ -36,8 +36,13 @@ type GrantSource interface {
 // write that failed — returns nil and is reported by the implementation, which
 // is the only side that can tell a routine ending from a fault (that reading
 // is realtime's close reasons, which runs must never name).
+// projectID is the run's project, which this side has already resolved and
+// authorized against. It travels with the run id because the implementation
+// needs it to keep enforcing the grant for the LIFETIME of the stream, and a
+// run carries no project of its own — so the alternative is the far side
+// re-reading the run and its task to learn what this side already knows.
 type StreamServer interface {
-	ServeRunStream(ctx context.Context, w http.ResponseWriter, runID, userID uuid.UUID, lastEventID int64, hasLastID bool) error
+	ServeRunStream(ctx context.Context, w http.ResponseWriter, runID, projectID, userID uuid.UUID, lastEventID int64, hasLastID bool) error
 }
 
 type API struct {
@@ -286,26 +291,31 @@ func (a *API) taskScoped(w http.ResponseWriter, r *http.Request, sess authn.Auth
 //
 // It reads the run row only. The projection its one page-rendering caller
 // needs is five queries, and the event poll runs this on every tick.
-func (a *API) runScoped(w http.ResponseWriter, r *http.Request, sess authn.AuthSession, min authn.GrantLevel) (runs.Run, bool) {
+//
+// The project it authorized against is RETURNED rather than discarded. It cost
+// a query to learn and it is not recoverable from the run, so the one caller
+// that needs to pass it on would otherwise have to repeat both reads to obtain
+// a value this function already had in hand.
+func (a *API) runScoped(w http.ResponseWriter, r *http.Request, sess authn.AuthSession, min authn.GrantLevel) (runs.Run, uuid.UUID, bool) {
 	id, err := pathUUID(r, "no such run")
 	if err != nil {
 		httpx.Problem(w, r, err)
-		return runs.Run{}, false
+		return runs.Run{}, uuid.Nil, false
 	}
 	run, err := a.svc.GetRunSummary(r.Context(), id)
 	if err != nil {
 		httpx.Problem(w, r, err)
-		return runs.Run{}, false
+		return runs.Run{}, uuid.Nil, false
 	}
 	task, err := a.svc.GetTask(r.Context(), run.TaskID)
 	if err != nil {
 		httpx.Problem(w, r, err)
-		return runs.Run{}, false
+		return runs.Run{}, uuid.Nil, false
 	}
 	if !a.authorize(w, r, sess, task.ProjectID, min) {
-		return runs.Run{}, false
+		return runs.Run{}, uuid.Nil, false
 	}
-	return run, true
+	return run, task.ProjectID, true
 }
 
 func (a *API) handleGetTask(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
@@ -347,7 +357,7 @@ func (a *API) handleListTaskRuns(w http.ResponseWriter, r *http.Request, sess au
 }
 
 func (a *API) handleGetRun(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
-	run, ok := a.runScoped(w, r, sess, authn.GrantView)
+	run, _, ok := a.runScoped(w, r, sess, authn.GrantView)
 	if !ok {
 		return
 	}
@@ -449,7 +459,7 @@ func (a *API) handleListApprovals(w http.ResponseWriter, r *http.Request, sess a
 // outside their grants — the stream gives too, and neither branch can drift
 // from the other because there is only one check.
 func (a *API) handleListRunEvents(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
-	run, ok := a.runScoped(w, r, sess, authn.GrantView)
+	run, projectID, ok := a.runScoped(w, r, sess, authn.GrantView)
 	if !ok {
 		return
 	}
@@ -457,7 +467,7 @@ func (a *API) handleListRunEvents(w http.ResponseWriter, r *http.Request, sess a
 	// repeated headers, and Get would see only the first — which for a client
 	// that put its refusal in the second would be a stream it declined.
 	if acceptsEventStream(strings.Join(r.Header.Values("Accept"), ",")) {
-		a.streamRunEvents(w, r, sess, run.ID)
+		a.streamRunEvents(w, r, sess, run.ID, projectID)
 		return
 	}
 	after, err := eventCursor(r)
@@ -485,7 +495,7 @@ func (a *API) handleListRunEvents(w http.ResponseWriter, r *http.Request, sess a
 // the 200 forever; after that the only thing left to report a returned error
 // to is the log, and the port has already done that where the close reasons
 // are in scope (see StreamServer).
-func (a *API) streamRunEvents(w http.ResponseWriter, r *http.Request, sess authn.AuthSession, runID uuid.UUID) {
+func (a *API) streamRunEvents(w http.ResponseWriter, r *http.Request, sess authn.AuthSession, runID, projectID uuid.UUID) {
 	// No port means nobody wired the realtime context, and a wiring omission
 	// must be LOUD. Falling back to the poll is the tempting alternative and
 	// the wrong one: the endpoint would look like it works and the streaming
@@ -499,7 +509,7 @@ func (a *API) streamRunEvents(w http.ResponseWriter, r *http.Request, sess authn
 		httpx.Problem(w, r, err)
 		return
 	}
-	if err := a.streams.ServeRunStream(r.Context(), w, runID, sess.UserID, lastID, hasLastID); err != nil {
+	if err := a.streams.ServeRunStream(r.Context(), w, runID, projectID, sess.UserID, lastID, hasLastID); err != nil {
 		httpx.Problem(w, r, err)
 	}
 }

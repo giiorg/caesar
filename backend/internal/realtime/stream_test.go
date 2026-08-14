@@ -305,9 +305,26 @@ func (r *streamRecorder) ids(t *testing.T) []int64 {
 }
 
 // runFilter is a per-run subscription scoped to one project — the shape the
-// per-run HTTP surface builds, through the same constructor it uses.
+// per-run HTTP surface builds, through the same constructor it uses. project is
+// both the run's own project and the whole of the scope, which is what the
+// surface produces for a member holding exactly this one grant.
 func runFilter(run, project uuid.UUID) Filter {
-	return RunFilter(run, Scope{Projects: []uuid.UUID{project}})
+	return RunFilter(run, project, Scope{Projects: []uuid.UUID{project}})
+}
+
+// legacyRunFilter is the per-run shape a caller gets from a Filter LITERAL: no
+// run project, so the field stays nil. Outside this package that is forced —
+// the field is unexported — and here it is written out deliberately, which is
+// the only way to build the shape under test from inside realtime.
+//
+// It is not a hypothetical. It is what every per-run Filter in this process
+// looked like before RunFilter took a project, and what a future caller who
+// builds one by hand will get. The fallback it exercises — a nil run project
+// meaning "not supplied" rather than a project to test a scope against — is
+// what keeps forgetting the field a liveness cost instead of a denial, and a
+// claim no test can construct is not one the code is held to.
+func legacyRunFilter(run, project uuid.UUID) Filter {
+	return Filter{RunID: &run, Scope: Scope{Projects: []uuid.UUID{project}}}
 }
 
 // idleStreamer is the configuration for tests that assert on ids: a heartbeat
@@ -1134,10 +1151,17 @@ func TestServe_DropsEventsOutsideRefreshedScope(t *testing.T) {
 // principal's grants, so there is nothing left for it to show and it ends.
 //
 // The refreshed scope here is NON-empty — the principal still holds another
-// project — so the idle close cannot fire and only the event can end this
-// stream. That is deliberate: "the run's project left the scope" is not
-// computable without an event, because a Filter carries a RunID and never that
-// run's project.
+// project — so the idle close cannot fire and the EVENT is what ends this
+// stream.
+//
+// The filter is a literal, and that is the whole reason this test still has a
+// subject. A filter built by RunFilter carries the run's project, and the
+// re-check closes on that before any event is looked at (see
+// TestServe_ClosesQuiescentPerRunStreamWhenItsProjectLeavesScope). What is left
+// for an event to close is precisely the filter that carries no run project —
+// the fallback — and this is the path that keeps such a stream from streaming
+// on regardless. Written with runFilter, this test would still pass and would
+// no longer reach the code it names.
 func TestServe_ClosesPerRunStreamOnAForbiddenEvent(t *testing.T) {
 	t.Parallel()
 	proj, other, run := uuid.New(), uuid.New(), uuid.New()
@@ -1150,7 +1174,7 @@ func TestServe_ClosesPerRunStreamOnAForbiddenEvent(t *testing.T) {
 		ReplayBatch:       10,
 	})
 
-	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: legacyRunFilter(run, proj)})
 
 	// At or past the resolve, which is all this needs — see the same wait in
 	// TestServe_DropsEventsOutsideRefreshedScope for why that suffices.
@@ -1164,6 +1188,124 @@ func TestServe_ClosesPerRunStreamOnAForbiddenEvent(t *testing.T) {
 	// client, which is the point of checking before writing.
 	if diff := cmp.Diff(forbiddenOnTheWire, rec.written()); diff != "" {
 		t.Errorf("wire bytes (-want +got):\n%s", diff)
+	}
+}
+
+// The gap that motivated the run project, closed: a per-run stream whose
+// project leaves a scope that is STILL OTHERWISE POPULATED, over a run that
+// emits nothing at all, now ends at the re-check.
+//
+// Nothing is ever published here, and that is the assertion. The empty-scope
+// close cannot fire (the principal keeps `other`), and follow's per-run close
+// needs an event this run will never produce — so before the run project
+// reached the Filter, this stream stayed open and heartbeating forever with
+// the revocation already in force.
+func TestServe_ClosesQuiescentPerRunStreamWhenItsProjectLeavesScope(t *testing.T) {
+	t.Parallel()
+	proj, other, run := uuid.New(), uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	// Non-empty: an empty scope would close this stream through the path that
+	// already worked, and prove nothing about this one.
+	grants := &stubGrants{steps: []grantStep{{scope: Scope{Projects: []uuid.UUID{other}}}}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       10,
+	})
+
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+
+	if err := waitServe(t, errc); !errors.Is(err, CloseForbidden) {
+		t.Fatalf("Serve() on a quiescent per-run stream whose project left the scope = %v, "+
+			"want %v: no event will ever arrive to close it", err, CloseForbidden)
+	}
+	// The whole body. A heartbeat here would mean the stream outlived the
+	// revocation long enough to tick, and the terminal frame is the only thing
+	// a client should see after one.
+	if diff := cmp.Diff(forbiddenOnTheWire, rec.written()); diff != "" {
+		t.Errorf("wire bytes (-want +got):\n%s", diff)
+	}
+}
+
+// A run whose project genuinely IS the zero uuid is checked like any other.
+//
+// This is the case a zero-uuid sentinel could not express. "Not supplied" and
+// "supplied, and it happens to be all zeros" are different facts, and nothing
+// in the schema rules the second out: projects.id has a uuidv7 DEFAULT and no
+// non-zero constraint, so an imported or hand-inserted row can hold one. Under
+// a sentinel this stream would be exempted from the check and keep the exact
+// leak the run project exists to close — silently, since it serves correctly in
+// every other respect.
+//
+// It is a pointer instead, so this test and the fallback test below can both
+// hold: same absence of a project in the SCOPE, opposite outcomes, decided by
+// whether a project was supplied rather than by its value.
+func TestServe_ClosesQuiescentPerRunStreamWhoseProjectIsTheZeroUUID(t *testing.T) {
+	t.Parallel()
+	other, run := uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	grants := &stubGrants{steps: []grantStep{{scope: Scope{Projects: []uuid.UUID{other}}}}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       10,
+	})
+
+	// Supplied through the constructor, and zero. Nothing is ever published.
+	f := RunFilter(run, uuid.Nil, Scope{Projects: []uuid.UUID{uuid.Nil}})
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: f})
+
+	if err := waitServe(t, errc); !errors.Is(err, CloseForbidden) {
+		t.Fatalf("Serve() on a quiescent per-run stream whose project is the zero uuid = %v, "+
+			"want %v: the project was SUPPLIED and the refreshed scope denies it", err, CloseForbidden)
+	}
+	if diff := cmp.Diff(forbiddenOnTheWire, rec.written()); diff != "" {
+		t.Errorf("wire bytes (-want +got):\n%s", diff)
+	}
+}
+
+// The fallback, and the reason runProject is a pointer rather than a uuid.
+//
+// A Filter LITERAL leaves the run project nil. Were it a plain uuid, a literal
+// would carry the zero one instead — which this scope does not list, so a
+// re-check testing it blindly would close this stream, and every other stream
+// built from a literal, on its first tick, denying a principal whose grants are
+// entirely intact. That is a silent deny, and it is worse than the liveness gap
+// the run project exists to fix.
+//
+// So nil means "not supplied" and the stream carries on, exactly as it did
+// before any of this existed. This test is what makes that a decision rather
+// than an accident: it fails the moment the check stops distinguishing the two.
+func TestServe_PerRunStreamWithoutARunProjectSurvivesANarrowing(t *testing.T) {
+	t.Parallel()
+	proj, other, run := uuid.New(), uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	grants := &stubGrants{steps: []grantStep{{scope: Scope{Projects: []uuid.UUID{other}}}}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       10,
+	})
+
+	rec, cancel, errc := startServe(t, s, StreamRequest{Filter: legacyRunFilter(run, proj)})
+
+	// Several re-checks, not one: a close on the FIRST tick is the failure this
+	// is looking for, and waiting for a single resolve would race it.
+	eventually(t, func() bool { return grants.callCount() >= 3 }, "several grant re-checks")
+
+	// Still serving, and nothing denied has been written.
+	if got := rec.written(); got != "" {
+		t.Errorf("wire bytes = %q, want none: nothing has been published and the "+
+			"stream must not have ended", got)
+	}
+	cancel()
+	if err := waitServe(t, errc); err != nil {
+		t.Fatalf("Serve() on a per-run stream with no run project = %v, want nil: a zero "+
+			"run project means NOT SUPPLIED, and must never be read as a project the "+
+			"scope denies", err)
 	}
 }
 
@@ -1361,17 +1503,22 @@ func TestServe_ClosesWhenGrantRevokedDuringCatchUp(t *testing.T) {
 	}
 }
 
-// The residue of finding 4's rule, pinned rather than assumed. A per-run stream
-// whose project leaves a scope that is still otherwise populated has no empty
-// scope to close on: replay simply stops returning its rows, because the
+// The residue of finding 4's rule, on the filter that still has one. A per-run
+// stream whose project leaves a scope that is still otherwise populated has no
+// empty scope to close on: replay simply stops returning its rows, because the
 // refreshed scope goes into the next page's Filter.
 //
 // What ends it is the hub's deliberately stale subscription filter. Serve never
 // mutates that filter, so the tailer keeps delivering this run's events into
 // follow — where the per-run denial closes the stream. This test is the whole
 // chain: rows 3-6 withheld by SQL during catch-up, then one live event closing
-// it. The chain has a gap, stated on Serve: a run that emits nothing further
-// leaves the connection open and idle, showing the client nothing.
+// it.
+//
+// The filter is a LITERAL for the same reason as
+// TestServe_ClosesPerRunStreamOnAForbiddenEvent: given a run project the
+// catch-up re-check ends the stream at the page boundary, and this chain never
+// runs. That case has its own test below — the two together are what say which
+// of the two closes a given per-run stream gets.
 func TestServe_PerRunStreamNarrowedMidCatchUpClosesOnTheNextEvent(t *testing.T) {
 	t.Parallel()
 	proj, other, run := uuid.New(), uuid.New(), uuid.New()
@@ -1391,7 +1538,7 @@ func TestServe_PerRunStreamNarrowedMidCatchUpClosesOnTheNextEvent(t *testing.T) 
 		ReplayBatch:       2,
 	})
 
-	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: legacyRunFilter(run, proj)})
 
 	// A raised count means the pager reached its second boundary, which means
 	// the subscription has existed since before the snapshot. Publishing now is
@@ -1405,6 +1552,47 @@ func TestServe_PerRunStreamNarrowedMidCatchUpClosesOnTheNextEvent(t *testing.T) 
 	}
 	// Page one, and nothing after it: ids 3-6 were excluded by the next page's
 	// Filter, and id 7 by follow's scope test on its way to the close.
+	if diff := cmp.Diff([]int64{1, 2}, rec.ids(t)); diff != "" {
+		t.Errorf("ids on the wire (-want +got):\n%s", diff)
+	}
+	if got := rec.written(); !strings.HasSuffix(got, forbiddenOnTheWire) {
+		t.Errorf("stream did not end with the terminal frame:\n%q", got)
+	}
+}
+
+// And the same narrowing with the run project present: the catch-up re-check
+// ends it AT THE PAGE BOUNDARY, without the live event the test above needs.
+//
+// This is the case that matters most in production and the one the gap hurt
+// worst. Catch-up is unbounded — it runs for as long as the client is behind —
+// so a revocation landing during a long replay of a run that then goes quiet
+// left a stream open for the rest of the connection's life. The wire is the
+// evidence: ids 1 and 2 from before the re-check, then the terminal frame, and
+// nothing from the four rows the narrowed scope withheld.
+func TestServe_PerRunStreamNarrowedMidCatchUpClosesWithoutAnEvent(t *testing.T) {
+	t.Parallel()
+	proj, other, run := uuid.New(), uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	retained := make([]Event, 0, 6)
+	for id := int64(1); id <= 6; id++ {
+		retained = append(retained, hubEvent(id, proj, run, "run.started"))
+	}
+	src := &streamSource{retained: retained}
+	src.onReplay = slowFirstPage()
+	grants := &stubGrants{steps: []grantStep{{scope: Scope{Projects: []uuid.UUID{other}}}}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       2,
+	})
+
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: runFilter(run, proj)})
+
+	// Nothing is published. The stream must end anyway.
+	if err := waitServe(t, errc); !errors.Is(err, CloseForbidden) {
+		t.Fatalf("Serve() on a per-run stream narrowed mid-catch-up = %v, want %v: the "+
+			"re-check carries the run's project and needs no event", err, CloseForbidden)
+	}
 	if diff := cmp.Diff([]int64{1, 2}, rec.ids(t)); diff != "" {
 		t.Errorf("ids on the wire (-want +got):\n%s", diff)
 	}
