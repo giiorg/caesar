@@ -33,6 +33,20 @@ func newTestService(t *testing.T) (*assets.Service, *pgxpool.Pool, *clock.Fake) 
 	return assets.NewService(pool, fake, audit.NewRecorder(fake), keys), pool, fake
 }
 
+// newTestServiceWithFaults is newTestService on a pool carrying the query
+// tracer, for the tests that have to force one exact interleaving rather than
+// race for it.
+func newTestServiceWithFaults(t *testing.T) (*assets.Service, *pgxpool.Pool, *testdb.QueryFaults) {
+	t.Helper()
+	pool, faults := testdb.NewWithFaults(t)
+	fake := clock.NewFake(time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC))
+	keys, err := secrets.ParseKeyset(testKeyset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return assets.NewService(pool, fake, audit.NewRecorder(fake), keys), pool, faults
+}
+
 // seedActor inserts a user row directly (assets never imports identity)
 // and returns a principal for it.
 func seedActor(t *testing.T, pool *pgxpool.Pool, email string, role authn.Role) authn.Principal {

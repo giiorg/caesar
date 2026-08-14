@@ -35,6 +35,9 @@ import (
 // against the golden set's live HTTP stack. One implementation cannot drift
 // from itself.
 //
+// The same tracer also injects the other kind of fault a transaction has to
+// survive — an inconvenient interleaving rather than an error. See AfterQuery.
+//
 // Inert until armed, so every test that never calls Fail is untouched.
 type QueryFaults struct {
 	mu    sync.Mutex
@@ -42,7 +45,14 @@ type QueryFaults struct {
 	// fired counts firings per name and is never cleared, so a test can arm,
 	// wait, disarm and still prove the injection happened.
 	fired map[string]int
+	// after holds the one-shot interleaving hooks armed by AfterQuery.
+	after map[string]func()
 }
+
+// afterHookKey carries an armed hook from TraceQueryStart, which is the only
+// callback handed the SQL, to TraceQueryEnd, which is the only one that runs
+// after the statement.
+type afterHookKey struct{}
 
 // queryFault is one armed statement. times is how many firings are left when
 // unlimited is false.
@@ -53,7 +63,39 @@ type queryFault struct {
 }
 
 func NewQueryFaults() *QueryFaults {
-	return &QueryFaults{rules: map[string]*queryFault{}, fired: map[string]int{}}
+	return &QueryFaults{
+		rules: map[string]*queryFault{}, fired: map[string]int{}, after: map[string]func(){},
+	}
+}
+
+// AfterQuery runs fn once, on the connection's own goroutine, as soon as the
+// named statement returns — inside the transaction that issued it and before
+// that transaction's next statement. It is how a test pins one exact
+// interleaving ("this committed between those two statements") instead of
+// racing for it with sleeps and hoping the loser loses.
+//
+// fn runs synchronously, so it must not wait on a lock the paused transaction
+// holds: a test whose injected writer may legitimately block runs it in a
+// goroutine and waits with a timeout, and treats "still blocked" as a
+// possible outcome rather than a hang.
+func (q *QueryFaults) AfterQuery(name string, fn func()) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.after[name] = fn
+}
+
+// takeAfterHook claims the hook armed for sql, if any. Claiming it under the
+// lock is what makes one arming fire exactly once.
+func (q *QueryFaults) takeAfterHook(sql string) func() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for name, fn := range q.after {
+		if strings.Contains(sql, "-- name: "+name+" ") {
+			delete(q.after, name)
+			return fn
+		}
+	}
+	return nil
 }
 
 // Fail arms the named sqlc query — the Go method name, e.g. "RecordPushReceipt"
@@ -129,15 +171,22 @@ func (q *QueryFaults) armed(sql string) bool {
 }
 
 func (q *QueryFaults) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
-	if !q.armed(data.SQL) {
-		return ctx
+	if q.armed(data.SQL) {
+		dead, cancel := context.WithCancel(ctx)
+		cancel()
+		return dead
 	}
-	dead, cancel := context.WithCancel(ctx)
-	cancel()
-	return dead
+	if fn := q.takeAfterHook(data.SQL); fn != nil {
+		return context.WithValue(ctx, afterHookKey{}, fn)
+	}
+	return ctx
 }
 
-func (q *QueryFaults) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+func (q *QueryFaults) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryEndData) {
+	if fn, ok := ctx.Value(afterHookKey{}).(func()); ok {
+		fn()
+	}
+}
 
 // NewWithFaults returns a pool on a fresh isolated database with the fault
 // tracer already installed, closed on test cleanup. The tracer has to be set
