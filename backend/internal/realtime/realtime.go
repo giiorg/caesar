@@ -93,23 +93,34 @@ type Filter struct {
 	// the only other way to learn a run's project is from one of its events and
 	// a quiescent run supplies none.
 	//
-	// It is UNEXPORTED, and that is the safety argument rather than a matter of
-	// style. A Filter literal cannot set it, so on every literal it is the zero
-	// uuid — read as "not supplied", which falls back to the event-driven close
-	// in follow. The exported alternative inverts that failure: a hand-built
-	// literal would carry uuid.Nil, NO scope allows uuid.Nil, and the first
-	// re-check would close every per-run stream built that way. That is a
-	// silent deny, and a silent deny is the one outcome this rule may not have
-	// — so the field is shaped to make forgetting it degrade to today's
-	// behaviour instead of to a closed stream.
+	// Two properties carry the safety here, and neither is stylistic.
 	//
-	// RunFilter takes it POSITIONALLY for the other half: on the supported
-	// path, forgetting it is a compile error rather than a zero.
-	runProject uuid.UUID
+	// UNEXPORTED, so a Filter literal cannot set it and therefore leaves it
+	// NIL. Nil is read as "not supplied" and falls back to the event-driven
+	// close in follow. Were the field exported, a hand-built literal would
+	// carry a zero uuid that most scopes deny, and the first re-check would
+	// close every per-run stream built that way — a silent deny of a principal
+	// whose grants are intact. Forgetting this field must degrade to the older,
+	// weaker close; it must never deny.
+	//
+	// A POINTER rather than a zero-uuid sentinel, so "not supplied" and "the
+	// project whose id happens to be all zeros" stay distinguishable. Nothing
+	// in the schema forbids a zero project id — projects.id has a uuidv7
+	// DEFAULT, not a non-zero CHECK — so an imported or hand-inserted row can
+	// hold one, and under a sentinel that run's stream would silently keep the
+	// leak this field exists to close.
+	//
+	// RunFilter takes it POSITIONALLY for the last part: on the supported path,
+	// forgetting it is a compile error rather than a quiet nil.
+	runProject *uuid.UUID
 }
 
-// RunProject is the project the run belongs to, or the zero uuid on a Filter
-// that was not built by RunFilter.
+// RunProject is the project the run belongs to, and whether the Filter carries
+// one at all — false on any Filter not built by RunFilter.
+//
+// The bool is not decoration: a caller cannot otherwise tell "no project" from
+// "the zero project", which is the same conflation the pointer exists to avoid,
+// merely moved to the accessor.
 //
 // Read-only ON PURPOSE, and the asymmetry with the unexported field is the
 // point: what makes an exported field dangerous here is that a caller can SET
@@ -117,13 +128,18 @@ type Filter struct {
 // actually threaded the project id is observable only inside this package —
 // and the wiring that could drop it spans three (runs/api → realtime/api →
 // here), so the assertion that matters would have nowhere to live.
-func (f Filter) RunProject() uuid.UUID { return f.runProject }
+func (f Filter) RunProject() (uuid.UUID, bool) {
+	if f.runProject == nil {
+		return uuid.Nil, false
+	}
+	return *f.runProject, true
+}
 
 // RunFilter is one run's stream within scope. projectID is the run's OWN
 // project — see Filter.runProject for why it is a parameter and not a field a
 // caller may fill in later.
 func RunFilter(runID, projectID uuid.UUID, s Scope) Filter {
-	return Filter{RunID: &runID, runProject: projectID, Scope: s}
+	return Filter{RunID: &runID, runProject: &projectID, Scope: s}
 }
 
 // AttentionFilter is the global attention stream within scope.

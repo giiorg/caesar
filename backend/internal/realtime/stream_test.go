@@ -1226,6 +1226,44 @@ func TestServe_ClosesQuiescentPerRunStreamWhenItsProjectLeavesScope(t *testing.T
 	}
 }
 
+// A run whose project genuinely IS the zero uuid is checked like any other.
+//
+// This is the case a zero-uuid sentinel could not express. "Not supplied" and
+// "supplied, and it happens to be all zeros" are different facts, and nothing
+// in the schema rules the second out: projects.id has a uuidv7 DEFAULT and no
+// non-zero constraint, so an imported or hand-inserted row can hold one. Under
+// a sentinel this stream would be exempted from the check and keep the exact
+// leak the run project exists to close — silently, since it serves correctly in
+// every other respect.
+//
+// It is a pointer instead, so this test and the fallback test below can both
+// hold: same absence of a project in the SCOPE, opposite outcomes, decided by
+// whether a project was supplied rather than by its value.
+func TestServe_ClosesQuiescentPerRunStreamWhoseProjectIsTheZeroUUID(t *testing.T) {
+	t.Parallel()
+	other, run := uuid.New(), uuid.New()
+	hub := NewHub(HubConfig{SubscriberQueue: 8})
+	src := &streamSource{}
+	grants := &stubGrants{steps: []grantStep{{scope: Scope{Projects: []uuid.UUID{other}}}}}
+	s := NewStreamer(hub, src, grants, StreamerConfig{
+		HeartbeatInterval: time.Hour,
+		GrantRecheck:      testPoll,
+		ReplayBatch:       10,
+	})
+
+	// Supplied through the constructor, and zero. Nothing is ever published.
+	f := RunFilter(run, uuid.Nil, Scope{Projects: []uuid.UUID{uuid.Nil}})
+	rec, _, errc := startServe(t, s, StreamRequest{Filter: f})
+
+	if err := waitServe(t, errc); !errors.Is(err, CloseForbidden) {
+		t.Fatalf("Serve() on a quiescent per-run stream whose project is the zero uuid = %v, "+
+			"want %v: the project was SUPPLIED and the refreshed scope denies it", err, CloseForbidden)
+	}
+	if diff := cmp.Diff(forbiddenOnTheWire, rec.written()); diff != "" {
+		t.Errorf("wire bytes (-want +got):\n%s", diff)
+	}
+}
+
 // The fallback, and the reason runProject is unexported rather than exported.
 //
 // A Filter LITERAL cannot set the run project, so it carries the zero uuid. No

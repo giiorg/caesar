@@ -328,9 +328,9 @@ type recheck struct {
 	// told. The first tick is the earliest anything can have changed.
 	scope Scope
 	// runProject is Filter.runProject, copied so refresh has it: a per-run
-	// stream ends when a refreshed scope stops covering it. ZERO MEANS NOT
+	// stream ends when a refreshed scope stops covering it. NIL MEANS NOT
 	// SUPPLIED — never "a project that is denied" — and refresh says why.
-	runProject uuid.UUID
+	runProject *uuid.UUID
 	// failures is the run of CONSECUTIVE resolver failures, reset by any
 	// success. See maxGrantFailures for why a run rather than a lifetime.
 	failures int
@@ -401,12 +401,13 @@ func (r *recheck) refresh(ctx context.Context, st *stream) error {
 	// requires an event to test, and a run that has stopped emitting supplies
 	// none, so without this the connection outlived the revocation indefinitely.
 	//
-	// The zero check is NOT a nil-guard for tidiness — it is the whole reason
+	// The nil check is NOT a guard for tidiness — it is the whole reason
 	// runProject is unexported, and removing it inverts this rule into the
-	// failure it was designed around. Nothing that lacks a run project carries
-	// anything but the zero uuid here, no scope allows the zero uuid, and so an
-	// unconditional test would close, on its first tick, every stream that has
-	// one — denying principals whose grants never changed.
+	// failure it was designed around. A stream that carries no run project
+	// would be tested against the zero uuid, which a scope denies unless it is
+	// All or literally lists it, so an unconditional test would close, on its
+	// first tick, most streams that have none — denying principals whose grants
+	// never changed.
 	//
 	// That is TWO populations, not one, and the second is the larger: per-run
 	// filters built as literals, and EVERY ATTENTION STREAM, which has no run
@@ -414,7 +415,11 @@ func (r *recheck) refresh(ctx context.Context, st *stream) error {
 	// fail — TestServe_PerRunStreamWithoutARunProjectSurvivesANarrowing and
 	// TestServe_DropsEventsOutsideRefreshedScope. A missing project must degrade
 	// to the event-driven close, never to a denial.
-	if r.runProject != uuid.Nil && !r.scope.allows(r.runProject) {
+	//
+	// Nil and not a zero uuid, so that a run whose project genuinely IS the zero
+	// uuid — schema-valid, since projects.id has a default and no non-zero
+	// constraint — is still checked rather than silently exempted.
+	if r.runProject != nil && !r.scope.allows(*r.runProject) {
 		return st.closeForbidden()
 	}
 	return nil

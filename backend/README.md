@@ -1297,13 +1297,21 @@ grant closes it by a second, older route: an empty scope matches nothing.
 The one shape still without this is a per-run `Filter` built as a struct
 literal, which carries no run project and falls back to closing on the
 first event it must deny. That is deliberate, and the reasoning is worth
-knowing before anyone "tidies" it: the field is unexported precisely so a
-literal leaves it at the zero uuid, and the re-check treats that zero as
-*not supplied* rather than as a project to deny. Were it exported, or
-were the zero tested blindly, every stream built from a literal — and
-every attention stream, which has no run project at all — would be closed
-on its first re-check with the principal's grants entirely intact. A
-liveness gap is the acceptable failure here; a silent denial is not.
+knowing before anyone "tidies" it. The field is unexported precisely so a
+literal leaves it *absent*, and the re-check reads absent as "not
+supplied" rather than as a project to deny. Were it exported, or were the
+absence tested blindly against a zero uuid, streams built from a literal —
+and attention streams, which have no run project at all — would be closed
+on their first re-check with the principal's grants entirely intact,
+wherever the refreshed scope was not an admin's. A liveness gap is the
+acceptable failure here; a silent denial is not.
+
+The field is a *pointer* for the other half of that: absence and the
+project whose id happens to be all zeros must stay distinguishable.
+`projects.id` has a `uuidv7()` default but no non-zero constraint, so a
+zero project id is schema-valid through an import or hand-written SQL, and
+a zero-uuid sentinel would have exempted exactly that run's streams from
+the check while they carried on looking healthy.
 
 **A revoke-then-re-grant can leave a permanent hole in one stream.** The
 cursor is a single high-water mark, so once a narrowed scope has

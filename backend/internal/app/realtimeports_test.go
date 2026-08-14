@@ -252,11 +252,15 @@ func TestServeRunStream_TranslatesAnEndingThatAlreadyCommittedTheResponse(t *tes
 	}
 	// And the project reached it. This is the assertion a Filter LITERAL would
 	// fail while every other check here still passed: runProject is unexported,
-	// so a literal leaves it zero, and a zero is read as "not supplied" — the
+	// so a literal leaves it nil, and nil is read as "not supplied" — the
 	// stream would serve correctly and simply never close on a partial
 	// revocation over a quiescent run. Nothing else in this process can see
 	// that, because the value crosses two package boundaries to get here.
-	if got := src.filter.RunProject(); got != projectID {
+	got, ok := src.filter.RunProject()
+	if !ok {
+		t.Errorf("filter carries no run project at all: the adapter built a Filter " +
+			"literal, or dropped the id runs/api handed it")
+	} else if got != projectID {
 		t.Errorf("filter.RunProject() = %s, want %s: the run's project did not survive "+
 			"runs/api -> realtime/api -> the Filter", got, projectID)
 	}
