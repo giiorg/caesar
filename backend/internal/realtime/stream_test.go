@@ -313,14 +313,16 @@ func runFilter(run, project uuid.UUID) Filter {
 }
 
 // legacyRunFilter is the per-run shape a caller gets from a Filter LITERAL: no
-// run project, because the field is unexported and a literal cannot reach it.
+// run project, so the field stays nil. Outside this package that is forced —
+// the field is unexported — and here it is written out deliberately, which is
+// the only way to build the shape under test from inside realtime.
 //
 // It is not a hypothetical. It is what every per-run Filter in this process
 // looked like before RunFilter took a project, and what a future caller who
-// builds one by hand will get. The fallback it exercises — a zero run project
-// meaning "not supplied" rather than "a project no scope allows" — is the
-// entire argument for that field being unexported, and an argument no test can
-// even construct is not one the code is held to.
+// builds one by hand will get. The fallback it exercises — a nil run project
+// meaning "not supplied" rather than a project to test a scope against — is
+// what keeps forgetting the field a liveness cost instead of a denial, and a
+// claim no test can construct is not one the code is held to.
 func legacyRunFilter(run, project uuid.UUID) Filter {
 	return Filter{RunID: &run, Scope: Scope{Projects: []uuid.UUID{project}}}
 }
@@ -1264,15 +1266,16 @@ func TestServe_ClosesQuiescentPerRunStreamWhoseProjectIsTheZeroUUID(t *testing.T
 	}
 }
 
-// The fallback, and the reason runProject is unexported rather than exported.
+// The fallback, and the reason runProject is a pointer rather than a uuid.
 //
-// A Filter LITERAL cannot set the run project, so it carries the zero uuid. No
-// scope allows the zero uuid, so a re-check that tested it blindly would close
-// this stream — and every other stream built from a literal — on its first
-// tick, denying a principal whose grants are entirely intact. That is a silent
-// deny, and it is worse than the liveness gap the run project exists to fix.
+// A Filter LITERAL leaves the run project nil. Were it a plain uuid, a literal
+// would carry the zero one instead — which this scope does not list, so a
+// re-check testing it blindly would close this stream, and every other stream
+// built from a literal, on its first tick, denying a principal whose grants are
+// entirely intact. That is a silent deny, and it is worse than the liveness gap
+// the run project exists to fix.
 //
-// So the zero means "not supplied" and the stream carries on, exactly as it did
+// So nil means "not supplied" and the stream carries on, exactly as it did
 // before any of this existed. This test is what makes that a decision rather
 // than an accident: it fails the moment the check stops distinguishing the two.
 func TestServe_PerRunStreamWithoutARunProjectSurvivesANarrowing(t *testing.T) {

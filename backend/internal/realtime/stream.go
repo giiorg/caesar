@@ -401,13 +401,13 @@ func (r *recheck) refresh(ctx context.Context, st *stream) error {
 	// requires an event to test, and a run that has stopped emitting supplies
 	// none, so without this the connection outlived the revocation indefinitely.
 	//
-	// The nil check is NOT a guard for tidiness — it is the whole reason
-	// runProject is unexported, and removing it inverts this rule into the
-	// failure it was designed around. A stream that carries no run project
-	// would be tested against the zero uuid, which a scope denies unless it is
-	// All or literally lists it, so an unconditional test would close, on its
-	// first tick, most streams that have none — denying principals whose grants
-	// never changed.
+	// The nil check is NOT a guard for tidiness. Dereferencing unconditionally
+	// would panic; testing a stream that has no run project against the zero
+	// uuid instead — which is what a value-typed field would have forced — is
+	// the subtler failure, and the one worth naming. A scope denies the zero
+	// uuid unless it is All or explicitly lists it, so that version would close,
+	// on its first tick, most streams carrying no project at all, denying
+	// principals whose grants never changed.
 	//
 	// That is TWO populations, not one, and the second is the larger: per-run
 	// filters built as literals, and EVERY ATTENTION STREAM, which has no run

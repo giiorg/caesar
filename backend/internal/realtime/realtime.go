@@ -93,24 +93,32 @@ type Filter struct {
 	// the only other way to learn a run's project is from one of its events and
 	// a quiescent run supplies none.
 	//
-	// Two properties carry the safety here, and neither is stylistic.
+	// Three properties carry the safety here, and they are not the same one
+	// said three ways — each closes a failure the others leave open.
 	//
-	// UNEXPORTED, so a Filter literal cannot set it and therefore leaves it
-	// NIL. Nil is read as "not supplied" and falls back to the event-driven
-	// close in follow. Were the field exported, a hand-built literal would
-	// carry a zero uuid that most scopes deny, and the first re-check would
-	// close every per-run stream built that way — a silent deny of a principal
-	// whose grants are intact. Forgetting this field must degrade to the older,
-	// weaker close; it must never deny.
+	// A POINTER is what makes OMISSION safe. Any Filter literal leaves it nil,
+	// nil is read as "not supplied", and the stream falls back to the
+	// event-driven close in follow. That holds whatever the field's visibility,
+	// which is worth stating because the design note this came from argued it
+	// the other way round: with a VALUE field an omission would be the zero
+	// uuid, a scope that is neither All nor explicitly listing zero denies it,
+	// and the first re-check would close every stream built that way — a silent
+	// deny of a principal whose grants are intact. The pointer, not the export
+	// rules, is what makes that unreachable.
 	//
-	// A POINTER rather than a zero-uuid sentinel, so "not supplied" and "the
-	// project whose id happens to be all zeros" stay distinguishable. Nothing
-	// in the schema forbids a zero project id — projects.id has a uuidv7
-	// DEFAULT, not a non-zero CHECK — so an imported or hand-inserted row can
-	// hold one, and under a sentinel that run's stream would silently keep the
-	// leak this field exists to close.
+	// The pointer also keeps "not supplied" distinct from "the project whose id
+	// happens to be all zeros". Nothing in the schema forbids the latter —
+	// projects.id has a uuidv7 DEFAULT, not a non-zero CHECK — so an imported or
+	// hand-inserted row can hold one, and a zero-uuid sentinel would have
+	// exempted exactly that run's streams from the check while they went on
+	// looking healthy.
 	//
-	// RunFilter takes it POSITIONALLY for the last part: on the supported path,
+	// UNEXPORTED is what makes a WRONG value unreachable, which is the failure
+	// the pointer does not cover. RunFilter is then the only door, and it takes
+	// the project the HTTP surface has already resolved and authorized against;
+	// a literal cannot substitute a project nobody checked.
+	//
+	// POSITIONAL on that constructor is the last part: on the supported path,
 	// forgetting it is a compile error rather than a quiet nil.
 	runProject *uuid.UUID
 }
