@@ -1012,10 +1012,21 @@ func (o *Orchestrator) evaluate(ctx context.Context, workerID string, cp cachedP
 	c claimed, fromStatus PhaseStatus, res ExecutionResult, execErr error,
 ) {
 	now := o.svc.clock.Now()
-	deltaMS := now.Sub(c.ClaimedAt).Milliseconds()
 	var runFinished bool
 	err := pg.WithTx(ctx, o.svc.pool, func(tx pgx.Tx) error {
-		var err error
+		// Both ends of the charged interval come from the database clock: the
+		// claim stamped its start there, and now() here is this transaction's
+		// start — before the fencing CAS, so no interval outlives the row it
+		// belongs to. Closing it against the app clock instead would subtract
+		// two independent clocks and bill the run their skew on every attempt,
+		// which is the constant-error version of the very bug the DB-side
+		// claim stamp removes. `now` above stays app-side: it timestamps
+		// events and finished_at, and it decides nothing.
+		dbNow, err := store.New(tx).DBNow(ctx)
+		if err != nil {
+			return err
+		}
+		deltaMS := dbNow.Sub(c.ClaimedAt).Milliseconds()
 		if execErr == nil {
 			runFinished, err = o.evaluateSuccess(ctx, tx, workerID, cp, c, fromStatus, res, now, deltaMS)
 		} else {

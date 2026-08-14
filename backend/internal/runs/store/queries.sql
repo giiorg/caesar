@@ -147,7 +147,13 @@ WITH candidate AS (
 UPDATE phase_runs
 SET status = 'running', worker_id = $1,
     leased_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::float8),
-    claimed_at = $2
+    -- claimed_at is one END of an amount the run is charged for, not a label,
+    -- so it is read from the clock that GRANTS the lease. An app-side reading
+    -- is taken before this statement lands and bills the run for the gap —
+    -- preemption, round trip, host skew — which on a loaded host can start an
+    -- attempt's interval before the run existed and overlap it with its
+    -- predecessor's. Same now() as leased_until: one instant, one clock.
+    claimed_at = now()
 FROM candidate
 WHERE phase_runs.id = candidate.id
 RETURNING phase_runs.*, candidate.wall_deadline AS run_wall_deadline,

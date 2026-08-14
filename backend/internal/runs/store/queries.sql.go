@@ -101,8 +101,14 @@ WITH candidate AS (
 )
 UPDATE phase_runs
 SET status = 'running', worker_id = $1,
-    leased_until = now() + make_interval(secs => $3::float8),
-    claimed_at = $2
+    leased_until = now() + make_interval(secs => $2::float8),
+    -- claimed_at is one END of an amount the run is charged for, not a label,
+    -- so it is read from the clock that GRANTS the lease. An app-side reading
+    -- is taken before this statement lands and bills the run for the gap —
+    -- preemption, round trip, host skew — which on a loaded host can start an
+    -- attempt's interval before the run existed and overlap it with its
+    -- predecessor's. Same now() as leased_until: one instant, one clock.
+    claimed_at = now()
 FROM candidate
 WHERE phase_runs.id = candidate.id
 RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attempt, phase_runs.max_attempts, phase_runs.chargeable_failures, phase_runs.not_before, phase_runs.status, phase_runs.generation, phase_runs.worker_id, phase_runs.leased_until, phase_runs.claimed_at, phase_runs.finished_at, phase_runs.outcome, phase_runs.created_at, candidate.wall_deadline AS run_wall_deadline,
@@ -111,7 +117,6 @@ RETURNING phase_runs.id, phase_runs.run_id, phase_runs.node_id, phase_runs.attem
 
 type ClaimPhaseParams struct {
 	WorkerID     pgtype.Text
-	ClaimedAt    *time.Time
 	LeaseSeconds float64
 }
 
@@ -142,7 +147,7 @@ type ClaimPhaseRow struct {
 // delayed retry until the DATABASE clock passes it — same clock as the
 // deadline predicates, so nothing app-side can move the boundary (§4.1).
 func (q *Queries) ClaimPhase(ctx context.Context, arg ClaimPhaseParams) (ClaimPhaseRow, error) {
-	row := q.db.QueryRow(ctx, claimPhase, arg.WorkerID, arg.ClaimedAt, arg.LeaseSeconds)
+	row := q.db.QueryRow(ctx, claimPhase, arg.WorkerID, arg.LeaseSeconds)
 	var i ClaimPhaseRow
 	err := row.Scan(
 		&i.ID,
