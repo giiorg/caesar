@@ -121,6 +121,15 @@ func gatedConveyorDoc() runs.DefinitionDoc {
 
 func newService(t *testing.T, f fixture, doc runs.DefinitionDoc, snap runs.PolicySnapshot) (*runs.Service, fixturePorts) {
 	t.Helper()
+	return newServiceWithClock(t, f, doc, snap, clock.System{})
+}
+
+// newServiceWithClock is newService with the time seam left to the caller —
+// for tests about what the app clock may and may not decide.
+func newServiceWithClock(t *testing.T, f fixture, doc runs.DefinitionDoc,
+	snap runs.PolicySnapshot, c clock.Clock,
+) (*runs.Service, fixturePorts) {
+	t.Helper()
 	// A fixture with a real remote pins that remote's head; everything else
 	// keeps the synthetic literal its assertions were written against.
 	head := "basesha0000000000000000000000000000000000"
@@ -137,7 +146,7 @@ func newService(t *testing.T, f fixture, doc runs.DefinitionDoc, snap runs.Polic
 		f: f, doc: doc, hash: "deadbeef", harness: uuid.Max, harnessCred: uuid.New(),
 		forge: forge, publisher: publisher,
 	}
-	svc := runs.NewService(f.pool, clock.System{}, audit.NewRecorder(clock.System{}),
+	svc := runs.NewService(f.pool, c, audit.NewRecorder(c),
 		ports, ports, ports, forge, publisher, ports, runs.Params{Snapshot: snap})
 	return svc, ports
 }

@@ -26,7 +26,10 @@ type claimed struct {
 	RunWallDeadline    time.Time
 	BudgetMS           int64
 	UsedMS             int64
-	ClaimedAt          time.Time
+	// ClaimedAt is DATABASE time — the instant the claim statement took the
+	// lease. It is the start of the interval this attempt is charged for, so
+	// it is measured against the database clock and nothing else.
+	ClaimedAt time.Time
 }
 
 // workerText is the worker identity as the store sees it. The escape
@@ -46,15 +49,21 @@ func workerText(workerID string) pgtype.Text {
 // SKIP LOCKED hides rows other workers hold and a parked retry is
 // invisible until its not_before passes on the database clock.
 func (s *Service) claimNext(ctx context.Context, workerID string, leaseSeconds float64) (claimed, bool, error) {
-	now := s.clock.Now()
 	row, err := store.New(s.pool).ClaimPhase(ctx, store.ClaimPhaseParams{
-		WorkerID: workerText(workerID), LeaseSeconds: leaseSeconds, ClaimedAt: &now,
+		WorkerID: workerText(workerID), LeaseSeconds: leaseSeconds,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return claimed{}, false, nil
 	}
 	if err != nil {
 		return claimed{}, false, fmt.Errorf("runs: claim: %w", err)
+	}
+	// The statement stamped the claim; reading it back is what keeps the
+	// worker path and the reconcile path — which has only ever had the
+	// column — measuring from the same instant on the same clock.
+	claimedAt := time.Time{}
+	if row.ClaimedAt != nil {
+		claimedAt = *row.ClaimedAt
 	}
 	return claimed{
 		PhaseID:            row.ID,
@@ -64,7 +73,7 @@ func (s *Service) claimNext(ctx context.Context, workerID string, leaseSeconds f
 		RunWallDeadline:    row.RunWallDeadline,
 		BudgetMS:           row.ExecutionBudgetMs,
 		UsedMS:             row.ExecutionUsedMs,
-		ClaimedAt:          now,
+		ClaimedAt:          claimedAt,
 	}, true, nil
 }
 
