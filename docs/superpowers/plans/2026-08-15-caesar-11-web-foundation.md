@@ -2195,10 +2195,30 @@ The shared typed form abstraction lands **before** any form that has a feature b
 - Consumes: `ApiError`, `api`, `unwrap` (Task 5).
 - Produces:
   - `applyProblemToForm<T>(err: ApiError, setError: UseFormSetError<T>, knownFields: readonly string[]): { formError: string | null }`
-  - `useAppForm<S extends ZodType>(opts: { schema: S; onSubmit: (values: z.output<S>) => Promise<void> })` returning react-hook-form's return value plus `formError: string | null`, `correlationId: string | null`, and `submit: FormEventHandler`.
+  - `useAppForm<S extends ZodType>(opts: { schema: S; onSubmit: (values: z.output<S>) => Promise<void> })` returning react-hook-form's return value plus `formError: string | null`, `correlationId: string | null`, `submit: FormEventHandler`, and **`formProps`** (see below).
   - `<TextField name label type? autoComplete? />` — the field-component registry's first entry.
   - `<FormError message correlationId />` — uniform error rendering.
   - Route `/login`.
+
+> **CORRECTED AGAINST WHAT EXECUTION MEASURED (wave 4). The shipped files in
+> `web/src/forms/` are authoritative where this section still disagrees.** Three claims
+> below were false as written and each was caught by running it:
+>
+> 1. The login fixture email `a@b.c` is **rejected** by the pinned zod 4.4.3 — its TLD
+>    group is `[A-Za-z]{2,}`, so a single-character TLD fails. Five of the six login tests
+>    could never have passed. Corrected throughout to `user@example.com`.
+> 2. `<form onSubmit={form.submit}>` around an `<input type="email">` means the browser's
+>    own interactive constraint validation blocks submission and React's `onSubmit` never
+>    fires — so the zod message and the `role="alert"` the form exists to show are
+>    unreachable in a real browser, while a `type="text"` field would hide the bug
+>    entirely. `noValidate` therefore lives in the abstraction: **every form must spread
+>    `<form {...form.formProps}>`**, and Tasks 7, 8 and 11 must do the same. `submit` is
+>    still returned, so writing `onSubmit={form.submit}` silently reintroduces the bug and
+>    only a form with a constrained input type would catch it.
+> 3. The `use-app-form.ts` doc comment's error count is wrong: the `<S extends ZodType>`
+>    variant yields **8** errors under the pinned toolchain, not five, and `Object.keys` is
+>    not among them. Its `ZodType<T, T>` conclusion is correct and was re-verified —
+>    `ZodType<T>` alone fails with TS2769 on `_zod.input`.
 
 - [ ] **Step 1: Write the failing mapper test**
 
@@ -2447,14 +2467,14 @@ describe('the login form', () => {
     )
     const onSuccess = vi.fn()
     render(<LoginForm onSuccess={onSuccess} />)
-    await userEvent.type(screen.getByLabelText(/email/i), 'a@b.c')
+    await userEvent.type(screen.getByLabelText(/email/i), 'user@example.com')
     await userEvent.type(screen.getByLabelText(/password/i), 'wrongpassword')
     await userEvent.click(screen.getByRole('button', { name: /sign in/i }))
 
     expect(await screen.findByText('invalid email or password')).toBeInTheDocument()
     expect(screen.getByText(/cid-login/)).toBeInTheDocument()
     expect(onSuccess).not.toHaveBeenCalled()
-    expect(screen.getByLabelText(/email/i)).toHaveValue('a@b.c')
+    expect(screen.getByLabelText(/email/i)).toHaveValue('user@example.com')
   })
 
   it('surfaces lockout as its own message rather than as bad credentials', async () => {
@@ -2464,7 +2484,7 @@ describe('the login form', () => {
       ),
     )
     render(<LoginForm onSuccess={vi.fn()} />)
-    await userEvent.type(screen.getByLabelText(/email/i), 'a@b.c')
+    await userEvent.type(screen.getByLabelText(/email/i), 'user@example.com')
     await userEvent.type(screen.getByLabelText(/password/i), 'wrongpassword')
     await userEvent.click(screen.getByRole('button', { name: /sign in/i }))
     expect(await screen.findByText(/too many failed attempts/i)).toBeInTheDocument()
@@ -2473,12 +2493,12 @@ describe('the login form', () => {
   it('calls onSuccess on a 200', async () => {
     server.use(
       http.post('/api/v1/auth/login', () =>
-        HttpResponse.json({ id: 'u1', email: 'a@b.c', role: 'admin', active: true, created_at: '', updated_at: '' }),
+        HttpResponse.json({ id: 'u1', email: 'user@example.com', role: 'admin', active: true, created_at: '', updated_at: '' }),
       ),
     )
     const onSuccess = vi.fn()
     render(<LoginForm onSuccess={onSuccess} />)
-    await userEvent.type(screen.getByLabelText(/email/i), 'a@b.c')
+    await userEvent.type(screen.getByLabelText(/email/i), 'user@example.com')
     await userEvent.type(screen.getByLabelText(/password/i), 'correcthorsebattery')
     await userEvent.click(screen.getByRole('button', { name: /sign in/i }))
     await vi.waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(1))
@@ -2526,7 +2546,7 @@ export function LoginForm(props: { onSuccess: () => void }) {
 
   return (
     <FormProvider {...form}>
-      <form onSubmit={form.submit} className="flex w-full max-w-sm flex-col gap-4">
+      <form {...form.formProps} className="flex w-full max-w-sm flex-col gap-4">
         <FormError message={form.formError} correlationId={form.correlationId} />
         <TextField name="email" label="Email" type="email" autoComplete="username" />
         <TextField name="password" label="Password" type="password" autoComplete="current-password" />
@@ -2969,7 +2989,7 @@ git add web && git commit -m "feat(web): resolve the session before the shell re
 Shell A and the page map are locked in `docs/brainstorm/2026-08-01-decisions.md` §7 with mockups in `.superpowers/brainstorm/12432-1785604290/content/`. This task does not revisit them. What it adds is the one thing the shell owes the realtime layer: a connection indicator that admits when the stream is lost.
 
 **Files:**
-- Create: `web/src/realtime/connection-state.ts` — `export type ConnectionState = 'live' | 'reconnecting' | 'stopped'`, and nothing else
+- ~~Create~~ **CONSUME** `web/src/realtime/connection-state.ts` — `export type ConnectionState = 'live' | 'reconnecting' | 'stopped'`, and nothing else. **Task 10 already created it** and the file is committed: creating it here scheduled it two waves after `sse-connection.ts`, which imports it, so Task 10 could not compile. The placement argument below is unchanged and is why `realtime/` — not `shell/` — is where it went.
 - Create: `web/src/shell/app-shell.tsx`, `web/src/shell/nav.tsx`, `web/src/shell/connection-indicator.tsx`, `web/src/shell/theme-toggle.tsx`
 - Create: `web/src/shell/app-shell.test.tsx`
 - Create: `web/src/routes/_app/runs.tsx`, `workflows.tsx`, `repos.tsx`, `admin.tsx`, `approvals.tsx`
@@ -3392,12 +3412,46 @@ This layer carries five behaviours a parser test cannot see and the one E2E happ
 
 **Files:**
 - Create: `web/src/realtime/sse-connection.ts`, `web/src/realtime/sse-connection.test.ts`
+- Create: `web/src/realtime/connection-state.ts` — **moved here from Task 8.** The plan
+  scheduled it two waves after the file that imports it, so Task 10 could not compile.
+  Task 8 now CONSUMES it. Its own argument (Task 8's prose) is why it belongs in
+  `realtime/`: the transport produces the state and the shell only displays it.
 
 **Interfaces:**
 - Consumes: `createSseParser`, `ParsedFrame` (Task 9); `api`, `unwrap`, `ApiError` (Task 5).
 - Produces:
   - `type ConnectionEvent = { type: 'frame'; frame: ParsedFrame & { kind: 'event' } } | { type: 'state'; state: ConnectionState } | { type: 'scope-lost' } | { type: 'session-lost' }`
-  - `function openAttentionStream(opts: { onEvent(e: ConnectionEvent): void; fetchImpl?: typeof fetch; now?: () => number; setTimeoutImpl?: typeof setTimeout; probeMe(): Promise<{ grants: unknown[] }> }): { close(): void }`
+  - `function openAttentionStream(opts: { onEvent(e: ConnectionEvent): void; fetchImpl?: typeof fetch; now?: () => number; setTimeoutImpl?: typeof setTimeout; probeMe(): Promise<MeProbe> }): { close(): void }`
+  - `type MeProbe = { grants: readonly unknown[] | null }` — **nullable deliberately**,
+    because `ApiMeResponse.grants` is generated as `ApiGrantResponse[] | null`. Task 8
+    wires this: `unwrap(api.GET('/api/v1/auth/me'))` satisfies it directly. Do not narrow
+    it to `unknown[]` to make a signature line up, and do not paper over it with `?? []`
+    at the call site — the transport owns that decision.
+
+> **CORRECTED AGAINST WHAT EXECUTION MEASURED (wave 4). `web/src/realtime/sse-connection.ts`
+> and its test are authoritative where this section still disagrees.** The code block below
+> was wrong on nine counts, and the ones that change behaviour rather than style are:
+>
+> - **`globalThis.fetch` is banned by the repo's own GritQL plugin** (Task 5's
+>   `no-qualified-fetch.grit`), and the seam must be a wrapper — `opts.fetchImpl ?? fetch`
+>   resolves the global once at `openAttentionStream()` time, so a fetch swapped later is
+>   never seen. Measured: with `?? fetch`, tsc and all tests passed until a mid-connection
+>   swap test existed.
+> - **The watchdog `setInterval`/`clearInterval` must be injected too.** The plan injects
+>   `now` and `setTimeout` and then reaches for a real interval, which no test can drive.
+> - **`me.grants.length` dereferences a nullable contract** — see `MeProbe` above.
+> - **Three of the plan's own tests were vacuous or backwards**: the heartbeat test asserted
+>   nothing that could fail, the "forbidden does not reconnect" test asserted the opposite
+>   of the code, and the `stream()` helper was blind to aborts.
+> - **Two constants were pinned only loosely by the plan's suite.** `STABLE_MS` passed at
+>   any value in `(0, 30_000]` — including `1`, which reintroduces verbatim the hot loop
+>   its own docstring says it exists to prevent, because the guard test left its injected
+>   clock frozen at 0 and `0 >= STABLE_MS` is false for every positive threshold. The test
+>   now steps to one millisecond short of the threshold, bracketing it to `[25_000, 30_000]`.
+> - The terminal-outcome test must assert a timer **delta**, not `getTimerCount() === 0`:
+>   the count is global, so an absolute assertion couples it to every earlier test in the
+>   file and manufactures a phantom second failure under unrelated mutants — which
+>   misdirects exactly the mutation sweep this project verifies with.
 
 - [ ] **Step 1: Write the failing transport tests**
 
