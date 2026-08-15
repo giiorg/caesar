@@ -36,11 +36,39 @@ route-inference mutant), `web:arch`, `web:test` (**113** tests, 12 files), `web:
 ./internal/webui/`. The gate itself still covers only the backend four — **the web lanes are run
 by hand until Task 14 mirrors them into `scripts/gate`.**
 
-**`node_modules` lost the rolldown native binding again** at the start of wave 5, exactly as in
-wave 4: `@rolldown/` held only `pluginutils`, and vitest and vite died together. `cd web && npm ci`
-fixed it and left `package-lock.json` byte-identical. The error message's own advice — delete the
-lock — would unpin all 34 versions `web:pins` exists to guard. Twice in two sessions now; if it
-recurs, it is worth a lane that asserts the binding's presence rather than a memory.
+### DIAGNOSED — `scripts/gate` is what breaks `web/node_modules`, every single run
+
+The rolldown-binding failure that ate an hour in wave 4 and recurred in wave 5 is not npm being
+flaky and not a stale checkout. **`scripts/gate` causes it, deterministically, and this is
+measured, not inferred:**
+
+1. `scripts/gate` runs `task contracts:check`, which depends on `contracts:ts`, whose first
+   command is **`npm ci` in `web/`** (`Taskfile.yml:234-240`).
+2. go-task spawns that through `sh`, which on this machine resolves node to **v20.9.0 / npm
+   10.1.0** — not the nvm 24.19.0 every web lane needs and not the login shell's node either.
+   The gate scrubs `PKG`/`GOFLAGS`-style variables but **does not touch `PATH`**.
+3. npm 10.1.0 hits the optional-dependency bug (npm/cli#4828) and installs a tree with no
+   `@rolldown/binding-darwin-arm64`. **vitest and vite both die**, because vitest 4 is built on
+   rolldown — so it presents as a catastrophic repo failure rather than one missing package.
+4. `web/package.json` DOES declare `"engines": { "node": "24.19.0" }`, and npm prints
+   `EBADENGINE … current: { node: 'v20.9.0' }` and **installs anyway**. The constraint exists and
+   enforces nothing.
+
+Proof: binding present and 113 tests green → `scripts/gate` (PASS) → `@rolldown/` holds only
+`pluginutils`. Reproduced twice. `npm ci` under npm 11.17.0 *or* 11.6.2 restores it and leaves
+`package-lock.json` byte-identical; the error message's own advice — delete the lock — would
+unpin all 34 versions `web:pins` exists to guard, and must not be followed.
+
+**This is Task 14's problem before it is anyone else's.** Task 14 mirrors the web lanes into
+`scripts/gate`; wired naively, `contracts:check` corrupts `node_modules` and then the web lanes
+run against the wreckage *inside the same gate invocation*. The ordering comment at
+`Taskfile.yml:362` already assumes `contracts:ts` is what provides `web/node_modules` — it is
+also what destroys it.
+
+Recommended fix, not applied here because it is outside Task 7 and changes gate behaviour:
+`engine-strict=true` in `web/.npmrc`, which turns EBADENGINE from a warning into a refusal, so a
+wrong-node `npm ci` fails loudly instead of silently shipping a broken tree. Whatever the fix,
+the acceptance criterion is that a full gate run leaves `web:test` green.
 
 ## The dependency graph, which is mostly a chain
 
