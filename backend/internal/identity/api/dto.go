@@ -8,28 +8,35 @@ import (
 	"github.com/giiorg/caesar/backend/internal/identity"
 )
 
+// required:"true" on the fields below is read by swaggest/jsonschema-go and
+// puts the property in the schema's `required` array; without it
+// openapi-typescript renders every property optional. Only Plan 11's web
+// slice is marked up — the rest of this file's DTOs are Plan 12's to do as
+// those screens arrive. required and nullable are independent: Grants stays
+// type ["array","null"] because the handler really can emit null.
+
 type LoginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email    string `json:"email" required:"true"`
+	Password string `json:"password" required:"true"`
 }
 
 type UserResponse struct {
-	ID        string    `json:"id"`
-	Email     string    `json:"email"`
-	Role      string    `json:"role"`
-	Active    bool      `json:"active"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        string    `json:"id" required:"true"`
+	Email     string    `json:"email" required:"true"`
+	Role      string    `json:"role" required:"true"`
+	Active    bool      `json:"active" required:"true"`
+	CreatedAt time.Time `json:"created_at" required:"true"`
+	UpdatedAt time.Time `json:"updated_at" required:"true"`
 }
 
 type GrantResponse struct {
-	ProjectID string `json:"project_id"`
-	Level     string `json:"level"`
+	ProjectID string `json:"project_id" required:"true"`
+	Level     string `json:"level" required:"true"`
 }
 
 type MeResponse struct {
-	User   UserResponse    `json:"user"`
-	Grants []GrantResponse `json:"grants"`
+	User   UserResponse    `json:"user" required:"true"`
+	Grants []GrantResponse `json:"grants" required:"true"`
 }
 
 type UserListResponse struct {

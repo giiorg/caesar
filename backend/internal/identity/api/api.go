@@ -42,6 +42,12 @@ func Operations(a *API) []httpx.Operation {
 		{
 			Pattern: "POST /api/v1/auth/login", ID: "login", Summary: "Authenticate and set the session cookie",
 			Request: LoginRequest{}, Response: UserResponse{}, Status: http.StatusOK,
+			// identity/login.go classifies bad credentials as
+			// ClassUnauthenticated and lockout as ClassRateLimited, so 401 is
+			// the single most common outcome of this endpoint and 429 is the
+			// second. A client switching on the generated union would have no
+			// branch for either.
+			Errors:  []int{http.StatusUnauthorized, http.StatusTooManyRequests},
 			Handler: http.HandlerFunc(a.handleLogin),
 		},
 		{
@@ -52,6 +58,11 @@ func Operations(a *API) []httpx.Operation {
 		{
 			Pattern: "GET /api/v1/auth/me", ID: "me", Summary: "Current user with project grants",
 			Response: MeResponse{}, Status: http.StatusOK,
+			// The web client polls this to learn whether it still has a
+			// session, so 401 is a routine answer here rather than a fault:
+			// authenticated() refuses a missing or expired cookie before the
+			// handler runs.
+			Errors:  []int{http.StatusUnauthorized},
 			Handler: a.authenticated(a.handleMe),
 		},
 		{

@@ -107,12 +107,17 @@ func TestBuild_DocumentsTheErrorStatusesAnOperationDeclares(t *testing.T) {
 		t.Errorf("409 content = %v, want the problem+json envelope", conflict.Content)
 	}
 
-	// And only where it is declared: an operation that lists no extra statuses
-	// keeps the two it always had, so the loop cannot be documenting 409
-	// everywhere.
+	// And only where it is declared. listApprovals declares exactly one extra
+	// status — 401, added by Plan 11 because authenticated() refuses a missing
+	// cookie before the handler runs — and it must get exactly that one: not
+	// 409, which is decideGate's and only decideGate's, and not 403, which no
+	// handler on this path can send. This comparison is EXACT on purpose. The
+	// slice test in slice_test.go only checks that expected statuses are
+	// PRESENT, so this is the sole guard against the Errors loop documenting
+	// statuses everywhere; loosening it to a subset check would delete it.
 	listed := doc.Paths["/api/v1/approvals"]["get"]
-	if got := sortedKeys(listed.Responses); len(got) != 2 || got[0] != "200" || got[1] != "400" {
-		t.Errorf("listApprovals responses = %v, want only 200 and 400", got)
+	if got := sortedKeys(listed.Responses); len(got) != 3 || got[0] != "200" || got[1] != "400" || got[2] != "401" {
+		t.Errorf("listApprovals responses = %v, want only 200, 400 and 401", got)
 	}
 }
 

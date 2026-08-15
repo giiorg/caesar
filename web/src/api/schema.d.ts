@@ -669,21 +669,21 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         ApiApprovalListResponse: {
-            approvals?: components["schemas"]["ApiApprovalResponse"][] | null;
+            approvals: components["schemas"]["ApiApprovalResponse"][] | null;
         };
         ApiApprovalResponse: {
             /** Format: int32 */
-            attempt?: number;
+            attempt: number;
             /** Format: int32 */
-            generation?: number;
-            node_id?: string;
-            project_id?: string;
-            requester_id?: string;
-            run_id?: string;
-            task_id?: string;
-            task_title?: string;
+            generation: number;
+            node_id: string;
+            project_id: string;
+            requester_id: string;
+            run_id: string;
+            task_id: string;
+            task_title: string;
             /** Format: date-time */
-            waiting_since?: string;
+            waiting_since: string;
         };
         ApiArtifactResponse: {
             /** Format: int32 */
@@ -772,8 +772,8 @@ export interface components {
             grants?: components["schemas"]["ApiProjectGrantResponse"][] | null;
         };
         ApiGrantResponse: {
-            level?: string;
-            project_id?: string;
+            level: string;
+            project_id: string;
         };
         ApiHarnessListResponse: {
             harnesses?: components["schemas"]["ApiHarnessResponse"][] | null;
@@ -794,12 +794,12 @@ export interface components {
             updated_at?: string;
         };
         ApiLoginRequest: {
-            email?: string;
-            password?: string;
+            email: string;
+            password: string;
         };
         ApiMeResponse: {
-            grants?: components["schemas"]["ApiGrantResponse"][] | null;
-            user?: components["schemas"]["ApiUserResponse"];
+            grants: components["schemas"]["ApiGrantResponse"][] | null;
+            user: components["schemas"]["ApiUserResponse"];
         };
         ApiOutcomeResponse: {
             class?: string;
@@ -940,14 +940,14 @@ export interface components {
             users?: components["schemas"]["ApiUserResponse"][] | null;
         };
         ApiUserResponse: {
-            active?: boolean;
+            active: boolean;
             /** Format: date-time */
-            created_at?: string;
-            email?: string;
-            id?: string;
-            role?: string;
+            created_at: string;
+            email: string;
+            id: string;
+            role: string;
             /** Format: date-time */
-            updated_at?: string;
+            updated_at: string;
         };
         ApiWorkflowListResponse: {
             workflows?: components["schemas"]["ApiWorkflowResponse"][] | null;
@@ -1099,6 +1099,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["HttpxProblemDetails"];
                 };
             };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
         };
     };
     login: {
@@ -1125,6 +1134,24 @@ export interface operations {
             };
             /** @description Bad Request */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1181,6 +1208,15 @@ export interface operations {
             };
             /** @description Bad Request */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2106,6 +2142,15 @@ export interface operations {
             };
             /** @description Bad Request */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };

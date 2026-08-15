@@ -66,6 +66,14 @@ func Operations(a *API) []httpx.Operation {
 				"can no longer be a 403.",
 			Request:  StreamParams{},
 			Response: realtime.StreamFrame{}, Status: http.StatusOK,
+			// 401 is the one non-2xx status this endpoint can still answer
+			// with, and only because authenticated() runs BEFORE the Streamer
+			// commits the 200. There is deliberately no 403: the scope this
+			// stream resolves may legitimately be empty, and a revocation
+			// arrives as the terminal `forbidden` FRAME described above,
+			// because by then the 200 is committed and can no longer be a
+			// status.
+			Errors:              []int{http.StatusUnauthorized},
 			ResponseContentType: "text/event-stream",
 			Handler:             a.authenticated(a.handleStreamAttention),
 		},

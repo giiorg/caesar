@@ -30,6 +30,16 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
           }
         }
       }
@@ -61,6 +71,26 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -112,6 +142,16 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1261,6 +1301,16 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
           }
         }
       }
@@ -1986,6 +2036,9 @@
             ]
           }
         },
+        "required": [
+          "approvals"
+        ],
         "type": "object"
       },
       "ApiApprovalResponse": {
@@ -2021,6 +2074,17 @@
             "type": "string"
           }
         },
+        "required": [
+          "run_id",
+          "task_id",
+          "project_id",
+          "task_title",
+          "node_id",
+          "attempt",
+          "generation",
+          "requester_id",
+          "waiting_since"
+        ],
         "type": "object"
       },
       "ApiArtifactResponse": {
@@ -2273,6 +2337,10 @@
             "type": "string"
           }
         },
+        "required": [
+          "project_id",
+          "level"
+        ],
         "type": "object"
       },
       "ApiHarnessListResponse": {
@@ -2336,6 +2404,10 @@
             "type": "string"
           }
         },
+        "required": [
+          "email",
+          "password"
+        ],
         "type": "object"
       },
       "ApiMeResponse": {
@@ -2353,6 +2425,10 @@
             "$ref": "#/components/schemas/ApiUserResponse"
           }
         },
+        "required": [
+          "user",
+          "grants"
+        ],
         "type": "object"
       },
       "ApiOutcomeResponse": {
@@ -2793,6 +2869,14 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "email",
+          "role",
+          "active",
+          "created_at",
+          "updated_at"
+        ],
         "type": "object"
       },
       "ApiWorkflowListResponse": {
