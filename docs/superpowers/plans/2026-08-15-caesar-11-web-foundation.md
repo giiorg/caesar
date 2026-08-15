@@ -952,6 +952,8 @@ Consumer-count file placement needs a cross-file import graph, which no per-file
 - Create: `web/tools/arch/fixtures/` (the mutants both checks must catch)
 - Create: `web/tools/arch/arch.test.ts`
 - Modify: `Taskfile.yml`
+- Modify: `web/tsconfig.json` — `allowImportingTsExtensions: true` and `exclude: ["tools/mutants", "tools/arch/fixtures"]`. Both are load-bearing, MEASURED on node 24.19.0 / tsc 5.9.3: `node --experimental-strip-types` will not complete an extensionless TypeScript specifier (`ERR_MODULE_NOT_FOUND`), so `main.ts` must import `./import-graph.ts` **with** the extension, and tsc then refuses that spelling with `TS5097` unless the flag is on. Separately, `fixtures/misplaced/routes/c/page.ts` imports `@/routes/a/helper`, which resolves to `src/routes/a/helper` and does not exist — `TS2307` unless the fixtures are excluded.
+- Modify: `web/biome.json` — the two `files.includes` exclusions of Step 7. This file is also edited by Task 5; the two exclusions belong to **this** commit, because this task's own fixtures are what turn `web:lint` red without them.
 
 **Interfaces:**
 - Consumes: the token names from Task 2.
@@ -980,6 +982,12 @@ export const a = shared
 // The second consumer. helper.ts must now live at routes/, not routes/a/.
 import { shared } from '../a/helper'
 export const b = shared
+```
+
+`web/tools/arch/fixtures/misplaced/routes/d/page.ts` — the dynamic consumer. Without it the `import\s*\(` half of `IMPORT_RE` is unfalsifiable: MEASURED, deleting it from the regex left the whole suite green, while the Global Constraint at the top of this plan ("static or dynamic") and the checker's own comment both name that clause as load-bearing.
+
+```ts
+export const d = async () => (await import('../a/helper')).shared
 ```
 
 `web/tools/arch/fixtures/misplaced/routes/a/helper.test.ts`:
@@ -1105,8 +1113,8 @@ describe('token check', () => {
 
 - [ ] **Step 3: Run it and watch it fail**
 
-Run: `cd web && npx vitest run tools/arch/arch.test.ts`
-Expected: FAIL — `Failed to resolve import "./import-graph"`.
+Run: `cd web && ./node_modules/.bin/vitest run tools/arch/arch.test.ts` (never `npx` — pre-flight finding 15)
+Expected: FAIL — `Failed to resolve import "./import-graph.ts"`.
 
 - [ ] **Step 4: Implement the import-graph rule**
 
@@ -1459,9 +1467,11 @@ export function findNonSemanticColors(root: string): Violation[] {
 
 `web/tools/arch/main.ts`:
 
+The `.ts` extensions below are mandatory, not stylistic. MEASURED on node 24.19.0: under `--experimental-strip-types`, `import { x } from './dep'` dies with `ERR_MODULE_NOT_FOUND: Cannot find module …/dep` — node's ESM resolver does not complete an extensionless specifier onto a `.ts` file. With the extension, tsc 5.9.3 then requires `allowImportingTsExtensions` (`TS5097`), which is why the Files block above modifies `tsconfig.json`.
+
 ```ts
-import { findCrossGroupImports, findMisplacedModules } from './import-graph'
-import { findNonSemanticColors } from './tokens'
+import { findCrossGroupImports, findMisplacedModules } from './import-graph.ts'
+import { findNonSemanticColors } from './tokens.ts'
 
 const root = new URL('../../src', import.meta.url).pathname
 const violations = [
@@ -1479,8 +1489,8 @@ console.log('web:arch: clean')
 
 - [ ] **Step 6: Run the tests and confirm they pass**
 
-Run: `cd web && npx vitest run tools/arch/arch.test.ts`
-Expected: PASS, 4 tests. If the colour count is not exactly 9, fix the checker rather than the expectation — every one of those six lines in `bad.tsx` is a real evasion someone will write.
+Run: `cd web && ./node_modules/.bin/vitest run tools/arch/arch.test.ts` (never `npx` — pre-flight finding 15)
+Expected: PASS. The count grew past the four tests drafted here as the fixtures grew — the `@/` alias consumer, the `import()` consumer, the group-root clamp and the token/CSS drift check are each a separate `it`. If the colour count is not exactly 9, fix the checker rather than the expectation — every one of those six lines in `bad.tsx` is a real evasion someone will write.
 
 - [ ] **Step 7: Add the target, exclude fixtures from lint, and commit**
 
@@ -1492,7 +1502,7 @@ Expected: PASS, 4 tests. If the colour count is not exactly 9, fix the checker r
       - node --experimental-strip-types tools/arch/main.ts
 ```
 
-Add `"!tools/arch/fixtures/**"` and `"!tools/mutants/**"` to `biome.json`'s `files.includes` — those directories exist to be wrong.
+Add `"!tools/arch/fixtures"` and `"!tools/mutants"` to `biome.json`'s `files.includes` — those directories exist to be wrong. **No trailing `/**`**: Task 1 established that a trailing `/**` does not match the directory itself. **These two lines must be in THIS task's commit.** MEASURED with the repo's Biome 2.5.8 against `HEAD`'s `biome.json` plus this task's `tools/` tree: `tools/arch/fixtures/colors/bad.css format ✖ File content differs from formatting output … Found 1 error.` With the two lines added and nothing else, `Checked 8 files … No fixes applied`, exit 0. Task 5 edits the same file; if the commits are split by hunk, do **not** drag Task 5's `"plugins"` line along without `web/tools/lint/no-qualified-fetch.grit` — MEASURED, that combination fails the lane with `Error(s) during loading of plugins: Cannot read file.`
 
 Run: `task web:arch` → expect `web:arch: clean`.
 
