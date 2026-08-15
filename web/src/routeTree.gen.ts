@@ -12,7 +12,12 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
+import { Route as AppAdminRouteImport } from './routes/_app/admin'
+import { Route as AppApprovalsRouteImport } from './routes/_app/approvals'
+import { Route as AppReposRouteImport } from './routes/_app/repos'
+import { Route as AppRunsRouteImport } from './routes/_app/runs'
 import { Route as AppTasksRouteImport } from './routes/_app/tasks'
+import { Route as AppWorkflowsRouteImport } from './routes/_app/workflows'
 
 const AppRoute = AppRouteImport.update({
   id: '/_app',
@@ -28,35 +33,101 @@ const AppIndexRoute = AppIndexRouteImport.update({
   path: '/',
   getParentRoute: () => AppRoute,
 } as any)
+const AppAdminRoute = AppAdminRouteImport.update({
+  id: '/admin',
+  path: '/admin',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppApprovalsRoute = AppApprovalsRouteImport.update({
+  id: '/approvals',
+  path: '/approvals',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppReposRoute = AppReposRouteImport.update({
+  id: '/repos',
+  path: '/repos',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppRunsRoute = AppRunsRouteImport.update({
+  id: '/runs',
+  path: '/runs',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppTasksRoute = AppTasksRouteImport.update({
   id: '/tasks',
   path: '/tasks',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppWorkflowsRoute = AppWorkflowsRouteImport.update({
+  id: '/workflows',
+  path: '/workflows',
   getParentRoute: () => AppRoute,
 } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/login': typeof LoginRoute
+  '/admin': typeof AppAdminRoute
+  '/approvals': typeof AppApprovalsRoute
+  '/repos': typeof AppReposRoute
+  '/runs': typeof AppRunsRoute
   '/tasks': typeof AppTasksRoute
+  '/workflows': typeof AppWorkflowsRoute
 }
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
+  '/admin': typeof AppAdminRoute
+  '/approvals': typeof AppApprovalsRoute
+  '/repos': typeof AppReposRoute
+  '/runs': typeof AppRunsRoute
   '/tasks': typeof AppTasksRoute
+  '/workflows': typeof AppWorkflowsRoute
   '/': typeof AppIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppRouteWithChildren
   '/login': typeof LoginRoute
+  '/_app/admin': typeof AppAdminRoute
+  '/_app/approvals': typeof AppApprovalsRoute
+  '/_app/repos': typeof AppReposRoute
+  '/_app/runs': typeof AppRunsRoute
   '/_app/tasks': typeof AppTasksRoute
+  '/_app/workflows': typeof AppWorkflowsRoute
   '/_app/': typeof AppIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/login' | '/tasks'
+  fullPaths:
+    | '/'
+    | '/login'
+    | '/admin'
+    | '/approvals'
+    | '/repos'
+    | '/runs'
+    | '/tasks'
+    | '/workflows'
   fileRoutesByTo: FileRoutesByTo
-  to: '/login' | '/tasks' | '/'
-  id: '__root__' | '/_app' | '/login' | '/_app/tasks' | '/_app/'
+  to:
+    | '/login'
+    | '/admin'
+    | '/approvals'
+    | '/repos'
+    | '/runs'
+    | '/tasks'
+    | '/workflows'
+    | '/'
+  id:
+    | '__root__'
+    | '/_app'
+    | '/login'
+    | '/_app/admin'
+    | '/_app/approvals'
+    | '/_app/repos'
+    | '/_app/runs'
+    | '/_app/tasks'
+    | '/_app/workflows'
+    | '/_app/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -87,6 +158,34 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppIndexRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/admin': {
+      id: '/_app/admin'
+      path: '/admin'
+      fullPath: '/admin'
+      preLoaderRoute: typeof AppAdminRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/approvals': {
+      id: '/_app/approvals'
+      path: '/approvals'
+      fullPath: '/approvals'
+      preLoaderRoute: typeof AppApprovalsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/repos': {
+      id: '/_app/repos'
+      path: '/repos'
+      fullPath: '/repos'
+      preLoaderRoute: typeof AppReposRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/runs': {
+      id: '/_app/runs'
+      path: '/runs'
+      fullPath: '/runs'
+      preLoaderRoute: typeof AppRunsRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/tasks': {
       id: '/_app/tasks'
       path: '/tasks'
@@ -94,16 +193,33 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppTasksRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/workflows': {
+      id: '/_app/workflows'
+      path: '/workflows'
+      fullPath: '/workflows'
+      preLoaderRoute: typeof AppWorkflowsRouteImport
+      parentRoute: typeof AppRoute
+    }
   }
 }
 
 interface AppRouteChildren {
+  AppAdminRoute: typeof AppAdminRoute
+  AppApprovalsRoute: typeof AppApprovalsRoute
+  AppReposRoute: typeof AppReposRoute
+  AppRunsRoute: typeof AppRunsRoute
   AppTasksRoute: typeof AppTasksRoute
+  AppWorkflowsRoute: typeof AppWorkflowsRoute
   AppIndexRoute: typeof AppIndexRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
+  AppAdminRoute: AppAdminRoute,
+  AppApprovalsRoute: AppApprovalsRoute,
+  AppReposRoute: AppReposRoute,
+  AppRunsRoute: AppRunsRoute,
   AppTasksRoute: AppTasksRoute,
+  AppWorkflowsRoute: AppWorkflowsRoute,
   AppIndexRoute: AppIndexRoute,
 }
 

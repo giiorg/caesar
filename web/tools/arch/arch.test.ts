@@ -150,6 +150,17 @@ describe('token check', () => {
     expect(z[0]?.message).toContain('named CSS colour')
   })
 
+  it('does not scan tests, whose colours style nothing', () => {
+    // `fixtures/colors/bad.test.tsx` carries four violations in the same forms
+    // bad.tsx does, so this asserts the EXCLUSION and not merely a quiet file.
+    // Task 8's WCAG suite is the real case: it reads the shipped tokens out of
+    // the theme files, and the regex that parses them contains `oklch(`, which
+    // the literal pass cannot tell from a colour. Drop the pattern from SKIP
+    // and both this and the count above go red.
+    const v = findNonSemanticColors(fx('colors'))
+    expect(v.filter((x) => x.file.includes('bad.test'))).toEqual([])
+  })
+
   it('passes semantic utilities and every same-prefix non-colour utility', () => {
     // text-sm, border-t, border-dashed, shadow-sm and the /opacity forms all
     // share a prefix with a real colour utility and none of them is one.

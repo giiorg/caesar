@@ -19,6 +19,9 @@
    `script-src 'self'` and Task 12 asserts the built index.html carries no
    src-less <script> tag. */
 :root:not([data-theme="light"]) {
+  /* See theme-light.css: this follows the tokens, not the OS. */
+  color-scheme: dark;
+
   --caesar-ground: oklch(0.176 0.014 258.4); /* #0d1117 */
   --caesar-surface: oklch(0.22 0.016 256.8); /* #161b22 */
   --caesar-surface-raised: oklch(0.267 0.015 256.8); /* #21262d */

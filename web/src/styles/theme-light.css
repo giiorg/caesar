@@ -1,15 +1,36 @@
 /* The twin over the identical semantic names. A third theme is this file again
    with different numbers — never a component edit. */
 :root[data-theme="light"] {
+  /* Follows the tokens, NOT the OS. app.css used to say `color-scheme: dark
+     light` on html, which asks the UA to pick — so a light-OS visitor got the
+     dark tokens (data-theme defaults to dark) painted around light native
+     scrollbars, form controls and focus rings. Until Task 8 there was no
+     toggle, so the mismatch was only ever the OS's doing; now anyone can
+     choose, and the choice has to carry the whole page. Declared once per
+     theme block for the same reason the colours are: a third theme is this
+     file again, never an edit somewhere else. */
+  color-scheme: light;
+
   --caesar-ground: oklch(0.985 0.002 259.5);
   --caesar-surface: oklch(1 0 0);
   --caesar-surface-raised: oklch(0.96 0.004 259.5);
   --caesar-border: oklch(0.9 0.006 259.5);
   --caesar-text: oklch(0.25 0.014 259.5);
   --caesar-text-muted: oklch(0.5 0.014 259.5);
-  --caesar-accent: oklch(0.56 0.13 165);
+  /* DARKENED FOR CONTRAST, and the numbers are measured — see the WCAG suite
+     in theme-default.test.ts, which now holds both themes to AA.
+
+     At the mockup's L=0.56 the pair whose entire purpose is contrast measured
+     4.23:1 in this theme against 10.43:1 in dark, and accent-on-ground 4.11:1;
+     both are below AA's 4.5. L=0.52 is the first value on the sweep where BOTH
+     clear it (4.95 and 4.81). Dark is untouched. */
+  --caesar-accent: oklch(0.52 0.13 165);
   --caesar-accent-contrast: oklch(0.995 0.002 165);
   --caesar-danger: oklch(0.52 0.2 25);
-  --caesar-warning: oklch(0.6 0.14 80);
-  --caesar-success: oklch(0.56 0.13 165);
+  /* Same story, and this one is load-bearing for the connection indicator:
+     it renders `text-warning` on `bg-warning/10`, which composited over ground
+     measured 3.55:1 at L=0.6 — the banner that exists to be noticed was the
+     least readable thing on the page. L=0.54 puts it at 4.52:1. */
+  --caesar-warning: oklch(0.54 0.14 80);
+  --caesar-success: oklch(0.52 0.13 165);
 }

@@ -66,7 +66,22 @@ function classifyUtility(value: string): 'ok' | 'bad' | 'not-a-colour' {
 }
 
 const SCAN = new Set(['.ts', '.tsx', '.css'])
-const SKIP = /(tokens\.css|theme-dark\.css|theme-light\.css|routeTree\.gen\.ts|schema\.d\.ts)$/
+/**
+ * Tests, stories and generated files are not scanned, matching the
+ * `NOT_A_CONSUMER` exclusion the import-graph checker already applies.
+ *
+ * For THIS rule the exclusion is not a softening at all: nothing in a test file
+ * styles anything. The rule's subject is what ships, and the component whose
+ * classes a test asserts on is itself scanned — so a test can only ever produce
+ * a false positive here. It produced one immediately: Task 8's WCAG suite reads
+ * the shipped tokens out of the theme files, and the REGEX THAT PARSES THEM
+ * contains the substring `oklch(`, which the literal-colour pass cannot tell
+ * from a colour. The theme files are skipped below for exactly that reason —
+ * they are where colour is allowed to be spelled out — and the test that reads
+ * them inherits the same exemption.
+ */
+const SKIP =
+  /(tokens\.css|theme-dark\.css|theme-light\.css|routeTree\.gen\.ts|schema\.d\.ts|\.(test|spec|stories)\.tsx?)$/
 
 function walk(dir: string, out: string[] = []): string[] {
   if (statSync(dir).isFile()) return [dir]

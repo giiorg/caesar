@@ -2,9 +2,12 @@
 @import "./theme-dark.css";
 @import "./theme-light.css";
 
-html {
-  color-scheme: dark light;
-}
+/* `color-scheme` lives in the theme blocks, not here. `dark light` on html asks
+   the UA to choose from the OS preference, which is the one input the theme
+   tokens deliberately do not obey once someone has picked — so a light-OS
+   visitor on the default dark theme got light scrollbars and native controls
+   around a dark page. Moved rather than deleted: the property still has to be
+   set, just by whoever knows which theme won. */
 
 body {
   background-color: var(--color-ground);
