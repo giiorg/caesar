@@ -3059,7 +3059,10 @@ Shell A and the page map are locked in `docs/brainstorm/2026-08-01-decisions.md`
 - Create: `web/src/shell/app-shell.test.tsx`
 - Create: `web/src/routes/_app/runs.tsx`, `workflows.tsx`, `repos.tsx`, `admin.tsx`, `approvals.tsx`
 - Replace: `web/src/routes/_app/tasks.tsx` — Task 7 left a placeholder so its guard test had a request-free route to visit; this is the real one
+- Replace: `web/src/routes/_app/index.tsx` — **the plan omitted Home and should not have.** Task 7 left `<p>caesar</p>` there, which is precisely the "plausible empty content" `StubPanel` exists to prevent: decisions §7 asks Home for a situation résumé, gate cards and running cards, so a wordmark alone is indistinguishable from Home having loaded and found nothing to say. Row 12 builds it; until then it is a stub like the other six.
 - Create: `web/src/ui/stub-panel.tsx`
+- Modify: `web/src/styles/theme-light.css`, `theme-dark.css`, `app.css`, `theme-default.test.ts` — the light theme's AA failures and the `color-scheme` item the ledger left for this task (see the corrective block below)
+- Modify: `web/tools/arch/tokens.ts`, `tools/arch/arch.test.ts`, and create `tools/arch/fixtures/colors/bad.test.tsx` — the token rule stops scanning tests
 
 **Interfaces:**
 - Consumes: `useTheme` (Task 2), the `_app` layout (Task 7).
@@ -3069,54 +3072,124 @@ Shell A and the page map are locked in `docs/brainstorm/2026-08-01-decisions.md`
 
 **`ConnectionState` is declared in `src/realtime/connection-state.ts`, not beside the indicator that renders it.** The transport PRODUCES this state and the shell DISPLAYS it, so declaring it in `shell/` points the dependency backwards and makes `realtime` — a layer with no DOM in it — import from the chrome. The cross-group rule added in Task 3 does not currently ban that edge, which is exactly why it has to be got right by construction here: a type in the wrong directory is the cheapest possible thing to fix now and an entangled layer later.
 
+**CORRECTIVE BLOCK — five things below were wrong, and all five were measured.**
+
+1. **The shell CANNOT be rendered bare.** `render(<AppShell me={me}>body</AppShell>)` dies inside
+   `useLinkProps` with `Cannot read properties of null (reading 'isServer')`: `<Link>` reads the
+   router off context and there is none. So Step 1's first test — which asserts the nav offers
+   every route in the page map — **could not have passed for any correct implementation**, because
+   the nav it demands is built from the links its own harness cannot render. Use
+   `RouterContextProvider` (NOT `RouterProvider`): it publishes the router on context and renders
+   its own children, where `RouterProvider` renders the router's matches instead. The subject stays
+   the shell-as-component with no loader, no query and no server, while the links resolve against
+   the real route tree.
+2. **The theme toggle was two-state over a three-state `Theme`.** `useTheme` starts at `'system'`,
+   so `theme === 'dark' ? 'light' : 'dark'` yields `'dark'` on first render and labels the button
+   "Dark" — and Step 1's own test clicks `{ name: /light/i }` and finds nothing. It also stranded
+   `'system'` permanently, leaving `use-theme.test.ts`'s `removeItem` leg — whose comment says
+   "Task 8's ThemeToggle is built directly on this leg" — with no production caller at all. And on
+   a dark OS the first click changed nothing visible, since `system` already resolved to dark.
+3. **Step 1's theme assertion is vacuous under the shared harness.** `src/test/setup.ts` gives
+   every DOM test a `matchMedia` reporting no preference, so `system` resolves to **light** and
+   `dataset.theme === 'light'` holds *before* any click — against a component with no button in it.
+   The test must stub a dark preference first, so switching to light is an observable event.
+4. **Step 3's `connection-indicator.tsx` re-declared `ConnectionState`**, which is the exact edge
+   `realtime/connection-state.ts` was created to remove. Import it.
+5. **Step 2's expectation is wrong** — Task 7 shipped `app-shell.tsx` as a stub, so this fails on
+   content, not on resolution. Worse, the fourth test ("silent when the stream is live") **passes
+   against that stub**, which renders no indicator at all; it only means anything once one exists.
+
+Two more, from the ledger's open items, both of which land here:
+
+6. **The light theme fails WCAG AA** and the pair whose entire purpose is contrast is one of the
+   failures. Fixed below, with a test.
+7. **`color-scheme: dark light` on `html`** asks the UA to follow the OS — the one input the tokens
+   stop obeying the moment this task's toggle exists.
+
 - [ ] **Step 1: Write the failing shell test**
 
-`web/src/shell/app-shell.test.tsx`:
+`web/src/shell/app-shell.test.tsx`. **The shipped file is authoritative**; it carries twelve cases
+where this excerpt shows four, and each of the extra ones killed a mutant the plan's set did not
+(a `'stopped'` stream rendering the reconnecting string, the approvals badge and its `> 0` guard,
+either default prop flipped, and `me` never reaching the chrome at all).
 
 ```tsx
-import { render, screen } from '@testing-library/react'
+import { createMemoryHistory, createRouter, RouterContextProvider } from '@tanstack/react-router'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { queryClient } from '../api/query-client'
+import { routeTree } from '../routeTree.gen'
 import { AppShell } from './app-shell'
 
 const me = {
-  user: { id: 'u1', email: 'a@b.c', role: 'admin', active: true, created_at: '', updated_at: '' },
+  user: {
+    id: 'u1', email: 'user@example.com', role: 'admin',
+    active: true, created_at: '', updated_at: '',
+  },
   grants: [],
 }
 
+function renderShell(props: Partial<Parameters<typeof AppShell>[0]> = {}) {
+  const router = createRouter({
+    routeTree,
+    // Never dereferenced — no loader runs, because no match is rendered.
+    context: { queryClient },
+    history: createMemoryHistory({ initialEntries: ['/'] }),
+  })
+  render(
+    <RouterContextProvider router={router}>
+      <AppShell me={me} {...props}>body</AppShell>
+    </RouterContextProvider>,
+  )
+}
+
 describe('the app shell', () => {
-  it('offers every route in the V1 page map', async () => {
-    render(<AppShell me={me}>body</AppShell>)
+  afterEach(() => {
+    // useTheme writes to BOTH, and neither resets between tests in a file.
+    document.documentElement.removeAttribute('data-theme')
+    localStorage.clear()
+  })
+
+  it('offers every route in the V1 page map', () => {
+    renderShell()
     const nav = screen.getByRole('navigation')
-    for (const label of ['Home', 'Tasks', 'Runs', 'Approvals', 'Workflows', 'Repos', 'Admin']) {
-      expect(nav).toHaveTextContent(label)
+    // Asserted as LINKS WITH HREFS. `toHaveTextContent` alone passes just as
+    // happily against seven <span>s — a nav that navigates nowhere.
+    const expected: ReadonlyArray<readonly [string, string]> = [
+      ['Home', '/'], ['Tasks', '/tasks'], ['Runs', '/runs'], ['Approvals', '/approvals'],
+      ['Workflows', '/workflows'], ['Repos', '/repos'], ['Admin', '/admin'],
+    ]
+    for (const [label, href] of expected) {
+      expect(within(nav).getByRole('link', { name: label })).toHaveAttribute('href', href)
     }
+    expect(within(nav).getAllByRole('link')).toHaveLength(expected.length)
+  })
+
+  it('hands the resolved session to the chrome rather than fetching one', () => {
+    // Task 7 left `me` accepted and never read. There is no MSW handler here,
+    // so the prop is the only place the address can come from.
+    renderShell()
+    expect(screen.getByText('user@example.com')).toBeInTheDocument()
   })
 
   it('switches theme by writing data-theme, never by editing a component', async () => {
-    render(<AppShell me={me}>body</AppShell>)
-    await userEvent.click(screen.getByRole('button', { name: /light/i }))
+    // The OS must prefer DARK, or the assertion holds before the click.
+    vi.stubGlobal('matchMedia', (q: string) => ({
+      matches: q.includes('dark'), media: q,
+      addEventListener: () => {}, removeEventListener: () => {},
+    }))
+    renderShell()
+    expect(document.documentElement.dataset.theme).toBe('dark')
+    await userEvent.click(screen.getByRole('button', { name: /switch to light/i }))
     expect(document.documentElement.dataset.theme).toBe('light')
   })
 
   it('says so out loud when the stream is lost', () => {
     // The UI never renders stale data as live. A frozen badge that looks
     // authoritative is worse than an honest one that admits it lost the stream.
-    render(
-      <AppShell me={me} connection="reconnecting">
-        body
-      </AppShell>,
-    )
+    renderShell({ connection: 'reconnecting' })
     expect(screen.getByRole('status')).toHaveTextContent(/reconnecting/i)
-  })
-
-  it('is silent when the stream is live', () => {
-    render(
-      <AppShell me={me} connection="live">
-        body
-      </AppShell>,
-    )
-    expect(screen.queryByRole('status')).not.toBeInTheDocument()
   })
 })
 ```
@@ -3124,14 +3197,22 @@ describe('the app shell', () => {
 - [ ] **Step 2: Run it and watch it fail**
 
 Run: `cd web && ./node_modules/.bin/vitest run src/shell/app-shell.test.tsx`
-Expected: FAIL — module not found.
+Expected: FAIL on CONTENT, not on module resolution — `app-shell.tsx` already exists as Task 7's
+stub. Confirm all four fail; if "silent when the stream is live" passes, that is the stub having no
+indicator rather than the shell being right.
 
 - [ ] **Step 3: Implement the shell**
 
-`web/src/shell/connection-indicator.tsx`:
+**Order note:** `nav.tsx` cannot typecheck until Step 5 exists. Every `to` is compiler-checked
+against the generated route tree, so `/runs`, `/approvals`, `/workflows`, `/repos` and `/admin` are
+type errors until their route files are created and `tsr generate` has run. `vitest` does not
+typecheck, so Step 4 passes regardless — run `tsc --noEmit` only after Step 5. (That rejection is
+itself the positive control for the `Register` augmentation, and it fires unprompted.)
+
+`web/src/shell/connection-indicator.tsx` — **imports the type, does not declare it:**
 
 ```tsx
-export type ConnectionState = 'live' | 'reconnecting' | 'stopped'
+import type { ConnectionState } from '../realtime/connection-state'
 
 export function ConnectionIndicator(props: { state: ConnectionState }) {
   if (props.state === 'live') return null
@@ -3148,14 +3229,26 @@ export function ConnectionIndicator(props: { state: ConnectionState }) {
 `web/src/shell/theme-toggle.tsx`:
 
 ```tsx
-import { useTheme } from '../theme/use-theme'
+import { type Theme, useTheme } from '../theme/use-theme'
+
+// THREE states, because `Theme` has three. The cycle starts at the default and
+// ends back at it, and the label always names WHAT YOU GET — so the first click
+// out of 'system' is a visible change on any OS.
+const NEXT: Record<Theme, Theme> = { system: 'light', light: 'dark', dark: 'system' }
 
 export function ThemeToggle() {
   const { theme, setTheme } = useTheme()
-  const next = theme === 'dark' ? 'light' : 'dark'
+  const next = NEXT[theme]
   return (
-    <button type="button" onClick={() => setTheme(next)} className="text-text-muted px-3 text-sm">
-      {next === 'light' ? 'Light' : 'Dark'}
+    <button
+      type="button"
+      onClick={() => setTheme(next)}
+      // The visible word alone is ambiguous — "Light" could name the current
+      // theme or the next one. The accessible name says both.
+      aria-label={`Theme: ${theme}. Switch to ${next}.`}
+      className="text-text-muted px-3 text-sm capitalize"
+    >
+      {next}
     </button>
   )
 }
@@ -3272,7 +3365,47 @@ function Tasks() {
 
 Repeat verbatim for each, changing the route path and the `what` string. Do not factor these into a shared generator: five three-line files are cheaper to read than one abstraction, and `web:arch` would want the generator hoisted anyway.
 
-`web/src/routes/_app/approvals.tsx` is a `StubPanel` for now; Task 11 replaces its body.
+`web/src/routes/_app/approvals.tsx` is a `StubPanel` for now (`plan="Plan 11"`, since Task 11 of
+this plan replaces its body, not row 12). **`_app/index.tsx` becomes a `StubPanel` too** — see the
+Files list; Home is a real screen in decisions §7 and `<p>caesar</p>` is exactly the plausible
+empty content this component exists to refuse.
+
+- [ ] **Step 5a: The theme debts the ledger left for this task**
+
+Both are open items that only become reachable once the toggle exists.
+
+*Contrast.* In the light theme `accent-contrast` on `accent` measured **4.23:1** against dark's
+10.43:1, `accent` on `ground` 4.11:1, and the connection indicator's `text-warning` on
+`bg-warning/10` composited to **3.55:1** — the banner that exists to be noticed was the least
+readable thing on the page. sofo approved darkening both: `--caesar-accent` `oklch(0.56 0.13 165)`
+→ `oklch(0.52 0.13 165)` (`success` follows it) and `--caesar-warning` `oklch(0.6 0.14 80)` →
+`oklch(0.54 0.14 80)`. L=0.52 is the first value on the sweep where accent clears AA against *both*
+`accent-contrast` and `ground`. Dark is untouched.
+
+These numbers had been measured by hand, recorded in a ledger and left — the same defect class as
+findings 3, 12, 15 and 20. So `theme-default.test.ts` grows a WCAG suite over **both** themes,
+reading the shipped tokens out of the two CSS files with `?raw`. Its colour maths is guarded twice,
+because a converter that returned a constant would report a comfortable ratio for everything:
+black-on-white is 21:1, and **every hex `theme-dark.css` says it was converted from must
+round-trip** — a claim that file has carried in a comment since Task 2 with nothing holding it to
+it. Exclude `border` on `ground` (~1.25:1, a divider, not a control outline).
+
+*`color-scheme`.* Move it off `html` and into the two theme blocks (`color-scheme: dark` /
+`color-scheme: light`). `dark light` asks the UA to follow the OS, which is the one input the
+tokens deliberately stop obeying once anyone uses the toggle — so a light-OS visitor on the default
+dark theme got light scrollbars, form controls and focus rings around a dark page. It must move as
+a pair, or the theme that lacks it inherits whatever the other one stamped.
+
+- [ ] **Step 5b: The token rule stops scanning tests**
+
+`web:arch` goes red on the WCAG suite: the regex that PARSES the theme files contains the substring
+`oklch(`, which `tools/arch/tokens.ts`'s literal pass cannot tell from a colour. Add
+`\.(test|spec|stories)\.tsx?` to its `SKIP`, matching the `NOT_A_CONSUMER` exclusion
+`import-graph.ts` already applies. This is not a softening: the rule's subject is what ships,
+nothing in a test styles anything, and the component whose classes a test asserts on is itself
+scanned — so a test can only ever produce a false positive here. Keep it falsifiable with
+`tools/arch/fixtures/colors/bad.test.tsx` (excluded from collection by
+`vitest.config.ts`'s `tools/**/fixtures/**`) and a case in `arch.test.ts`.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -3280,6 +3413,18 @@ Repeat verbatim for each, changing the route path and the `what` string. Do not 
 cd web && ./node_modules/.bin/tsr generate && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/vitest run && ./node_modules/.bin/biome ci . && node --experimental-strip-types tools/arch/main.ts
 git add web && git commit -m "feat(web): app shell, the V1 page map, and an honest connection indicator"
 ```
+
+**`web:routes:check` runs only on a clean tree** — its `git diff --exit-code` plus
+`git status --porcelain` companion both report the new uncommitted route files, so run it after the
+commit, not before.
+
+**Mutation is the acceptance criterion here as everywhere.** Sixteen mutants against the shell and
+six against the theme guard, each watched to fail: a dropped nav row, links downgraded to spans,
+the badge guard removed, the badge moved to another row, one string for both lost-stream states, a
+missing `role="status"`, either default prop flipped, the email not rendered, the toggle removed,
+the plan's own two-state toggle, an unreachable `'system'`, both light tokens reverted to their
+shipped values, a dropped `color-scheme`, a hex comment off by one, a flipped converter matrix sign
+and swapped luminance weights.
 
 ---
 

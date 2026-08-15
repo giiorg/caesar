@@ -21,20 +21,29 @@ full session on this project.
 | 4 | 12 — embedded bundle behind `embedui`, CSP on | `acec71d` | **PASS** |
 | — | wave-4 plan corrections + ledger entry | `a4be81a` | docs only |
 | 5 | 7 — session bootstrap: `_app` guard, error panel, `tsr.config.json` | `8a40eae` | **PASS** |
-| — | wave-5 plan corrections + this ledger entry | _(this commit)_ | docs only |
+| — | wave-5 plan corrections + ledger entry | `def3554` | docs only |
+| — | the `scripts/gate` / `node_modules` diagnosis | `30bd099` | docs only |
+| 6 | 8 — app shell, the V1 page map, the connection indicator | `5073519` | **PASS** |
+| — | wave-6 plan corrections + this ledger entry | _(this commit)_ | docs only |
 
-**Done: Tasks 1, 2, 3, 4, 5, 6, 7, 9, 10, 12. Remaining: 8 → 11 → 13 → 14 (a chain).**
+**Done: Tasks 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12. Remaining: 11 → 13 → 14 (a chain).**
 
 The gate is `scripts/gate <abs-worktree> <sha> <branch>` and it ran green at each wave boundary,
 not after each task. Within a wave, tasks are committed in dependency order and their individual
 commits' greenness is asserted by construction rather than measured — stating that plainly because
 the plan's own rule is per-task.
 
-All web lanes green at `8a40eae`: `web:pins` (34 pinned), `web:lint`, `web:typecheck` (tsc + the
-route-inference mutant), `web:arch`, `web:test` (**113** tests, 12 files), `web:routes:check`,
+All web lanes green at `5073519`: `web:pins` (34 pinned), `web:lint`, `web:typecheck` (tsc + the
+route-inference mutant), `web:arch`, `web:test` (**154** tests, 13 files), `web:routes:check`,
 `web:build`. Both Go twins green: `go test ./internal/...` and `go test -tags embedui
 ./internal/webui/`. The gate itself still covers only the backend four — **the web lanes are run
 by hand until Task 14 mirrors them into `scripts/gate`.**
+
+**Every web lane above was re-run AFTER the gate, not before**, because the gate corrupts
+`node_modules` on the way through (below). The sequence that produced this line is: lanes green →
+commit → `scripts/gate` PASS → `@rolldown/` down to `pluginutils` → `npm ci` under node 24 →
+lanes green again, `package-lock.json` byte-identical. Anyone reporting a green web lane from
+before a gate run is reporting it against a tree that no longer exists.
 
 ### DIAGNOSED — `scripts/gate` is what breaks `web/node_modules`, every single run
 
@@ -78,8 +87,8 @@ Only the two braces parallelize; the file sets inside each are disjoint. Tasks 4
 overlap — Task 4 regenerates `schema.d.ts` out of `web/node_modules` while Task 1 rewrites
 `package.json` and reinstalls that same tree.
 
-**Both braces are now done. Everything left is strictly serial**, one task per wave: 8 → 11 → 13
-→ 14. There is no more parallelism to find in this plan.
+**Both braces are now done. Everything left is strictly serial**, one task per wave: 11 → 13 → 14.
+There is no more parallelism to find in this plan.
 
 Wave 5 (Task 7) was executed **inline by the orchestrator**, not through the per-wave Workflow the
 operating model below describes. With one task left per wave there is no fan-out to buy, and the
@@ -87,23 +96,37 @@ quality bar it existed to enforce — write the test, watch it fail, then mutate
 watch it die — was applied directly. Three of this task's findings came out of that mutation pass
 and would not have come out of a green suite.
 
-## What Task 8 inherits from wave 5, and must not undo
+## What Task 11 inherits from wave 6, and must not undo
 
-- **`web/src/shell/app-shell.tsx` EXISTS as a stub** — a `<nav aria-label="Main" />` plus
-  `{children}`, typed `{ me: Me; children: ReactNode }` where `Me` is
-  `components['schemas']['ApiMeResponse']`. Task 8 replaces the file wholesale, but **keep the
-  `me` prop**: the session is resolved by the `_app` loader and handed down, so no shell
-  component ever fetches it. `_app.test.tsx` asserts `role="navigation"` to mean "the shell
-  rendered"; a real shell must keep a `<nav>` or three tests fail for the wrong reason.
-- **`web/src/routes/_app/tasks.tsx` is COMPONENT-ONLY on purpose.** `_app.test.tsx`'s first test
-  navigates there precisely because it issues no request — the case a redirect-on-401 design
-  cannot catch. Giving it a loader destroys the property that test exists to prove.
-- **`useMe()` is exported from `routes/_app.tsx`** and is currently unused. It has zero consumers,
-  so the arch misplacement rule (which needs two) says nothing about it yet; a second consumer
-  will pull it toward a shared home.
-- **`_app.tsx` renders `<ApiErrorPanel>` for every non-401 route error.** Task 8's stub routes
-  inherit it. The panel is in `errors/`, not `ui/`, because it does `error instanceof ApiError`
-  and Task 3's matrix bans `ui/ -> api/`.
+- **`web/src/routes/_app/approvals.tsx` EXISTS as a `StubPanel`.** Task 11 replaces its body. It
+  is component-only today; giving it a loader is the point of Task 11, and it is also what finally
+  makes `AppErrorBoundary`'s 401 branch testable (see the untested-branch list).
+- **`AppShell` takes `connection` and `approvalCount` as OPTIONAL props**, defaulting to `'live'`
+  and `0`. `AppLayout` passes neither yet. Task 11 wires the real values in, and both defaults
+  have a test asserting the silent case — a shell that warned before the transport had spoken
+  would be worse than one that stayed quiet.
+- **There is no `useConnectionState`, deliberately.** Everything *below* the layout reads
+  `useStreamStatus()` from `src/realtime/stream-status.tsx` (Task 11). `AppShell` takes a prop
+  because `AppLayout` is its single caller and already holds the value; two mechanisms for one
+  value means one of them is dead, and the dead one is the one a reader reaches for.
+- **`web/src/routes/_app/tasks.tsx` is STILL COMPONENT-ONLY on purpose**, `StubPanel` and all.
+  `_app.test.tsx`'s first test navigates there precisely because it issues no request — the case a
+  redirect-on-401 design cannot catch. Giving it a loader destroys the property that test proves.
+- **`_app.test.tsx` asserts `role="navigation"` to mean "the shell rendered"** in three places. The
+  shell has exactly one `<nav>` (`aria-label="Sections"`); adding a second breaks those three tests
+  for a reason that reads as the guard being broken.
+- **`useMe()` is exported from `routes/_app.tsx`** and is STILL unused — Task 8 did not need it,
+  because the shell is handed `me` as a prop. Zero consumers, so the arch misplacement rule (which
+  needs two) says nothing about it yet.
+- **`_app.tsx` renders `<ApiErrorPanel>` for every non-401 route error.** The stub routes inherit
+  it. The panel is in `errors/`, not `ui/`, because it does `error instanceof ApiError` and Task
+  3's matrix bans `ui/ -> api/`.
+- **`tools/arch/tokens.ts` no longer scans tests.** If Task 11 adds a test that names a colour, it
+  will not be reported — and that is correct, because a test styles nothing. The component it
+  renders is still scanned.
+- **The shell test's harness is `RouterContextProvider`, not `RouterProvider`.** Any later test
+  that wants to render chrome without running loaders should copy `renderShell` rather than
+  rediscover why a bare `render()` of anything containing a `<Link>` throws.
 
 ## What Tasks 8, 11 and 14 must not rediscover the hard way
 
@@ -281,6 +304,48 @@ Wave 5 added three, and the first two came from mutating guards that were alread
     identically by generating with each and diffing — otherwise `web:build` and
     `web:routes:check` could disagree about what the route tree is.
 
+Wave 6 added five. Three are the plan's own Task 8 snippets failing to run at all, and the pattern
+across them is worth naming: **a component test harness is as much a subject as the component.**
+Two of the three could never have passed for any correct implementation.
+
+22. **`<Link>` cannot render outside a router, so the plan's shell test could not pass for ANY
+    correct shell.** `render(<AppShell me={me}>body</AppShell>)` dies in `useLinkProps` with
+    `Cannot read properties of null (reading 'isServer')`. The first test asserts that the nav
+    offers every route in the V1 page map — i.e. it *demands* the links its own harness cannot
+    render. The fix is `RouterContextProvider` rather than `RouterProvider`: it publishes the
+    router on context and renders its own children, where `RouterProvider` renders the router's
+    matches instead. That keeps the subject the shell-as-component — no loader, no query, no
+    server — while the links still resolve against the real route tree.
+23. **The plan's theme toggle was two-state over a three-state `Theme`, and its own test proved
+    it.** `useTheme` starts at `'system'`, so `theme === 'dark' ? 'light' : 'dark'` labels the
+    button "Dark" on first render while the test clicks `{ name: /light/i }`. Beyond the test: it
+    stranded `'system'` permanently, leaving `use-theme.test.ts`'s `removeItem` leg — whose comment
+    reads "Task 8's ThemeToggle is built directly on this leg" — with no production caller at all.
+    A test can cover a branch that production can no longer reach. And on a dark OS the first click
+    was invisible, since `system` already resolved to dark. Now a cycle, labelled with what you get.
+24. **The plan's theme assertion was vacuous under the shared harness — the third time this exact
+    shape has appeared** (items 3, 12, 15, 20). `src/test/setup.ts` gives every DOM test a
+    `matchMedia` reporting no preference, so `system` resolves to LIGHT and
+    `dataset.theme === 'light'` holds *before* the click, against a component with no button in it.
+    Stubbing a dark preference is what makes switching to light an event. Related: the plan's
+    fourth test ("silent when the stream is live") **passed against Task 7's stub**, which renders
+    no indicator at all.
+25. **`web:arch` cannot tell a regex that PARSES colours from a colour.** The WCAG suite reads the
+    shipped tokens out of the theme files, and the substring `oklch(` in its parser tripped the
+    literal-colour pass — while the theme files themselves are exempt for exactly that reason.
+    `tools/arch/tokens.ts` now skips tests, matching `import-graph.ts`'s existing `NOT_A_CONSUMER`
+    exclusion. For this rule that is not a softening at all: its subject is what ships, a test
+    styles nothing, and the component whose classes a test asserts on is itself scanned — so a test
+    can only ever produce a false positive. `fixtures/colors/bad.test.tsx` keeps it falsifiable.
+26. **`theme-dark.css` had claimed since Task 2 that every hex-annotated value "was produced by the
+    sRGB -> OKLab -> OKLCH conversion of that hex, not typed by hand", and nothing held it to
+    that.** It is now the WCAG suite's own self-check, which needed one anyway: every assertion
+    routes through one colour converter, so a converter returning a constant would report a
+    comfortable ratio for every pair and the whole suite would be worth nothing. All seven hexes
+    round-trip exactly. Greyscale anchors alone would not do — a transposed or mis-signed a/b term
+    is invisible on them. (The first draft of that self-check asserted a *remembered* ratio for
+    mid-grey and was simply wrong; the run caught it.)
+
 Also measured and NOT adopted: the plan's second, disabled observer
 (`useQuery({ ...meQueryOptions, enabled: false })`) for background expiry. Both observers read
 the same cache entry and report the same error, so reading `error` off the existing
@@ -311,15 +376,19 @@ than assumed (finding 21). One thing it does NOT close: deleting that file leave
 green today, because no test file currently exports a `Route`. The guard is latent, and the
 protection against removing it is this note plus the comment in `vite.config.ts`.
 
-**For sofo — a taste call, not blocking.** In the light theme `accent-contrast` on `accent`
-measures **4.23:1** (below WCAG AA 4.5) where dark measures 10.43:1, and `warning` on `ground` is
-**3.84:1** vs 9.33:1. A token pair whose whole purpose is contrast fails in one theme. Proposal:
-darken the light-theme `accent` until both clear 4.5:1, folded into Task 8 where the theme toggle
-first makes light mode reachable.
+**~~For sofo — a taste call~~ — DECIDED AND CLOSED in `5073519`.** sofo chose to darken both and
+add the test. The four ratios were re-derived independently before asking and matched the recorded
+ones exactly (10.43 / 4.23 / 9.33 / 3.84); the ask also turned up a fifth, worse number the ledger
+did not have — the connection indicator renders `text-warning` on `bg-warning/10`, which
+composited over `ground` is **3.55:1**, not 3.84. The banner that exists to be noticed was the
+least readable thing in the theme. `--caesar-accent` 0.56 → 0.52 (`success` follows) and
+`--caesar-warning` 0.6 → 0.54; every text pair in both themes now clears AA, and
+`theme-default.test.ts` holds them there. Reverting either token to its shipped value turns the
+suite red, so the fix is pinned rather than remembered.
 
-**Also for Task 8.** `app.css` declares `html { color-scheme: dark light }`, which follows the OS,
-while `data-theme` (defaulting to dark) is authoritative for the tokens. Until the toggle exists,
-a light-OS user gets a dark page with light UA scrollbars and native controls.
+**~~Also for Task 8~~ — CLOSED in `5073519`.** `color-scheme` moved off `html` and into the two
+theme blocks. It had to move as a pair: setting it in one file only leaves the other theme
+inheriting whatever the first stamped.
 
 **A contracts follow-up, deliberately out of Task 4's scope.** `changePassword`
 (`backend/internal/identity/api/api.go`) has no `Errors: []int{http.StatusUnauthorized}` entry, so
@@ -381,6 +450,33 @@ From wave 5:
 - Content-hashed assets are served with **no explicit `Cache-Control`**. The plan does not ask
   for it and wave 4 declined to ship an untested branch; worth a decision later.
 
+From wave 6:
+
+- **`AppShell` is never rendered through a real route in any test.** The shell suite mounts it
+  directly under `RouterContextProvider`, and `_app.test.tsx` only ever asserts
+  `role="navigation"` — so nothing exercises the composition of layout and shell together, and
+  `AppLayout` passing `me` but neither `connection` nor `approvalCount` is asserted nowhere.
+  Task 11 is the first task with a real reason to.
+- **`activeProps={{ className: 'text-accent' }}` on the nav is untested.** The harness never
+  navigates, so no link is ever active. A `<Link>` that highlighted the wrong row, or none, would
+  pass the whole suite.
+- **The six stub routes and `StubPanel` have no tests of their own** — they are reached only
+  through `web:build` and `web:routes:check`. Deliberate: a test asserting that a stub says "not
+  built yet" pins a string, not a behaviour. It does mean `StubPanel`'s two-paragraph shape is
+  unguarded.
+- **The WCAG suite covers token PAIRS, not usage.** It knows `text-muted` on `surface` clears AA;
+  it does not know which pairs a component actually renders, so a component pairing `warning` on
+  `accent` would be invisible to it. The `TEXT_PAIRS` list is hand-maintained and will drift from
+  what the tree does. The one composited case (`bg-warning/10`) is spelled out for that reason and
+  is itself hand-copied from `connection-indicator.tsx`.
+- **`color-scheme` is asserted by regex over the CSS text**, not by anything that renders. It
+  proves the declaration is present in each theme block and nothing about the UA honouring it.
+  `app.css` is not read by that test at all — `vitest.config.ts`'s `css.include` covers only the
+  two theme files, and widening it would pull the whole Tailwind build onto every DOM test's
+  critical path. So re-adding `color-scheme: dark light` to `app.css` would go unnoticed.
+- **`ThemeToggle`'s `capitalize` class is the only thing making the label read as a word rather
+  than a lowercase token**, and no test asserts rendered case — jsdom does not apply it.
+
 ## Plan divergences, all FIXED in the plan text
 
 The rule this project follows: when execution proves a plan snippet wrong, **correct the plan**,
@@ -398,6 +494,15 @@ because the next person to execute it will otherwise reintroduce exactly what wa
   moved into Task 10's file list, and `probeMe` retyped to the nullable `MeProbe`.
 - **Task 8** (wave 4). Its "Create `connection-state.ts`" line is now "CONSUME" — Task 10 owns
   the file. The placement argument is unchanged and is why it lives in `realtime/`.
+- **Task 8** (wave 6). Step 1's harness is now `RouterContextProvider` over the real route tree
+  with a `renderShell` helper, and its theme case stubs a dark OS preference; Step 2's expectation
+  is FAIL-on-content rather than module-not-found, and names the test that passes against Task 7's
+  stub; Step 3's `connection-indicator.tsx` imports `ConnectionState` instead of re-declaring it,
+  its `ThemeToggle` is the three-state cycle, and an order note says `nav.tsx` cannot typecheck
+  until Step 5 exists; the Files list gained `_app/index.tsx`, the four theme files and the three
+  arch files; new Steps 5a and 5b carry the contrast/`color-scheme` fixes and the token-rule
+  exclusion; Step 6 notes that `web:routes:check` needs a clean tree and lists the 22 mutants. A
+  corrective block at the top of the task names all five false claims.
 - **Task 7** (wave 5). Step 4's `ensureQueryData` is now `fetchQuery({ ...meQueryOptions,
   staleTime: 0 })` with the redirect moved outside the `try`, and carries the loop it caused;
   Step 3's second disabled observer is gone in favour of reading `error` off the existing
