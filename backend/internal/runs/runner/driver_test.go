@@ -450,6 +450,15 @@ func TestMapExit_ClaudeMarkers(t *testing.T) {
 		// still has to classify as a dead credential.
 		{"Invalid API key - Please run /login", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
 		{"OAuth token expired: Please run /login", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
+		// RECORDED VERBATIM 2026-08-15 by the row 07 smoke run, v2.1.223, with
+		// a token PRESENT and REJECTED. The rows above are what the CLI prints
+		// with NO token at all; a rejected one renders a different sentence and
+		// never offers the slash command, so none of them matched it and a dead
+		// subscription classified transient and retried to exhaustion.
+		{
+			"Failed to authenticate. API Error: 401 OAuth access token is invalid.",
+			runs.CodeAuthExpired, runs.OutcomePermanent, 0,
+		},
 		{"panic: something else entirely", runs.CodeHarnessError, runs.OutcomeTransient, 0},
 	}
 	for _, c := range cases {
@@ -496,6 +505,19 @@ func TestMapExit_CodexMarkers(t *testing.T) {
 		{"ERROR: refresh token has expired", runs.CodeAuthExpired, runs.OutcomePermanent, 0},
 		{
 			"2026-08-06T12:32:24.735772Z ERROR codex_core::auth: access token expired",
+			runs.CodeAuthExpired, runs.OutcomePermanent, 0,
+		},
+		// RECORDED VERBATIM 2026-08-15 by the row 07 smoke run against
+		// v0.146.1 with a rejected auth.json. Both real shapes put a prose
+		// clause between the module preamble and the status, which is exactly
+		// what the rows above did not allow — so real auth death classified
+		// transient and retried to exhaustion on a token that could never work.
+		{
+			`2026-08-15T08:02:38.111818Z ERROR codex_models_manager::manager: failed to refresh available models: unexpected status 401 Unauthorized: {"detail":"Could not parse your authentication token. Please try signing in again."}, url: https://chatgpt.com/backend-api/codex/models?client_version=0.146.1`,
+			runs.CodeAuthExpired, runs.OutcomePermanent, 0,
+		},
+		{
+			"2026-08-15T08:02:39.781086Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://chatgpt.com/backend-api/codex/responses",
 			runs.CodeAuthExpired, runs.OutcomePermanent, 0,
 		},
 		{"segmentation fault", runs.CodeHarnessError, runs.OutcomeTransient, 0},
@@ -557,6 +579,23 @@ func TestMapExit_AuthRowsRejectAgentProse(t *testing.T) {
 		{"claude-code", "Invalid API key errors are handled by the retry loop."},
 		{"claude-code", "If Claude Code reports an invalid API key, please run /login again."},
 		{"claude-code", "The OAuth token expired at some point during the migration."},
+		// New exposure from the 2026-08-15 recorded rows. Those rows let prose
+		// sit between codex's module preamble and the status, and gave
+		// claude-code a sentence with no slash command in it — so both need
+		// their own prose guards, not only the ones written for the old shapes.
+		//
+		// codex: an ERROR-shaped line an agent writes ABOUT the status rather
+		// than one the CLI emits reporting it. What separates them is that the
+		// CLI always names how the status arrived — `unexpected status`,
+		// `HTTP error:` — and prose reasons about it instead.
+		{"codex", "ERROR: the retry loop should treat 401 Unauthorized as permanent"},
+		{"codex", "ERROR: do not classify 401 Unauthorized here, the caller does it"},
+		{"codex", "2026-08-15T08:02:38Z ERROR my_module::thing: 401 Unauthorized is what we assert on"},
+		// claude-code: the recorded sentence quoted rather than emitted. The
+		// CLI puts it at column 0 on its own; an agent citing it does not.
+		{"claude-code", "If it prints Failed to authenticate. API Error: 401, the token is dead."},
+		{"claude-code", "// Failed to authenticate. API Error: 401 is the line we match on"},
+		{"claude-code", "The CLI said: Failed to authenticate. API Error: 401 OAuth access token is invalid."},
 	}
 	for _, c := range cases {
 		t.Run(c.harness+"/"+c.tail, func(t *testing.T) {
