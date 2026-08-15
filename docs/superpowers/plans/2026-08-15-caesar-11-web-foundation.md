@@ -23,7 +23,7 @@ Project-wide. They apply to **every** task below and are not re-litigated inside
 - **Named exports only. No barrel files. No default exports.** Enforced by Biome (`noBarrelFile`, `noReExportAll`, `noDefaultExport`, `useFilenamingConvention`) — with the single documented exception that Vite's config and Playwright's config require default exports and are listed as overrides.
 - **A module with two or more direct importers must live at their nearest common ancestor directory.** A "consumer" is a direct importing module, static or dynamic, excluding tests, stories and generated files. Enforced by `task web:arch`, not by convention.
 - **Non-semantic colors are unrepresentable, not merely discouraged.** `--color-*: initial` in the theme block removes Tailwind's default palette; `bg-white` and `text-red-500` stop resolving. `task web:arch` validates token *names*, never hunts for literals.
-- **Every generated artifact is committed and regen-diffed**: `web/src/routes/routeTree.gen.ts` in the web lane, `web/src/api/schema.d.ts` and `backend/api/openapi.json` in the contracts lane. No generated artifact in this repo is trusted to be hand-current.
+- **Every generated artifact is committed and regen-diffed**: `web/src/routeTree.gen.ts` in the web lane, `web/src/api/schema.d.ts` and `backend/api/openapi.json` in the contracts lane. No generated artifact in this repo is trusted to be hand-current.
 - **Hand-written `fetch` against `/api` is banned by lint**, not by convention. All server data goes through the generated client and TanStack Query.
 - **The cache bridge invalidates; it never reconstructs.** `setQueryData` from an SSE event payload is banned. The server emits its opening snapshot as ordinary event frames and re-sends a backlog on resume, so duplicate delivery is the documented normal case; invalidation is idempotent under it and reconstruction is not.
 - **`correlation_id` is rendered on every error surface.** It is the only thread between a user's complaint and a server log line.
@@ -83,7 +83,7 @@ Verified against the tree at `8314e51`. Several contradict what a reader of the 
 - `web/tools/arch/` — `main.ts` (entry), `import-graph.ts` (consumer-count rule + the cross-group matrix), `tokens.ts` (token-name check), `fixtures/` (the mutants every check must catch).
 - `web/src/main.tsx` — the entry: providers, router mount.
 - `web/src/router.ts` — the router instance **and** the `Register` module augmentation.
-- `web/src/routes/` — file-based routes; `routeTree.gen.ts` committed and regen-diffed.
+- `web/src/routes/` — file-based routes. The generated tree is `web/src/routeTree.gen.ts`, one level UP: it is `@tanstack/router-generator`'s default (`generatedRouteTree: './src/routeTree.gen.ts'`), and placing it inside `routes/` would both need configuring in two places and hand the generator its own output as a route file. Committed and regen-diffed.
 - `web/src/api/schema.d.ts` — generated (exists today).
 - `web/src/api/client.ts` — the `openapi-fetch` client and the auth-call exemption list.
 - `web/src/api/errors.ts` — `ApiError`, built from the HTTP status and the `problem+json` body.
@@ -127,7 +127,7 @@ The router's type safety is opt-in. Without the `Register` augmentation `tsc` pa
 **Files:**
 - Create: `web/.nvmrc`, `web/biome.json`, `web/tsconfig.json`, `web/tsconfig.mutants.json`, `web/vite.config.ts`, `web/index.html`
 - Create: `web/src/main.tsx`, `web/src/router.ts`, `web/src/routes/__root.tsx`, `web/src/routes/index.tsx`
-- Create: `web/src/routes/routeTree.gen.ts` (generated, committed)
+- Create: `web/src/routeTree.gen.ts` (generated, committed)
 - Create: `web/tools/check-pins.mjs`, `web/tools/mutants/bad-route-to.tsx`
 - Modify: `web/package.json`
 - Modify: `Taskfile.yml`, `.github/workflows/ci.yml` (contracts job Node version only)
@@ -188,6 +188,7 @@ The router's type safety is opt-in. Without the `Register` augmentation `tsc` pa
     "@testing-library/dom": "10.4.1",
     "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.4",
+    "@types/node": "24.13.3",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
     "@vitejs/plugin-react": "6.0.5",
@@ -248,7 +249,7 @@ Then temporarily change one version to `^19.2.8` and run again → expect exit 1
     "module": "ESNext",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
-    "types": ["vite/client"],
+    "types": ["vite/client", "node"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -344,7 +345,7 @@ declare const __CAESAR_COMMIT__: string
 
 ```ts
 import { createRouter } from '@tanstack/react-router'
-import { routeTree } from './routes/routeTree.gen'
+import { routeTree } from './routeTree.gen'
 
 export const router = createRouter({ routeTree })
 
@@ -463,7 +464,7 @@ Add `"mutants": "node tools/check-mutants.mjs"` to `package.json` scripts.
 {
   "$schema": "https://biomejs.dev/schemas/2.5.8/schema.json",
   "files": {
-    "includes": ["**", "!**/node_modules/**", "!src/api/schema.d.ts", "!src/routes/routeTree.gen.ts", "!**/dist/**"]
+    "includes": ["**", "!**/node_modules/**", "!src/api/schema.d.ts", "!src/routeTree.gen.ts", "!**/dist/**"]
   },
   "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
   "javascript": { "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" } },
@@ -473,10 +474,7 @@ Add `"mutants": "node tools/check-mutants.mjs"` to `package.json` scripts.
       "recommended": true,
       "style": {
         "noDefaultExport": "error",
-        "useFilenamingConvention": { "level": "error", "options": { "filenameCases": ["kebab-case"] } }
-      },
-      "performance": { "noBarrelFile": "error", "noReExportAll": "error" },
-      "nursery": {
+        "useFilenamingConvention": { "level": "error", "options": { "filenameCases": ["kebab-case"] } },
         "noRestrictedImports": {
           "level": "error",
           "options": {
@@ -486,7 +484,8 @@ Add `"mutants": "node tools/check-mutants.mjs"` to `package.json` scripts.
             }
           }
         }
-      }
+      },
+      "performance": { "noBarrelFile": "error", "noReExportAll": "error" }
     }
   },
   "overrides": [
@@ -537,7 +536,7 @@ Add to `Taskfile.yml`:
     dir: web
     cmds:
       - npm exec -- tsr generate
-      - git diff --exit-code -- src/routes/routeTree.gen.ts
+      - git diff --exit-code -- src/routeTree.gen.ts
 
   web:build:
     dir: web
@@ -564,7 +563,7 @@ Every web lane added later uses this identical block. No lane restates a literal
 ```bash
 cd web
 npm install                       # writes package-lock.json; expect exit 0, no ERESOLVE
-npm exec -- tsr generate                  # writes src/routes/routeTree.gen.ts
+npm exec -- tsr generate                  # writes src/routeTree.gen.ts (the generator's default)
 npx tsc --noEmit                  # expect 0 errors
 node tools/check-mutants.mjs      # expect "correctly rejected (TS2322)"
 node tools/check-pins.mjs         # expect the pinned-count line
@@ -2223,12 +2222,24 @@ Expected: PASS, 3 tests.
 ```ts
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useState } from 'react'
-import { type FieldValues, type UseFormReturn, useForm } from 'react-hook-form'
-import type { ZodType, z } from 'zod'
+import { type DefaultValues, type FieldValues, type Resolver, type UseFormReturn, useForm } from 'react-hook-form'
+import type { ZodType } from 'zod'
 import { ApiError } from '../api/errors'
 import { applyProblemToForm } from './problem-to-fields'
 
-export type AppForm<S extends ZodType> = UseFormReturn<z.output<S> & FieldValues> & {
+/**
+ * Parameterized on the VALUES type, not on the schema type.
+ *
+ * `<S extends ZodType>` reads more naturally and does not compile: bare
+ * `ZodType` in Zod 4 has `unknown` for both input and output, so `z.output<S>`
+ * is `unknown`, and react-hook-form needs a `FieldValues` (a record) at every
+ * position. The pinned toolchain reports five separate errors — at
+ * `zodResolver`, `defaultValues`, `onSubmit(values)`, `Object.keys` and the
+ * final cast. `ZodType<T, T>` rather than `ZodType<T>` because @hookform
+ * /resolvers 5.8.0 constrains the schema's INPUT to FieldValues too; a plain
+ * `z.object({...})` satisfies it with no cast at the call site.
+ */
+export type AppForm<T extends FieldValues> = UseFormReturn<T> & {
   formError: string | null
   correlationId: string | null
   submit: (e?: React.BaseSyntheticEvent) => Promise<void>
@@ -2243,14 +2254,19 @@ export type AppForm<S extends ZodType> = UseFormReturn<z.output<S> & FieldValues
  * and a migration touches THIS FILE rather than every form — the same argument
  * §5 makes for building the abstraction before any feature form.
  */
-export function useAppForm<S extends ZodType>(opts: {
-  schema: S
-  defaultValues: z.output<S>
-  onSubmit: (values: z.output<S>) => Promise<void>
-}): AppForm<S> {
+export function useAppForm<T extends FieldValues>(opts: {
+  schema: ZodType<T, T>
+  defaultValues: DefaultValues<T>
+  onSubmit: (values: T) => Promise<void>
+}): AppForm<T> {
   const [formError, setFormError] = useState<string | null>(null)
   const [correlationId, setCorrelationId] = useState<string | null>(null)
-  const form = useForm({ resolver: zodResolver(opts.schema), defaultValues: opts.defaultValues })
+  const form = useForm<T>({
+    // The one cast, and it is narrow: the resolver's own generics carry a
+    // third TContext parameter this wrapper does not use.
+    resolver: zodResolver(opts.schema) as Resolver<T>,
+    defaultValues: opts.defaultValues,
+  })
 
   const submit = form.handleSubmit(async (values) => {
     setFormError(null)
@@ -2267,7 +2283,7 @@ export function useAppForm<S extends ZodType>(opts: {
     }
   })
 
-  return Object.assign(form, { formError, correlationId, submit }) as AppForm<S>
+  return Object.assign(form, { formError, correlationId, submit })
 }
 ```
 
@@ -2313,10 +2329,15 @@ export function TextField(props: {
 
 ```tsx
 export function FormError(props: { message: string | null; correlationId: string | null }) {
-  if (props.message === null) return null
+  // Returning null on a null MESSAGE would drop the correlation id in the most
+  // common server-rejection shape there is: applyProblemToForm returns
+  // formError null whenever every error mapped to a known field, so a 400 with
+  // per-field messages would render field errors and no reference at all —
+  // exactly the case a user reports and support cannot trace.
+  if (props.message === null && props.correlationId === null) return null
   return (
     <div role="alert" className="border-danger text-danger rounded-md border px-3 py-2 text-sm">
-      <p>{props.message}</p>
+      {props.message !== null && <p>{props.message}</p>}
       {props.correlationId !== null && (
         <p className="text-text-muted font-mono text-xs">reference: {props.correlationId}</p>
       )}
@@ -2519,7 +2540,7 @@ import { render, screen } from '@testing-library/react'
 import { HttpResponse, http } from 'msw'
 import { describe, expect, it } from 'vitest'
 import { queryClient } from '../api/query-client'
-import { routeTree } from './routeTree.gen'
+import { routeTree } from '../routeTree.gen'
 import { server } from '../test/msw'
 
 const me = () =>
@@ -2699,7 +2720,7 @@ Move `src/routes/index.tsx` to `src/routes/_app/index.tsx` and change its path t
 import { createRouter } from '@tanstack/react-router'
 import { onUnauthenticated } from './api/client'
 import { queryClient } from './api/query-client'
-import { routeTree } from './routes/routeTree.gen'
+import { routeTree } from './routeTree.gen'
 
 export const router = createRouter({
   routeTree,
@@ -3789,7 +3810,7 @@ Level three. REST is the source of truth for list **and** badge; the stream's en
 
 **Files:**
 - Create: `web/src/realtime/cache-bridge.ts`, `web/src/realtime/cache-bridge.test.ts`
-- Create: `web/src/realtime/use-attention-stream.ts`
+- Create: `web/src/realtime/use-attention-stream.ts`, `web/src/realtime/stream-status.tsx`
 - Create: `web/src/approvals/approvals-query.ts`, `web/src/approvals/approval-list.tsx`
 - Modify: `web/src/routes/_app/approvals.tsx`, `web/src/routes/_app.tsx`
 - Create: `web/src/routes/_app/approvals.test.tsx`
@@ -3800,7 +3821,7 @@ Level three. REST is the source of truth for list **and** badge; the stream's en
   - `ATTENTION_KINDS: ReadonlySet<string>`
   - `createCacheBridge(qc: QueryClient, opts?: { debounceMs?: number; setTimeoutImpl?: typeof setTimeout }): { onFrame(f: EventFrame): void; flush(): void }`
   - `approvalsQueryOptions` — `{ queryKey: ['approvals'], queryFn, ...AUTH_SCOPED_QUERY_OPTIONS }`
-  - `useAttentionStream()` — the hook the `_app` layout mounts once.
+  - `useAttentionStream()` — the hook the `_app` layout mounts once; `StreamStatusProvider` / `useStreamStatus()` — how every other route reads `connection` and `scopeEmpty` without opening a second stream.
 
 - [ ] **Step 1: Write the failing bridge tests**
 
@@ -3984,7 +4005,24 @@ export function useAttentionStream(): { connection: ConnectionState; scopeEmpty:
 }
 ```
 
-`web/src/routes/_app.tsx` — in `AppLayout`, call `useAttentionStream()` and pass `connection` and the approvals count into `AppShell`. Mount it **once, here**: one stream per tab, not one per route.
+`web/src/realtime/stream-status.tsx` — the context that PUBLISHES what the hook produces, so consumers read the stream's state without opening one:
+
+```tsx
+import { createContext, useContext } from 'react'
+import type { ConnectionState } from './connection-state'
+
+export type StreamStatus = { connection: ConnectionState; scopeEmpty: boolean }
+
+// Defaults describe a tab that has not connected yet, not an error: a consumer
+// rendered outside the provider should read as "still connecting", never as
+// "your scope is empty" — which is a claim about the user's grants.
+const StreamStatusContext = createContext<StreamStatus>({ connection: 'reconnecting', scopeEmpty: false })
+
+export const StreamStatusProvider = StreamStatusContext.Provider
+export const useStreamStatus = (): StreamStatus => useContext(StreamStatusContext)
+```
+
+`web/src/routes/_app.tsx` — in `AppLayout`, call `useAttentionStream()` **once** (one stream per tab, not one per route), pass `connection` and the approvals count into `AppShell`, and wrap the `<Outlet />` in `<StreamStatusProvider value={status}>` so descendant routes can read `scopeEmpty` without opening a second connection. `useConnectionState()` from Task 8 reads this same context.
 
 - [ ] **Step 6: The approvals query and list**
 
@@ -4044,6 +4082,7 @@ import { useSuspenseQuery } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
 import { ApprovalList } from '../../approvals/approval-list'
 import { approvalsQueryOptions } from '../../approvals/approvals-query'
+import { useStreamStatus } from '../../realtime/stream-status'
 
 export const Route = createFileRoute('/_app/approvals')({
   loader: ({ context }) => context.queryClient.ensureQueryData(approvalsQueryOptions),
@@ -4052,7 +4091,14 @@ export const Route = createFileRoute('/_app/approvals')({
 
 function Approvals() {
   const { data } = useSuspenseQuery(approvalsQueryOptions)
-  return <ApprovalList approvals={data} scopeEmpty={false} />
+  // scopeEmpty comes from the stream, not from a literal. Hardcoding false
+  // makes "No projects are shared with you yet" unreachable and tells a user
+  // with no grants that nothing is waiting on them — a different and wrong
+  // statement. It is READ FROM CONTEXT, never by calling useAttentionStream()
+  // again: that hook opens a connection, and a second caller would open a
+  // second stream per tab.
+  const { scopeEmpty } = useStreamStatus()
+  return <ApprovalList approvals={data} scopeEmpty={scopeEmpty} />
 }
 ```
 
@@ -4767,14 +4813,36 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
-	// ... plus the imports the body needs
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/giiorg/caesar/backend/internal/assets"
+	"github.com/giiorg/caesar/backend/internal/identity"
+	"github.com/giiorg/caesar/backend/internal/platform/audit"
+	"github.com/giiorg/caesar/backend/internal/platform/authn"
+	"github.com/giiorg/caesar/backend/internal/platform/clock"
+	"github.com/giiorg/caesar/backend/internal/platform/config"
+	"github.com/giiorg/caesar/backend/internal/platform/secrets"
+	"github.com/giiorg/caesar/backend/internal/platform/testdb"
+	"github.com/giiorg/caesar/backend/internal/runs"
+	"github.com/giiorg/caesar/backend/internal/runs/fake"
+	"github.com/giiorg/caesar/backend/internal/workflows"
 )
+
+// If `goimports` disagrees with this list, believe goimports — it is stated in
+// full here rather than as "plus what the body needs" because an import block
+// a reader has to reconstruct is a step that cannot be executed as written,
+// and this file's body reaches into twelve packages.
+
 
 const e2eWorkflow = `{
   "schema": 1,
@@ -5109,6 +5177,8 @@ test('a gate opened by the backend moves the approvals badge with no user action
 ```
 
 Add a `web:e2e` prerequisite in the CI job rather than as a Taskfile `deps`, so `vite build` and `npx playwright install` stay visible steps in the workflow.
+
+**Which CI job, and when.** The `web` job does not exist yet — Task 14 creates it. So this task adds the Taskfile target and the `scripts/gate` edit that goes with it, and Task 14 wires the workflow step when it writes the job. Do not edit `.github/workflows/ci.yml` here: there is nothing to edit, and a half-written job is worse than none. `.github/workflows/ci.yml` is deliberately absent from this task's file list for that reason.
 
 - [ ] **Step 5: Keep the new tag inside the vetted set**
 
