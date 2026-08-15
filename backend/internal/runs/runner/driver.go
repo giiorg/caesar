@@ -165,6 +165,31 @@ var drivers = map[string]driver{
 					`(?im)^(?:not logged in|invalid api key|oauth token (?:revoked|expired))\W{1,8}please run /login`),
 				code: runs.CodeAuthExpired, class: runs.OutcomePermanent,
 			},
+			{
+				// RECORDED VERBATIM (2026-08-15, row 07's smoke run, the same
+				// pinned v2.1.223): with a token PRESENT and REJECTED the CLI
+				// prints, at column 0 and alone,
+				//
+				//	Failed to authenticate. API Error: 401 OAuth access token is invalid.
+				//
+				// The row above covers the OTHER half of auth death — no token
+				// at all — and cannot reach this one: there is no slash command
+				// in this sentence to complete on. Until this row existed a
+				// dead subscription classified transient and retried to
+				// exhaustion, and last_auth_expired_at was never written, so
+				// the operator got no signal their subscription had died.
+				//
+				// The discriminator here is the whole opening clause, not the
+				// `401`: `Failed to authenticate.` followed by this CLI's own
+				// `API Error:` label, anchored at the start of a line. An agent
+				// citing the line writes it mid-sentence ("if it prints …") or
+				// behind a comment marker, which is what the prose guards in
+				// driver_test.go pin. The reason after the code is deliberately
+				// NOT matched: it varies with why the token is bad, and the
+				// status is what makes it auth death.
+				pattern: regexp.MustCompile(`(?im)^failed to authenticate\. +api error: +401\b`),
+				code:    runs.CodeAuthExpired, class: runs.OutcomePermanent,
+			},
 		},
 		sensitive: func(secret []byte) ([][]byte, error) { return [][]byte{secret}, nil },
 		// identity nil: a static token has no read-back and no identity pin.
@@ -232,8 +257,39 @@ var drivers = map[string]driver{
 				// which is what separates the CLI's own level marker from an
 				// agent's prose "Error handling: …" — the whole discriminator
 				// is that the CLI shouts and prose does not.
+				// NO LONGER PROVISIONAL as of 2026-08-15: row 07's smoke run
+				// recorded both real shapes against v0.146.1 with a rejected
+				// auth.json, and NEITHER matched what stood here. Both put a
+				// prose clause between the module preamble and the status:
+				//
+				//	<ts> ERROR codex_models_manager::manager: failed to refresh available models: unexpected status 401 Unauthorized: {"detail":…}
+				//	<ts> ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://…
+				//
+				// So the status may now sit anywhere in the line — but only
+				// when the CLI also says HOW it arrived. `unexpected status`
+				// and `HTTP error:` are reporting phrases; an agent reasoning
+				// about a 401 writes none of them. That is what keeps this
+				// widening from becoming "any ERROR line mentioning 401".
 				pattern: regexp.MustCompile(
-					`(?im)^(?:\S+ +)?(?-i:ERROR)(?: +\S+)?: +(?:401 unauthorized|(?:access|refresh|id) token (?:has )?expired)\b`),
+					`(?im)^(?:\S+ +)?(?-i:ERROR)(?: +\S+)?: .*(?:unexpected status|http error:) +401 unauthorized\b`),
+				code: runs.CodeAuthExpired, class: runs.OutcomePermanent,
+			},
+			{
+				// The immediate form, unchanged in shape but TIGHTENED on the
+				// right. It used to end at `\b`, which let an agent's fabricated
+				// log line through — `ERROR my_module::thing: 401 Unauthorized
+				// is what we assert on` classified as a dead credential, a
+				// false match of exactly the permanent kind this table's whole
+				// design is organised against. The real lines stop at the
+				// status or continue with a colon; prose continues with more
+				// words, so requiring one of those two endings separates them.
+				pattern: regexp.MustCompile(
+					`(?im)^(?:\S+ +)?(?-i:ERROR)(?: +\S+)?: +401 unauthorized *(?::|$)`),
+				code: runs.CodeAuthExpired, class: runs.OutcomePermanent,
+			},
+			{
+				pattern: regexp.MustCompile(
+					`(?im)^(?:\S+ +)?(?-i:ERROR)(?: +\S+)?: +(?:access|refresh|id) token (?:has )?expired\b`),
 				code: runs.CodeAuthExpired, class: runs.OutcomePermanent,
 			},
 		},
