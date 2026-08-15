@@ -1176,6 +1176,17 @@ function commonAncestor(paths: string[]): string {
  * every route, so it would place everything at the top and assert nothing. The
  * two definitions disagree precisely on transitive helpers, which is most of
  * what this rule will ever see.
+ *
+ * THE REQUIRED HOME IS CLAMPED TO THE TARGET'S OWN GROUP ROOT — corrected
+ * 2026-08-15; this block previously used the unclamped ancestor below and was
+ * wrong. Spec §2 asks for colocation *within* the route tree, while `api/`,
+ * `realtime/`, `forms/` and `ui/` are declared permanent homes, so a module
+ * reaching them is shared by construction. MEASURED against a tree built from
+ * this plan's own literal import lines, the unclamped rule reported
+ * `api/errors.ts has 5 consumers (…) so it must live in .` — it contradicts the
+ * File Structure it is meant to enforce. See the shipped
+ * `web/tools/arch/import-graph.ts` for `groupRootOf` and `isWithin`, which this
+ * block does not define; that file is authoritative, not this snippet.
  */
 export function findMisplacedModules(root: string): Violation[] {
   const files = walk(root)
@@ -1196,7 +1207,9 @@ export function findMisplacedModules(root: string): Violation[] {
   const out: Violation[] = []
   for (const [target, importers] of consumers) {
     if (importers.length < 2) continue
-    const required = commonAncestor(importers)
+    const groupRoot = groupRootOf(root, target)
+    const ancestor = commonAncestor(importers)
+    const required = isWithin(groupRoot, ancestor) ? ancestor : groupRoot
     if (dirname(target) === required) continue
     out.push({
       file: relative(root, target),
