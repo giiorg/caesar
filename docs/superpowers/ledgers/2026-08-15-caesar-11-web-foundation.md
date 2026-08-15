@@ -19,20 +19,28 @@ full session on this project.
 | 4 | 6 — typed form abstraction + `/login` | `a987927` | — |
 | 4 | 10 — SSE transport, backoff/resume/watchdog/probe | `43143b2` | — |
 | 4 | 12 — embedded bundle behind `embedui`, CSP on | `acec71d` | **PASS** |
-| — | wave-4 plan corrections + this ledger entry | _(this commit)_ | docs only |
+| — | wave-4 plan corrections + ledger entry | `a4be81a` | docs only |
+| 5 | 7 — session bootstrap: `_app` guard, error panel, `tsr.config.json` | `8a40eae` | **PASS** |
+| — | wave-5 plan corrections + this ledger entry | _(this commit)_ | docs only |
 
-**Done: Tasks 1, 2, 3, 4, 5, 6, 9, 10, 12. Remaining: 7 → 8 → 11 → 13 → 14 (a chain).**
+**Done: Tasks 1, 2, 3, 4, 5, 6, 7, 9, 10, 12. Remaining: 8 → 11 → 13 → 14 (a chain).**
 
 The gate is `scripts/gate <abs-worktree> <sha> <branch>` and it ran green at each wave boundary,
 not after each task. Within a wave, tasks are committed in dependency order and their individual
 commits' greenness is asserted by construction rather than measured — stating that plainly because
 the plan's own rule is per-task.
 
-All web lanes green at `acec71d`: `web:pins` (34 pinned), `web:lint`, `web:typecheck` (tsc + the
-route-inference mutant), `web:arch`, `web:test` (**103** tests, 10 files), `web:routes:check`,
+All web lanes green at `8a40eae`: `web:pins` (34 pinned), `web:lint`, `web:typecheck` (tsc + the
+route-inference mutant), `web:arch`, `web:test` (**113** tests, 12 files), `web:routes:check`,
 `web:build`. Both Go twins green: `go test ./internal/...` and `go test -tags embedui
 ./internal/webui/`. The gate itself still covers only the backend four — **the web lanes are run
 by hand until Task 14 mirrors them into `scripts/gate`.**
+
+**`node_modules` lost the rolldown native binding again** at the start of wave 5, exactly as in
+wave 4: `@rolldown/` held only `pluginutils`, and vitest and vite died together. `cd web && npm ci`
+fixed it and left `package-lock.json` byte-identical. The error message's own advice — delete the
+lock — would unpin all 34 versions `web:pins` exists to guard. Twice in two sessions now; if it
+recurs, it is worth a lane that asserts the binding's presence rather than a memory.
 
 ## The dependency graph, which is mostly a chain
 
@@ -42,15 +50,39 @@ Only the two braces parallelize; the file sets inside each are disjoint. Tasks 4
 overlap — Task 4 regenerates `schema.d.ts` out of `web/node_modules` while Task 1 rewrites
 `package.json` and reinstalls that same tree.
 
-**Both braces are now done. Everything left is strictly serial**, one task per wave: 7 → 8 → 11
-→ 13 → 14. There is no more parallelism to find in this plan.
+**Both braces are now done. Everything left is strictly serial**, one task per wave: 8 → 11 → 13
+→ 14. There is no more parallelism to find in this plan.
 
-## What Tasks 7, 8, 11 and 14 must not rediscover the hard way
+Wave 5 (Task 7) was executed **inline by the orchestrator**, not through the per-wave Workflow the
+operating model below describes. With one task left per wave there is no fan-out to buy, and the
+quality bar it existed to enforce — write the test, watch it fail, then mutate every guard and
+watch it die — was applied directly. Three of this task's findings came out of that mutation pass
+and would not have come out of a green suite.
+
+## What Task 8 inherits from wave 5, and must not undo
+
+- **`web/src/shell/app-shell.tsx` EXISTS as a stub** — a `<nav aria-label="Main" />` plus
+  `{children}`, typed `{ me: Me; children: ReactNode }` where `Me` is
+  `components['schemas']['ApiMeResponse']`. Task 8 replaces the file wholesale, but **keep the
+  `me` prop**: the session is resolved by the `_app` loader and handed down, so no shell
+  component ever fetches it. `_app.test.tsx` asserts `role="navigation"` to mean "the shell
+  rendered"; a real shell must keep a `<nav>` or three tests fail for the wrong reason.
+- **`web/src/routes/_app/tasks.tsx` is COMPONENT-ONLY on purpose.** `_app.test.tsx`'s first test
+  navigates there precisely because it issues no request — the case a redirect-on-401 design
+  cannot catch. Giving it a loader destroys the property that test exists to prove.
+- **`useMe()` is exported from `routes/_app.tsx`** and is currently unused. It has zero consumers,
+  so the arch misplacement rule (which needs two) says nothing about it yet; a second consumer
+  will pull it toward a shared home.
+- **`_app.tsx` renders `<ApiErrorPanel>` for every non-401 route error.** Task 8's stub routes
+  inherit it. The panel is in `errors/`, not `ui/`, because it does `error instanceof ApiError`
+  and Task 3's matrix bans `ui/ -> api/`.
+
+## What Tasks 8, 11 and 14 must not rediscover the hard way
 
 Wave 4 changed interfaces the later tasks were written against. These are the contracts, not
 suggestions:
 
-- **Every form spreads `<form {...form.formProps}>`** (Tasks 7, 8, 11). `noValidate` lives in
+- **Every form spreads `<form {...form.formProps}>`** (Tasks 8, 11). `noValidate` lives in
   the abstraction because native constraint validation otherwise eats the submit and the error
   the form exists to show. `useAppForm` still returns `submit`, so `onSubmit={form.submit}`
   compiles and silently reintroduces the bug — and only a form with a constrained input type
@@ -193,6 +225,39 @@ Wave 4 added six more, and again every one came from running something:
     `ui_noembed_test.go` is what actually catches it (`GET / = 200, want 501`). That is why the
     file the plan never asked for was kept.
 
+Wave 5 added three, and the first two came from mutating guards that were already green:
+
+19. **`ensureQueryData` resolves from a cache entry whose refetch already 401d — without
+    issuing a request at all.** MEASURED on the pinned react-query 5.101.4: a failed refetch
+    leaves `data` in place, and `ensureQueryData` hands it back. The plan used it for `/login`'s
+    redirect-inward guard, so the guard concluded "signed in" from an answer the server had
+    already rejected, redirected to `/`, and `_app`'s expiry check bounced it straight back —
+    **an infinite redirect loop rendering an empty page.** Adding Step 4 as written turned the
+    already-passing expired-session test red, which is the only reason it was caught in the
+    minute rather than in a browser. Now `fetchQuery({ ...meQueryOptions, staleTime: 0 })`: a
+    guard that sends someone *away* from the login form has to prove the session, not recall one.
+    `_app`'s loader keeps `ensureQueryData` deliberately — accepting cached data is what makes a
+    reload instant, and the layout's expiry check is what makes it correct.
+20. **Task 7's three guard tests were vacuous for the thing the task exists to build.** Neuter
+    the `_app` loader entirely and all three still pass, because `useSuspenseQuery` then throws
+    the same 401 and the error boundary navigates to the same place. Same visible outcome, two
+    different mechanisms. The discriminator is the history: a loader `throw redirect()` during
+    the initial load REPLACES the entry, a boundary `navigate()` PUSHES one — so the mutant
+    leaves the unreachable route sitting behind `/login` in the back stack. `expect(router.
+    history.length).toBe(1)` kills it. Same defect class as items 3, 12 and 15: a property
+    asserted in a comment that no test could falsify.
+21. **A test file under `src/routes/` that exports a `Route` becomes a real route and ships.**
+    The ledger left this open "for Task 7 to decide" and it was worth deciding: measured, such a
+    file lands 13 references in `routeTree.gen.ts`. `web/tsr.config.json` now sets
+    `routeFileIgnorePattern`, and the Vite plugin and the `tsr` CLI were confirmed to read it
+    identically by generating with each and diffing — otherwise `web:build` and
+    `web:routes:check` could disagree about what the route tree is.
+
+Also measured and NOT adopted: the plan's second, disabled observer
+(`useQuery({ ...meQueryOptions, enabled: false })`) for background expiry. Both observers read
+the same cache entry and report the same error, so reading `error` off the existing
+`useSuspenseQuery` is equivalent — one hook fewer, no change to any test or fetch count.
+
 ## Open items
 
 **FOR THE OPERATOR — Task 12 Step 11 is undone and cannot be closed by an agent.** The
@@ -212,11 +277,11 @@ promise. React does not await it, so **the user sees the form do nothing, with n
 Swallowing it would be worse (a TypeError presented as though the server had spoken), so the
 behaviour stands, but it is untested and it is a hole.
 
-**For Task 7 to decide:** `web/tsr.config.json` does not exist, so `routeFileIgnorePattern` is
-unset and `tsr generate` warns on every test file under `src/routes/`. It exits 0 and the tree
-is correct, so nothing is broken — but `login.test.tsx` is excluded only because it happens to
-export no `Route` symbol. Nothing pins that. A future test file in `routes/` that re-exported a
-Route would silently become a route.
+**~~For Task 7 to decide~~ — CLOSED in `8a40eae`.** `web/tsr.config.json` now sets
+`routeFileIgnorePattern`, the `tsr generate` warnings are gone, and the leak is measured rather
+than assumed (finding 21). One thing it does NOT close: deleting that file leaves every lane
+green today, because no test file currently exports a `Route`. The guard is latent, and the
+protection against removing it is this note plus the comment in `vite.config.ts`.
 
 **For sofo — a taste call, not blocking.** In the light theme `accent-contrast` on `accent`
 measures **4.23:1** (below WCAG AA 4.5) where dark measures 10.43:1, and `warning` on `ground` is
@@ -268,6 +333,19 @@ From wave 4:
   against a fake in jsdom, not a real browser. `WATCHDOG_MS` and `STABLE_MS` are pinned relative
   to the values the tests choose, so a coordinated change of both constant and test still passes
   — the mutants prove the rules, not the numbers.
+From wave 5:
+
+- `_app.tsx` — **`AppErrorBoundary`'s 401 branch is untested.** The first load's 401 is the
+  loader's, and a background expiry is AppLayout's; nothing today produces a 401 that arrives
+  through the boundary, because that needs a child route with its own loader (Task 11's
+  `/approvals`). The branch is reasoned, not measured, and Task 11 is where it becomes testable.
+- `_app.tsx` — the loader's non-401 rethrow IS covered (the 500 test), but its `redirect` on 401
+  is only covered on the stub-route path; no test drives a 401 into `_app` from `/`.
+- `api-error-panel.tsx` — the non-403 branch renders `error.detail`, and no test asserts the
+  detail text itself, only the correlation id. A panel that rendered an empty `<p>` would pass.
+- `app-shell.tsx` is a stub whose `me` prop is accepted and never read, so nothing yet proves the
+  session actually reaches the shell. Task 8 makes that real.
+- `useMe()` has no consumers and no test.
 - `ui_embed.go` — both panics (`dist` not embedded, `index.html` missing) are unreachable
   whenever `//go:embed all:dist` compiled, and untested.
 - `security.go` — **the entire `dev=true` CSP branch is live only in tests.** `Routes()`
@@ -292,3 +370,16 @@ because the next person to execute it will otherwise reintroduce exactly what wa
   moved into Task 10's file list, and `probeMe` retyped to the nullable `MeProbe`.
 - **Task 8** (wave 4). Its "Create `connection-state.ts`" line is now "CONSUME" — Task 10 owns
   the file. The placement argument is unchanged and is why it lives in `realtime/`.
+- **Task 7** (wave 5). Step 4's `ensureQueryData` is now `fetchQuery({ ...meQueryOptions,
+  staleTime: 0 })` with the redirect moved outside the `try`, and carries the loop it caused;
+  Step 3's second disabled observer is gone in favour of reading `error` off the existing
+  `useSuspenseQuery`; Step 1's harness returns the router and asserts `history.length === 1`,
+  without which the whole task is unfalsifiable; Step 6's route-level assertion moved off
+  `/approvals` (a Task 11 route) onto a 500 from `/auth/me`; the Files list gained
+  `shell/app-shell.tsx`, `tsr.config.json` and the real set of modified files, and lost the
+  `main.tsx` change, which turned out to be unnecessary.
+- **Every task's verify line** (wave 5). The remaining `npx` / `npm exec --` invocations across
+  Tasks 2, 5, 6, 7, 8, 11, 12, 13 and 14 are now `./node_modules/.bin/<tool>`, matching the rule
+  pre-flight 15 states and the Taskfile and Dockerfile already follow. The prose explaining *why*
+  the ban exists still says `npx`, deliberately, as does the one intentional versioned registry
+  call (`npx @biomejs/biome@2.5.8 explain`).

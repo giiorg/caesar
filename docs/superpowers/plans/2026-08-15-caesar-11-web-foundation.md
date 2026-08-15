@@ -839,7 +839,7 @@ describe('useTheme', () => {
 
 - [ ] **Step 4: Run it and watch it fail**
 
-Run: `cd web && npx vitest run src/theme/use-theme.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/theme/use-theme.test.ts`
 Expected: FAIL — `Failed to resolve import "./use-theme"`.
 
 - [ ] **Step 5: Implement `useTheme`**
@@ -882,7 +882,7 @@ export function useTheme() {
 
 - [ ] **Step 6: Run the tests and confirm they pass**
 
-Run: `cd web && npx vitest run src/theme/use-theme.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/theme/use-theme.test.ts`
 Expected: PASS, 2 tests.
 
 - [ ] **Step 7: Prove the palette reset actually removed the palette**
@@ -892,7 +892,7 @@ This is the load-bearing half and it is not a unit test — it is a property of 
 ```bash
 cd web
 printf '%s\n' 'export function Bad() { return <div className="bg-white text-red-500" /> }' > src/palette-probe.tsx
-npx vite build
+./node_modules/.bin/vite build
 grep -c 'bg-white\|text-red-500' ../backend/internal/webui/dist/assets/*.css || echo "0 matches — palette is gone"
 rm src/palette-probe.tsx
 ```
@@ -932,7 +932,7 @@ The manifest promises installability, not offline behaviour — there is no serv
   web:test:
     dir: web
     cmds:
-      - npx vitest run
+      - ./node_modules/.bin/vitest run
 ```
 
 ```bash
@@ -1832,7 +1832,7 @@ describe('ApiError.fromResponse', () => {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd web && npx vitest run src/api/errors.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/api/errors.test.ts`
 Expected: FAIL — `Failed to resolve import "./errors"`.
 
 - [ ] **Step 3: Implement `ApiError`**
@@ -1933,7 +1933,7 @@ export class ApiError extends Error {
 
 - [ ] **Step 4: Run the error tests and confirm they pass**
 
-Run: `cd web && npx vitest run src/api/errors.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/api/errors.test.ts`
 Expected: PASS, 10 tests (3 envelope cases + the 7 malformed-body cases).
 
 - [ ] **Step 5: Write the failing interceptor test**
@@ -2025,7 +2025,7 @@ describe('the generated client', () => {
 
 - [ ] **Step 6: Run it and watch it fail**
 
-Run: `cd web && npx vitest run src/api/client.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/api/client.test.ts`
 Expected: FAIL — `Failed to resolve import "./client"`.
 
 - [ ] **Step 7: Implement the client**
@@ -2080,7 +2080,7 @@ The structural shape above is what the client actually returns and is what `unwr
 
 - [ ] **Step 8: Run the client tests and confirm they pass**
 
-Run: `cd web && npx vitest run src/api/client.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/api/client.test.ts`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 9: Ban the thing this replaced**
@@ -2116,7 +2116,7 @@ Add an override exempting the three files that legitimately hold a `fetch`: `src
     }
 ```
 
-Verify the ban bites — this is the step that catches a misplaced group, since a rule Biome never applied looks exactly like a codebase with no violations. Add `const x = fetch('/api/v1/auth/me')` to `src/routes/index.tsx`, run `npx biome ci .`, expect a failure naming `lint/style/noRestrictedGlobals`, then remove it. If it passes, the rule is inert: re-run `npx @biomejs/biome@2.5.8 explain noRestrictedGlobals` and put it under whatever group that prints.
+Verify the ban bites — this is the step that catches a misplaced group, since a rule Biome never applied looks exactly like a codebase with no violations. Add `const x = fetch('/api/v1/auth/me')` to `src/routes/index.tsx`, run `./node_modules/.bin/biome ci .`, expect a failure naming `lint/style/noRestrictedGlobals`, then remove it. If it passes, the rule is inert: re-run `npx @biomejs/biome@2.5.8 explain noRestrictedGlobals` and put it under whatever group that prints.
 
 - [ ] **Step 10: The QueryClient and the bounded refresh floor**
 
@@ -2171,7 +2171,7 @@ export const AUTH_SCOPED_QUERY_OPTIONS = {
 - [ ] **Step 11: Verify and commit**
 
 ```bash
-cd web && npx vitest run && npx tsc --noEmit && npx biome ci . && node tools/arch/main.ts
+cd web && ./node_modules/.bin/vitest run && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/biome ci . && node tools/arch/main.ts
 ```
 
 ```bash
@@ -2263,7 +2263,7 @@ describe('applyProblemToForm', () => {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd web && npx vitest run src/forms/problem-to-fields.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/forms/problem-to-fields.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement the mapper**
@@ -2299,7 +2299,7 @@ export function applyProblemToForm<T extends FieldValues>(
 
 - [ ] **Step 4: Run the mapper tests and confirm they pass**
 
-Run: `cd web && npx vitest run src/forms/problem-to-fields.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/forms/problem-to-fields.test.ts`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Implement `useAppForm` and the field registry**
@@ -2508,7 +2508,7 @@ describe('the login form', () => {
 
 - [ ] **Step 7: Run it and watch it fail**
 
-Run: `cd web && npx vitest run src/routes/login.test.tsx`
+Run: `cd web && ./node_modules/.bin/vitest run src/routes/login.test.tsx`
 Expected: FAIL — `LoginForm` is not exported from `./login`.
 
 - [ ] **Step 8: Implement the login route**
@@ -2584,13 +2584,13 @@ function LoginPage() {
 
 - [ ] **Step 9: Run the login tests and confirm they pass**
 
-Run: `cd web && npx vitest run src/routes/login.test.tsx`
+Run: `cd web && ./node_modules/.bin/vitest run src/routes/login.test.tsx`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 10: Regenerate routes, verify, commit**
 
 ```bash
-cd web && npm exec -- tsr generate && npx tsc --noEmit && npx vitest run && npx biome ci . && node tools/arch/main.ts
+cd web && ./node_modules/.bin/tsr generate && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/vitest run && ./node_modules/.bin/biome ci . && node --experimental-strip-types tools/arch/main.ts
 ```
 
 ```bash
@@ -2610,7 +2610,23 @@ The design as first written specified only one auth transition, a redirect *afte
 - Create: `web/src/routes/_app/tasks.tsx` — a placeholder, replaced by Task 8
 - Create: `web/src/routes/_app.test.tsx`
 - Create: `web/src/errors/api-error-panel.tsx`, `web/src/errors/api-error-panel.test.tsx`
-- Modify: `web/src/main.tsx`, `web/src/router.ts`
+- Create: `web/src/shell/app-shell.tsx` — the stub named under Step 5's placeholders
+- Create: `web/tsr.config.json` — see below
+- Modify: `web/src/routes/__root.tsx`, `web/src/router.ts`, `web/src/routes/login.tsx`, `web/vite.config.ts`
+
+`web/src/main.tsx` needs no change: the router is constructed with its context in `router.ts`, and the `QueryClientProvider` already sits outside the `RouterProvider`.
+
+**`web/tsr.config.json` closes the route-leak hole this task inherited.** With no config file, `routeFileIgnorePattern` is unset and `tsr generate` warns on every test file under `src/routes/` — and those files stay out of the route tree only because they happen to export no `Route` symbol. Nothing pinned that. MEASURED: a test file under `src/routes/` that *does* export one is picked up as a real route and ships (13 references in `routeTree.gen.ts`); with the pattern set, zero.
+
+```json
+{
+  "routesDirectory": "./src/routes",
+  "generatedRouteTree": "./src/routeTree.gen.ts",
+  "routeFileIgnorePattern": "\\.(test|spec)\\.tsx?$"
+}
+```
+
+Both the Vite plugin and `./node_modules/.bin/tsr generate` (`task web:routes:check`) read this file — VERIFIED by generating with each and diffing: identical, so the build and the drift check cannot disagree about what the route tree is. It is strict JSON with **no comments**, for the same reason `biome.json` is: a `//` line silently voids the config. The rationale therefore lives in a comment next to `tanstackRouter(...)` in `vite.config.ts`.
 
 **Interfaces:**
 - Consumes: `api`, `unwrap`, `queryClient`, `onUnauthenticated` (Task 5); the `/login` route (Task 6).
@@ -2657,11 +2673,12 @@ function renderAt(path: string) {
     context: { queryClient },
     history: createMemoryHistory({ initialEntries: [path] }),
   })
-  return render(
+  render(
     <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
     </QueryClientProvider>,
   )
+  return router // the history assertion below needs it
 }
 
 describe('the protected layout', () => {
@@ -2669,8 +2686,22 @@ describe('the protected layout', () => {
     // The whole reason this layout exists: a stub makes no request to be
     // rejected, so without a loader it would render the full shell to anyone.
     server.use(http.get('/api/v1/auth/me', noSession))
-    renderAt('/tasks')
+    const router = renderAt('/tasks')
     expect(await screen.findByRole('button', { name: /sign in/i })).toBeInTheDocument()
+
+    // AND IT MUST BE THE LOADER THAT DID IT. Without this line the test is
+    // VACUOUS — MEASURED during execution: neuter the loader's ensureQueryData
+    // and all three tests still pass, because AppLayout's useSuspenseQuery then
+    // throws the same 401 and AppErrorBoundary navigates to the same place. The
+    // visible outcome is identical; the history is not.
+    //
+    // A loader `throw redirect()` during the initial load REPLACES the entry
+    // (length 1). A navigate() from a rendered error boundary PUSHES one
+    // (length 2), leaving /tasks behind /login in the back stack — so Back
+    // returns the visitor to a route they cannot see and re-runs the whole
+    // failed load. Resolving the session before anything renders is the
+    // property this route exists for, and this is what makes it falsifiable.
+    expect(router.history.length).toBe(1)
   })
 
   it('renders the shell on a reload with a valid cookie', async () => {
@@ -2705,7 +2736,7 @@ describe('the protected layout', () => {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd web && npx vitest run src/routes/_app.test.tsx`
+Run: `cd web && ./node_modules/.bin/vitest run src/routes/_app.test.tsx`
 Expected: FAIL — the `_app` route does not exist, so `/tasks` and `/` are unguarded.
 
 - [ ] **Step 3: Implement the query and the layout route**
@@ -2730,7 +2761,7 @@ export const meQueryOptions = queryOptions({
 `web/src/routes/_app.tsx`:
 
 ```tsx
-import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
+import { useSuspenseQuery } from '@tanstack/react-query'
 import { type ErrorComponentProps, Outlet, createFileRoute, redirect, useNavigate } from '@tanstack/react-router'
 import { useEffect } from 'react'
 import { meQueryOptions } from '../auth/me-query'
@@ -2757,11 +2788,9 @@ export const Route = createFileRoute('/_app')({
 })
 
 function AppLayout() {
-  const { data } = useSuspenseQuery(meQueryOptions)
-
   /**
-   * THE SECOND OBSERVER, and it is not redundant — it is the only thing that
-   * can see a session expiring in the background.
+   * `error` IS READ, AND IT IS NOT REDUNDANT WITH SUSPENSE — it is the only
+   * thing that can see a session expiring in the background.
    *
    * useSuspenseQuery does NOT throw once the query holds data. It hard-sets
    * `throwOnError` to its own default AFTER spreading the caller's options
@@ -2772,14 +2801,19 @@ function AppLayout() {
    * anywhere. The shell keeps rendering to an expired session indefinitely —
    * exactly what this layout exists to prevent, deferred past the first load.
    *
-   * `enabled: false` makes this a pure subscription: it reports the query's
-   * state and never fetches or schedules a refetch of its own, so
-   * AUTH_SCOPED_QUERY_OPTIONS' interval and focus refetch do not double up.
-   * Verified against the pinned version — a disabled observer on a query whose
-   * refetch failed reports status 'error' with the error, and the fetch count
-   * is unchanged.
+   * The same non-throwing behaviour is what makes `.error` readable here at
+   * all: the failure is reported as state rather than raised.
+   *
+   * CORRECTED 2026-08-15 during execution. This slot previously held a SECOND,
+   * disabled observer — `useQuery({ ...meQueryOptions, enabled: false,
+   * throwOnError: false })` — to avoid doubling AUTH_SCOPED_QUERY_OPTIONS'
+   * interval and focus refetch. MEASURED: unnecessary. Both observers read the
+   * same cache entry and report the same error, so the extra hook adds a
+   * subscription and no information. Dropping it changes no test and no fetch
+   * count; making the expiry unobservable (`const error = undefined`) still
+   * fails the expired-session test, so the line remains falsifiable.
    */
-  const { error } = useQuery({ ...meQueryOptions, enabled: false, throwOnError: false })
+  const { data, error } = useSuspenseQuery(meQueryOptions)
   const navigate = useNavigate()
   const expired = error instanceof ApiError && error.status === 401
   useEffect(() => {
@@ -2797,9 +2831,9 @@ function AppLayout() {
 /**
  * Route-level errors: a child loader that failed, or a query that threw
  * because it had no data to fall back on. The FIRST load's 401 is caught by
- * the loader above and redirected there; a background expiry is caught by the
- * disabled observer in AppLayout, because useSuspenseQuery will not throw
- * over cached data. This handles the rest.
+ * the loader above and redirected there; a background expiry is caught by
+ * AppLayout reading the query's `error`, because useSuspenseQuery will not
+ * throw over cached data. This handles the rest.
  *
  * The 401 branch is kept here anyway — a child route's own loader can 401
  * without /auth/me having been refetched, and that is a real expiry too.
@@ -2867,21 +2901,46 @@ An existing session at `/login` redirects inward. In `src/routes/login.tsx`, add
 export const Route = createFileRoute('/login')({
   beforeLoad: async ({ context }) => {
     try {
-      await context.queryClient.ensureQueryData(meQueryOptions)
-      throw redirect({ to: '/' })
+      await context.queryClient.fetchQuery({ ...meQueryOptions, staleTime: 0 })
     } catch (e) {
-      if (e instanceof ApiError) return // no session: stay on the form
+      if (e instanceof ApiError) return // no proven session: stay on the form
       throw e
     }
+    throw redirect({ to: '/' })
   },
   component: LoginPage,
 })
 ```
 
+**CORRECTED 2026-08-15 during execution. The version above replaces one that used `ensureQueryData` and threw the redirect inside the `try`; both were wrong, and the first was a live infinite loop.**
+
+1. **`ensureQueryData` cannot answer the question this guard asks.** MEASURED against the pinned react-query 5.101.4: after a refetch 401s, the cache entry KEEPS its `data`, and `ensureQueryData` then resolves from it **without issuing a request at all**. So the guard concluded "signed in" from an answer the server had already rejected, redirected to `/`, and `_app`'s expiry check bounced it straight back here — an infinite redirect loop rendering an empty page. It is not subtle when it happens: adding this step as written turned the already-passing expired-session test red. A guard that sends a visitor *away* from the login form has to PROVE the session; `fetchQuery` with `staleTime: 0` always fetches and throws the 401. `_app`'s loader is deliberately the opposite — it accepts cached data so a reload is instant, and relies on the layout's expiry check for correctness.
+2. **The redirect belongs outside the `try`.** A router redirect is itself thrown, so `throw redirect()` inside the try lands in the catch and survives only because it is not an `ApiError` — one `instanceof` edit away from a guard that silently swallows its own redirect.
+
+Add the two cases to `_app.test.tsx` as well; without them the guard has no test at all:
+
+```tsx
+describe('the /login route guard', () => {
+  it('redirects an already-signed-in visitor inward', async () => {
+    server.use(http.get('/api/v1/auth/me', me))
+    const router = renderAt('/login')
+    expect(await screen.findByRole('navigation')).toBeInTheDocument()
+    expect(router.state.location.pathname).toBe('/')
+  })
+
+  it('leaves a visitor with no session on the form', async () => {
+    server.use(http.get('/api/v1/auth/me', noSession))
+    const router = renderAt('/login')
+    expect(await screen.findByRole('button', { name: /sign in/i })).toBeInTheDocument()
+    expect(router.state.location.pathname).toBe('/login')
+  })
+})
+```
+
 - [ ] **Step 5: Run the guard tests and confirm they pass**
 
-Run: `cd web && npx vitest run src/routes/_app.test.tsx`
-Expected: PASS, 3 tests. (Step 6 adds a fourth to this file.)
+Run: `cd web && ./node_modules/.bin/vitest run src/routes/_app.test.tsx`
+Expected: PASS. Three tests from Step 1, plus the two /login-guard tests Step 4 adds; Step 6 adds one more.
 
 **Two placeholders this task owes itself, because it is executed before Task 8 exists.** Both are named in the Files list above; neither is optional, and a test that cannot resolve them fails in a way that looks like the guard is broken.
 
@@ -2966,19 +3025,25 @@ Then add the route-level assertion in `_app.test.tsx`, since a component nobody 
 
 ```tsx
 it('renders the correlation id when a protected route 500s', async () => {
-  server.use(http.get('/api/v1/auth/me', me))
-  server.use(http.get('/api/v1/approvals', () =>
-    HttpResponse.json({ title: 'Internal error', status: 500, correlation_id: 'cid-99' },
-      { status: 500, headers: { 'content-type': 'application/problem+json' } })))
-  renderAt('/approvals')
+  server.use(
+    http.get('/api/v1/auth/me', () =>
+      HttpResponse.json(
+        { title: 'Internal error', status: 500, correlation_id: 'cid-99' },
+        { status: 500, headers: { 'content-type': 'application/problem+json' } },
+      ),
+    ),
+  )
+  renderAt('/')
   expect(await screen.findByText('cid-99')).toBeInTheDocument()
 })
 ```
 
+**CORRECTED 2026-08-15 during execution.** This was written against `/approvals` returning a 500, but **Task 11 creates that route** — Task 7 runs with only `_app/index.tsx` and the `_app/tasks.tsx` stub, so `renderAt('/approvals')` resolves to a not-found, never reaches the boundary, and the assertion would have passed or failed for reasons unrelated to the panel. A 500 from `/auth/me` reaches the same boundary through the same wiring: the `_app` loader rethrows anything that is not a 401, and `errorComponent` is what catches it. Verified non-vacuous by deleting `errorComponent: AppErrorBoundary` from the route — the test goes red.
+
 - [ ] **Step 7: Verify and commit**
 
 ```bash
-cd web && npm exec -- tsr generate && npx tsc --noEmit && npx vitest run && npx biome ci . && node tools/arch/main.ts
+cd web && ./node_modules/.bin/tsr generate && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/vitest run && ./node_modules/.bin/biome ci . && node --experimental-strip-types tools/arch/main.ts
 git add web && git commit -m "feat(web): resolve the session before the shell renders"
 ```
 
@@ -3058,7 +3123,7 @@ describe('the app shell', () => {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd web && npx vitest run src/shell/app-shell.test.tsx`
+Run: `cd web && ./node_modules/.bin/vitest run src/shell/app-shell.test.tsx`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement the shell**
@@ -3171,7 +3236,7 @@ export function AppShell(props: {
 
 - [ ] **Step 4: Run the shell tests and confirm they pass**
 
-Run: `cd web && npx vitest run src/shell/app-shell.test.tsx`
+Run: `cd web && ./node_modules/.bin/vitest run src/shell/app-shell.test.tsx`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 5: The typed stubs**
@@ -3212,7 +3277,7 @@ Repeat verbatim for each, changing the route path and the `what` string. Do not 
 - [ ] **Step 6: Verify and commit**
 
 ```bash
-cd web && npm exec -- tsr generate && npx tsc --noEmit && npx vitest run && npx biome ci . && node tools/arch/main.ts
+cd web && ./node_modules/.bin/tsr generate && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/vitest run && ./node_modules/.bin/biome ci . && node --experimental-strip-types tools/arch/main.ts
 git add web && git commit -m "feat(web): app shell, the V1 page map, and an honest connection indicator"
 ```
 
@@ -3298,7 +3363,7 @@ describe('createSseParser', () => {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd web && npx vitest run src/realtime/sse-parser.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/realtime/sse-parser.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement the parser**
@@ -3394,13 +3459,13 @@ function parseBlock(block: string): ParsedFrame | null {
 
 - [ ] **Step 4: Run the parser tests and confirm they pass**
 
-Run: `cd web && npx vitest run src/realtime/sse-parser.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/realtime/sse-parser.test.ts`
 Expected: PASS, 6 tests (the split-chunk case runs one assertion per byte offset).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd web && npx tsc --noEmit && npx biome ci .
+cd web && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/biome ci .
 git add web && git commit -m "feat(web): pure incremental SSE frame parser"
 ```
 
@@ -3722,7 +3787,7 @@ describe('sse-connection', () => {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd web && npx vitest run src/realtime/sse-connection.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/realtime/sse-connection.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement the connection**
@@ -3942,7 +4007,7 @@ export function openAttentionStream(opts: {
 
 - [ ] **Step 4: Run the transport tests and confirm they pass**
 
-Run: `cd web && npx vitest run src/realtime/sse-connection.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/realtime/sse-connection.test.ts`
 Expected: PASS, 11 tests.
 
 These are timing-shaped and the injected clock is what keeps them honest. If one flakes, **do not add a sleep** — find which of `now`, `setTimeoutImpl` or `fetchImpl` the code is reaching around, and inject it. A test that passes because it waited long enough proves nothing about the watchdog.
@@ -3950,7 +4015,7 @@ These are timing-shaped and the injected clock is what keeps them honest. If one
 - [ ] **Step 5: Commit**
 
 ```bash
-cd web && npx tsc --noEmit && npx biome ci . && node tools/arch/main.ts
+cd web && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/biome ci . && node tools/arch/main.ts
 git add web && git commit -m "feat(web): SSE transport with backoff, resume, watchdog and the forbidden probe"
 ```
 
@@ -4049,7 +4114,7 @@ describe('createCacheBridge', () => {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd web && npx vitest run src/realtime/cache-bridge.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/realtime/cache-bridge.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement the bridge**
@@ -4117,7 +4182,7 @@ export function createCacheBridge(
 
 - [ ] **Step 4: Run the bridge tests and confirm they pass**
 
-Run: `cd web && npx vitest run src/realtime/cache-bridge.test.ts`
+Run: `cd web && ./node_modules/.bin/vitest run src/realtime/cache-bridge.test.ts`
 Expected: PASS, 5 tests.
 
 - [ ] **Step 5: Wire the stream into the layout**
@@ -4303,13 +4368,13 @@ describe('/approvals', () => {
 
 Write `web/src/test/render-app.tsx` as the shared harness that mounts the router at a path inside a `QueryClientProvider` with an authenticated `/auth/me` handler — the `_app.test.tsx` from Task 7 should be refactored onto it in this task, since it now has two consumers and `web:arch` will say so.
 
-Run: `cd web && npx vitest run src/routes/_app/approvals.test.tsx`
+Run: `cd web && ./node_modules/.bin/vitest run src/routes/_app/approvals.test.tsx`
 Expected: PASS.
 
 - [ ] **Step 7: Verify and commit**
 
 ```bash
-cd web && npm exec -- tsr generate && npx tsc --noEmit && npx vitest run && npx biome ci . && node tools/arch/main.ts
+cd web && ./node_modules/.bin/tsr generate && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/vitest run && ./node_modules/.bin/biome ci . && node --experimental-strip-types tools/arch/main.ts
 git add web && git commit -m "feat(web): invalidate-only cache bridge and the real /approvals slice"
 ```
 
@@ -4755,7 +4820,7 @@ Update `runServe` to pass `webui.Handler()`, and fix every other `Routes(` call 
 ```bash
 cd backend
 go test ./internal/webui/ ./internal/app/ -run 'TestHandler|TestUnknownAPIPath'   # tagless
-cd ../web && npx vite build
+cd ../web && ./node_modules/.bin/vite build
 cd ../backend && go test -tags embedui ./internal/webui/                          # embedded
 ```
 
@@ -4784,7 +4849,7 @@ ARG COMMIT=none
 # build stamp out of the candidate's own index.html and confirming the asset it
 # names exists would be satisfied perfectly by a stale-but-consistent build —
 # which is the exact thing being tested for.
-RUN CAESAR_COMMIT=${COMMIT} npx vite build
+RUN CAESAR_COMMIT=${COMMIT} ./node_modules/.bin/vite build
 ```
 
 and in the Go build stage, after `COPY backend/ ./`:
@@ -5330,7 +5395,7 @@ test('a gate opened by the backend moves the approvals badge with no user action
       - go test -tags "integration,webe2e,embedui" -count=1 -timeout 15m ./internal/app/ -run TestWebE2E
 ```
 
-Add a `web:e2e` prerequisite in the CI job rather than as a Taskfile `deps`, so `vite build` and `npx playwright install` stay visible steps in the workflow.
+Add a `web:e2e` prerequisite in the CI job rather than as a Taskfile `deps`, so `vite build` and `./node_modules/.bin/playwright install` stay visible steps in the workflow.
 
 **Which CI job, and when.** The `web` job does not exist yet — Task 14 creates it. So this task adds the Taskfile target and the `scripts/gate` edit that goes with it, and Task 14 wires the workflow step when it writes the job. Do not edit `.github/workflows/ci.yml` here: there is nothing to edit, and a half-written job is worse than none. `.github/workflows/ci.yml` is deliberately absent from this task's file list for that reason.
 
@@ -5350,7 +5415,7 @@ Then update `scripts/gate`'s `LANE_CMDS` to the new resolved lines — the scrip
 
 ```bash
 task db:up
-cd web && npx playwright install --with-deps chromium && npx vite build
+cd web && ./node_modules/.bin/playwright install --with-deps chromium && ./node_modules/.bin/vite build
 cd .. && task web:e2e
 ```
 
@@ -5404,7 +5469,7 @@ git commit -m "test(web): prove a real gate moves the badge with no user action"
       - run: task web:test
       - run: task web:routes:check
       - run: task web:build
-      - run: npx playwright install --with-deps chromium
+      - run: ./node_modules/.bin/playwright install --with-deps chromium
         working-directory: web
       - run: task web:e2e
 ```
