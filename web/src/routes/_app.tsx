@@ -1,4 +1,4 @@
-import { useSuspenseQuery } from '@tanstack/react-query'
+import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
 import {
   createFileRoute,
   type ErrorComponentProps,
@@ -8,8 +8,11 @@ import {
 } from '@tanstack/react-router'
 import { useEffect } from 'react'
 import { ApiError } from '../api/errors'
+import { approvalsQueryOptions } from '../approvals/approvals-query'
 import { meQueryOptions } from '../auth/me-query'
 import { ApiErrorPanel } from '../errors/api-error-panel'
+import { StreamStatusProvider } from '../realtime/stream-status'
+import { useAttentionStream } from '../realtime/use-attention-stream'
 import { AppShell } from '../shell/app-shell'
 
 /**
@@ -58,6 +61,29 @@ function AppLayout() {
    * expired-session test, so this line remains falsifiable.
    */
   const { data, error } = useSuspenseQuery(meQueryOptions)
+  /**
+   * THE ONE STREAM THIS TAB OPENS. Everything below reads `useStreamStatus()`;
+   * a second call to the hook would be a second connection.
+   */
+  const status = useAttentionStream()
+  /**
+   * The badge count, and the reason it is a plain `useQuery` here rather than
+   * the route's `useSuspenseQuery`.
+   *
+   * The badge is chrome: it is rendered on every protected page, including the
+   * five that have nothing to do with approvals, so it must not suspend them
+   * and it must not take them down. On failure `data` is undefined and the
+   * badge simply does not render — the same rendering as an empty inbox, which
+   * is a real cost stated plainly: a broken approvals endpoint looks like a
+   * quiet one from the nav. The screen that must not lie about it is
+   * `/approvals` itself, and there the loader plus `useSuspenseQuery` route the
+   * failure into `AppErrorBoundary` where it becomes visible with its
+   * correlation id.
+   *
+   * A 401 is the exception and it never reaches this line: `unwrap` sends every
+   * non-exempt 401 through the client's redirect interceptor.
+   */
+  const approvals = useQuery(approvalsQueryOptions)
   const navigate = useNavigate()
   const expired = error instanceof ApiError && error.status === 401
   useEffect(() => {
@@ -66,8 +92,14 @@ function AppLayout() {
   if (expired) return null
 
   return (
-    <AppShell me={data}>
-      <Outlet />
+    <AppShell me={data} connection={status.connection} approvalCount={approvals.data?.length ?? 0}>
+      {/* The provider wraps the OUTLET and not the shell, and that boundary is
+          the design: chrome is HANDED what it renders (§7), routes READ the
+          stream's state from context. A shell that reached for the context
+          would have two ways to learn one value. */}
+      <StreamStatusProvider value={status}>
+        <Outlet />
+      </StreamStatusProvider>
     </AppShell>
   )
 }
