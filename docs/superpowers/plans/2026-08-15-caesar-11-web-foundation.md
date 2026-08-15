@@ -2671,6 +2671,35 @@ export const Route = createFileRoute('/_app')({
 
 function AppLayout() {
   const { data } = useSuspenseQuery(meQueryOptions)
+
+  /**
+   * THE SECOND OBSERVER, and it is not redundant — it is the only thing that
+   * can see a session expiring in the background.
+   *
+   * useSuspenseQuery does NOT throw once the query holds data. It hard-sets
+   * `throwOnError` to its own default AFTER spreading the caller's options
+   * (react-query 5.101.4, useSuspenseQuery.js), and that default is
+   * `(_error, query) => query.state.data === undefined`. So passing
+   * `throwOnError: true` through meQueryOptions is silently discarded, and a
+   * refetch that 401s leaves the stale `data` in place with nothing surfacing
+   * anywhere. The shell keeps rendering to an expired session indefinitely —
+   * exactly what this layout exists to prevent, deferred past the first load.
+   *
+   * `enabled: false` makes this a pure subscription: it reports the query's
+   * state and never fetches or schedules a refetch of its own, so
+   * AUTH_SCOPED_QUERY_OPTIONS' interval and focus refetch do not double up.
+   * Verified against the pinned version — a disabled observer on a query whose
+   * refetch failed reports status 'error' with the error, and the fetch count
+   * is unchanged.
+   */
+  const { error } = useQuery({ ...meQueryOptions, enabled: false, throwOnError: false })
+  const navigate = useNavigate()
+  const expired = error instanceof ApiError && error.status === 401
+  useEffect(() => {
+    if (expired) void navigate({ to: '/login' })
+  }, [expired, navigate])
+  if (expired) return null
+
   return (
     <AppShell me={data}>
       <Outlet />
@@ -2882,7 +2911,9 @@ Shell A and the page map are locked in `docs/brainstorm/2026-08-01-decisions.md`
 
 **Interfaces:**
 - Consumes: `useTheme` (Task 2), the `_app` layout (Task 7).
-- Produces: `<AppShell me={MeResponse}>`; `<StubPanel plan="Plan 12" what="…" />`; `useConnectionState(): ConnectionState` — a context Task 10 publishes into and this shell reads.
+- Produces: `<AppShell me={MeResponse} connection={ConnectionState}>`; `<StubPanel plan="Plan 12" what="…" />`.
+
+**The connection state reaches the shell as a PROP, not as a hook of its own.** An earlier draft promised a `useConnectionState()` here as well; two mechanisms for one value means one of them is dead, and the dead one is the one a reader will reach for. `AppShell` takes `connection` as a prop because `AppLayout` already holds it — it is the single caller and the value is one hop away. Everything *below* the layout that needs the stream's state reads `useStreamStatus()` from `src/realtime/stream-status.tsx` (Task 11), which is the same context and the only hook. There is no `useConnectionState`.
 
 **`ConnectionState` is declared in `src/realtime/connection-state.ts`, not beside the indicator that renders it.** The transport PRODUCES this state and the shell DISPLAYS it, so declaring it in `shell/` points the dependency backwards and makes `realtime` — a layer with no DOM in it — import from the chrome. The cross-group rule added in Task 3 does not currently ban that edge, which is exactly why it has to be got right by construction here: a type in the wrong directory is the cheapest possible thing to fix now and an entangled layer later.
 
@@ -4022,7 +4053,7 @@ export const StreamStatusProvider = StreamStatusContext.Provider
 export const useStreamStatus = (): StreamStatus => useContext(StreamStatusContext)
 ```
 
-`web/src/routes/_app.tsx` — in `AppLayout`, call `useAttentionStream()` **once** (one stream per tab, not one per route), pass `connection` and the approvals count into `AppShell`, and wrap the `<Outlet />` in `<StreamStatusProvider value={status}>` so descendant routes can read `scopeEmpty` without opening a second connection. `useConnectionState()` from Task 8 reads this same context.
+`web/src/routes/_app.tsx` — in `AppLayout`, call `useAttentionStream()` **once** (one stream per tab, not one per route), pass `connection` and the approvals count into `AppShell`, and wrap the `<Outlet />` in `<StreamStatusProvider value={status}>` so descendant routes can read `scopeEmpty` without opening a second connection. Task 8's `AppShell` takes `connection` as a prop from this same call; `useStreamStatus()` is the only hook, and there is deliberately no second one.
 
 - [ ] **Step 6: The approvals query and list**
 
@@ -4813,6 +4844,8 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -4841,7 +4874,7 @@ import (
 // If `goimports` disagrees with this list, believe goimports — it is stated in
 // full here rather than as "plus what the body needs" because an import block
 // a reader has to reconstruct is a step that cannot be executed as written,
-// and this file's body reaches into twelve packages.
+// and this file's body reaches into twelve non-stdlib packages and a dozen stdlib ones. `io` and `log/slog` in particular are needed only by `e2eLogger`, stated further down — the kind of import that is easy to leave out because the expression that needs it is nowhere near the block.
 
 
 const e2eWorkflow = `{
