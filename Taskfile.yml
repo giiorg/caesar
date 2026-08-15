@@ -189,6 +189,18 @@ tasks:
       - ./node_modules/.bin/tsc --noEmit
       - node tools/check-mutants.mjs
 
+  web:arch:
+    desc: "The two constitution rules no per-file linter can express"
+    dir: web
+    cmds:
+      # `node`, not a node_modules binary: type stripping is built into the
+      # runtime. The flag is still spelled out because it is what makes the
+      # lane's requirement on Node 24 explicit. main.ts imports its two modules
+      # WITH the .ts extension — MEASURED: node's ESM resolver does not complete
+      # an extensionless TypeScript specifier (ERR_MODULE_NOT_FOUND), which is
+      # why tsconfig.json sets allowImportingTsExtensions.
+      - node --experimental-strip-types tools/arch/main.ts
+
   web:test:
     dir: web
     cmds:

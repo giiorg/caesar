@@ -4,6 +4,7 @@
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
     "jsx": "react-jsx",
     "types": ["vite/client", "node"],
     "strict": true,
@@ -19,5 +20,5 @@
     "paths": { "@/*": ["src/*"] }
   },
   "include": ["src", "vite.config.ts", "vitest.config.ts", "playwright.config.ts", "tools"],
-  "exclude": ["tools/mutants"]
+  "exclude": ["tools/mutants", "tools/arch/fixtures"]
 }
