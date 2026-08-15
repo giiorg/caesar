@@ -991,7 +991,7 @@ export function Good() {
 
 ```ts
 import { describe, expect, it } from 'vitest'
-import { findMisplacedModules } from './import-graph'
+import { findCrossGroupImports, findMisplacedModules } from './import-graph'
 import { findNonSemanticColors } from './tokens'
 
 const fx = (p: string) => new URL(`./fixtures/${p}`, import.meta.url).pathname
@@ -1221,9 +1221,22 @@ export function findCrossGroupImports(root: string): Violation[] {
 }
 ```
 
-Fixtures — **one per forbidden edge**, because a matrix tested by a single example is a matrix with one row anybody can trust and six nobody has:
+Fixtures — **one per forbidden edge**, because a matrix tested by a single example is a matrix with one row anybody can trust and six nobody has.
 
-`web/tools/arch/fixtures/groups/ui/bad-widget.tsx` (four violations, one per banned target):
+> **EVERY IMPORT TARGET MUST EXIST AS A REAL FILE.** `resolveSpecifier` (above) `statSync`s each candidate and returns `null` when nothing is there, and `findCrossGroupImports` skips a `null` target. A fixture importing `../api/client` with no `fixtures/groups/api/client.ts` on disk therefore produces **zero** violations — the test fails, and the tempting repair is to change the expected count to 0, which leaves a permanently inert guard that passes forever. Create all nine files — six targets and three importers.
+
+Targets, each one line, contents irrelevant beyond having an export:
+
+```
+fixtures/groups/api/client.ts               export const api = 1
+fixtures/groups/realtime/sse-connection.ts  export const openAttentionStream = 1
+fixtures/groups/auth/me-query.ts            export const meQueryOptions = 1
+fixtures/groups/routes/index.tsx            export const Route = 1
+fixtures/groups/shell/app-shell.tsx         export const AppShell = 1
+fixtures/groups/ui/button.tsx               export const Button = 1
+```
+
+`fixtures/groups/ui/bad-widget.tsx` — four violations, one per banned target:
 
 ```tsx
 import { api } from '../api/client'
@@ -1233,7 +1246,7 @@ import { Route } from '../routes/index'
 export const BadWidget = () => null
 ```
 
-`web/tools/arch/fixtures/groups/api/bad-client.ts` (three):
+`fixtures/groups/api/bad-client.ts` — three:
 
 ```ts
 import { AppShell } from '../shell/app-shell'
@@ -1242,7 +1255,12 @@ import { Route } from '../routes/index'
 export const bad = 1
 ```
 
-`web/tools/arch/fixtures/groups/ui/good-widget.tsx` — imports another `ui` module and nothing else; must yield zero.
+`fixtures/groups/ui/good-widget.tsx` — the over-firing half; imports within its own group and must yield zero:
+
+```tsx
+import { Button } from './button'
+export const GoodWidget = () => Button
+```
 
 Add to `arch.test.ts`:
 
@@ -1250,6 +1268,9 @@ Add to `arch.test.ts`:
 describe('cross-group imports', () => {
   it('names every forbidden edge, once per import', () => {
     const v = findCrossGroupImports(fx('groups'))
+    // 4 from ui/bad-widget + 3 from api/bad-client. If this is 0, the fixture
+    // import targets are missing from disk and the checker resolved nothing —
+    // do NOT "fix" it by changing this number.
     expect(v).toHaveLength(7)
     for (const to of ['api', 'realtime', 'auth', 'routes']) {
       expect(v.some((x) => x.file.includes('bad-widget') && x.message.includes(`import ${to}/`))).toBe(true)
@@ -1260,7 +1281,12 @@ describe('cross-group imports', () => {
   })
 
   it('permits imports within a group', () => {
-    const v = findCrossGroupImports(fx('groups/ui/good-widget.tsx'))
+    // The root stays the GROUPS DIRECTORY and the filter is applied to the
+    // result. Passing `fx('groups/ui/good-widget.tsx')` instead would make
+    // `relative(root, file)` the empty string, so `groupOf` returns '', no
+    // rule matches, and the assertion passes without the checker having
+    // looked at anything — a green that means nothing.
+    const v = findCrossGroupImports(fx('groups')).filter((x) => x.file.includes('good-widget'))
     expect(v).toEqual([])
   })
 })
@@ -1439,6 +1465,7 @@ git commit -m "feat(web): enforce file placement and semantic colour by import g
 `ApiError` is built from the HTTP status rather than the generated response union, because the document declares only `200` and `400` on these endpoints while login really answers `401` and `429`. That gap is worth closing rather than only routing around — but **scope discipline is the risk here, not correctness**. This task covers the slice's endpoints and stops. Widening it to every endpoint is Plan 12's to do as those screens arrive.
 
 **Files:**
+- Modify: `backend/internal/contracts/contracts_test.go` — the exact-response assertion for `listApprovals`
 - Modify: `backend/internal/identity/api/api.go`, `backend/internal/identity/api/dto.go`
 - Modify: `backend/internal/runs/api/api.go`, `backend/internal/runs/api/dto.go`
 - Modify: `backend/internal/realtime/api/api.go`
@@ -1560,6 +1587,19 @@ Expected: FAIL — every `required` assertion, plus the missing `401`/`429` resp
 
 `internal/runs/api/api.go` — on `listApprovals` add `Errors: []int{http.StatusUnauthorized}`.
 `internal/realtime/api/api.go` — on `streamAttention` add the same.
+
+**This breaks an existing test, and it must be fixed in THIS commit.** `internal/contracts/contracts_test.go:113` asserts that `listApprovals` carries *exactly* two responses:
+
+```go
+	listed := doc.Paths["/api/v1/approvals"]["get"]
+	if got := sortedKeys(listed.Responses); len(got) != 2 || got[0] != "200" || got[1] != "400" {
+		t.Errorf("listApprovals responses = %v, want only 200 and 400", got)
+	}
+```
+
+It was written as the negative half of Plan 08's 409 work — proof that the `Errors` loop documents a status only where it is declared — and `/approvals` was the operation that declared none. It now declares one. Update the assertion to `200, 400, 401` and keep it an EXACT comparison; the new slice test in Step 1 only checks that expected statuses are *present*, so exactness lives here and nowhere else. Loosening it to a subset check would delete the only guard against the loop documenting statuses everywhere.
+
+Add `backend/internal/contracts/contracts_test.go` to this task's Modify list.
 
 **Not 403 on either, and the reason is worth stating because the opposite is the intuitive guess.** Neither endpoint refuses an authenticated caller. `handleListApprovals` scopes to the projects the caller holds any grant on and returns 200 with an empty `approvals` array when that set is empty — seeing nothing and being refused are different answers, and this endpoint only ever gives the first. `streamAttention` resolves the same possibly-empty scope; its `forbidden` is a terminal frame written over a 200 that `NewWriter` committed long before the scope was known, which is precisely why that frame exists instead of a status. Verify before writing either line rather than trusting this paragraph. `rg -n 'ClassForbidden' internal/runs/api internal/realtime/api` does hit `runs/api/api.go` — but on `authorize`, the shared grant check that `decideGate` and its siblings call and that `handleListApprovals` does not. Read the two handler bodies and confirm neither reaches it.
 
@@ -1700,6 +1740,27 @@ describe('ApiError.fromResponse', () => {
     expect(err.title).toBe('Request failed')
     expect(err.fields).toEqual([])
   })
+
+  // The case above only covers UNPARSEABLE bodies, which the try/catch already
+  // handles. These are the ones that PARSE and still are not problem
+  // documents — the gap a catch block cannot see. Each threw a TypeError
+  // before the shape guards existed, which does not merely lose the
+  // correlation id: it escapes fromResponse entirely, so unwrap never throws
+  // an ApiError and the 401 interceptor and error panel are both bypassed.
+  it.each([
+    ['null', null],
+    ['an array', []],
+    ['a bare string', 'nope'],
+    ['a number', 7],
+    ['errors as an object', { title: 'x', errors: {} }],
+    ['errors as a string', { title: 'x', errors: 'none' }],
+    ['a null entry in errors', { title: 'x', errors: [null] }],
+  ])('does not throw on %s', async (_name, body) => {
+    const err = await ApiError.fromResponse(problem(500, body))
+    expect(err).toBeInstanceOf(ApiError)
+    expect(err.status).toBe(500)
+    expect(err.fields).toEqual([])
+  })
 })
 ```
 
@@ -1763,19 +1824,36 @@ export class ApiError extends Error {
    * the UI must render honestly rather than crash on.
    */
   static async fromResponse(res: Response): Promise<ApiError> {
+    // THIS FUNCTION MUST NOT THROW. It is the last thing standing between a
+    // malformed response and the user, and every caller — unwrap, the 401
+    // interceptor, the error panel — assumes it returns an ApiError. A
+    // TypeError escaping here does not merely lose the correlation id; it
+    // bypasses the whole error path and surfaces as an unhandled rejection.
+    //
+    // `JSON.parse` succeeding does NOT mean the body is a problem document.
+    // `null`, `[]` and `"text"` are all valid JSON, and `null` in particular
+    // survives the try/catch and then throws on the first property read —
+    // which is why the check is `typeof === 'object' && !== null` and not a
+    // truthiness test.
     let body: Partial<Problem> = {}
     try {
-      body = (await res.clone().json()) as Partial<Problem>
+      const parsed: unknown = await res.clone().json()
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        body = parsed as Partial<Problem>
+      }
     } catch {
       /* not JSON; the status still is */
     }
+    // Same reasoning one level down: a server that sends `errors: {}` or
+    // `errors: "none"` would otherwise reach `.map` on a non-array.
+    const errors = Array.isArray(body.errors) ? body.errors : []
     return new ApiError({
       type: body.type ?? 'about:blank',
       title: body.title ?? 'Request failed',
       status: res.status,
       detail: body.detail ?? '',
       correlationId: body.correlation_id ?? res.headers.get('X-Correlation-ID') ?? '',
-      fields: (body.errors ?? []).map((e) => ({ field: e.field ?? '', message: e.message ?? '' })),
+      fields: errors.map((e) => ({ field: e?.field ?? '', message: e?.message ?? '' })),
     })
   }
 }
@@ -1784,7 +1862,7 @@ export class ApiError extends Error {
 - [ ] **Step 4: Run the error tests and confirm they pass**
 
 Run: `cd web && npx vitest run src/api/errors.test.ts`
-Expected: PASS, 3 tests.
+Expected: PASS, 10 tests (3 envelope cases + the 7 malformed-body cases).
 
 - [ ] **Step 5: Write the failing interceptor test**
 
@@ -1937,8 +2015,10 @@ Expected: PASS, 4 tests.
 
 Add to `web/biome.json` under `linter.rules`:
 
+Both rules live under **`style`**, not `nursery` or `suspicious`. Verified rather than assumed — `npx @biomejs/biome@2.5.8 explain noRestrictedGlobals` and `... explain noRestrictedImports` both report `Diagnostic category: lint/style/…`. A rule nested under the wrong group is not a typo Biome shrugs off: the config is rejected, or worse the key is ignored and the ban silently never applies.
+
 ```json
-      "nursery": {
+      "style": {
         "noRestrictedImports": {
           "level": "error",
           "options": {
@@ -1947,9 +2027,7 @@ Add to `web/biome.json` under `linter.rules`:
               "node:path": "the client runs in a browser"
             }
           }
-        }
-      },
-      "suspicious": {
+        },
         "noRestrictedGlobals": {
           "level": "error",
           "options": { "deniedGlobals": { "fetch": "use the generated client in src/api/client.ts — a hand-written fetch bypasses the contract, the 401 interceptor and the correlation id" } }
@@ -1962,11 +2040,11 @@ Add an override exempting the three files that legitimately hold a `fetch`: `src
 ```json
     {
       "includes": ["src/api/client.ts", "src/realtime/sse-connection.ts", "src/test/**"],
-      "linter": { "rules": { "suspicious": { "noRestrictedGlobals": "off" } } }
+      "linter": { "rules": { "style": { "noRestrictedGlobals": "off" } } }
     }
 ```
 
-Verify the ban bites: add `const x = fetch('/api/v1/auth/me')` to `src/routes/index.tsx`, run `npx biome ci .`, expect a failure naming the rule, then remove it.
+Verify the ban bites — this is the step that catches a misplaced group, since a rule Biome never applied looks exactly like a codebase with no violations. Add `const x = fetch('/api/v1/auth/me')` to `src/routes/index.tsx`, run `npx biome ci .`, expect a failure naming `lint/style/noRestrictedGlobals`, then remove it. If it passes, the rule is inert: re-run `npx @biomejs/biome@2.5.8 explain noRestrictedGlobals` and put it under whatever group that prints.
 
 - [ ] **Step 10: The QueryClient and the bounded refresh floor**
 
@@ -2430,7 +2508,7 @@ The design as first written specified only one auth transition, a redirect *afte
 
 ```tsx
 import { QueryClientProvider } from '@tanstack/react-query'
-import { RouterProvider, createRouter } from '@tanstack/react-router'
+import { RouterProvider, createMemoryHistory, createRouter } from '@tanstack/react-router'
 import { render, screen } from '@testing-library/react'
 import { HttpResponse, http } from 'msw'
 import { describe, expect, it } from 'vitest'
@@ -2539,7 +2617,8 @@ export const meQueryOptions = queryOptions({
 
 ```tsx
 import { useSuspenseQuery } from '@tanstack/react-query'
-import { Outlet, createFileRoute, redirect } from '@tanstack/react-router'
+import { type ErrorComponentProps, Outlet, createFileRoute, redirect, useNavigate } from '@tanstack/react-router'
+import { useEffect } from 'react'
 import { meQueryOptions } from '../auth/me-query'
 import { ApiError } from '../api/errors'
 import { AppShell } from '../shell/app-shell'
@@ -2560,6 +2639,7 @@ export const Route = createFileRoute('/_app')({
     }
   },
   component: AppLayout,
+  errorComponent: AppErrorBoundary,
 })
 
 function AppLayout() {
@@ -2569,6 +2649,37 @@ function AppLayout() {
       <Outlet />
     </AppShell>
   )
+}
+
+/**
+ * THE LOADER IS NOT ENOUGH, and the gap is not obvious.
+ *
+ * The loader covers the first load. After that, AUTH_SCOPED_QUERY_OPTIONS
+ * refetches /auth/me on window focus and on a 60s interval, so a session that
+ * expires while the tab sits open produces a BACKGROUND 401 with no loader
+ * running to catch it. That call is also globally exempt from the 401
+ * interceptor (Task 5) — correctly, since a 401 from /auth/me *means* "no
+ * session" and routing it through the generic redirect would fight the
+ * bootstrap. So nothing else is watching, and useSuspenseQuery throws the
+ * error rather than returning it: it lands HERE.
+ *
+ * Which is why the redirect is a navigate-in-effect and not `throw redirect`.
+ * This is a render, not a loader; throwing a redirect from a component is not
+ * how the router accepts one.
+ */
+function AppErrorBoundary({ error }: ErrorComponentProps) {
+  const navigate = useNavigate()
+  const expired = error instanceof ApiError && error.status === 401
+  useEffect(() => {
+    if (expired) void navigate({ to: '/login' })
+  }, [expired, navigate])
+  // Render nothing while the navigation lands; a flash of an error panel on
+  // the way to the login form reads as a bug to the person it happens to.
+  if (expired) return null
+  // Everything else is somebody else's problem until Step 6, which replaces
+  // this line with the panel that renders correlation_id. Left as a rethrow so
+  // THIS step is independently green: the panel does not exist yet.
+  throw error
 }
 
 export function useMe() {
@@ -2629,7 +2740,7 @@ export const Route = createFileRoute('/login')({
 - [ ] **Step 5: Run the guard tests and confirm they pass**
 
 Run: `cd web && npx vitest run src/routes/_app.test.tsx`
-Expected: PASS, 3 tests. (Steps 6 and 7 add two more to this file.)
+Expected: PASS, 3 tests. (Step 6 adds a fourth to this file.)
 
 **Two placeholders this task owes itself, because it is executed before Task 8 exists.** Both are named in the Files list above; neither is optional, and a test that cannot resolve them fails in a way that looks like the guard is broken.
 
@@ -2640,14 +2751,22 @@ Expected: PASS, 3 tests. (Steps 6 and 7 add two more to this file.)
 
 The global constraint says `correlation_id` is rendered on **every** error surface, and after Task 6 exactly one surface renders it: form submission. Every route that reads data through Suspense has no error path of its own, so a 403 or a 500 on `/approvals` reaches TanStack's default error component — generic text, no correlation id, and for a grant failure no explanation of what the user is missing. The thread between a user's complaint and a server log line breaks precisely where the user is most likely to complain.
 
-Create `web/src/errors/api-error-panel.tsx`, and install it as `errorComponent` on the `_app` route so every protected route inherits it.
+Step 3 already installed `AppErrorBoundary` as the `_app` route's `errorComponent` and had it rethrow anything that is not an expired session. This step creates `web/src/errors/api-error-panel.tsx` and replaces that rethrow:
+
+```tsx
+// in _app.tsx — add the import and swap the last line of AppErrorBoundary
+import { ApiErrorPanel } from '../errors/api-error-panel'
+// ...
+  if (expired) return null
+  return <ApiErrorPanel error={error} />
+```
 
 **It goes in `errors/`, not `ui/`.** The panel does `error instanceof ApiError`, which is a value import from `api/`, and Task 3's matrix bans `ui/ -> api/` — `ui` is the presentational layer and a component that knows the shape of a transport error is not presentational. `errors/` is its own group, carries no inbound restriction, and is where the next error surface belongs too. Getting this wrong is not a lint annoyance: it is the edge that makes every button in `ui/` untestable without a client.
 
 ```tsx
 // web/src/errors/api-error-panel.tsx
+import { ApiError } from '../api/errors'
 
-```tsx
 export function ApiErrorPanel({ error }: { error: unknown }) {
   if (!(error instanceof ApiError)) throw error // not ours; let the root handle it
 
@@ -2678,6 +2797,15 @@ export function ApiErrorPanel({ error }: { error: unknown }) {
 Tests, in `web/src/errors/api-error-panel.test.tsx` — one per status class, because a panel tested only on 403 silently drops the id on the path where it matters most:
 
 ```tsx
+import { render, screen } from '@testing-library/react'
+import { expect, it } from 'vitest'
+import { ApiError } from '../api/errors'
+import { ApiErrorPanel } from './api-error-panel'
+
+// A 500's `detail` is deliberately vague, so the id is the only thread back to
+// a log line — which is exactly why both statuses are asserted, not just 403.
+const base = { type: '', title: 'Something failed', detail: 'detail', correlationId: 'cid', fields: [] }
+
 it.each([403, 500])('renders the correlation id for a %s', (status) => {
   render(<ApiErrorPanel error={new ApiError({ ...base, status, correlationId: 'cid-42' })} />)
   expect(screen.getByText('cid-42')).toBeInTheDocument()
@@ -2706,35 +2834,7 @@ it('renders the correlation id when a protected route 500s', async () => {
 })
 ```
 
-- [ ] **Step 7: Close the background-401 hole the exemption opens**
-
-`/api/v1/auth/me` is globally exempt from the 401 redirect (Task 5), and the redirect to `/login` lives only in the `_app` loader. Between them there is a gap: `AUTH_SCOPED_QUERY_OPTIONS` refetches on window focus and on a 60s interval, so a session that expires while the tab sits open produces a **background** `/auth/me` 401 that no loader is running to catch and no interceptor will act on. It throws through Suspense and the user gets an error panel instead of a login form.
-
-The exemption is still right — a 401 from `/auth/me` *means* "no session", and routing it through the generic redirect would fight the bootstrap. The fix is that the layout must react to the query going into error, not only to the loader:
-
-```tsx
-const { data, error } = useSuspenseQuery(meQueryOptions())
-// The loader covers the first load; this covers every refetch after it.
-if (error instanceof ApiError && error.status === 401) {
-  throw redirect({ to: '/login', search: { next: location.href } })
-}
-```
-
-Add the test — and note it refetches an ACTIVE query rather than clearing the cache, for the same reason as Step 1's expired-session case:
-
-```tsx
-it('sends a session that expires in the background back to /login', async () => {
-  let calls = 0
-  server.use(http.get('/api/v1/auth/me', () => (++calls === 1 ? me() : noSession())))
-  server.use(http.get('/api/v1/approvals', () => HttpResponse.json({ approvals: [] })))
-  renderAt('/')
-  await screen.findByRole('navigation')
-  await queryClient.refetchQueries({ queryKey: ['auth', 'me'] })
-  expect(await screen.findByRole('button', { name: /sign in/i })).toBeInTheDocument()
-})
-```
-
-- [ ] **Step 8: Verify and commit**
+- [ ] **Step 7: Verify and commit**
 
 ```bash
 cd web && npm exec -- tsr generate && npx tsc --noEmit && npx vitest run && npx biome ci . && node tools/arch/main.ts
@@ -3399,6 +3499,27 @@ describe('sse-connection', () => {
     conn.close()
   })
 
+  it('stops the watchdog on a terminal outcome', async () => {
+    // Without this the suite proves nothing about termination: every other
+    // test calls conn.close() immediately after seeing the terminal event,
+    // which clears the interval by hand and hides a timer that would
+    // otherwise fire `reconnecting` 45s after the stream was declared dead.
+    // Deliberately does NOT call close().
+    const events: string[] = []
+    let t = 0
+    openAttentionStream({
+      onEvent: (e) => events.push(e.type),
+      now: () => t,
+      fetchImpl: (async () => new Response('{"status":401}', { status: 401 })) as never,
+      probeMe: async () => ({ grants: [] }),
+    })
+    await vi.waitFor(() => expect(events).toContain('session-lost'))
+    const after = events.length
+    t += 120_000
+    await new Promise((r) => setTimeout(r, 1_100)) // let the 1s watchdog tick
+    expect(events).toHaveLength(after)
+  })
+
   it('treats an opening 401 as a dead session, not a retryable fault', async () => {
     // realtime/api authenticates BEFORE the handler so this is a real
     // problem+json 401 rather than a stream that opens and says nothing. A
@@ -3501,6 +3622,25 @@ export function openAttentionStream(opts: {
   }, 1_000)
 
   /**
+   * A TERMINAL outcome, and the reason it is a named function rather than a
+   * bare `return`.
+   *
+   * session-lost and scope-lost end the stream for good: there is nothing left
+   * to reconnect to and no caller action that would change the answer. But the
+   * watchdog is a setInterval, and an early `return` out of connect() leaves it
+   * running — so 45 seconds after the connection is declared stopped it starts
+   * emitting `reconnecting`, contradicting the terminal state it just reported
+   * and keeping a timer alive for the life of the page. Every existing test
+   * happens to call conn.close() right after observing the terminal event,
+   * which hides this completely.
+   */
+  function stop(): void {
+    closed = true
+    clearInterval(watchdog)
+    controller?.abort()
+  }
+
+  /**
    * THE PROBE. `forbidden` does not say what happened, and three different
    * conditions send those identical bytes: a real revocation; an empty scope
    * at the 30s re-check (which is also what a DEACTIVATED principal and an
@@ -3526,9 +3666,11 @@ export function openAttentionStream(opts: {
       // An active principal who legitimately sees nothing.
       emit({ type: 'scope-lost' })
       emit({ type: 'state', state: 'stopped' })
+      stop()
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         emit({ type: 'session-lost' })
+        stop()
         return
       }
       // The probe itself failed for some other reason. Reconnecting is the
@@ -3556,6 +3698,7 @@ export function openAttentionStream(opts: {
         // and reconnecting forever against a dead session is the result.
         if (res.status === 401) {
           emit({ type: 'session-lost' })
+          stop()
           return
         }
         if (!res.ok || res.body === null) throw new Error(`stream: ${res.status}`)
@@ -3616,20 +3759,14 @@ export function openAttentionStream(opts: {
 
   connect()
 
-  return {
-    close() {
-      closed = true
-      clearInterval(watchdog)
-      controller?.abort()
-    },
-  }
+  return { close: stop }
 }
 ```
 
 - [ ] **Step 4: Run the transport tests and confirm they pass**
 
 Run: `cd web && npx vitest run src/realtime/sse-connection.test.ts`
-Expected: PASS, 10 tests.
+Expected: PASS, 11 tests.
 
 These are timing-shaped and the injected clock is what keeps them honest. If one flakes, **do not add a sleep** — find which of `now`, `setTimeoutImpl` or `fetchImpl` the code is reaching around, and inject it. A test that passes because it waited long enough proves nothing about the watchdog.
 
@@ -3967,7 +4104,7 @@ Write `web/src/test/render-app.tsx` as the shared harness that mounts the router
 Run: `cd web && npx vitest run src/routes/_app/approvals.test.tsx`
 Expected: PASS.
 
-- [ ] **Step 8: Verify and commit**
+- [ ] **Step 7: Verify and commit**
 
 ```bash
 cd web && npm exec -- tsr generate && npx tsc --noEmit && npx vitest run && npx biome ci . && node tools/arch/main.ts
@@ -4769,6 +4906,13 @@ The two config helpers this file adds:
 // appOrigin is the browser-visible base URL, and it must be character-for-
 // character what Playwright's Origin header will carry — CheckOrigin does not
 // normalize.
+//
+// This struct omits Runner entirely, which leaves Cpus at 0 and PidsLimit
+// below the floor that config.validate() rejects. That is FINE and is not an
+// oversight: validate() is called only from config.Load (config.go:260), and
+// nothing here goes through Load — the same shape serve_integration_test.go
+// has always used. Stated because it looks like a bug on every reading and
+// has already been reported as one.
 func e2eConfig(t *testing.T, dbURL, forgeBase, appOrigin string) config.Config {
 	t.Helper()
 	return config.Config{
@@ -5112,7 +5256,14 @@ Replace the `publish` job so the artifact under test is the artifact published:
           # config.Load opens the path and fails if it is absent, so the file
           # must exist; everything else this check needs comes from defaults
           # and the two environment overrides Load already honours.
-          echo '{}' > /tmp/config.json
+          # NOT '{}'. With an empty document the defaults apply, and
+          # forge.publish_work_dir defaults to /var/lib/caesar/publish —
+          # which runServe creates AND write-probes before it binds HTTP.
+          # The final image is distroless:nonroot running as uid 65532, and
+          # /var/lib is root-owned 0755, so MkdirAll fails, nothing ever
+          # listens, and both this check and its no-UI mutant die before
+          # reaching the thing they test. /tmp is 01777 in that image.
+          echo '{"forge":{"publish_work_dir":"/tmp/caesar-publish"}}' > /tmp/config.json
           docker run -d --name candidate --network host \
             -v /tmp/config.json:/etc/caesar/config.json:ro \
             -e DATABASE_URL='postgres://caesar:caesar@127.0.0.1:5432/caesar?sslmode=disable' \
@@ -5185,7 +5336,9 @@ docker build --build-arg COMMIT=deadbeef --build-arg GOTAGS= -t caesar:noui .
 # because a container that never listens proves nothing either way.
 docker run -d --name pg -e POSTGRES_PASSWORD=caesar -e POSTGRES_USER=caesar \
   -e POSTGRES_DB=caesar -p 5432:5432 postgres:17
-echo '{}' > /tmp/config.json
+# See the CI job: '{}' would default publish_work_dir to /var/lib/caesar/publish,
+# which the distroless:nonroot uid cannot create, so the container never listens.
+echo '{"forge":{"publish_work_dir":"/tmp/caesar-publish"}}' > /tmp/config.json
 docker run -d --name noui --network host \
   -v /tmp/config.json:/etc/caesar/config.json:ro \
   -e DATABASE_URL='postgres://caesar:caesar@127.0.0.1:5432/caesar?sslmode=disable' \
@@ -5251,10 +5404,10 @@ Run against the spec after the plan is written, before execution begins.
 
 2. **Task 1 is large.** It carries the manifest, three configs, the router, two checker scripts and a mutant. It resisted splitting because none of its pieces is independently verifiable: a manifest with no `tsc` proves nothing, and the mutant needs the router. If it needs splitting during execution, the seam is after Step 8 (Biome), with the mutant machinery as a second task.
 
-3. **The `noRestrictedGlobals` fetch ban is the right Biome rule at 2.5.8** — `suspicious.noRestrictedGlobals` accepts `options.deniedGlobals` at this version, so the GritQL fallback §2 sanctions is not needed. Still verify the ban actually bites (Task 5 Step 9) rather than trusting the config: what is being enforced is that no hand-written `fetch` reaches the API, and a rule that is configured but inert looks identical to one that works.
+3. **The `noRestrictedGlobals` fetch ban is the right Biome rule at 2.5.8, under the `style` group** — `explain` reports `lint/style/noRestrictedGlobals`, and it accepts `options.deniedGlobals`, so the GritQL fallback §2 sanctions is not needed. The GROUP was wrong in an earlier draft (`suspicious`), which is the failure worth remembering: the option name was right the whole time and the rule would still never have fired. Verify the ban actually bites (Task 5 Step 9) rather than trusting the config — a rule that is configured but inert looks identical to one that works.
 
 **Placeholder scan.** No "TBD", no "add error handling", no "similar to Task N". One step still states a decision procedure rather than an outcome — Task 14 Step 2, the `%CAESAR_COMMIT%` substitution mechanism — because the exact Vite surface at this pin was not verified against an install. It names the property to preserve and the fallback, which is the honest shape for a fact the plan author could not check.
 
-Two others used to. Both are now resolved against the published packages: `unwrap`'s signature is the structural shape, because `openapi-fetch@0.17.0`'s `FetchResponse` takes the operation's response map first (Task 5 Step 7); and the `fetch` ban is `suspicious.noRestrictedGlobals` with `options.deniedGlobals`, which Biome 2.5.8 does support, so the GritQL fallback §2 sanctioned is not needed here.
+Two others used to. Both are now resolved against the published packages: `unwrap`'s signature is the structural shape, because `openapi-fetch@0.17.0`'s `FetchResponse` takes the operation's response map first (Task 5 Step 7); and the `fetch` ban is `style.noRestrictedGlobals` with `options.deniedGlobals`, which Biome 2.5.8 does support, so the GritQL fallback §2 sanctioned is not needed here.
 
 **Type consistency.** `ApiError` fields (`correlationId`, `fields`) are used identically in Tasks 5, 6 and 10. `ParsedFrame`/`EventFrame` flow unchanged from Task 9 into 10 into 11. `ConnectionState` is defined once in Task 8 and imported by Tasks 10 and 11. `meQueryOptions`/`approvalsQueryOptions` both spread `AUTH_SCOPED_QUERY_OPTIONS` from Task 5. `Routes` gains its fifth parameter in Task 12 and every call site is named there.
