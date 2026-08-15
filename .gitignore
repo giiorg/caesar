@@ -1,3 +1,4 @@
 .superpowers/
 backend/bin/
 .task/
+backend/internal/webui/dist/

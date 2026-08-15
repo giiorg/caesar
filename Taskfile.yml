@@ -167,6 +167,49 @@ tasks:
       - git diff --exit-code -- backend/api/openapi.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store backend/internal/workflows/store backend/internal/runs/store
       - test -z "$(git status --porcelain -- backend/api web/src/api)"
 
+  # Every web lane invokes the installed binary by path. `npx` and `npm exec --`
+  # both fall back to the public registry when the binary is not in
+  # node_modules: `npx biome ci .` then downloads an unrelated `biome` package
+  # and exits 0 having checked nothing, and `npm exec -- tsr generate` runs
+  # "TypeScript Remove" instead of the router CLI. A missing install has to be a
+  # hard error, not a silently vacuous pass.
+  web:install:
+    dir: web
+    cmds:
+      - npm ci
+
+  web:lint:
+    dir: web
+    cmds:
+      - ./node_modules/.bin/biome ci .
+
+  web:typecheck:
+    dir: web
+    cmds:
+      - ./node_modules/.bin/tsc --noEmit
+      - node tools/check-mutants.mjs
+
+  web:pins:
+    dir: web
+    cmds:
+      - node tools/check-pins.mjs
+
+  web:routes:check:
+    desc: "Regenerate routeTree.gen.ts and fail on drift"
+    dir: web
+    cmds:
+      - ./node_modules/.bin/tsr generate
+      - git diff --exit-code -- src/routeTree.gen.ts
+      # git diff is blind to an untracked or already-staged path, so the drift
+      # gate would be vacuous exactly when the generated tree is not committed.
+      # Same companion assertion as contracts:check.
+      - test -z "$(git status --porcelain -- src/routeTree.gen.ts)"
+
+  web:build:
+    dir: web
+    cmds:
+      - ./node_modules/.bin/vite build
+
   secrets:
     cmds:
       - docker run --rm -u "$(id -u):$(id -g)" -v "{{.ROOT_DIR}}:/repo" {{.GITLEAKS_IMAGE}} git /repo --config /repo/.gitleaks.toml --verbose

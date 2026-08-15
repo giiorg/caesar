@@ -64,7 +64,11 @@ Verified against the tree at `8314e51`. Several contradict what a reader of the 
 
 14. **`GET /auth/me` returns `{user, grants}`; `POST /auth/login` returns only the user.** So login success invalidates the `auth/me` query rather than seeding it from the login response, which would cache an entry missing the grants the rest of the app reads.
 
-15. **`tsr` is published by `@tanstack/router-cli`, not by `@tanstack/router-plugin`.** `npm view @tanstack/router-plugin@1.168.32 bin` is empty; `npm view @tanstack/router-cli@1.167.30 bin` is `{ tsr: 'bin/tsr.cjs' }`. So a manifest carrying only the plugin has no `tsr` on its path, and **`npx tsr generate` would silently install `tsr@1.3.4` from the public registry — an unrelated package, "TypeScript Remove"** — then fail with `No files matched the entrypoints pattern`. Hence two things this plan does deliberately: `@tanstack/router-cli@1.167.30` is a pinned devDependency, and every invocation is `npm exec -- tsr generate`, which resolves the local binary and **never reaches the network**. The version is not arbitrary — plugin 1.168.32 and cli 1.167.30 both depend on `@tanstack/router-generator@1.167.30` exactly, so the CLI and the Vite plugin emit the identical route tree. That shared generator is the whole premise of the `web:routes:check` drift gate; if you bump one, `npm view <pkg> dependencies` and confirm the generator still matches, or the drift check starts failing on a diff neither tool is wrong about.
+15. **`tsr` is published by `@tanstack/router-cli`, not by `@tanstack/router-plugin`.** `npm view @tanstack/router-plugin@1.168.32 bin` is empty; `npm view @tanstack/router-cli@1.167.30 bin` is `{ tsr: 'bin/tsr.cjs' }`. So a manifest carrying only the plugin has no `tsr` on its path, and **`npx tsr generate` would silently install `tsr` from the public registry — an unrelated package, "TypeScript Remove"**. Hence `@tanstack/router-cli@1.167.30` is a pinned devDependency.
+
+    **`npm exec --` is NOT the protection here — corrected 2026-08-15, this bullet previously claimed it was.** Measured on npm 11.17.0 / node 24.19.0 against a copy of `web/` with `node_modules` removed: `npm exec -- tsr generate` fetched "TypeScript Remove" and ran it (`Project has 8 files … ✖ delete 2 files, remove 5 exports`), and `npx biome ci .` **exited 0 having emitted zero bytes** — a silently vacuous lint. `npx --no` does not close it once the npx cache is warm. Both invocation forms reach the network. The protection is therefore mechanical, not lexical: **every web lane in `Taskfile.yml` invokes the installed binary by path** — `./node_modules/.bin/biome`, `./node_modules/.bin/tsc`, `./node_modules/.bin/tsr`, `./node_modules/.bin/vite` — and `web/tools/check-mutants.mjs` spawns `node_modules/.bin/tsc` resolved from `import.meta.url`. A missing install then fails the lane with `stat …/node_modules/.bin/<tool>: no such file or directory`, exit 127. Task 14 mirrors these exact command lines into `scripts/gate`'s `LANE_CMDS`; `npx`/`npm exec` must not reappear in a web lane.
+
+    The CLI version is not arbitrary — plugin 1.168.32 and cli 1.167.30 both depend on `@tanstack/router-generator@1.167.30` exactly, so the CLI and the Vite plugin emit the identical route tree. That shared generator is the whole premise of the `web:routes:check` drift gate; if you bump one, `npm view <pkg> dependencies` and confirm the generator still matches, or the drift check starts failing on a diff neither tool is wrong about.
 
 16. **The `forbidden` frame is `event: forbidden\ndata: {"error":"forbidden"}\n\n` with no `id:` line** (`internal/realtime/stream.go:48`), and the idle heartbeat is the SSE **comment** `: hb\n\n` at `config.Realtime.HeartbeatInterval`, default 20s (`internal/realtime/sse.go:183`). Every event frame is `id: <int64>` / `event: <dotted kind>` / `data: <compact StreamFrame JSON>`.
 
@@ -419,7 +423,7 @@ export function BadLink() {
 }
 ```
 
-Run: `cd web && npx tsc --noEmit -p tsconfig.mutants.json`
+Run: `cd web && ./node_modules/.bin/tsc --noEmit -p tsconfig.mutants.json`
 Expected: FAIL, with `TS2322` naming `"/does-not-exist"` as not assignable to the union of real route ids.
 
 Now temporarily comment out the `declare module` block in `src/router.ts` and re-run.
@@ -433,22 +437,52 @@ Expected: PASS — which is the failure mode this mutant exists to catch. Restor
 // Inverted assertions need a runner: a lane that merely ran `tsc` on the
 // mutants would go red for the RIGHT outcome. This one fails when they compile.
 import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
+// Invoke the installed compiler by path, never `npx tsc`: npx falls back to the
+// public registry when the binary is absent, and the package it lands on is not
+// the TypeScript compiler. A missing install must be a named error here, not a
+// mutant that "failed for an unrelated reason". (Pre-flight 15.)
+const webRoot = fileURLToPath(new URL('..', import.meta.url))
+const tsc = fileURLToPath(new URL('../node_modules/.bin/tsc', import.meta.url))
+if (!existsSync(tsc)) {
+  console.error(`web: ${tsc} is missing — run \`task web:install\` before the mutant check`)
+  process.exit(1)
+}
 
 const cases = [
-  { config: 'tsconfig.mutants.json', expect: 'TS2322', what: 'route-inference mutant (src/router.ts Register augmentation)' },
+  {
+    config: 'tsconfig.mutants.json',
+    file: 'tools/mutants/bad-route-to.tsx',
+    expect: 'TS2322',
+    what: 'route-inference mutant (src/router.ts Register augmentation)',
+  },
 ]
 let failed = false
 for (const c of cases) {
-  const r = spawnSync('npx', ['tsc', '--noEmit', '--pretty', 'false', '-p', c.config], { encoding: 'utf8' })
+  const r = spawnSync(tsc, ['--noEmit', '--pretty', 'false', '-p', c.config], {
+    cwd: webRoot,
+    encoding: 'utf8',
+  })
   const out = `${r.stdout}${r.stderr}`
+  // The assertion must identify the MUTANT, not the run: `cases` is written to
+  // grow, and a second fixture emitting the same code anywhere in the output
+  // would otherwise keep this green with the guarded augmentation deleted.
+  // tsc --pretty false emits `<path>(<line>,<col>): error TSxxxx: ...`.
+  const named = out
+    .split('\n')
+    .some((line) => line.startsWith(`${c.file}(`) && line.includes(`error ${c.expect}:`))
   if (r.status === 0) {
     console.error(`web: ${c.what} COMPILED — the guard it protects is not active`)
     failed = true
-  } else if (!out.includes(c.expect)) {
-    console.error(`web: ${c.what} failed, but not with ${c.expect} — the mutant may be failing for an unrelated reason:\n${out}`)
+  } else if (!named) {
+    console.error(
+      `web: ${c.what} failed, but ${c.file} did not report ${c.expect} — the mutant may be failing for an unrelated reason:\n${out}`,
+    )
     failed = true
   } else {
-    console.log(`web: ${c.what} correctly rejected (${c.expect})`)
+    console.log(`web: ${c.what} correctly rejected (${c.file}: ${c.expect})`)
   }
 }
 process.exit(failed ? 1 : 0)
@@ -503,13 +537,19 @@ Add `"mutants": "node tools/check-mutants.mjs"` to `package.json` scripts.
 
 The `src/routes/**` override exists because TanStack's file-based routing derives route ids from filenames, so the router — not the convention — owns those names. The `fetch` ban is added in Task 5, when there is something to ban. **The cross-group import matrix is Task 3's**, in `tools/arch` rather than in Biome: it is a rule about directions between directories, the same shape as the existing consumer-count rule, and it wants a fixture and a mutant that a lint config cannot carry.
 
-Run: `cd web && npx biome ci .` → expect exit 0.
+Run: `cd web && ./node_modules/.bin/biome ci .` → expect exit 0.
 
 - [ ] **Step 9: Task targets**
 
 Add to `Taskfile.yml`:
 
 ```yaml
+  # Every web lane invokes the installed binary by path. `npx` and `npm exec --`
+  # both fall back to the public registry when the binary is not in
+  # node_modules: `npx biome ci .` then downloads an unrelated `biome` package
+  # and exits 0 having checked nothing, and `npm exec -- tsr generate` runs
+  # "TypeScript Remove" instead of the router CLI. A missing install has to be a
+  # hard error, not a silently vacuous pass. (Pre-flight 15.)
   web:install:
     dir: web
     cmds:
@@ -518,12 +558,12 @@ Add to `Taskfile.yml`:
   web:lint:
     dir: web
     cmds:
-      - npx biome ci .
+      - ./node_modules/.bin/biome ci .
 
   web:typecheck:
     dir: web
     cmds:
-      - npx tsc --noEmit
+      - ./node_modules/.bin/tsc --noEmit
       - node tools/check-mutants.mjs
 
   web:pins:
@@ -535,13 +575,17 @@ Add to `Taskfile.yml`:
     desc: "Regenerate routeTree.gen.ts and fail on drift"
     dir: web
     cmds:
-      - npm exec -- tsr generate
+      - ./node_modules/.bin/tsr generate
       - git diff --exit-code -- src/routeTree.gen.ts
+      # git diff is blind to an untracked or already-staged path, so the drift
+      # gate would be vacuous exactly when the generated tree is not committed.
+      # Same companion assertion as contracts:check.
+      - test -z "$(git status --porcelain -- src/routeTree.gen.ts)"
 
   web:build:
     dir: web
     cmds:
-      - npx vite build
+      - ./node_modules/.bin/vite build
 ```
 
 - [ ] **Step 10: Move the contracts lane onto `.nvmrc`**
@@ -562,13 +606,13 @@ Every web lane added later uses this identical block. No lane restates a literal
 
 ```bash
 cd web
-npm install                       # writes package-lock.json; expect exit 0, no ERESOLVE
-npm exec -- tsr generate                  # writes src/routeTree.gen.ts (the generator's default)
-npx tsc --noEmit                  # expect 0 errors
-node tools/check-mutants.mjs      # expect "correctly rejected (TS2322)"
-node tools/check-pins.mjs         # expect the pinned-count line
-npx biome ci .                    # expect exit 0
-npx vite build                    # expect a bundle in ../backend/internal/webui/dist
+npm install                          # writes package-lock.json; expect exit 0, no ERESOLVE
+./node_modules/.bin/tsr generate     # writes src/routeTree.gen.ts (the generator's default)
+./node_modules/.bin/tsc --noEmit     # expect 0 errors
+node tools/check-mutants.mjs         # expect "correctly rejected (TS2322)"
+node tools/check-pins.mjs            # expect the pinned-count line
+./node_modules/.bin/biome ci .       # expect exit 0
+./node_modules/.bin/vite build       # expect a bundle in ../backend/internal/webui/dist
 ```
 
 If `npm install` reports `ERESOLVE`, do **not** reach for `--legacy-peer-deps`: it would break the `npm ci` the contracts lane runs. Read the conflict — the known one is TypeScript against `openapi-typescript`'s `^5.x` peer, which the 5.9.3 pin already answers.
