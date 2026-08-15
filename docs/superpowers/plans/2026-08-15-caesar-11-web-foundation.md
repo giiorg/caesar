@@ -4173,21 +4173,63 @@ Level three. REST is the source of truth for list **and** badge; the stream's en
 **Files:**
 - Create: `web/src/realtime/cache-bridge.ts`, `web/src/realtime/cache-bridge.test.ts`
 - Create: `web/src/realtime/use-attention-stream.ts`, `web/src/realtime/stream-status.tsx`
+- Create: `web/src/realtime/stream-status.test.tsx` — **the plan omitted it.** The context's defaults are a decision ("never claim an empty scope"), and every real consumer renders inside the provider, so nothing else in the tree can reach them: both were mutable with the whole suite green until this file existed.
 - Create: `web/src/approvals/approvals-query.ts`, `web/src/approvals/approval-list.tsx`
 - Modify: `web/src/routes/_app/approvals.tsx`, `web/src/routes/_app.tsx`
 - Create: `web/src/routes/_app/approvals.test.tsx`
+- Create: `web/src/test/render-app.tsx` — the shared harness, listed in Step 7's prose but not here
+- Modify: `web/src/routes/_app.test.tsx` — refactored onto that harness (the plan asks for this), plus the stream-ownership cases, which are the layout's behaviour and not the route's
 
 **Interfaces:**
 - Consumes: `EventFrame`, `openAttentionStream` (Task 10); `queryClient`, `AUTH_SCOPED_QUERY_OPTIONS` (Task 5).
 - Produces:
   - `ATTENTION_KINDS: ReadonlySet<string>`
-  - `createCacheBridge(qc: QueryClient, opts?: { debounceMs?: number; setTimeoutImpl?: typeof setTimeout }): { onFrame(f: EventFrame): void; flush(): void }`
+  - `createCacheBridge(qc: QueryClient, opts?: { debounceMs?: number; setTimeoutImpl?: typeof setTimeout }): { onFrame(f: EventFrame): void }` — **no `flush`**; see correction 1
   - `approvalsQueryOptions` — `{ queryKey: ['approvals'], queryFn, ...AUTH_SCOPED_QUERY_OPTIONS }`
-  - `useAttentionStream()` — the hook the `_app` layout mounts once; `StreamStatusProvider` / `useStreamStatus()` — how every other route reads `connection` and `scopeEmpty` without opening a second stream.
+  - `useAttentionStream(): StreamStatus` — the hook the `_app` layout mounts once; `StreamStatusProvider` / `useStreamStatus()` — how every other route reads `connection` and `scopeEmpty` without opening a second stream.
+
+**CORRECTIVE BLOCK — four things below were wrong, and all four were measured.**
+
+1. **`flush()` HAS NO PRODUCTION CALLER, AND IT MADE THE WHOLE BRIDGE SUITE VACUOUS.** Every one of
+   Step 1's five tests closes the debounce window by calling `flush()`, and `useAttentionStream`
+   never does — the browser only ever reaches the invalidation through the scheduled timer.
+   MEASURED: delete the scheduling arm entirely and all five plan tests stay green while the
+   shipped bridge never invalidates anything at all. Worse, four of the five pass `debounceMs: 0`,
+   which under the plan's own `if (debounceMs > 0 && !scheduled)` guard means "never schedule" — a
+   mode production does not have. The seam is `setTimeoutImpl`: a test that wants the window closed
+   fires the timer, which is what the browser does. Same defect class as findings 3, 12, 15, 20 and
+   24 in the ledger.
+2. **The plan's bridge could go permanently deaf and its suite could not tell.** `fire()` must
+   reset `scheduled` BEFORE invalidating; leave it set and the first burst is the last one that
+   ever reaches the cache. Nothing about a single burst distinguishes the two, so it takes a second
+   burst — which no plan test performs.
+3. **`useAttentionStream` must NOT start at `'reconnecting'`.** That renders "this view may be out
+   of date" from the first paint of every page load, over data the route loader fetched moments
+   earlier, and the indicator's own rule is that an ever-present banner stops being read. It starts
+   `'live'`, which renders nothing; the transport's opening deadline (`OPEN_TIMEOUT_MS`, 20s) is
+   what converts a wedged server into a banner, and a refused connection announces itself in
+   milliseconds. `stream-status.tsx`'s context default changes with it — the two must agree, or a
+   component reads a different "not yet known" from the context than from the hook.
+4. **A harness whose stream is already open cannot assert anything about the connection state.**
+   MEASURED: the pre-connection silence test passed identically with the initial state flipped back
+   to `'reconnecting'`, because by the time the shell rendered the transport had said `'live'`.
+   `render-app.tsx` needs a second handler that never answers (`await delay('infinite')`), and the
+   assertion has to use it. This is the harness-is-also-a-subject lesson from wave 6, again.
+
+Two more, smaller:
+
+5. **Step 5 never says where the badge count comes from.** It is `useQuery(approvalsQueryOptions)`
+   in `AppLayout` — plain, not suspense, because the badge is chrome on all seven pages and must
+   neither suspend nor break the five that have nothing to do with approvals.
+6. **The task has two Step 7s.** The second is Step 8.
 
 - [ ] **Step 1: Write the failing bridge tests**
 
-`web/src/realtime/cache-bridge.test.ts`:
+`web/src/realtime/cache-bridge.test.ts`. **The shipped file is authoritative** — it carries nine
+cases where this excerpt shows three, and the extra ones exist because the plan's five could not
+kill their own mutants (a bridge that goes deaf after the first burst, a debounce default of 0, a
+delay of 0 passed to a real `setTimeout`, and a filter reading the SSE `event` label instead of the
+frame body). Every test drives the window through an injected timer; **there is no `flush()`**.
 
 ```ts
 import { QueryClient } from '@tanstack/react-query'
@@ -4202,60 +4244,70 @@ const frame = (id: number, kind: string): EventFrame => ({
   frame: { id, run_id: 'r1', kind, payload: { node_id: 'gate' }, occurred_at: '' },
 })
 
+/** `run()` is the debounce window closing — i.e. what the browser does 250ms later. */
+function fakeTimer() {
+  const scheduled: Array<{ fn: () => void; ms: number }> = []
+  const impl = ((fn: () => void, ms?: number) => {
+    scheduled.push({ fn, ms: ms ?? 0 })
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as unknown as typeof setTimeout
+  return {
+    impl,
+    get count() { return scheduled.length },
+    delays: () => scheduled.map((s) => s.ms),
+    run() { for (const s of scheduled.splice(0, scheduled.length)) s.fn() },
+  }
+}
+
 describe('createCacheBridge', () => {
   it('invalidates the approvals query on an attention frame', () => {
     const qc = new QueryClient()
     const spy = vi.spyOn(qc, 'invalidateQueries')
-    const b = createCacheBridge(qc, { debounceMs: 0 })
+    const t = fakeTimer()
+    const b = createCacheBridge(qc, { debounceMs: 10, setTimeoutImpl: t.impl })
     b.onFrame(frame(1, 'gate.waiting'))
-    b.flush()
+    expect(spy).not.toHaveBeenCalled()          // not until the window closes
+    t.run()
     expect(spy).toHaveBeenCalledWith({ queryKey: ['approvals'] })
   })
 
-  it('NEVER writes cache data from an event payload', () => {
-    // setQueryData from an event payload is wrong under BOTH of the server's
-    // stated behaviours: the opening frames are the most recent 500 events,
-    // not a projection of open gates, so a gate still waiting from before that
-    // window is not on the stream at all; and resume deliberately re-sends a
-    // backlog. Invalidation is idempotent under both. Reconstruction is not.
-    const qc = new QueryClient()
-    const spy = vi.spyOn(qc, 'setQueryData')
-    const b = createCacheBridge(qc, { debounceMs: 0 })
-    b.onFrame(frame(1, 'gate.waiting'))
-    b.flush()
-    expect(spy).not.toHaveBeenCalled()
-  })
-
-  it('coalesces a burst into one refetch', () => {
+  it('coalesces a burst into one window and one refetch', () => {
     const qc = new QueryClient()
     const spy = vi.spyOn(qc, 'invalidateQueries')
-    const b = createCacheBridge(qc, { debounceMs: 50, setTimeoutImpl: ((fn: () => void) => setTimeout(fn, 0)) as never })
+    const t = fakeTimer()
+    const b = createCacheBridge(qc, { debounceMs: 10, setTimeoutImpl: t.impl })
     for (let i = 0; i < 20; i++) b.onFrame(frame(i, 'run.started'))
-    b.flush()
+    // ONE window, not twenty. The invalidation count alone does not say this:
+    // twenty windows all firing also produce one invalidation, because the
+    // first clears the flag and the other nineteen no-op.
+    expect(t.count).toBe(1)
+    t.run()
     expect(spy).toHaveBeenCalledTimes(1)
   })
 
-  it('is idempotent under a replayed backlog', () => {
+  it('opens a NEW window for a frame that arrives after the last one closed', () => {
+    // The bridge that goes permanently deaf. No single-burst test can see it.
     const qc = new QueryClient()
     const spy = vi.spyOn(qc, 'invalidateQueries')
-    const b = createCacheBridge(qc, { debounceMs: 0 })
-    b.onFrame(frame(5, 'gate.waiting'))
-    b.flush()
-    b.onFrame(frame(5, 'gate.waiting'))   // the same event, re-delivered on resume
-    b.flush()
-    expect(spy).toHaveBeenCalledTimes(2)  // two invalidations, one truth
-  })
-
-  it('ignores kinds outside the attention set', () => {
-    const qc = new QueryClient()
-    const spy = vi.spyOn(qc, 'invalidateQueries')
-    const b = createCacheBridge(qc, { debounceMs: 0 })
-    b.onFrame(frame(1, 'phase.materialized'))
-    b.flush()
-    expect(spy).not.toHaveBeenCalled()
+    const t = fakeTimer()
+    const b = createCacheBridge(qc, { debounceMs: 10, setTimeoutImpl: t.impl })
+    b.onFrame(frame(1, 'gate.waiting'))
+    t.run()
+    b.onFrame(frame(2, 'gate.decided'))
+    expect(t.count).toBe(1)
+    t.run()
+    expect(spy).toHaveBeenCalledTimes(2)
   })
 })
 ```
+
+The other six: no `setQueryData`, ever; idempotence under a replayed backlog; kinds outside the
+attention set arming no window at all; the real-timer default (`vi.useFakeTimers`, 249ms silent /
+250ms fires — the only test that can tell a default of 250 from one of 0); the injected delay
+reaching `setTimeout` verbatim; and the kind being read from `f.frame.kind` rather than `f.event`.
+That last one needs a fixture where the two DISAGREE: the server writes the same string into both
+(`realtime/sse.go`), so a suite whose fixtures carry matching values cannot tell which field the
+bridge consulted — measured, the swap survived everything else.
 
 - [ ] **Step 2: Run it and watch it fail**
 
@@ -4296,39 +4348,47 @@ export function createCacheBridge(
   qc: QueryClient,
   opts?: { debounceMs?: number; setTimeoutImpl?: typeof setTimeout },
 ) {
-  const debounceMs = opts?.debounceMs ?? 250
+  const debounceMs = opts?.debounceMs ?? DEFAULT_DEBOUNCE_MS
   const later = opts?.setTimeoutImpl ?? setTimeout
-  let pending = false
   let scheduled = false
 
   function fire() {
+    // Reset BEFORE the invalidation, so the next frame arms a new window. Left
+    // set, the bridge goes permanently deaf after its first burst while every
+    // single-burst test still passes.
     scheduled = false
-    if (!pending) return
-    pending = false
     void qc.invalidateQueries({ queryKey: ['approvals'] })
   }
 
   return {
     onFrame(f: EventFrame): void {
       if (!ATTENTION_KINDS.has(f.frame.kind)) return
-      pending = true
-      // A run emitting twenty events costs one refetch.
-      if (debounceMs > 0 && !scheduled) {
-        scheduled = true
-        later(fire, debounceMs)
-      }
-    },
-    flush(): void {
-      fire()
+      // A run emitting twenty events costs one refetch. The guard is on the
+      // window, not on a separate `pending` flag: nothing arms a window except a
+      // frame that belongs in the inbox, so a window that exists always has
+      // something to say.
+      if (scheduled) return
+      scheduled = true
+      later(fire, debounceMs)
     },
   }
 }
 ```
 
+**No `flush`, and the scheduling is unconditional** — see correction 1. The plan's `pending` flag
+was the other half of the same mistake: it exists only to make `flush()` a no-op when nothing is
+waiting, and with `flush` gone there is no state a window can be in except "armed because a frame
+arrived". No `close()` either: a pending window that outlives its stream fires into a query with no
+observers, which marks it stale and fetches nothing, so cancellation would buy one untestable
+branch and no behaviour.
+
 - [ ] **Step 4: Run the bridge tests and confirm they pass**
 
 Run: `cd web && ./node_modules/.bin/vitest run src/realtime/cache-bridge.test.ts`
-Expected: PASS, 5 tests.
+Expected: PASS, 9 tests. Then mutate: drop the coalescing guard, leave `scheduled` set after
+firing, fire synchronously instead of scheduling, default the debounce to 0, pass 0 to `later`,
+drop each attention kind, admit every kind, invalidate a different key, and read `f.event` instead
+of `f.frame.kind`. All eleven must go red.
 
 - [ ] **Step 5: Wire the stream into the layout**
 
@@ -4343,10 +4403,13 @@ import type { ConnectionState } from './connection-state'
 import { createCacheBridge } from './cache-bridge'
 import { openAttentionStream } from './sse-connection'
 
-export function useAttentionStream(): { connection: ConnectionState; scopeEmpty: boolean } {
+export function useAttentionStream(): StreamStatus {
   const qc = useQueryClient()
   const navigate = useNavigate()
-  const [connection, setConnection] = useState<ConnectionState>('reconnecting')
+  // 'live' IS SILENCE, NOT A CLAIM — see correction 3. The indicator renders
+  // nothing for 'live', and nothing is the honest rendering of "the transport
+  // has not spoken yet" over data the loader just fetched.
+  const [connection, setConnection] = useState<ConnectionState>('live')
   const [scopeEmpty, setScopeEmpty] = useState(false)
 
   useEffect(() => {
@@ -4354,13 +4417,28 @@ export function useAttentionStream(): { connection: ConnectionState; scopeEmpty:
     const conn = openAttentionStream({
       probeMe: async () => unwrap(await api.GET('/api/v1/auth/me')),
       onEvent: (e) => {
-        if (e.type === 'frame') bridge.onFrame(e.frame)
-        else if (e.type === 'state') setConnection(e.state)
-        else if (e.type === 'scope-lost') setScopeEmpty(true)
-        else void navigate({ to: '/login' })
+        switch (e.type) {
+          case 'frame':
+            bridge.onFrame(e.frame)
+            break
+          case 'state':
+            setConnection(e.state)
+            break
+          case 'scope-lost':
+            setScopeEmpty(true)
+            break
+          case 'session-lost':
+            void navigate({ to: '/login' })
+            break
+        }
       },
     })
     return () => conn.close()
+    // `navigate` is safe in this list only because TanStack Router returns a
+    // stable reference: an unstable one tears down and reopens the stream on
+    // every state change this hook itself causes. MEASURED both ways —
+    // `_app.test.tsx` counts connections across a state change, and the
+    // unstable-dependency mutant fails it.
   }, [qc, navigate])
 
   return { connection, scopeEmpty }
@@ -4375,16 +4453,35 @@ import type { ConnectionState } from './connection-state'
 
 export type StreamStatus = { connection: ConnectionState; scopeEmpty: boolean }
 
-// Defaults describe a tab that has not connected yet, not an error: a consumer
-// rendered outside the provider should read as "still connecting", never as
-// "your scope is empty" — which is a claim about the user's grants.
-const StreamStatusContext = createContext<StreamStatus>({ connection: 'reconnecting', scopeEmpty: false })
+// Defaults describe a tab that has not connected yet, not an error. The
+// scopeEmpty half is the load-bearing one: a consumer rendered outside the
+// provider must never claim "your scope is empty", which is a statement about
+// the user's grants. `connection: 'live'` means the same "nothing said yet" as
+// the hook's initial state, and the two must agree — see correction 3.
+const StreamStatusContext = createContext<StreamStatus>({ connection: 'live', scopeEmpty: false })
 
 export const StreamStatusProvider = StreamStatusContext.Provider
 export const useStreamStatus = (): StreamStatus => useContext(StreamStatusContext)
 ```
 
+`web/src/realtime/stream-status.test.tsx` — a `Probe` component rendered with and without the
+provider. Without it, both defaults are unreachable from anywhere else in the tree and both mutate
+freely with the suite green.
+
 `web/src/routes/_app.tsx` — in `AppLayout`, call `useAttentionStream()` **once** (one stream per tab, not one per route), pass `connection` and the approvals count into `AppShell`, and wrap the `<Outlet />` in `<StreamStatusProvider value={status}>` so descendant routes can read `scopeEmpty` without opening a second connection. Task 8's `AppShell` takes `connection` as a prop from this same call; `useStreamStatus()` is the only hook, and there is deliberately no second one.
+
+**The count is `useQuery(approvalsQueryOptions).data?.length ?? 0`** — correction 5. Plain
+`useQuery`, not `useSuspenseQuery`: the badge is chrome on all seven pages, so it must not suspend
+the five that have nothing to do with approvals, and it must not take them down. The cost of that
+is real and should be stated rather than discovered: when the endpoint fails, `data` is undefined
+and the badge renders nothing, which looks exactly like an empty inbox. `/approvals` itself is
+where the failure has to be visible, and there the loader and `useSuspenseQuery` route it into
+`AppErrorBoundary` with its correlation id. A 401 never reaches the badge — `unwrap` sends every
+non-exempt 401 through the client's redirect interceptor.
+
+The provider wraps the **outlet**, not the shell: chrome is handed what it renders (§7), routes read
+the stream's state from context. A shell that reached for the context would have two ways to learn
+one value, which is the thing this task's whole design is avoiding.
 
 - [ ] **Step 6: The approvals query and list**
 
@@ -4464,15 +4561,26 @@ function Approvals() {
 }
 ```
 
+**What the loader does and does not buy, stated so the next reader does not overclaim it.** This is
+the first route in the tree that fetches anything of its own, which is what finally produces a 401
+arriving at `_app`'s error boundary from below — the branch the ledger had recorded as reasoned but
+never measured. The LOADER is not what does that: MEASURED, remove it and the failure still reaches
+the same boundary, because `useSuspenseQuery` throws to the same place, and every test in the file
+still passes. What the loader buys is a router-level load — the fetch starts with the route rather
+than with its first render, and `defaultPreload: 'intent'` can start it on hover. Nothing in a jsdom
+suite distinguishes the two, partly because `AppLayout`'s badge query has already asked for the same
+key; it goes on the unfalsifiable list rather than getting a test that pretends otherwise.
+
 - [ ] **Step 7: Write the badge-moves test and run it**
 
-`web/src/routes/_app/approvals.test.tsx` — the component-level rehearsal of what Task 13 proves end to end:
+`web/src/routes/_app/approvals.test.tsx` — the component-level rehearsal of what Task 13 proves end to end. **The shipped file is authoritative**; it carries seven cases where this excerpt shows one. The extra six: the null list the contract permits (today's handler emits `[]`, so every other test would pass against a client that reads `.length` off the response and throws on a first-ever visit); no badge while the inbox is empty; the whole forbidden→probe→`scopeEmpty` path arriving as *"no projects are shared with you yet"* plus the terminal banner; a 401 from this route's own loader; a 500 reaching the panel; and the list being on screen with the chrome.
+
+**Handlers are passed to `renderApp`, never installed with a bare `server.use` before it.** MEASURED: within one `server.use(...)` call msw gives priority to the EARLIER argument, and a later call outranks an earlier one — so a harness that installs its defaults after the caller's handlers would silently outrank them, and a test claiming to exercise a 401 would quietly exercise the authenticated default and still pass.
 
 ```tsx
-import { render, screen } from '@testing-library/react'
+import { screen } from '@testing-library/react'
 import { HttpResponse, http } from 'msw'
 import { describe, expect, it } from 'vitest'
-import { server } from '../../test/msw'
 import { renderApp } from '../../test/render-app'
 
 const approval = {
@@ -4483,24 +4591,23 @@ const approval = {
 describe('/approvals', () => {
   it('renders the list and moves the badge when a frame arrives, with no user action', async () => {
     let count = 0
-    server.use(
+    renderApp('/approvals', [
       http.get('/api/v1/approvals', () => HttpResponse.json({ approvals: count === 0 ? [] : [approval] })),
-      http.get('/api/v1/stream', () =>
-        new HttpResponse(
+      http.get('/api/v1/stream', () => {
+        count = 1
+        return new HttpResponse(
           new ReadableStream({
             start(c) {
               const enc = new TextEncoder()
               setTimeout(() => {
-                count = 1
                 c.enqueue(enc.encode(`id: 1\nevent: gate.waiting\ndata: ${JSON.stringify({ id: 1, run_id: 'r1', kind: 'gate.waiting', payload: {}, occurred_at: '' })}\n\n`))
               }, 10)
             },
           }),
           { headers: { 'content-type': 'text/event-stream' } },
-        ),
-      ),
-    )
-    await renderApp('/approvals')
+        )
+      }),
+    ])
     expect(await screen.findByText(/nothing is waiting on you/i)).toBeInTheDocument()
     // No click, no refresh: the assertion is on the RENDERED badge, never on a
     // request count. A refetch is the mechanism, and forbidding it would assert
@@ -4511,12 +4618,20 @@ describe('/approvals', () => {
 })
 ```
 
-Write `web/src/test/render-app.tsx` as the shared harness that mounts the router at a path inside a `QueryClientProvider` with an authenticated `/auth/me` handler — the `_app.test.tsx` from Task 7 should be refactored onto it in this task, since it now has two consumers and `web:arch` will say so.
+Write `web/src/test/render-app.tsx` as the shared harness that mounts the router at a path inside a `QueryClientProvider` — and refactor Task 7's `_app.test.tsx` onto it here, as the plan asks.
+
+It is SYNCHRONOUS and returns the router (`renderApp(path, handlers?)`); there is nothing to await, and the plan's `await renderApp(...)` is await-on-a-non-promise. It installs three defaults behind the caller's handlers: an authenticated `/auth/me`, an empty `/api/v1/approvals`, and an **open, silent `/api/v1/stream`**. That third one is not optional — mounting the protected layout now opens a connection whether or not a test cares, and `onUnhandledRequest: 'error'` would otherwise fail every test in the suite far from the missing handler. Silence rather than a closed stream, or every test races a backoff reconnect it never asked for.
+
+It also exports `pendingStream()` — a handler that never answers (`await delay('infinite')`) — and **any assertion about the connection state must use it**; see correction 4.
+
+`_app.test.tsx` gains what belongs to the layout rather than to the route: exactly one stream per tab across a state change (the unstable-`navigate` guard), the cleanup that closes it on unmount, no stream at all for a visitor with no session, silence before the transport speaks, a stream-level 401 reaching `/login`, and the badge staying absent when the approvals endpoint fails.
+
+Two harness facts worth not rediscovering, both measured: **msw does not run a response body's `cancel` callback when the client aborts**, so a close-on-unmount test written the obvious way reports failure for a perfectly good cleanup — observe `request.signal`'s `abort` event instead. And `approvalsQueryOptions` inherits the client's 5xx retry policy (two retries, ~1s then ~2s), so the 500 case needs a timeout in the seconds, not the default 1000ms.
 
 Run: `cd web && ./node_modules/.bin/vitest run src/routes/_app/approvals.test.tsx`
 Expected: PASS.
 
-- [ ] **Step 7: Verify and commit**
+- [ ] **Step 8: Verify and commit**
 
 ```bash
 cd web && ./node_modules/.bin/tsr generate && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/vitest run && ./node_modules/.bin/biome ci . && node --experimental-strip-types tools/arch/main.ts

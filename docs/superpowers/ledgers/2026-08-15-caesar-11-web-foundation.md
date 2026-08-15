@@ -24,17 +24,19 @@ full session on this project.
 | — | wave-5 plan corrections + ledger entry | `def3554` | docs only |
 | — | the `scripts/gate` / `node_modules` diagnosis | `30bd099` | docs only |
 | 6 | 8 — app shell, the V1 page map, the connection indicator | `5073519` | **PASS** |
-| — | wave-6 plan corrections + this ledger entry | _(this commit)_ | docs only |
+| — | wave-6 plan corrections + ledger entry | `ea92410` | docs only |
+| 7 | 11 — invalidate-only cache bridge, the real `/approvals` | `63bbb1f` | **PASS** |
+| — | wave-7 plan corrections + this ledger entry | _(this commit)_ | docs only |
 
-**Done: Tasks 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12. Remaining: 11 → 13 → 14 (a chain).**
+**Done: Tasks 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12. Remaining: 13 → 14 (a chain).**
 
 The gate is `scripts/gate <abs-worktree> <sha> <branch>` and it ran green at each wave boundary,
 not after each task. Within a wave, tasks are committed in dependency order and their individual
 commits' greenness is asserted by construction rather than measured — stating that plainly because
 the plan's own rule is per-task.
 
-All web lanes green at `5073519`: `web:pins` (34 pinned), `web:lint`, `web:typecheck` (tsc + the
-route-inference mutant), `web:arch`, `web:test` (**154** tests, 13 files), `web:routes:check`,
+All web lanes green at `63bbb1f`: `web:pins` (34 pinned), `web:lint`, `web:typecheck` (tsc + the
+route-inference mutant), `web:arch`, `web:test` (**178** tests, 16 files), `web:routes:check`,
 `web:build`. Both Go twins green: `go test ./internal/...` and `go test -tags embedui
 ./internal/webui/`. The gate itself still covers only the backend four — **the web lanes are run
 by hand until Task 14 mirrors them into `scripts/gate`.**
@@ -87,7 +89,7 @@ Only the two braces parallelize; the file sets inside each are disjoint. Tasks 4
 overlap — Task 4 regenerates `schema.d.ts` out of `web/node_modules` while Task 1 rewrites
 `package.json` and reinstalls that same tree.
 
-**Both braces are now done. Everything left is strictly serial**, one task per wave: 11 → 13 → 14.
+**Both braces are now done. Everything left is strictly serial**, one task per wave: 13 → 14.
 There is no more parallelism to find in this plan.
 
 Wave 5 (Task 7) was executed **inline by the orchestrator**, not through the per-wave Workflow the
@@ -96,7 +98,25 @@ quality bar it existed to enforce — write the test, watch it fail, then mutate
 watch it die — was applied directly. Three of this task's findings came out of that mutation pass
 and would not have come out of a green suite.
 
-## What Task 11 inherits from wave 6, and must not undo
+## What Task 13 inherits from wave 7, and must not undo
+
+- **`web/src/test/render-app.tsx` is the harness now**, and `_app.test.tsx` is refactored onto it.
+  Handlers are PASSED to it, never installed with a bare `server.use` beforehand — msw ranks a
+  later `server.use` call above an earlier one, so a test that stubbed a 401 itself would silently
+  get the harness's authenticated default and still pass. Within one call the EARLIER argument
+  wins, which is why the defaults are spread last.
+- **Three defaults are installed on every render**: an authenticated `/auth/me`, an empty
+  `/api/v1/approvals`, and an open-but-silent `/api/v1/stream`. The third is load-bearing — the
+  protected layout now opens a connection on every mount, and `onUnhandledRequest: 'error'` turns a
+  missing stream handler into a failure far from its cause.
+- **`pendingStream()` exists for one reason**: `silentStream` has already answered by the time
+  anything renders, so any assertion about the connection state is vacuous against it. Measured.
+- **`AppLayout` holds the badge query.** `/approvals` and the layout both observe `['approvals']`,
+  so a test that counts requests to that endpoint is counting two observers, not one.
+- **The stream is inside the protected layout, deliberately.** A visitor with no session opens none,
+  and `_app.test.tsx` asserts it.
+
+## What Task 11 inherited from wave 6, and did not undo
 
 - **`web/src/routes/_app/approvals.tsx` EXISTS as a `StubPanel`.** Task 11 replaces its body. It
   is component-only today; giving it a loader is the point of Task 11, and it is also what finally
@@ -346,6 +366,50 @@ Two of the three could never have passed for any correct implementation.
     is invisible on them. (The first draft of that self-check asserted a *remembered* ratio for
     mid-grey and was simply wrong; the run caught it.)
 
+Wave 7 added four. Three are again the plan's own snippets, and the first is the sharpest instance
+yet of the pattern: **a seam with no production caller is not a seam, it is a second implementation
+that only the tests exercise.**
+
+27. **`createCacheBridge`'s `flush()` had no production caller, and it made all five of the plan's
+    bridge tests vacuous.** Every one of them closes the debounce window by calling `flush()`;
+    `useAttentionStream` never would, so the only path the browser runs — the scheduled timer — was
+    unasserted. MEASURED: delete the scheduling arm entirely and all five plan tests stay green
+    while the shipped bridge never invalidates anything at all. Four of the five also pass
+    `debounceMs: 0`, which under the plan's own `if (debounceMs > 0 && !scheduled)` guard means
+    "never schedule" — a mode production does not have, so the suite ran a configuration that does
+    not ship. `flush` is gone and `setTimeoutImpl` is the seam: a test that wants the window closed
+    fires the timer. Related and also invisible to the plan's set: `fire()` must clear `scheduled`
+    BEFORE invalidating, or the bridge goes permanently deaf after its first burst — no
+    single-burst test can see it, and every plan test is single-burst.
+28. **The plan started the connection at `'reconnecting'`, which puts "this view may be out of
+    date" on screen at the first paint of every page load** — over data the route loader fetched
+    milliseconds earlier. The indicator's own doc comment is what decides it: a banner that is
+    always present trains people to stop reading it. It starts `'live'`, which renders nothing.
+    The exposure is bounded and small: a REFUSED stream announces `reconnecting` in milliseconds,
+    and the only case silence covers is a server that accepts and then says nothing, which the
+    transport's own `OPEN_TIMEOUT_MS` converts into the same announcement after 20s. Throughout
+    that window REST is still the source of truth and the 60s refresh floor is still running.
+29. **The harness could not assert either state, and the test I wrote for it passed with the
+    initial state flipped back.** `silentStream` is already open before anything renders, so the
+    transport has said `'live'` and "no banner" holds for a reason unrelated to the value under
+    test. A handler that never answers (`await delay('infinite')`) is what makes the opening window
+    long enough to assert about. Fifth appearance of this shape (items 3, 12, 15, 20, 24) and the
+    second time in two waves that the harness, not the component, was the defective subject.
+30. **`f.event` and `f.frame.kind` are the same string on the wire, so no fixture carrying both
+    could say which one the bridge reads.** The swap survived the entire sweep. They are not
+    interchangeable in principle — `event` is the SSE routing label and the parser defaults it to
+    `''` when the field is absent, while `frame.kind` is the record the backend stored and the
+    thing `GET /approvals` is a projection of — so the fixture now makes them DISAGREE.
+
+Two smaller ones, both about claims rather than code. **The `/approvals` loader does not make
+`AppErrorBoundary`'s 401 branch reachable** — measured, removing the loader leaves every test in the
+file green, because `useSuspenseQuery` throws to the same boundary; what makes the branch reachable
+is the route fetching anything at all. The comment claiming otherwise was corrected rather than
+kept, and the loader's real payoff (a router-level load that `defaultPreload: 'intent'` can start on
+hover) is recorded as unfalsifiable. And **msw does not run a response body's `cancel` callback when
+the client aborts**, so the obvious close-on-unmount test reports failure for a correct cleanup;
+`request.signal`'s `abort` event is what observes it.
+
 Also measured and NOT adopted: the plan's second, disabled observer
 (`useQuery({ ...meQueryOptions, enabled: false })`) for background expiry. Both observers read
 the same cache entry and report the same error, so reading `error` off the existing
@@ -432,10 +496,13 @@ From wave 4:
   — the mutants prove the rules, not the numbers.
 From wave 5:
 
-- `_app.tsx` — **`AppErrorBoundary`'s 401 branch is untested.** The first load's 401 is the
-  loader's, and a background expiry is AppLayout's; nothing today produces a 401 that arrives
-  through the boundary, because that needs a child route with its own loader (Task 11's
-  `/approvals`). The branch is reasoned, not measured, and Task 11 is where it becomes testable.
+- ~~`_app.tsx` — **`AppErrorBoundary`'s 401 branch is untested.**~~ **CLOSED in `63bbb1f`.**
+  `/approvals` fetching something of its own is what produces a 401 arriving from below.
+  `/auth/me` deliberately stays HEALTHY in that test: expire the session instead and three
+  mechanisms could produce the same redirect (the layout loader, AppLayout's expiry check, this
+  boundary), which is the trap wave 5 fell into once already. The full round trip is the
+  assertion — the boundary sends the user to `/login`, whose guard proves the session and sends
+  them back inward.
 - `_app.tsx` — the loader's non-401 rethrow IS covered (the 500 test), but its `redirect` on 401
   is only covered on the stub-route path; no test drives a 401 into `_app` from `/`.
 - `api-error-panel.tsx` — the non-403 branch renders `error.detail`, and no test asserts the
@@ -476,6 +543,30 @@ From wave 6:
   critical path. So re-adding `color-scheme: dark light` to `app.css` would go unnoticed.
 - **`ThemeToggle`'s `capitalize` class is the only thing making the label read as a word rather
   than a lowercase token**, and no test asserts rendered case — jsdom does not apply it.
+- ~~**`AppShell` is never rendered through a real route**~~ — **CLOSED in `63bbb1f`.** `AppLayout`
+  now passes `connection` and `approvalCount` from live values, and mutating either is caught.
+
+From wave 7:
+
+- **The `/approvals` loader is unfalsifiable.** Removing it leaves the whole suite green, because
+  `useSuspenseQuery` reaches the same cache and the same boundary and jsdom resolves the suspension
+  inside the same act() flush. Its real payoff is a router-level load that `defaultPreload:
+  'intent'` can start on hover — and `AppLayout`'s badge query has already requested the same key,
+  so even a request-counting test could not see it.
+- **`ApprovalList`'s composite key is unfalsifiable through the DOM.** Two waiting gates on one run
+  under a `run_id`-only key produce a React warning, not a failure, and both rows still render. The
+  key is right — one run can hold several gates and a retry gives the same node a new attempt — but
+  nothing holds it there.
+- **`useAttentionStream` has no seams**, deliberately: it is exercised end to end through msw, so
+  the bridge, the transport and the real `fetch`/`TextDecoderStream` path all run. That path had
+  never executed before this wave — every `sse-connection` test injects `fetchImpl` — and it works
+  under this jsdom, which is measured now rather than assumed.
+- **Nothing asserts the debounce is 250ms in the app**, only in the bridge's own suite. The hook
+  constructs the bridge with no options, so a changed default would show up as a slower badge and
+  no failure.
+- **The badge's failure rendering is now tested, but its ambiguity is inherent**: a failing
+  approvals endpoint and an empty inbox look identical from the nav. `/approvals` is where the
+  difference is visible.
 
 ## Plan divergences, all FIXED in the plan text
 
@@ -494,6 +585,16 @@ because the next person to execute it will otherwise reintroduce exactly what wa
   moved into Task 10's file list, and `probeMe` retyped to the nullable `MeProbe`.
 - **Task 8** (wave 4). Its "Create `connection-state.ts`" line is now "CONSUME" — Task 10 owns
   the file. The placement argument is unchanged and is why it lives in `realtime/`.
+- **Task 11** (wave 7). A corrective block at the top names all four false claims. Step 1's suite
+  is rewritten around an injected timer with `flush()` gone; Step 3's implementation drops `flush`
+  and the `pending` flag and schedules unconditionally; Step 4 lists the eleven mutants; Step 5's
+  hook starts at `'live'`, switches exhaustively on the event type and carries the
+  `navigate`-stability note, `stream-status.tsx`'s default follows it, and the prose now says where
+  the badge count comes from and why it is a plain `useQuery`; Step 6 gained the note on what the
+  loader does and does not buy; Step 7's harness is documented as synchronous and handler-taking,
+  with msw's precedence, `pendingStream`, the abort-signal fact and the retry timeout; the Files
+  list gained `stream-status.test.tsx`, `render-app.tsx` and the `_app.test.tsx` modification; and
+  the second Step 7 is now Step 8.
 - **Task 8** (wave 6). Step 1's harness is now `RouterContextProvider` over the real route tree
   with a `renderShell` helper, and its theme case stubs a dark OS preference; Step 2's expectation
   is FAIL-on-content rather than module-not-found, and names the test that passes against Task 7's
