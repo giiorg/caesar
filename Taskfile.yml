@@ -189,6 +189,13 @@ tasks:
       - ./node_modules/.bin/tsc --noEmit
       - node tools/check-mutants.mjs
 
+  web:test:
+    dir: web
+    cmds:
+      # Runs both vitest projects: `node` (pure/transport, no DOM globals) and
+      # `dom` (jsdom + the React plugin). Never npx — see the pre-flight note.
+      - ./node_modules/.bin/vitest run
+
   web:pins:
     dir: web
     cmds:

@@ -1,0 +1,23 @@
+@import "./tokens.css";
+@import "./theme-dark.css";
+@import "./theme-light.css";
+
+html {
+  color-scheme: dark light;
+}
+
+body {
+  background-color: var(--color-ground);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  /* Safe-area insets: the phone is the flagship surface (§6). */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+}
+
+/* 44px minimum targets, stated once rather than remembered per component. */
+button,
+a[role="button"],
+[role="tab"] {
+  min-height: 2.75rem;
+}

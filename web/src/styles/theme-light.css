@@ -1,0 +1,15 @@
+/* The twin over the identical semantic names. A third theme is this file again
+   with different numbers — never a component edit. */
+:root[data-theme="light"] {
+  --caesar-ground: oklch(0.985 0.002 259.5);
+  --caesar-surface: oklch(1 0 0);
+  --caesar-surface-raised: oklch(0.96 0.004 259.5);
+  --caesar-border: oklch(0.9 0.006 259.5);
+  --caesar-text: oklch(0.25 0.014 259.5);
+  --caesar-text-muted: oklch(0.5 0.014 259.5);
+  --caesar-accent: oklch(0.56 0.13 165);
+  --caesar-accent-contrast: oklch(0.995 0.002 165);
+  --caesar-danger: oklch(0.52 0.2 25);
+  --caesar-warning: oklch(0.6 0.14 80);
+  --caesar-success: oklch(0.56 0.13 165);
+}

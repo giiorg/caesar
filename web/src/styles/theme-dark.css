@@ -1,0 +1,34 @@
+/* The flagship theme, derived from the approved Terminal mockup's hexes.
+   Every value carrying a hex comment was produced by the sRGB -> OKLab -> OKLCH
+   conversion of that hex (CSS Color 4), not typed by hand. */
+/* Dark is also the DEFAULT, not merely one of two stamped choices: the selector
+   is "every document that has not been explicitly stamped light", which covers
+   data-theme="dark", a document nothing has stamped yet, and a document stamped
+   with anything else. It is disjoint from theme-light.css's
+   :root[data-theme="light"] by construction, so no cascade order or specificity
+   comparison decides the outcome.
+
+   This is load-bearing, not tidiness. Nothing sets data-theme before React
+   mounts, useTheme stamps it from an effect, and /login (Task 6) sits outside
+   the layout that renders the theme toggle at all — so without this selector
+   every --caesar-* is undefined, every semantic --color-* is
+   invalid-at-computed-value-time, and the page paints on the UA canvas.
+
+   The usual fix — a blocking inline <script> in index.html reading
+   localStorage + matchMedia — is RULED OUT here: production CSP is
+   `script-src 'self'` and Task 12 asserts the built index.html carries no
+   src-less <script> tag. */
+:root:not([data-theme="light"]) {
+  --caesar-ground: oklch(0.176 0.014 258.4); /* #0d1117 */
+  --caesar-surface: oklch(0.22 0.016 256.8); /* #161b22 */
+  --caesar-surface-raised: oklch(0.267 0.015 256.8); /* #21262d */
+  --caesar-border: oklch(0.267 0.015 256.8); /* #21262d */
+  --caesar-text: oklch(0.857 0.014 248); /* #c9d1d9 */
+  /* Not a mockup hex: the body colour dimmed, same hue and chroma family. */
+  --caesar-text-muted: oklch(0.65 0.014 248);
+  --caesar-accent: oklch(0.792 0.135 163.6); /* #58d6a3 */
+  --caesar-accent-contrast: oklch(0.176 0.014 258.4); /* #0d1117 — text ON accent */
+  --caesar-danger: oklch(0.64 0.19 25);
+  --caesar-warning: oklch(0.78 0.14 80);
+  --caesar-success: oklch(0.792 0.135 163.6);
+}
