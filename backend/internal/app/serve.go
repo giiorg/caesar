@@ -28,6 +28,7 @@ import (
 	realtimeapi "github.com/giiorg/caesar/backend/internal/realtime/api"
 	"github.com/giiorg/caesar/backend/internal/runs"
 	runsapi "github.com/giiorg/caesar/backend/internal/runs/api"
+	"github.com/giiorg/caesar/backend/internal/webui"
 	"github.com/giiorg/caesar/backend/internal/workflows"
 	workflowsapi "github.com/giiorg/caesar/backend/internal/workflows/api"
 )
@@ -232,7 +233,7 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		// No Addr: Serve takes the listener below, and only ListenAndServe
 		// would read this field. Leaving it set would be a second answer to
 		// "which address is this" that nothing consults.
-		Handler:           Routes(log, pool, ops, cfg.Server.AppOrigin),
+		Handler:           Routes(log, pool, ops, cfg.Server.AppOrigin, webui.Handler()),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		// WriteTimeout deliberately unset: SSE streams (Plan 10) are

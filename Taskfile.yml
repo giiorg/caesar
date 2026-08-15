@@ -78,6 +78,91 @@ tasks:
     cmds:
       - go test -race {{.CLI_ARGS}} {{.PKG | default "./..."}}
 
+  backend:test:embedui:
+    desc: "The webui tests that only exist under the embedui build tag (needs Node)"
+    # backend:test runs untagged, so it never compiles the //go:embed. What it
+    # DOES exercise is the whole routing contract: ui.go carries the serving
+    # rules with no build tag, ui_contract_test.go runs them against a fixture
+    # bundle, and MEASURED — the four mutants (drop path.Clean, serve
+    # directories, drop the root-file branch, let an /assets miss fall through
+    # to the SPA) each turn `go test ./internal/webui/` red with no tag set.
+    #
+    # What is left for THIS lane is only what needs Vite's real output: that the
+    # generated index.html carries no inline <script> and that it carries the
+    # build stamp — plus TestTheRealBundleSatisfiesTheRoutingContract, which
+    # replays the same contract against embed.FS so the fixture is never the
+    # only subject.
+    #
+    # deps on web:build rather than documenting an ordering, because
+    # backend/internal/webui/dist is gitignored: on a clean checkout the
+    # //go:embed in ui_embed.go does not compile at all, and the failure reads
+    # as a broken package rather than a missing build step.
+    #
+    # Deliberately NOT folded into backend:ci. That lane's Node-free-ness is a
+    # property ui_noembed.go's doc comment claims out loud, and it is why the
+    # tagless twin exists — and CI's `backend` job has no setup-node step, so
+    # folding it in would break that job outright. It is in the root `ci:`
+    # aggregate instead, which has needed Node since contracts:ts.
+    #
+    # NO CI JOB AND NO scripts/gate INVOCATION REACHES IT. `grep -rn
+    # backend:test:embedui Taskfile.yml scripts/gate .github/` returns only
+    # Taskfile.yml, and scripts/gate runs four named lanes (backend:ci,
+    # contracts:check, image:build, backend:test:runner) — `ci:` is not one of
+    # them. So the assertions still tagged embedui are operator-run only. Same
+    # for backend:static:embedui below. Both are escalated to §14 by name.
+    #
+    # That residual is deliberately small. MEASURED with `go test -list '.*'`:
+    # 6 of the package's 9 test functions run untagged and 8 run under the tag,
+    # so only 3 are embedui-only — TestTheRealBundleSatisfiesTheRoutingContract,
+    # TestEmbeddedIndexIsServedAndCarriesNoInlineScript and
+    # TestServedIndexCarriesTheBuildStamp. It was 9 of 10 before the routing
+    # contract moved to the untagged ui.go.
+    deps: [web:build]
+    dir: backend
+    cmds:
+      - go test -race -tags embedui {{.CLI_ARGS}} {{.PKG | default "./internal/webui/"}}
+
+  backend:static:embedui:
+    desc: "vet, house lint and the analyzers over the embedui-only files (needs Node)"
+    # The tagged file is invisible to every static lane, and that is MEASURED
+    # rather than suspected. backend:vet, backend:lint, backend:analyze and
+    # backend:vuln all run with -tags integration,property,runnerintegration and
+    # never with embedui:
+    #
+    #   go list -f "<.GoFiles> <.IgnoredGoFiles>" ./internal/webui/
+    #   -> [ui.go ui_noembed.go] [ui_embed.go ui_embed_test.go]
+    #   (angle brackets stand in for go list's template braces, which a Taskfile
+    #    comment can carry but which read as template syntax to a human.)
+    #
+    # The SAME mutant, `fmt.Printf("%d", "definitely not an int")`, planted in
+    # each of the two files — this is the whole argument for ui.go existing:
+    #
+    #   in ui_embed.go (tagged):
+    #     go vet -tags integration,property,runnerintegration ./internal/webui/ -> exit 0, silent
+    #     bin/golangci-lint run ./internal/webui/...                            -> exit 0, silent
+    #   in ui.go (untagged):
+    #     go vet -tags integration,property,runnerintegration ./internal/webui/ -> exit 1, "wrong type string"
+    #     bin/golangci-lint run ./internal/webui/...                            -> exit 1, forbidigo
+    #
+    # So this lane's remaining job is the //go:embed directive, the fs.Sub and
+    # the three embedui-tagged assertions — not the serving rules, which the
+    # untagged lanes now compile and check.
+    #
+    # Adding embedui to .golangci.yml's build-tags is the obvious alternative
+    # and is wrong: backend/internal/webui/dist is gitignored, so //go:embed
+    # does not compile on a clean checkout and `task backend:lint` would go red
+    # for every developer who has not run a Node build. Scoping the tag to a
+    # lane that deps on web:build is what keeps the untagged lanes Node-free.
+    deps: [tools, web:build]
+    dir: backend
+    cmds:
+      - go vet -tags embedui ./internal/webui/
+      - bin/golangci-lint run --build-tags embedui ./internal/webui/...
+      # The custom analyzers too: internal/arch and internal/analyzers are house
+      # law, and a file no lane compiles is a file house law does not reach.
+      - go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze
+      - go vet -tags embedui -vettool=./bin/caesar-analyze ./internal/webui/
+
   backend:analyze:
     dir: backend
     cmds:
@@ -274,5 +359,20 @@ tasks:
     cmds:
       - task: backend:ci
       - task: contracts:check
+      # AFTER contracts:check, not before: both embedui lanes dep on web:build,
+      # which needs web/node_modules, and contracts:ts is what runs `npm ci`.
+      # Ordering them here means `task ci` needs nothing it did not already
+      # need — this aggregate has required Node since Plan 02 added
+      # contracts:ts, so the embedui lanes cost it no new dependency.
+      #
+      # THIS IS NOT THE WIRING THE GUARDS NEED. `task ci` is the operator's
+      # local full-run; no CI job and no scripts/gate invocation reaches it
+      # (.github/workflows/ci.yml runs backend:ci, image:build,
+      # backend:test:runner, contracts:check, secrets and lint:actions as
+      # separate jobs, and scripts/gate runs four named lanes). Putting them
+      # here is strictly better than nowhere and is NOT a substitute for §14
+      # naming both lanes in scripts/gate.
+      - task: backend:test:embedui
+      - task: backend:static:embedui
       - task: secrets
       - task: lint:actions

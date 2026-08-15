@@ -21,6 +21,7 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/clock"
 	"github.com/giiorg/caesar/backend/internal/platform/testdb"
+	"github.com/giiorg/caesar/backend/internal/webui"
 	"github.com/giiorg/caesar/backend/internal/workflows"
 	workflowsapi "github.com/giiorg/caesar/backend/internal/workflows/api"
 )
@@ -47,7 +48,7 @@ func TestAppRoutes_WorkflowsEndToEnd(t *testing.T) {
 	ops := identityapi.Operations(identityapi.New(svc, 90*24*time.Hour, nil))
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, svc))...)
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	srv := httptest.NewServer(app.Routes(log, pool, ops, "http://caesar.test"))
+	srv := httptest.NewServer(app.Routes(log, pool, ops, "http://caesar.test", webui.Handler()))
 	t.Cleanup(srv.Close)
 
 	body, _ := json.Marshal(map[string]string{"email": "root@example.com", "password": "a long enough password"})
