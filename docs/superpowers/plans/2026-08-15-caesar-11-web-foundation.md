@@ -1844,16 +1844,22 @@ export class ApiError extends Error {
     } catch {
       /* not JSON; the status still is */
     }
-    // Same reasoning one level down: a server that sends `errors: {}` or
-    // `errors: "none"` would otherwise reach `.map` on a non-array.
-    const errors = Array.isArray(body.errors) ? body.errors : []
+    // Same reasoning one level down, twice. A server that sends `errors: {}`
+    // or `errors: "none"` would otherwise reach `.map` on a non-array — and
+    // an array is not enough either: `[null]` passes Array.isArray and then
+    // yields a `{field: '', message: ''}` entry, an empty field error the
+    // form layer would render as a blank bullet. Entries that are not objects
+    // are dropped, not defaulted.
+    const errors = (Array.isArray(body.errors) ? body.errors : []).filter(
+      (e): e is { field?: string; message?: string } => typeof e === 'object' && e !== null,
+    )
     return new ApiError({
       type: body.type ?? 'about:blank',
       title: body.title ?? 'Request failed',
       status: res.status,
       detail: body.detail ?? '',
       correlationId: body.correlation_id ?? res.headers.get('X-Correlation-ID') ?? '',
-      fields: errors.map((e) => ({ field: e?.field ?? '', message: e?.message ?? '' })),
+      fields: errors.map((e) => ({ field: e.field ?? '', message: e.message ?? '' })),
     })
   }
 }
@@ -2616,7 +2622,7 @@ export const meQueryOptions = queryOptions({
 `web/src/routes/_app.tsx`:
 
 ```tsx
-import { useSuspenseQuery } from '@tanstack/react-query'
+import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
 import { type ErrorComponentProps, Outlet, createFileRoute, redirect, useNavigate } from '@tanstack/react-router'
 import { useEffect } from 'react'
 import { meQueryOptions } from '../auth/me-query'
@@ -2652,19 +2658,17 @@ function AppLayout() {
 }
 
 /**
- * THE LOADER IS NOT ENOUGH, and the gap is not obvious.
+ * Route-level errors: a child loader that failed, or a query that threw
+ * because it had no data to fall back on. The FIRST load's 401 is caught by
+ * the loader above and redirected there; a background expiry is caught by the
+ * disabled observer in AppLayout, because useSuspenseQuery will not throw
+ * over cached data. This handles the rest.
  *
- * The loader covers the first load. After that, AUTH_SCOPED_QUERY_OPTIONS
- * refetches /auth/me on window focus and on a 60s interval, so a session that
- * expires while the tab sits open produces a BACKGROUND 401 with no loader
- * running to catch it. That call is also globally exempt from the 401
- * interceptor (Task 5) — correctly, since a 401 from /auth/me *means* "no
- * session" and routing it through the generic redirect would fight the
- * bootstrap. So nothing else is watching, and useSuspenseQuery throws the
- * error rather than returning it: it lands HERE.
+ * The 401 branch is kept here anyway — a child route's own loader can 401
+ * without /auth/me having been refetched, and that is a real expiry too.
  *
- * Which is why the redirect is a navigate-in-effect and not `throw redirect`.
- * This is a render, not a loader; throwing a redirect from a component is not
+ * The redirect is a navigate-in-effect rather than `throw redirect` because
+ * this is a render, not a loader; throwing a redirect from a component is not
  * how the router accepts one.
  */
 function AppErrorBoundary({ error }: ErrorComponentProps) {
