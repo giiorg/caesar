@@ -6,9 +6,12 @@
       "!**/node_modules",
       "!src/api/schema.d.ts",
       "!src/routeTree.gen.ts",
-      "!**/dist"
+      "!**/dist",
+      "!tools/arch/fixtures",
+      "!tools/mutants"
     ]
   },
+  "plugins": ["./tools/lint/no-qualified-fetch.grit"],
   "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
   "javascript": { "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" } },
   "css": { "parser": { "tailwindDirectives": true } },
@@ -30,6 +33,14 @@
               "node:path": "the client runs in a browser"
             }
           }
+        },
+        "noRestrictedGlobals": {
+          "level": "error",
+          "options": {
+            "deniedGlobals": {
+              "fetch": "use the generated client in src/api/client.ts — a hand-written fetch bypasses the contract, the 401 interceptor and the correlation id"
+            }
+          }
         }
       },
       "performance": { "noBarrelFile": "error", "noReExportAll": "error" }
@@ -47,6 +58,10 @@
     {
       "includes": ["tools/**"],
       "linter": { "rules": { "style": { "noRestrictedImports": "off" } } }
+    },
+    {
+      "includes": ["src/api/client.ts", "src/realtime/sse-connection.ts", "src/test/**"],
+      "linter": { "rules": { "style": { "noRestrictedGlobals": "off" } } }
     }
   ]
 }

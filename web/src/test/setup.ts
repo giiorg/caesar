@@ -6,7 +6,17 @@
 // toBeInTheDocument`, which reads like a typo rather than a missing import.
 import '@testing-library/jest-dom/vitest'
 import { cleanup } from '@testing-library/react'
-import { afterEach } from 'vitest'
+import { afterAll, afterEach, beforeAll } from 'vitest'
+import { server } from './msw'
+
+// MSW intercepts at the NETWORK level for every `dom` test, so the generated
+// client is exercised rather than stubbed. `onUnhandledRequest: 'error'` is the
+// load-bearing half: without it a request the suite forgot to stub would fall
+// through to the real network (or to jsdom's "not implemented"), and the test
+// would fail somewhere far away from the missing handler.
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }))
+afterEach(() => server.resetHandlers())
+afterAll(() => server.close())
 
 // React Testing Library registers its own `afterEach(cleanup)` ONLY when a
 // global `afterEach` exists. vitest.config.ts sets `globals: false` for this

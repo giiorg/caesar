@@ -1,0 +1,86 @@
+// Close the hole in the hand-written-`fetch` ban.
+//
+// Global Constraint: "Hand-written `fetch` against /api is banned by lint, not
+// by convention." biome.json's `noRestrictedGlobals` carries the ban, but that
+// rule is an IDENTIFIER-REFERENCE rule — `biome explain noRestrictedGlobals`
+// says so in as many words, and MEASURED on 2.5.8 it catches exactly one
+// spelling:
+//
+//   fetch('/api/v1/auth/me')             -> lint/style/noRestrictedGlobals, exit 1
+//   window.fetch('/api/v1/auth/me')      -> exit 0
+//   globalThis.fetch('/api/v1/auth/me')  -> exit 0
+//   self.fetch('/api/v1/auth/me')        -> exit 0
+//   const f = globalThis.fetch           -> exit 0
+//   const { fetch: f } = window          -> exit 0
+//   globalThis['fetch'](…)               -> exit 0
+//
+// `window.fetch(…)` is the most idiomatic browser spelling of the very thing
+// the constraint forbids, so the ban was measurably false for the likeliest
+// way to break it. Biome 2.5.8 has no property-level rule to reach for —
+// `biome explain noRestrictedProperties` and `... noRestrictedSyntax` both
+// answer "Unrecognized option" — so this is a GritQL plugin, which is Biome's
+// own first-class syntactic matcher (`plugins` is in
+// @biomejs/biome/configuration_schema.json at 2.5.8).
+//
+// WHY NOT just add `window`/`globalThis`/`self` to `deniedGlobals`, which also
+// closes it: because `noRestrictedGlobals` can only be exempted per FILE, and
+// the exemption is all-or-nothing. `src/theme/use-theme.ts` legitimately calls
+// `window.matchMedia`, Task 8's shell and Task 10's transport will legitimately
+// touch `window`/`document`, and every such file would need an override that
+// ALSO switches the bare-`fetch` ban back off for it. The ban would fill with
+// holes as the app grew. This plugin bans the one property and leaves
+// `window.location.origin` and `window.matchMedia` alone.
+//
+// THIS CANNOT SILENTLY GO INERT. MEASURED: a `plugins` entry pointing at a
+// missing file fails the lane with "Error(s) during loading of plugins: Cannot
+// read file." and exit 1; a `.grit` file that does not compile fails with
+// "Failed to compile the Grit plugin". Contrast biome.json itself, where a `//`
+// comment silently voids the whole config.
+//
+// Falsification probe (run it if you touch this file; each must exit 1, and
+// `window.location.origin` / `window.matchMedia` must stay clean):
+//   cd web && ./node_modules/.bin/biome ci <a file containing each line above>
+
+language js
+
+pattern global_object() {
+  or {
+    `window`,
+    `globalThis`,
+    `self`,
+    `document.defaultView`
+  }
+}
+
+// The message deliberately matches biome.json's `deniedGlobals` entry: both
+// spellings must teach the same thing.
+//
+// `predicate`, not `pattern`. MEASURED: wrapping `register_diagnostic` in a
+// named `pattern` fails with "Failed to compile the Grit plugin" — which is
+// itself the reassuring half of the story, because it fails the lane with exit
+// 1 rather than loading a plugin that matches nothing.
+predicate banned($node) {
+  register_diagnostic(span=$node, message="use the generated client in src/api/client.ts — a hand-written fetch bypasses the contract, the 401 interceptor and the correlation id")
+}
+
+or {
+  // window.fetch(…), globalThis.fetch, and `const f = globalThis.fetch`: the
+  // member access itself is the violation, so aliasing does not launder it.
+  `$obj.fetch` where { $obj <: global_object(), banned($obj) },
+  // globalThis['fetch'](…)
+  `$obj[$key]` where {
+    $obj <: global_object(),
+    $key <: or {
+      `"fetch"`,
+      `'fetch'`
+    },
+    banned($obj)
+  },
+  // `const { fetch } = window` / `const { fetch: f } = window`. Grit parses the
+  // shorthand and the renamed forms as different snippets, so both are stated.
+  // Destructuring the global object is banned outright rather than only for the
+  // `fetch` key: nothing in this client has a reason to do it, and a key-level
+  // test would be one more thing to get subtly wrong.
+  `const { $props } = $obj` where { $obj <: global_object(), banned($obj) },
+  `const { $key: $alias } = $obj` where { $obj <: global_object(), banned($obj) }
+}
