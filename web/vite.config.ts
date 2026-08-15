@@ -39,6 +39,18 @@ const commitStamp: Plugin = {
 
 export default defineConfig({
   plugins: [
+    // The generator's OTHER options live in tsr.config.json, which both this
+    // plugin and `./node_modules/.bin/tsr generate` (task web:routes:check)
+    // read — VERIFIED by generating with each and diffing: identical. Splitting
+    // them would let the build and the drift check disagree about what the
+    // route tree is.
+    //
+    // That file carries `routeFileIgnorePattern` for `*.test.tsx`. Before it,
+    // test files under src/routes/ were kept out of the tree only by happening
+    // to export no `Route` symbol, and nothing pinned that — MEASURED: a test
+    // file that does export one is picked up as a real route (13 references in
+    // routeTree.gen.ts) and ships. It is strict JSON with no comments, for the
+    // same reason biome.json is: a `//` line silently voids the config.
     tanstackRouter({ target: 'react', autoCodeSplitting: true }),
     react(),
     tailwindcss(),
