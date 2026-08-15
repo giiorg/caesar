@@ -31,6 +31,24 @@ neither form of broker variable is set at all: the gateway brokers nothing and
 tautology — a broker token appearing in a materialized attempt would mean the
 custody derivation had broken.
 
+## What the base image does not give you
+
+`node:22-bookworm-slim` ships **no CA trust store** — `/etc/ssl/certs` does not
+exist — so both Dockerfiles install `ca-certificates` explicitly. A JS CLI does
+not need it (Node compiles its own root bundle in), which is precisely why the
+gap survived until a live run: `npm install` and Claude Code both work fine
+without one, and the fake CLI CI runs against never opens a TLS connection at
+all. The codex CLI is a Rust binary reading the system store, and without it
+every connection fails `invalid peer certificate: UnknownIssuer`.
+
+Codex also builds a sandbox of its own, and it must be told not to. Any
+`--sandbox` mode but `danger-full-access` spawns bubblewrap, which needs
+unprivileged user namespaces that this container's posture denies; the CLI then
+cannot write a single file and exits 0 having changed nothing. The container is
+the boundary — see the entrypoint's own comment.
+
+Both were found by the row 07 smoke run and neither is reachable from CI.
+
 ## Pins
 
 Each Dockerfile pins its CLI version in an `ARG` so a build is reproducible and
