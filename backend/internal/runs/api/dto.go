@@ -118,20 +118,28 @@ type GateDecisionResponse struct {
 
 // ApprovalResponse is one attention item. It carries everything a list view
 // renders so the inbox is one request, not one plus N.
+//
+// required:"true" is read by swaggest/jsonschema-go and puts the property in
+// the schema's `required` array; without it openapi-typescript renders it
+// optional. Only Plan 11's web slice is marked up — the rest of this file's
+// DTOs are Plan 12's to do as those screens arrive.
 type ApprovalResponse struct {
-	RunID        string    `json:"run_id"`
-	TaskID       string    `json:"task_id"`
-	ProjectID    string    `json:"project_id"`
-	TaskTitle    string    `json:"task_title"`
-	NodeID       string    `json:"node_id"`
-	Attempt      int32     `json:"attempt"`
-	Generation   int32     `json:"generation"`
-	RequesterID  string    `json:"requester_id"`
-	WaitingSince time.Time `json:"waiting_since"`
+	RunID        string    `json:"run_id" required:"true"`
+	TaskID       string    `json:"task_id" required:"true"`
+	ProjectID    string    `json:"project_id" required:"true"`
+	TaskTitle    string    `json:"task_title" required:"true"`
+	NodeID       string    `json:"node_id" required:"true"`
+	Attempt      int32     `json:"attempt" required:"true"`
+	Generation   int32     `json:"generation" required:"true"`
+	RequesterID  string    `json:"requester_id" required:"true"`
+	WaitingSince time.Time `json:"waiting_since" required:"true"`
 }
 
+// Approvals is required AND nullable: the property is always present in the
+// contract, and its type stays ["array","null"] because a nil slice really
+// does marshal to null. The two are independent.
 type ApprovalListResponse struct {
-	Approvals []ApprovalResponse `json:"approvals"`
+	Approvals []ApprovalResponse `json:"approvals" required:"true"`
 }
 
 // GateDecisionSummary projects a decided gate onto its phase. The approver's

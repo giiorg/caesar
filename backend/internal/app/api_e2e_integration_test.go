@@ -27,6 +27,7 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/testdb"
 	"github.com/giiorg/caesar/backend/internal/runs"
 	runsapi "github.com/giiorg/caesar/backend/internal/runs/api"
+	"github.com/giiorg/caesar/backend/internal/webui"
 )
 
 // The month-one auth loop, through the real Routes wiring: bootstrap →
@@ -57,7 +58,7 @@ func TestAppRoutes_AuthLoopEndToEnd(t *testing.T) {
 	// source for the assets API, exactly as serve.go wires it.
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, svc, svc, svc))...)
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	srv := httptest.NewServer(app.Routes(log, pool, ops, "http://caesar.test"))
+	srv := httptest.NewServer(app.Routes(log, pool, ops, "http://caesar.test", webui.Handler()))
 	t.Cleanup(srv.Close)
 
 	body, _ := json.Marshal(map[string]string{"email": "root@example.com", "password": "a long enough password"})
@@ -187,7 +188,7 @@ func TestAppRoutes_GateSurfaceIsReachableThroughTheRealMiddleware(t *testing.T) 
 	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc))
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil))...)
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	srv := httptest.NewServer(app.Routes(log, pool, ops, "http://caesar.test"))
+	srv := httptest.NewServer(app.Routes(log, pool, ops, "http://caesar.test", webui.Handler()))
 	t.Cleanup(srv.Close)
 
 	loginBody, _ := json.Marshal(map[string]string{"email": "root@example.com", "password": password})

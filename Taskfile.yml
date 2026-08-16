@@ -1,5 +1,15 @@
 version: '3'
 
+# EVERY NODE-USING LANE RUNS THROUGH scripts/with-node, whoever invoked it.
+#
+# That script carries the full reasoning. The short version: this machine's
+# DEFAULT nvm version is 20.9.0, `scripts/gate` therefore ran `npm ci` under npm
+# 10.1.0, and that installs a tree with no @rolldown/binding — which kills vitest
+# AND vite together. It destroyed web/node_modules on four gate runs.
+#
+# `env: PATH:` here does NOT work and was measured not to: go-task honours other
+# injected env vars but resolves commands against the parent environment, so a
+# global PATH injection looks right and changes nothing. Hence a wrapper.
 vars:
   GOLANGCI_LINT_VERSION: v1.64.8
   GOFUMPT_VERSION: v0.7.0
@@ -41,7 +51,7 @@ tasks:
   backend:vet:
     dir: backend
     cmds:
-      - go vet -tags integration,property,runnerintegration ./...
+      - go vet -tags integration,property,runnerintegration,webe2e ./...
 
   backend:lint:
     deps: [tools]
@@ -53,7 +63,7 @@ tasks:
     deps: [tools]
     dir: backend
     cmds:
-      - bin/govulncheck -tags integration,property,runnerintegration ./...
+      - bin/govulncheck -tags integration,property,runnerintegration,webe2e ./...
 
   backend:build:
     dir: backend
@@ -78,11 +88,97 @@ tasks:
     cmds:
       - go test -race {{.CLI_ARGS}} {{.PKG | default "./..."}}
 
+  backend:test:embedui:
+    desc: "The webui tests that only exist under the embedui build tag (needs Node)"
+    # backend:test runs untagged, so it never compiles the //go:embed. What it
+    # DOES exercise is the whole routing contract: ui.go carries the serving
+    # rules with no build tag, ui_contract_test.go runs them against a fixture
+    # bundle, and MEASURED — the four mutants (drop path.Clean, serve
+    # directories, drop the root-file branch, let an /assets miss fall through
+    # to the SPA) each turn `go test ./internal/webui/` red with no tag set.
+    #
+    # What is left for THIS lane is only what needs Vite's real output: that the
+    # generated index.html carries no inline <script> and that it carries the
+    # build stamp — plus TestTheRealBundleSatisfiesTheRoutingContract, which
+    # replays the same contract against embed.FS so the fixture is never the
+    # only subject.
+    #
+    # deps on web:build rather than documenting an ordering, because
+    # backend/internal/webui/dist is gitignored: on a clean checkout the
+    # //go:embed in ui_embed.go does not compile at all, and the failure reads
+    # as a broken package rather than a missing build step.
+    #
+    # Deliberately NOT folded into backend:ci. That lane's Node-free-ness is a
+    # property ui_noembed.go's doc comment claims out loud, and it is why the
+    # tagless twin exists — and CI's `backend` job has no setup-node step, so
+    # folding it in would break that job outright. It is in the root `ci:`
+    # aggregate instead, which has needed Node since contracts:ts.
+    #
+    # THIS LANE IS NOW WIRED, and the escalation below has landed. Until §14 it
+    # ran in no CI job and no scripts/gate invocation, so everything still
+    # tagged embedui was operator-run only. §14 fixed that in both places:
+    # scripts/gate runs it as a named lane with its resolved command asserted in
+    # EMBEDUI_TEST_CMDS, and .github/workflows/ci.yml's `web` job runs it after
+    # task web:build. Same for backend:static:embedui below. `task ci` naming
+    # them is still not what protects them — the two call sites above are.
+    #
+    # That residual is deliberately small. MEASURED with `go test -list '.*'`:
+    # 6 of the package's 9 test functions run untagged and 8 run under the tag,
+    # so only 3 are embedui-only — TestTheRealBundleSatisfiesTheRoutingContract,
+    # TestEmbeddedIndexIsServedAndCarriesNoInlineScript and
+    # TestServedIndexCarriesTheBuildStamp. It was 9 of 10 before the routing
+    # contract moved to the untagged ui.go.
+    deps: [web:build]
+    dir: backend
+    cmds:
+      - go test -race -tags embedui {{.CLI_ARGS}} {{.PKG | default "./internal/webui/"}}
+
+  backend:static:embedui:
+    desc: "vet, house lint and the analyzers over the embedui-only files (needs Node)"
+    # The tagged file is invisible to every static lane, and that is MEASURED
+    # rather than suspected. backend:vet, backend:lint, backend:analyze and
+    # backend:vuln all run with -tags integration,property,runnerintegration and
+    # never with embedui:
+    #
+    #   go list -f "<.GoFiles> <.IgnoredGoFiles>" ./internal/webui/
+    #   -> [ui.go ui_noembed.go] [ui_embed.go ui_embed_test.go]
+    #   (angle brackets stand in for go list's template braces, which a Taskfile
+    #    comment can carry but which read as template syntax to a human.)
+    #
+    # The SAME mutant, `fmt.Printf("%d", "definitely not an int")`, planted in
+    # each of the two files — this is the whole argument for ui.go existing:
+    #
+    #   in ui_embed.go (tagged):
+    #     go vet -tags integration,property,runnerintegration ./internal/webui/ -> exit 0, silent
+    #     bin/golangci-lint run ./internal/webui/...                            -> exit 0, silent
+    #   in ui.go (untagged):
+    #     go vet -tags integration,property,runnerintegration ./internal/webui/ -> exit 1, "wrong type string"
+    #     bin/golangci-lint run ./internal/webui/...                            -> exit 1, forbidigo
+    #
+    # So this lane's remaining job is the //go:embed directive, the fs.Sub and
+    # the three embedui-tagged assertions — not the serving rules, which the
+    # untagged lanes now compile and check.
+    #
+    # Adding embedui to .golangci.yml's build-tags is the obvious alternative
+    # and is wrong: backend/internal/webui/dist is gitignored, so //go:embed
+    # does not compile on a clean checkout and `task backend:lint` would go red
+    # for every developer who has not run a Node build. Scoping the tag to a
+    # lane that deps on web:build is what keeps the untagged lanes Node-free.
+    deps: [tools, web:build]
+    dir: backend
+    cmds:
+      - go vet -tags embedui ./internal/webui/
+      - bin/golangci-lint run --build-tags embedui ./internal/webui/...
+      # The custom analyzers too: internal/arch and internal/analyzers are house
+      # law, and a file no lane compiles is a file house law does not reach.
+      - go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze
+      - go vet -tags embedui -vettool=./bin/caesar-analyze ./internal/webui/
+
   backend:analyze:
     dir: backend
     cmds:
       - go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze
-      - go vet -tags integration,property,runnerintegration -vettool=./bin/caesar-analyze ./...
+      - go vet -tags integration,property,runnerintegration,webe2e -vettool=./bin/caesar-analyze ./...
 
   backend:run:
     desc: "Run the control plane against the dev database (task db:up first)"
@@ -150,8 +246,8 @@ tasks:
     desc: "Regenerate web/src/api/schema.d.ts from the OpenAPI document"
     dir: web
     cmds:
-      - npm ci
-      - npm run api:gen
+      - ../scripts/with-node npm ci
+      - ../scripts/with-node npm run api:gen
 
   contracts:gen:
     desc: "Regenerate every generated contract artifact"
@@ -166,6 +262,111 @@ tasks:
       - task: contracts:gen
       - git diff --exit-code -- backend/api/openapi.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store backend/internal/workflows/store backend/internal/runs/store
       - test -z "$(git status --porcelain -- backend/api web/src/api)"
+
+  # Every web lane invokes the installed binary by path. `npx` and `npm exec --`
+  # both fall back to the public registry when the binary is not in
+  # node_modules: `npx biome ci .` then downloads an unrelated `biome` package
+  # and exits 0 having checked nothing, and `npm exec -- tsr generate` runs
+  # "TypeScript Remove" instead of the router CLI. A missing install has to be a
+  # hard error, not a silently vacuous pass.
+  web:install:
+    dir: web
+    cmds:
+      - ../scripts/with-node npm ci
+
+  web:lint:
+    dir: web
+    cmds:
+      - ../scripts/with-node ./node_modules/.bin/biome ci .
+
+  web:typecheck:
+    dir: web
+    cmds:
+      - ../scripts/with-node ./node_modules/.bin/tsc --noEmit
+      - ../scripts/with-node node tools/check-mutants.mjs
+
+  web:arch:
+    desc: "The two constitution rules no per-file linter can express"
+    dir: web
+    cmds:
+      # `node`, not a node_modules binary: type stripping is built into the
+      # runtime. The flag is still spelled out because it is what makes the
+      # lane's requirement on Node 24 explicit. main.ts imports its two modules
+      # WITH the .ts extension — MEASURED: node's ESM resolver does not complete
+      # an extensionless TypeScript specifier (ERR_MODULE_NOT_FOUND), which is
+      # why tsconfig.json sets allowImportingTsExtensions.
+      - ../scripts/with-node node --experimental-strip-types tools/arch/main.ts
+
+  web:test:
+    dir: web
+    cmds:
+      # Runs both vitest projects: `node` (pure/transport, no DOM globals) and
+      # `dom` (jsdom + the React plugin). Never npx — see the pre-flight note.
+      - ../scripts/with-node ./node_modules/.bin/vitest run
+
+  web:pins:
+    dir: web
+    cmds:
+      - ../scripts/with-node node tools/check-pins.mjs
+
+  web:routes:check:
+    desc: "Regenerate routeTree.gen.ts and fail on drift"
+    dir: web
+    cmds:
+      - ../scripts/with-node ./node_modules/.bin/tsr generate
+      - git diff --exit-code -- src/routeTree.gen.ts
+      # git diff is blind to an untracked or already-staged path, so the drift
+      # gate would be vacuous exactly when the generated tree is not committed.
+      # Same companion assertion as contracts:check.
+      - test -z "$(git status --porcelain -- src/routeTree.gen.ts)"
+
+  web:build:
+    dir: web
+    cmds:
+      - ../scripts/with-node ./node_modules/.bin/vite build
+
+  web:ci:
+    desc: "Every static web lane, in the order a failure is cheapest to read"
+    # web:build LAST: it is the slowest and the only one whose output another
+    # lane consumes (backend/internal/webui/dist). web:pins first because a
+    # drifted pin makes every later failure a red herring.
+    cmds:
+      - task: web:pins
+      - task: web:lint
+      - task: web:arch
+      - task: web:typecheck
+      - task: web:test
+      - task: web:routes:check
+      - task: web:build
+
+  web:e2e:
+    desc: "Playwright against the real backend (needs Docker for Postgres)"
+    # NOT `deps: [web:build]`, unlike backend:test:embedui. This lane needs two
+    # prerequisites — the built bundle AND the browser binary
+    # (`./node_modules/.bin/playwright install --with-deps chromium`) — and a
+    # browser download is not something a lane should trigger silently on a
+    # developer's machine or in a job that never declared it. Task 14 makes both
+    # visible steps in the CI workflow. Run them by hand before this target:
+    #
+    #   cd web && ./node_modules/.bin/playwright install --with-deps chromium
+    #   cd web && ./node_modules/.bin/vite build
+    #
+    # `task db:up` was listed here and was never a prerequisite: the harness
+    # gets its database from internal/platform/testdb, which starts its own
+    # postgres:18-alpine testcontainer on an ephemeral port and migrates it from
+    # scratch. MEASURED — the compose database on 5432 sits untouched for the
+    # whole run. Docker is still required, hence the desc; a compose stack is
+    # not.
+    #
+    # A missing bundle fails at compile time (//go:embed all:dist against an
+    # absent dist), and a missing browser fails inside Playwright with its own
+    # install instructions — both legible, neither silent.
+    dir: backend
+    cmds:
+      # embedui because the binary must serve the built UI; webe2e because the
+      # harness is tagged so it never runs in backend:test; integration because
+      # the harness reuses serve_integration_test.go's syncBuffer.
+      - go test -tags "integration,webe2e,embedui" -count=1 -timeout 15m ./internal/app/ -run TestWebE2E
 
   secrets:
     cmds:
@@ -212,5 +413,22 @@ tasks:
     cmds:
       - task: backend:ci
       - task: contracts:check
+      # AFTER contracts:check, not before: both embedui lanes dep on web:build,
+      # which needs web/node_modules, and contracts:ts is what runs `npm ci`.
+      # Ordering them here means `task ci` needs nothing it did not already
+      # need — this aggregate has required Node since Plan 02 added
+      # contracts:ts, so the embedui lanes cost it no new dependency.
+      #
+      # THIS IS NOT THE WIRING THE GUARDS NEED, and it never was. `task ci` is
+      # the operator's local full-run: no CI job and no scripts/gate invocation
+      # reaches this aggregate — still true, and it is the whole point of this
+      # note. Listing the lanes here was strictly better than nowhere and was
+      # never a substitute for §14 naming both of them in scripts/gate. §14 has
+      # since done exactly that, and added them to the `web` job as well, so
+      # what protects them now is those two call sites and not this one.
+      # Deliberately not re-enumerating ci.yml's jobs or the gate's lane count
+      # here: the previous version of this comment did, and both lists rotted.
+      - task: backend:test:embedui
+      - task: backend:static:embedui
       - task: secrets
       - task: lint:actions

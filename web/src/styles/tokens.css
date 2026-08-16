@@ -1,0 +1,31 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+@theme {
+  /* THE PALETTE RESET. This is what makes "a new theme is a token file"
+     true rather than aspirational: bg-white and text-red-500 stop resolving
+     entirely, so a component CANNOT couple itself to Tailwind's colors.
+     Removing this line silently un-enforces §6 and web:arch's token check. */
+  --color-*: initial;
+
+  --color-ground: var(--caesar-ground);
+  --color-surface: var(--caesar-surface);
+  --color-surface-raised: var(--caesar-surface-raised);
+  --color-border: var(--caesar-border);
+  --color-text: var(--caesar-text);
+  --color-text-muted: var(--caesar-text-muted);
+  --color-accent: var(--caesar-accent);
+  --color-accent-contrast: var(--caesar-accent-contrast);
+  --color-danger: var(--caesar-danger);
+  --color-warning: var(--caesar-warning);
+  --color-success: var(--caesar-success);
+
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+
+  /* Console-honest density, squarish corners (§6). */
+  --radius-sm: 0.125rem;
+  --radius-md: 0.25rem;
+  --radius-lg: 0.375rem;
+}

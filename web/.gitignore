@@ -1,1 +1,10 @@
 node_modules/
+.tanstack/
+# Playwright's run artifacts (task web:e2e). test-results/ is written on EVERY
+# run, including a passing one — it holds .last-run.json — so without this the
+# tree is dirty after any E2E run, and `scripts/gate` refuses to run against a
+# dirty worktree. Biome needs telling separately (biome.json's files.includes):
+# MEASURED, it does not read this file, and it reported .last-run.json as a
+# formatting error until it was excluded there too.
+test-results/
+playwright-report/

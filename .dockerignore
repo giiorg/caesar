@@ -4,3 +4,21 @@
 docs
 backend/bin
 compose.dev.yaml
+
+# A host node_modules is the wrong platform's binaries and megabytes of context;
+# the ui stage runs its own npm ci.
+web/node_modules
+web/.tanstack
+# The bundle is a BUILD OUTPUT. The ui stage builds it fresh and the go stage
+# takes it with COPY --from=ui, so this line is about what the CONTEXT must not
+# smuggle in.
+#
+# It matters because COPY merges a directory rather than replacing it —
+# MEASURED, not assumed: with a stale dist/OLD-HASH.js in the context and a
+# fresh dist/NEW-HASH.js in the source stage, the image ends up holding BOTH,
+# while index.html is overwritten by the fresh one. A developer's stale local
+# dist would therefore leave orphaned hashed assets nothing references sitting
+# in every image built on that machine, and vite's emptyOutDir — which does
+# prune — would never get the chance to clean them, because it ran in a
+# different stage.
+backend/internal/webui/dist

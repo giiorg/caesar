@@ -1,0 +1,69 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.8/schema.json",
+  "files": {
+    "includes": [
+      "**",
+      "!**/node_modules",
+      "!src/api/schema.d.ts",
+      "!src/routeTree.gen.ts",
+      "!**/dist",
+      "!tools/arch/fixtures",
+      "!tools/mutants",
+      "!test-results",
+      "!playwright-report"
+    ]
+  },
+  "plugins": ["./tools/lint/no-qualified-fetch.grit"],
+  "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
+  "javascript": { "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" } },
+  "css": { "parser": { "tailwindDirectives": true } },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "style": {
+        "noDefaultExport": "error",
+        "useFilenamingConvention": {
+          "level": "error",
+          "options": { "filenameCases": ["kebab-case"] }
+        },
+        "noRestrictedImports": {
+          "level": "error",
+          "options": {
+            "paths": {
+              "node:fs": "the client runs in a browser",
+              "node:path": "the client runs in a browser"
+            }
+          }
+        },
+        "noRestrictedGlobals": {
+          "level": "error",
+          "options": {
+            "deniedGlobals": {
+              "fetch": "use the generated client in src/api/client.ts — a hand-written fetch bypasses the contract, the 401 interceptor and the correlation id"
+            }
+          }
+        }
+      },
+      "performance": { "noBarrelFile": "error", "noReExportAll": "error" }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["vite.config.ts", "vitest.config.ts", "playwright.config.ts"],
+      "linter": { "rules": { "style": { "noDefaultExport": "off" } } }
+    },
+    {
+      "includes": ["src/routes/**"],
+      "linter": { "rules": { "style": { "useFilenamingConvention": "off" } } }
+    },
+    {
+      "includes": ["tools/**"],
+      "linter": { "rules": { "style": { "noRestrictedImports": "off" } } }
+    },
+    {
+      "includes": ["src/api/client.ts", "src/realtime/sse-connection.ts", "src/test/**"],
+      "linter": { "rules": { "style": { "noRestrictedGlobals": "off" } } }
+    }
+  ]
+}

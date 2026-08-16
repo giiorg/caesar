@@ -1,0 +1,26 @@
+@import "./tokens.css";
+@import "./theme-dark.css";
+@import "./theme-light.css";
+
+/* `color-scheme` lives in the theme blocks, not here. `dark light` on html asks
+   the UA to choose from the OS preference, which is the one input the theme
+   tokens deliberately do not obey once someone has picked — so a light-OS
+   visitor on the default dark theme got light scrollbars and native controls
+   around a dark page. Moved rather than deleted: the property still has to be
+   set, just by whoever knows which theme won. */
+
+body {
+  background-color: var(--color-ground);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  /* Safe-area insets: the phone is the flagship surface (§6). */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+}
+
+/* 44px minimum targets, stated once rather than remembered per component. */
+button,
+a[role="button"],
+[role="tab"] {
+  min-height: 2.75rem;
+}

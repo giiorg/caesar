@@ -142,6 +142,13 @@ func Operations(a *API) []httpx.Operation {
 			// allowed to decide it — decideGate is where approve is enforced.
 			Summary:  "List gates awaiting a decision on the projects the caller holds any grant on (an admin sees every one). Unbounded by design at V1.",
 			Response: ApprovalListResponse{}, Status: http.StatusOK,
+			// 401 and no 403: authenticated() refuses a missing or expired
+			// cookie before the handler runs, but the handler itself never
+			// refuses an authenticated caller — it scopes to the projects they
+			// hold any grant on and answers 200 with an empty list when that
+			// set is empty. Seeing nothing and being refused are different
+			// answers and this endpoint only ever gives the first.
+			Errors:  []int{http.StatusUnauthorized},
 			Handler: a.authenticated(a.handleListApprovals),
 		},
 	}

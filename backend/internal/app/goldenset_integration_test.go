@@ -32,6 +32,7 @@ import (
 	"github.com/giiorg/caesar/backend/internal/runs"
 	runsapi "github.com/giiorg/caesar/backend/internal/runs/api"
 	"github.com/giiorg/caesar/backend/internal/runs/fake"
+	"github.com/giiorg/caesar/backend/internal/webui"
 	"github.com/giiorg/caesar/backend/internal/workflows"
 )
 
@@ -144,7 +145,7 @@ func TestGoldenSet_MonthOneLoopThroughRealRoutes(t *testing.T) {
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, identitySvc, identitySvc, identitySvc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, identitySvc))...)
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil))...)
-	srv := httptest.NewServer(Routes(discard(), pool, ops, "http://caesar.test"))
+	srv := httptest.NewServer(Routes(discard(), pool, ops, "http://caesar.test", webui.Handler()))
 	t.Cleanup(srv.Close)
 
 	orch := runs.NewOrchestrator(runsSvc, fake.NewExecutor(), runs.AlwaysAdmit{}, nil, runs.OrchestratorConfig{
@@ -458,7 +459,7 @@ func newGoldenEnv(t *testing.T) *goldenEnv {
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, identitySvc, identitySvc, identitySvc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, identitySvc))...)
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil))...)
-	srv := httptest.NewServer(Routes(discard(), pool, ops, "http://caesar.test"))
+	srv := httptest.NewServer(Routes(discard(), pool, ops, "http://caesar.test", webui.Handler()))
 	t.Cleanup(srv.Close)
 
 	orch := runs.NewOrchestrator(runsSvc, executor, runs.AlwaysAdmit{}, nil, runs.OrchestratorConfig{
