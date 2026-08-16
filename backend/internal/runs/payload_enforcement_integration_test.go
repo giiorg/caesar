@@ -91,12 +91,19 @@ func (h *spineHarness) runStatus(t *testing.T, runID uuid.UUID) runs.RunStatus {
 
 // nodeInstructions is what the PINNED DOCUMENT says the node was told, before
 // anything the runtime appends.
-func (h *spineHarness) nodeInstructions(nodeID string) string {
+//
+// It FATALS on an unknown node id rather than returning "". Both callers
+// compare against it — one with strings.HasPrefix, one with equality — and
+// against "" each of those degrades to trivially true, so a typo'd id would
+// silently convert a live assertion into a tautology.
+func (h *spineHarness) nodeInstructions(t *testing.T, nodeID string) string {
+	t.Helper()
 	for _, n := range h.doc.Nodes {
 		if n.ID == nodeID {
 			return n.Instructions
 		}
 	}
+	t.Fatalf("no node %q in the pinned document", nodeID)
 	return ""
 }
 
@@ -174,13 +181,27 @@ func TestPayloadEnforcement(t *testing.T) {
 		}
 	})
 
-	t.Run("a payload with extra keys is persisted unchanged", func(t *testing.T) {
-		// The extra key must reach the DATABASE, not merely survive validation.
-		// A validator that stripped unknown keys would pass every test in
+	t.Run("a payload with extra keys is accepted and stored unchanged", func(t *testing.T) {
+		// TWO CLAIMS, and the status assertion is what separates them.
+		//
+		// First, the extra key does not fail the run: unknown keys pass by
+		// contract (spec §2.3). Second, it reaches the DATABASE intact — a
+		// validator that stripped unknown keys would pass every test in
 		// payload_test.go and quietly delete whatever a harness added.
+		//
+		// Without the status check the payload assertion alone proves only the
+		// second: a validator that REJECTED the extra key would terminalize the
+		// node, and evaluateFailure stores res.Artifacts anyway (see the
+		// subtest below), so `confidence` would still be in the row. The
+		// acceptance half is also pinned at unit level in payload_test.go's
+		// "UNKNOWN KEYS PASS"; this is the same rule with a real orchestrator
+		// and a real row behind it.
 		h := newSpineHarness(t, schemaVersion(2))
 		h.executor.PlanExtra(map[string]any{"confidence": 0.8})
 		run := h.runToCompletion(t)
+		if got := h.runStatus(t, run); got != runs.RunSucceeded {
+			t.Fatalf("run = %s, want succeeded — an unknown key must not fail a node", got)
+		}
 		payload := h.artifactPayload(t, run, "plan")
 		if _, ok := payload["confidence"]; !ok {
 			t.Errorf("the extra key was dropped on the way to storage: %v", payload)
@@ -242,13 +263,13 @@ func TestPayloadEnforcement(t *testing.T) {
 		if !strings.Contains(got, `"summary"`) || !strings.Contains(got, `"steps"`) {
 			t.Errorf("a schema-2 plan node was not told its output shape:\n%s", got)
 		}
-		if !strings.HasPrefix(got, h.nodeInstructions("plan")) {
+		if !strings.HasPrefix(got, h.nodeInstructions(t, "plan")) {
 			t.Error("the appended block displaced the node's own instructions instead of following them")
 		}
 
 		h1 := newSpineHarness(t, schemaVersion(1))
 		h1.runToCompletion(t)
-		if h1.executor.LastInstructions("plan") != h1.nodeInstructions("plan") {
+		if h1.executor.LastInstructions("plan") != h1.nodeInstructions(t, "plan") {
 			t.Error("a schema-1 node's instructions were modified; v1 behaviour must be byte-identical")
 		}
 	})

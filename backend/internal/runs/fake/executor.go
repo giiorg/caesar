@@ -216,11 +216,14 @@ func (e *Executor) scripted(req runs.ExecutionRequest) (runs.NewArtifact, error)
 		}}, nil
 	case runs.KindReview:
 		return runs.NewArtifact{Type: runs.ArtifactKindReviewVerdict, Payload: map[string]any{
-			// `notes` is kept alongside the schema-2 keys, and that is not
-			// laziness. Unknown keys pass by contract (spec §2.3), and every
-			// pre-12a test that asserts on `notes` stays meaningful — a fake
-			// updated by DELETING its old shape would fail a dozen suites for a
-			// reason unrelated to what they test.
+			// `notes` is kept alongside the schema-2 keys, and NOT because
+			// anything asserts on it — nothing does; this emission is its only
+			// occurrence in the tree. It stays for two reasons. Deleting a key
+			// the fake has always emitted is churn on a double, changing what a
+			// dozen suites observe to buy nothing. And an unknown key riding
+			// beside the required ones is exactly the case spec §2.3 promises to
+			// accept, so carrying one makes every fake-driven run exercise that
+			// promise instead of only the required set.
 			//
 			// The counts are untyped Go ints, which is what a payload built in
 			// Go really carries when nothing marshals it on the way to the
@@ -232,7 +235,12 @@ func (e *Executor) scripted(req runs.ExecutionRequest) (runs.NewArtifact, error)
 			"tests":    map[string]any{"status": "passed", "passed": 1, "failed": 0},
 		}}, nil
 	default: // plan and anything agentic-shaped
-		// `content` is kept for the same reason `notes` is above.
+		// `content` is kept because REMOVING IT WOULD BREAK REAL ASSERTIONS —
+		// a stronger reason than `notes` above has, and it stands on its own.
+		// Five call sites read this key (fake/executor_test.go, the runner's
+		// lineage/execute/reconcile/gatenote suites), and none of them is about
+		// the payload contract; deleting it would fail them for a reason
+		// unrelated to what they test.
 		payload := map[string]any{
 			"content": "plan: " + firstLine,
 			"summary": "plan: " + firstLine,
