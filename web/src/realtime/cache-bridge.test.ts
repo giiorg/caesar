@@ -201,8 +201,9 @@ describe('routing a frame to its run', () => {
     // ATTENTION_KINDS already, so a routing test written on either would pass
     // with phase routing entirely absent — which is the hole this file's house
     // rule exists for. MEASURED: re-gating `dirtyRuns.add` on ATTENTION_KINDS
-    // fails the three tests in THIS block and none of the eight above, every
-    // one of which is written on an attention kind.
+    // fails three of the four tests in THIS block (the run_id guard below
+    // survives it) and none of the eight above, every one of which is written
+    // on an attention kind.
     //
     // This test replaces `ignores kinds outside the attention set`, whose
     // assertion was `t.count === 0`: an ignored kind must not even ARM a

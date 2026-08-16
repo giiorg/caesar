@@ -12,12 +12,16 @@ export type RunFilters = { status?: string; taskId?: string }
  * The runs list.
  *
  * THE KEY IS `['runs', filters]` AND THE SHAPE IS LOAD-BEARING. The cache
- * bridge invalidates the prefix `['runs']`, which react-query matches against
- * every filter variant — so a phase transition refreshes the list the user is
- * actually looking at, whatever they have filtered to. Encoding the filters
- * into the first element instead (`['runs:waiting']`) would make that prefix
- * match nothing, and the failure would be invisible: the list would simply be
- * as stale as the bounded refresh floor allows.
+ * bridge invalidates the bare prefix `['runs']`, and react-query's filters
+ * match by prefix unless `exact` is set — MEASURED on the pinned 5.101.4:
+ * invalidating `['runs']` marked both `['runs',{status:'waiting'}]` and
+ * `['runs',{}]` stale and left `['approvals']` alone. So a phase transition
+ * refreshes the list the user is actually looking at, whatever they have
+ * filtered to. Encoding the filters into the first element instead
+ * (`['runs:waiting']`) would make that prefix match nothing, and the failure
+ * would be invisible: the list would simply be as stale as the bounded refresh
+ * floor allows. Nothing ASSERTS the match yet — it takes a mounted
+ * `['runs', filters]` query to observe, which arrives with Task 13.
  *
  * ONE PAGE, deliberately. 12a's screens show the newest runs and infinite
  * scroll is not in the locked designs. The contract's `next_cursor` is
@@ -36,10 +40,12 @@ export function runsQueryOptions(filters: RunFilters = {}) {
     queryKey: ['runs', filters],
     queryFn: async () => {
       const res = await unwrap(await api.GET('/api/v1/runs', { params: { query } }))
-      // Required AND nullable, like every list in this contract: required and
-      // nullable are independent, and a Go nil slice marshals to null. Reading
-      // `.length` off what the contract permits would throw a TypeError on
-      // exactly the empty case every new user starts in.
+      // The contract marks `runs` required AND nullable: required and nullable
+      // are independent, and a Go nil slice marshals to null. The handler
+      // happens to build `make([]RunSummaryResponse, 0, len(list))`
+      // (backend/internal/runs/api/dto.go:487), so the wire carries `[]`
+      // today — but reading `.length` off what the contract permits would
+      // throw a TypeError on exactly the empty case every new user starts in.
       return res.runs ?? []
     },
     ...AUTH_SCOPED_QUERY_OPTIONS,

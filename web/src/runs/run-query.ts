@@ -9,16 +9,23 @@ export type Run = components['schemas']['ApiRunResponse']
  * One run, with its phases and artifact metadata.
  *
  * THE KEY IS `['run', runId]` AND IT IS THE ONE THE CACHE BRIDGE NAMES. A
- * stream frame carries the run it belongs to, and the bridge invalidates
- * exactly this key for it — so a phase transition on the run being watched
- * refetches that run and nothing else. Both spellings are literal rather than
- * a shared constant, deliberately, for the reason `approvals-query.ts`
- * records: a constant would make the two agree by construction and the
- * invalidation would be true by definition rather than tested.
+ * stream frame carries the run it belongs to, and the bridge invalidates this
+ * key for that run and no other — so a phase transition on one run does not
+ * refetch every run detail the cache is holding. It is not the only key the
+ * window invalidates: `['runs']` goes out on every frame and `['approvals']`
+ * on an attention kind (realtime/cache-bridge.ts fire()).
+ *
+ * Both spellings are literal rather than a shared constant, deliberately, for
+ * the reason `approvals-query.ts:10-14` records: a constant would make the two
+ * agree by construction. What holds them together for the inbox is
+ * `approvals.test.tsx`, end to end and through a real refetch. THERE IS NO
+ * SUCH TEST FOR THIS KEY YET — the bridge's own suite asserts the string it
+ * emits and nothing observes it. Task 16 is the first screen that can, and it
+ * should assert the round trip rather than the spelling.
  *
  * No events here. `GET /runs/{id}/events` stays the poll-and-resume path and
- * no 12a screen subscribes to it; this run's timeline comes from the phases
- * the view returns.
+ * no 12a screen subscribes to it; a run's timeline is built from the `phases`
+ * this response already carries.
  */
 export function runQueryOptions(runId: string) {
   return queryOptions({

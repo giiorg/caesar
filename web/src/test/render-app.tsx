@@ -74,7 +74,16 @@ export function renderApp(path: string, handlers: RequestHandler[] = []) {
     ...handlers,
     http.get('/api/v1/auth/me', authenticatedMe),
     http.get('/api/v1/approvals', () => HttpResponse.json({ approvals: [] })),
-    http.get('/api/v1/runs', () => HttpResponse.json({ runs: [], next_cursor: null })),
+    // `runs: null`, not `[]`. A Go nil slice marshals to null and the contract
+    // permits it, so this is a body the server may really send — the handler
+    // happens to build `make(...)` today
+    // (backend/internal/runs/api/dto.go:487), which is why the empty case is
+    // the one nothing would otherwise ever exercise. Picking the permitted
+    // shape costs nothing now (no route fetches /api/v1/runs yet) and puts
+    // `runsQueryOptions`'s `?? []` on the path of the first screen that
+    // mounts a list, instead of leaving that branch unreachable from every
+    // test in the tree.
+    http.get('/api/v1/runs', () => HttpResponse.json({ runs: null, next_cursor: null })),
     http.get('/api/v1/stream', silentStream),
   )
   // BOTH router arguments are load-bearing and neither is optional.
