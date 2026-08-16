@@ -73,6 +73,75 @@ func ValidateArtifactPayload(schemaVersion int, artifactType string, payload map
 	}
 }
 
+// OutputShapeInstruction is what a node is told about the payload it must
+// declare. It is APPENDED to the node's own instructions, never substituted
+// for them.
+//
+// Empty below the payload schema version, and that emptiness is the whole
+// compatibility guarantee at the prompt end: a schema-1 node's instructions
+// are byte-identical to what they were before this plan.
+//
+// Keyed on the NODE KIND rather than on the artifact type, because that is
+// what is known when a request is built. A node may still declare an artifact
+// of the other kind — collect.go's allowlist permits plan and review_verdict
+// from anywhere — and the validator judges whatever arrives, so this text is
+// guidance and the validator is the rule.
+//
+// It must contain no line beginning with `caesar-fake:`: fake.parseDirective
+// scans instructions line by line for that prefix, and a stray one would turn
+// every schema-2 node in the test suite into a scripted failure.
+func OutputShapeInstruction(schemaVersion int, nodeKind string) string {
+	if schemaVersion < payloadSchemaVersion {
+		return ""
+	}
+	switch nodeKind {
+	case KindPlan:
+		return planShapeBlock
+	case KindReview:
+		return reviewShapeBlock
+	default:
+		return ""
+	}
+}
+
+// Both blocks OPEN WITH A BLANK LINE, and that is load-bearing rather than
+// cosmetic: they are concatenated onto instructions that may end without a
+// newline, and the fake executor's `scripted` reads the FIRST line of what it
+// was handed. Without the leading newline the block's first characters would
+// be glued onto that line and every fake-driven assertion about plan content
+// would shift.
+const planShapeBlock = `
+
+--- caesar: required output shape ---
+Write your plan to .caesar/out/artifacts.json as one entry:
+
+  [{"type": "plan", "payload": {
+      "summary": "one or two sentences on what this changes and why",
+      "steps": [{"title": "short imperative", "detail": "optional elaboration"}]
+  }}]
+
+"summary" and "steps" are required; "steps" may be empty. Extra keys are kept.
+`
+
+const reviewShapeBlock = `
+
+--- caesar: required output shape ---
+Write your verdict to .caesar/out/artifacts.json as one entry:
+
+  [{"type": "review_verdict", "payload": {
+      "verdict": "approve" | "request_changes" | "reject",
+      "findings": [{"severity": "info"|"minor"|"major"|"blocker",
+                    "message": "what is wrong",
+                    "file": "optional path", "line": 0}],
+      "tests": null
+  }}]
+
+"verdict", "findings" and "tests" are required; "findings" may be empty. Set
+"tests" to null if you did not run tests, or to
+{"status": "passed"|"failed"|"not_run", "passed": 0, "failed": 0,
+ "details": "optional"} if you did. Extra keys are kept.
+`
+
 func validatePlanPayload(p map[string]any) error {
 	if err := requireString(p, "summary"); err != nil {
 		return err

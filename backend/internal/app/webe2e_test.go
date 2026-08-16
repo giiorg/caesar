@@ -55,18 +55,29 @@ import (
 	"github.com/giiorg/caesar/backend/internal/workflows"
 )
 
-// e2eWorkflow is the smallest definition that can reach a waiting gate: one
-// agentic node the fake executor answers, and a gate examining its patch.
+// e2eWorkflow is the smallest definition that reaches a waiting gate AND
+// produces the evidence the approval surface renders: an implement node the
+// fake answers with a patch, a review node that answers with a schema-2
+// verdict, and a gate examining the patch with the verdict beside it.
 // A gate cannot be a root node — workflows.validateConsumption requires it to
 // examine exactly one plan or patch — which is the whole reason this lane
 // substitutes the executor rather than inserting a gate row.
+//
+// SCHEMA 2, deliberately. This lane is 12a's acceptance path, so it must run
+// with payload validation ON — a lane pinned at schema 1 would prove the
+// screens work against payloads nothing checks.
 const e2eWorkflow = `{
-  "schema": 1,
+  "schema": 2,
   "nodes": [
     {"id": "impl", "type": "implement", "harness": "e2e", "instructions": "Write the change."},
-    {"id": "gate", "type": "gate"}
+    {"id": "review", "type": "review", "harness": "e2e", "instructions": "Review the change."},
+    {"id": "gate", "type": "gate", "on_request_changes": {"target": "impl", "max_rounds": 2}}
   ],
-  "edges": [{"from": "impl", "to": "gate", "artifact": "patch"}]
+  "edges": [
+    {"from": "impl", "to": "review", "artifact": "patch"},
+    {"from": "impl", "to": "gate", "artifact": "patch"},
+    {"from": "review", "to": "gate", "artifact": "review_verdict"}
+  ]
 }`
 
 func TestWebE2E(t *testing.T) {

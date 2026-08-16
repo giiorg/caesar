@@ -167,8 +167,12 @@ func TestPinnedFromVersion_CarriesTheDocumentSchemaVersion(t *testing.T) {
 // binary where those disagree validates nothing while every test in both
 // packages stays green.
 func TestPinnedSchemaVersionIsWhatDecidesPayloadValidation(t *testing.T) {
-	// A plan payload in the pre-contract shape: exactly what the fake executor
-	// and every existing harness write today.
+	// A plan payload in the pre-contract shape, WRITTEN OUT HERE rather than
+	// taken from a producer. It is the shape every harness wrote before Plan
+	// 12a taught them the contract, and it is a literal on purpose: this test
+	// pins the schema BOUNDARY, not any current producer's output. Sourcing it
+	// from the fake executor would have made it re-pass the moment the fake was
+	// migrated, which is exactly when the boundary most needs asserting.
 	legacy := map[string]any{"content": "plan: do the thing"}
 
 	for _, c := range []struct {

@@ -5,10 +5,62 @@ package runs_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/giiorg/caesar/backend/internal/runs"
 )
+
+func TestOutputShapeInstruction(t *testing.T) {
+	t.Run("nothing is appended below the payload schema version", func(t *testing.T) {
+		// The compatibility guarantee at the PROMPT end. A schema-1 node's
+		// instructions must be byte-identical to what they were before the
+		// payload contract existed, or a pinned v1 run is judged against one
+		// shape while being told another.
+		for _, kind := range []string{runs.KindPlan, runs.KindReview, runs.KindImplement} {
+			if got := runs.OutputShapeInstruction(1, kind); got != "" {
+				t.Errorf("schema 1, %s: got %q, want the empty string", kind, got)
+			}
+		}
+	})
+
+	t.Run("the constrained kinds are told their required keys", func(t *testing.T) {
+		for kind, keys := range map[string][]string{
+			runs.KindPlan:   runs.RequiredPayloadKeys[runs.ArtifactKindPlan],
+			runs.KindReview: runs.RequiredPayloadKeys[runs.ArtifactKindReviewVerdict],
+		} {
+			got := runs.OutputShapeInstruction(2, kind)
+			// Read against RequiredPayloadKeys rather than a literal list, so a
+			// key added to the validator without a word to the producer fails
+			// here instead of in production.
+			for _, k := range keys {
+				if !strings.Contains(got, `"`+k+`"`) {
+					t.Errorf("schema 2, %s: the block never names required key %q:\n%s", kind, k, got)
+				}
+			}
+		}
+	})
+
+	t.Run("an unconstrained kind is told nothing", func(t *testing.T) {
+		if got := runs.OutputShapeInstruction(2, runs.KindImplement); got != "" {
+			t.Errorf("implement got %q; a patch is extracted, not declared by shape", got)
+		}
+	})
+
+	t.Run("no line may open with the fake's directive prefix", func(t *testing.T) {
+		// fake.parseDirective scans instructions line by line for
+		// `caesar-fake:`. A stray one anywhere in these blocks would turn every
+		// schema-2 agentic node in the suite into a scripted failure — a
+		// tripwire the doc comment names and nothing else checks.
+		for _, kind := range []string{runs.KindPlan, runs.KindReview} {
+			for _, line := range strings.Split(runs.OutputShapeInstruction(2, kind), "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "caesar-fake:") {
+					t.Errorf("%s block carries a fake directive line: %q", kind, line)
+				}
+			}
+		}
+	})
+}
 
 func TestValidateArtifactPayload(t *testing.T) {
 	goodPlan := map[string]any{
