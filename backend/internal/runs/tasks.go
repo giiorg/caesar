@@ -93,6 +93,15 @@ type ArtifactMeta struct {
 	CreatedAt  time.Time
 }
 
+// ArtifactWithPayload is one artifact including its content. It is separate
+// from ArtifactMeta because the run projection deliberately carries metadata
+// only: a run with twenty artifacts would otherwise ship every patch on every
+// page load.
+type ArtifactWithPayload struct {
+	ArtifactMeta
+	Payload map[string]any
+}
+
 // RunDetail is the single-run read: everything the run page renders, from one
 // query set. It replaces GetRun's four return values, which had run out of
 // room the moment publications joined phases and artifacts.
@@ -588,17 +597,9 @@ func (s *Service) GetRunDetail(ctx context.Context, id uuid.UUID) (RunDetail, er
 	}
 	arts := make([]ArtifactMeta, 0, len(artRows))
 	for _, ar := range artRows {
-		var parentStrs []string
-		if err := json.Unmarshal(ar.ParentIds, &parentStrs); err != nil {
-			return RunDetail{}, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
-		}
-		parents := make([]uuid.UUID, 0, len(parentStrs))
-		for _, ps := range parentStrs {
-			pid, err := uuid.Parse(ps)
-			if err != nil {
-				return RunDetail{}, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
-			}
-			parents = append(parents, pid)
+		parents, err := parentIDsFromRow(ar.ParentIds)
+		if err != nil {
+			return RunDetail{}, err
 		}
 		arts = append(arts, ArtifactMeta{
 			ID: ar.ID, NodeID: ar.NodeID, Attempt: ar.Attempt, Generation: ar.Generation,
@@ -614,6 +615,66 @@ func (s *Service) GetRunDetail(ctx context.Context, id uuid.UUID) (RunDetail, er
 		pubs = append(pubs, publicationFromRow(pi))
 	}
 	return RunDetail{Run: run, Phases: phases, Artifacts: arts, Publications: pubs}, nil
+}
+
+// parentIDsFromRow decodes an artifact's lineage column — jsonb NOT NULL
+// DEFAULT '[]', an array of uuid strings. A row that fails either half is
+// corruption, not a caller's mistake: nothing writes that column but this
+// system, which is why both failures are plain errors and neither is a 400.
+//
+// It returns an empty slice rather than nil for a lineage-less artifact, so the
+// two projections that call it both put [] on the wire and never null.
+//
+// Extracted from GetRunDetail so the payload read below decodes lineage the same
+// way: a client reads provenance off both responses, and one decoder is one
+// answer.
+func parentIDsFromRow(raw []byte) ([]uuid.UUID, error) {
+	var strs []string
+	if err := json.Unmarshal(raw, &strs); err != nil {
+		return nil, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
+	}
+	out := make([]uuid.UUID, 0, len(strs))
+	for _, s := range strs {
+		id, err := uuid.Parse(s)
+		if err != nil {
+			return nil, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+// ArtifactPayload reads one artifact of one run.
+//
+// The RUN ID IS PART OF THE PREDICATE and not merely of the path. Authorization
+// upstream is scoped on the run, so an artifact fetched by bare id would let
+// one project's run id authorize another project's artifact. Belt and braces:
+// the caller checks the run, this checks the artifact belongs to it.
+func (s *Service) ArtifactPayload(ctx context.Context, runID, artifactID uuid.UUID) (ArtifactWithPayload, error) {
+	row, err := store.New(s.pool).GetArtifactByID(ctx, artifactID)
+	if err != nil {
+		return ArtifactWithPayload{}, notFound(err, "no such artifact")
+	}
+	if row.RunID != runID {
+		// 404 rather than 403: the caller has been authorized for THIS run, and
+		// telling them an id exists elsewhere is an existence oracle.
+		return ArtifactWithPayload{}, xerrors.E(xerrors.ClassNotFound, "no such artifact")
+	}
+	payload, err := unmarshalMap(row.Payload)
+	if err != nil {
+		return ArtifactWithPayload{}, err
+	}
+	parents, err := parentIDsFromRow(row.ParentIds)
+	if err != nil {
+		return ArtifactWithPayload{}, err
+	}
+	return ArtifactWithPayload{
+		ArtifactMeta: ArtifactMeta{
+			ID: row.ID, NodeID: row.NodeID, Attempt: row.Attempt, Generation: row.Generation,
+			Type: row.Type, ParentIDs: parents, CreatedAt: row.CreatedAt,
+		},
+		Payload: payload,
+	}, nil
 }
 
 // attachGateEvidence fills in Evidence on every phase still awaiting a

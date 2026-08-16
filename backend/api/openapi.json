@@ -1131,6 +1131,57 @@
         }
       }
     },
+    "/api/v1/runs/{id}/artifacts/{artifact_id}": {
+      "get": {
+        "summary": "Read one artifact of a run, including its payload (view). A `patch` payload carries `diff` as base64 by contract — a patch is arbitrary bytes and JSON string encoding would replace invalid UTF-8 silently. Decode once for display; never round-trip it.",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "getArtifact",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          },
+          {
+            "name": "artifact_id",
+            "in": "path",
+            "description": "artifact id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "artifact id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiArtifactPayloadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/runs/{id}/events": {
       "get": {
         "summary": "Poll a run's events after an id (view). With `Accept: text/event-stream` the same URL answers a server-sent stream instead — snapshot-then-deltas, resumed with Last-Event-ID — and every other Accept keeps this JSON poll. A stream whose principal loses access to the run ends with a terminal frame that carries NO id — `event: forbidden` with `data: {\"error\":\"forbidden\"}` — and then closes: the 200 is committed with the first byte, so a revocation can no longer be a 403.",
@@ -2088,6 +2139,62 @@
           "requester_id",
           "waiting_since",
           "evidence"
+        ],
+        "type": "object"
+      },
+      "ApiArtifactPayloadResponse": {
+        "properties": {
+          "attempt": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "generation": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "parent_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "payload": {
+            "additionalProperties": {},
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "run_id",
+          "node_id",
+          "attempt",
+          "generation",
+          "type",
+          "parent_ids",
+          "created_at",
+          "payload"
         ],
         "type": "object"
       },

@@ -97,6 +97,18 @@ type runEventsParams struct {
 	LastEventID string `header:"Last-Event-ID" description:"id of the last frame received; the text/event-stream response resumes above it"`
 }
 
+// artifactParams covers GET …/runs/{id}/artifacts/{artifact_id} — two path
+// parameters, no body.
+//
+// Without the entry generation SUCCEEDS and is silently wrong. requestStructure
+// panics only where {id} meets a non-nil Request; this operation declares none,
+// so it takes the idParams branch and the document loses artifact_id — an
+// operation the generated client could not address.
+type artifactParams struct {
+	idParams
+	ArtifactID string `path:"artifact_id" description:"artifact id (uuid)"`
+}
+
 // gateDecisionParams covers POST …/runs/{id}/gates/{node}/decision — two path
 // parameters plus a body.
 type gateDecisionParams struct {
@@ -120,6 +132,7 @@ var requestOverrides = map[string]any{
 	"updateWorkflow":         idAndUpdateWorkflow{},
 	"createWorkflowVersion":  idAndCreateWorkflowVersion{},
 	"getWorkflowVersion":     workflowVersionParams{},
+	"getArtifact":            artifactParams{},
 	"listRunEvents":          runEventsParams{},
 	"decideGate":             gateDecisionParams{},
 }

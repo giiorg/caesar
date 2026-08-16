@@ -106,6 +106,15 @@ func Operations(a *API) []httpx.Operation {
 			Handler: a.authenticated(a.handleGetRun),
 		},
 		{
+			Pattern: "GET /api/v1/runs/{id}/artifacts/{artifact_id}", ID: "getArtifact",
+			Summary: "Read one artifact of a run, including its payload (view). " +
+				"A `patch` payload carries `diff` as base64 by contract — a patch is " +
+				"arbitrary bytes and JSON string encoding would replace invalid UTF-8 " +
+				"silently. Decode once for display; never round-trip it.",
+			Response: ArtifactPayloadResponse{}, Status: http.StatusOK,
+			Handler: a.authenticated(a.handleGetArtifact),
+		},
+		{
 			Pattern: "GET /api/v1/runs/{id}/events", ID: "listRunEvents",
 			// One URL, two representations. The stream's frame schema is the
 			// SECOND response media type on this operation, declared in
@@ -393,6 +402,31 @@ func (a *API) handleGetRun(w http.ResponseWriter, r *http.Request, sess authn.Au
 		return
 	}
 	httpx.JSON(w, http.StatusOK, runResponse(detail, gateViewer{canApprove: canApprove, actorID: sess.UserID}))
+}
+
+// handleGetArtifact serves one artifact's content. Authorization is on the RUN
+// (spec §2.2): an artifact id may not be used to reach across a project
+// boundary, so the run is resolved and authorized first and the artifact is
+// then required to belong to it.
+func (a *API) handleGetArtifact(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	run, _, ok := a.runScoped(w, r, sess, authn.GrantView)
+	if !ok {
+		return
+	}
+	// A path segment that is not a uuid names no artifact, so it is this
+	// endpoint's 404 and not a 400: reporting the parse failure would turn a
+	// caller's typo into an unclassified error, which httpx.Problem answers 500.
+	artifactID, err := uuid.Parse(r.PathValue("artifact_id"))
+	if err != nil {
+		httpx.Problem(w, r, xerrors.E(xerrors.ClassNotFound, "no such artifact"))
+		return
+	}
+	art, err := a.svc.ArtifactPayload(r.Context(), run.ID, artifactID)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, artifactPayloadResponse(run.ID, art))
 }
 
 // decidability answers §5 for one gate. It is SERVER-SIDE because neither half

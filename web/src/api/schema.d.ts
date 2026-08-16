@@ -392,6 +392,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/runs/{id}/artifacts/{artifact_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one artifact of a run, including its payload (view). A `patch` payload carries `diff` as base64 by contract — a patch is arbitrary bytes and JSON string encoding would replace invalid UTF-8 silently. Decode once for display; never round-trip it.
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["getArtifact"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/runs/{id}/events": {
         parameters: {
             query?: never;
@@ -685,6 +705,22 @@ export interface components {
             task_title: string;
             /** Format: date-time */
             waiting_since: string;
+        };
+        ApiArtifactPayloadResponse: {
+            /** Format: int32 */
+            attempt: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int32 */
+            generation: number;
+            id: string;
+            node_id: string;
+            parent_ids: string[] | null;
+            payload: {
+                [key: string]: unknown;
+            } | null;
+            run_id: string;
+            type: string;
         };
         ApiArtifactResponse: {
             /** Format: int32 */
@@ -2031,6 +2067,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApiRunResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    getArtifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description resource id (uuid) */
+                id: string;
+                /** @description artifact id (uuid) */
+                artifact_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiArtifactPayloadResponse"];
                 };
             };
             /** @description Bad Request */

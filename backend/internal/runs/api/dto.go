@@ -109,6 +109,35 @@ type ArtifactResponse struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// ArtifactPayloadResponse is one artifact WITH its content. The metadata
+// duplicates ArtifactResponse deliberately: this endpoint is reachable without
+// having fetched the run, and a client that had to correlate two responses to
+// learn an artifact's type would be one join away from rendering a plan as a
+// diff.
+//
+// Every field is required and none is a $ref, so the "a required $ref claims
+// non-nullability" rule does not bite here: the server sends all nine on every
+// 200. The generator still gives parent_ids and payload a null branch, because
+// a Go slice and a Go map can each marshal to null — but neither is ever null
+// FROM THIS ENDPOINT: the projection below builds parent_ids with make (an
+// artifact with no lineage ships []), and unmarshalMap answers an empty map
+// rather than nil for an empty column. A client must satisfy the null branch to
+// typecheck; it will not observe one.
+type ArtifactPayloadResponse struct {
+	ID         string    `json:"id" required:"true"`
+	RunID      string    `json:"run_id" required:"true"`
+	NodeID     string    `json:"node_id" required:"true"`
+	Attempt    int32     `json:"attempt" required:"true"`
+	Generation int32     `json:"generation" required:"true"`
+	Type       string    `json:"type" required:"true"`
+	ParentIDs  []string  `json:"parent_ids" required:"true"`
+	CreatedAt  time.Time `json:"created_at" required:"true"`
+	// Payload is the artifact's content verbatim, in the shape its producer
+	// wrote. A `patch` carries `diff` base64-encoded (collect.go) — decoding is
+	// the client's, and decoding TWICE is how a diff becomes garbage.
+	Payload map[string]any `json:"payload" required:"true"`
+}
+
 type GateDecisionRequest struct {
 	Decision string `json:"decision"` // approve | request_changes | reject
 	Note     string `json:"note,omitempty"`
@@ -327,6 +356,22 @@ func runResponse(d runs.RunDetail, v gateViewer) RunResponse {
 		})
 	}
 	return out
+}
+
+// artifactPayloadResponse projects one artifact's content. The run id is passed
+// in rather than read off the artifact: the service has already required the two
+// to agree, so this echoes the run the CALLER addressed and there is no second
+// value that could disagree with it.
+func artifactPayloadResponse(runID uuid.UUID, a runs.ArtifactWithPayload) ArtifactPayloadResponse {
+	parents := make([]string, 0, len(a.ParentIDs))
+	for _, id := range a.ParentIDs {
+		parents = append(parents, id.String())
+	}
+	return ArtifactPayloadResponse{
+		ID: a.ID.String(), RunID: runID.String(), NodeID: a.NodeID,
+		Attempt: a.Attempt, Generation: a.Generation, Type: a.Type,
+		ParentIDs: parents, CreatedAt: a.CreatedAt, Payload: a.Payload,
+	}
 }
 
 func gateDecisionSummary(d *runs.GateDecision) *GateDecisionSummary {
