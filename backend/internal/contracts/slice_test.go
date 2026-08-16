@@ -21,7 +21,8 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 		} `json:"paths"`
 		Components struct {
 			Schemas map[string]struct {
-				Required []string `json:"required"`
+				Required   []string                   `json:"required"`
+				Properties map[string]json.RawMessage `json:"properties"`
 			} `json:"schemas"`
 		} `json:"components"`
 	}
@@ -94,14 +95,31 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 	// therefore renders `evidence: ApiGateEvidenceResponse` in TypeScript: not
 	// optional, not nullable, and wrong on most phases of most runs. Optional is
 	// the honest half-truth, because it makes the client narrow before it reads.
+	//
+	// This loop asserts an ABSENCE, so it has to prove it is looking at
+	// something: a renamed schema or a renamed property would satisfy "not in
+	// required" vacuously, and the pin would go quiet exactly when the thing it
+	// pins moved. The loop above fails loudly on a missing schema for free —
+	// every wanted property reads as absent — and this one has to say so.
 	wantNotRequired := map[string][]string{"ApiPhaseResponse": {"evidence"}}
 	for name, unwanted := range wantNotRequired {
-		for _, r := range doc.Components.Schemas[name].Required {
-			for _, u := range unwanted {
-				if r == u {
-					t.Errorf("%s: property %q is required, but the server sends null for it; "+
-						"openapi-typescript renders a required $ref as non-nullable", name, u)
-				}
+		schema, ok := doc.Components.Schemas[name]
+		if !ok {
+			t.Errorf("%s: no such schema — this pin asserts an absence and cannot do it against nothing", name)
+			continue
+		}
+		required := map[string]bool{}
+		for _, r := range schema.Required {
+			required[r] = true
+		}
+		for _, u := range unwanted {
+			if _, ok := schema.Properties[u]; !ok {
+				t.Errorf("%s: no property %q — renamed or dropped, and this pin no longer pins it", name, u)
+				continue
+			}
+			if required[u] {
+				t.Errorf("%s: property %q is required, but the server sends null for it; "+
+					"openapi-typescript renders a required $ref as non-nullable", name, u)
 			}
 		}
 	}

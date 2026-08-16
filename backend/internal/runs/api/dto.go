@@ -157,6 +157,8 @@ type GateEvidenceResponse struct {
 	// ExaminedArtifactID is empty ONLY where the pinned definition binds an
 	// artifact the run never produced — a state decideGate also refuses. The
 	// surface says the evidence is missing; it does not render an empty diff.
+	// CanDecide is false there for every caller, so a client never has to infer
+	// undecidability from an empty string.
 	ExaminedArtifactID string `json:"examined_artifact_id" required:"true"`
 	// A plan and a patch render differently and the client must know which
 	// before it fetches the payload.
@@ -164,14 +166,17 @@ type GateEvidenceResponse struct {
 	// Required AND nullable. "This gate has no verdict" is a value the client
 	// handles, not a key it fails to find.
 	SummaryArtifactID *string `json:"summary_artifact_id" required:"true"`
-	// CanDecide covers BOTH refusals in §5, which are independent: this
-	// endpoint lists gates for any grant while decideGate needs approve, and
-	// the run's policy may forbid the requester deciding their own gate.
+	// CanDecide covers every way decideGate refuses before it reads the
+	// decision, and they are independent: this endpoint lists gates for any
+	// grant while decideGate needs approve, the run's policy may forbid the
+	// requester deciding their own gate, and a gate whose examined artifact the
+	// run never produced is decidable by nobody.
 	// Where it is false the client suppresses ALL THREE controls — DecideGate
 	// refuses before it branches on decision type.
 	CanDecide bool `json:"can_decide" required:"true"`
-	// One of "", "not_approver", "self_approval_forbidden". Empty exactly when
-	// CanDecide is true.
+	// One of "", "not_approver", "self_approval_forbidden", "evidence_missing".
+	// Empty exactly when CanDecide is true. Computed server-side in decideGate's
+	// own order, so it names the refusal the caller would actually receive.
 	CannotDecideReason string `json:"cannot_decide_reason" required:"true"`
 	// WallDeadline rides along because §5's third refusal is displayable BEFORE
 	// it bites: a run past its deadline can no longer be decided and the
@@ -252,8 +257,14 @@ type gateViewer struct {
 	actorID    uuid.UUID
 }
 
+// noGateViewer is the viewer for a projection that has no gate to project. The
+// zero value already fails closed, but only by accident of which field comes
+// first; naming it says so at the call site and survives a reordering.
+func noGateViewer() gateViewer { return gateViewer{canApprove: false} }
+
 func gateEvidenceResponse(ev runs.GateEvidence, v gateViewer) GateEvidenceResponse {
-	canDecide, reason := decidability(v.canApprove, v.actorID, ev.RequesterID, ev.AllowSelfApproval)
+	haveExamined := ev.ExaminedArtifactID != uuid.Nil
+	canDecide, reason := decidability(v.canApprove, v.actorID, ev.RequesterID, ev.AllowSelfApproval, haveExamined)
 	out := GateEvidenceResponse{
 		ExaminedArtifactType: ev.ExaminedArtifactType,
 		CanDecide:            canDecide,
@@ -263,7 +274,7 @@ func gateEvidenceResponse(ev runs.GateEvidence, v gateViewer) GateEvidenceRespon
 	// A zero id is "the run never produced it", and the empty string is how
 	// that reaches a client — the all-zeroes uuid would read as an artifact
 	// they could go and fetch.
-	if ev.ExaminedArtifactID != uuid.Nil {
+	if haveExamined {
 		out.ExaminedArtifactID = ev.ExaminedArtifactID.String()
 	}
 	if ev.SummaryArtifactID != nil {

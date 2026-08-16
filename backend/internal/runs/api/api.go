@@ -344,8 +344,8 @@ func (a *API) handleRerunTask(w http.ResponseWriter, r *http.Request, sess authn
 		return
 	}
 	// A freshly minted run carries no phases, so no gate of it is projected and
-	// the zero viewer is the honest answer rather than a shortcut.
-	httpx.JSON(w, http.StatusCreated, runResponse(runs.RunDetail{Run: run}, gateViewer{}))
+	// the empty viewer is the honest answer rather than a shortcut.
+	httpx.JSON(w, http.StatusCreated, runResponse(runs.RunDetail{Run: run}, noGateViewer()))
 }
 
 func (a *API) handleListTaskRuns(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
@@ -361,7 +361,7 @@ func (a *API) handleListTaskRuns(w http.ResponseWriter, r *http.Request, sess au
 	out := RunListResponse{Runs: make([]RunResponse, 0, len(list))}
 	for _, run := range list {
 		// List entries stay shallow — no phases, so no gate evidence.
-		out.Runs = append(out.Runs, runResponse(runs.RunDetail{Run: run}, gateViewer{}))
+		out.Runs = append(out.Runs, runResponse(runs.RunDetail{Run: run}, noGateViewer()))
 	}
 	httpx.JSON(w, http.StatusOK, out)
 }
@@ -374,6 +374,14 @@ func (a *API) handleGetRun(w http.ResponseWriter, r *http.Request, sess authn.Au
 	// The run is READABLE with view and DECIDABLE with approve, so a second
 	// question is asked of the same project: may this caller decide a gate they
 	// can see? Authorize answers it for an admin too, whose grants are empty.
+	//
+	// It is asked on EVERY run, including the ones with no waiting gate, and
+	// deliberately. Skipping it would mean deferring the authorization question
+	// until after GetRunDetail so the phases could be scanned first — putting an
+	// access check downstream of the data read, which is the ordering every
+	// other handler here avoids — to save one indexed single-row lookup
+	// (identity/service.go: GetGrantLevel, and free for an admin) on a page that
+	// has already run several queries.
 	canApprove, err := a.authz.Authorize(r.Context(), sess.Principal, projectID, authn.GrantApprove)
 	if err != nil {
 		httpx.Problem(w, r, err)
@@ -392,16 +400,30 @@ func (a *API) handleGetRun(w http.ResponseWriter, r *http.Request, sess authn.Au
 // fetch each one — the N+1 this endpoint exists to prevent) and the approve
 // grant is not in the response at all.
 //
-// ORDER MATTERS AND IS DELIBERATE. A caller who is both the requester and short
-// of approve gets "not_approver", because that is the one an operator can act
-// on: a grant can be raised, and self-approval is a property of a run already
-// created. Both are true; the message names the fixable one.
-func decidability(canApprove bool, actorID, requesterID uuid.UUID, allowSelf bool) (bool, string) {
+// ORDER MATTERS AND IS DELIBERATE, and it is decideGate's own order. That
+// endpoint refuses on the grant first, then on the policy, and only then
+// resolves the examined artifact (gates.go), so checking in the same sequence
+// makes cannot_decide_reason name the refusal the caller would ACTUALLY get
+// rather than some other true thing about the gate.
+//
+// The first two also happen to be ordered the way an operator can act on them:
+// a caller who is both the requester and short of approve gets "not_approver",
+// because a grant can be raised and self-approval is a property of a run
+// already created. Both are true; the message names the fixable one.
+//
+// haveExamined is last because it is not the caller's problem until the caller
+// is otherwise able. A gate whose examined artifact the run never produced is
+// undecidable BY ANYONE — decideGate answers 500, not a refusal — so the
+// surface has to say so rather than ship a control that provokes it.
+func decidability(canApprove bool, actorID, requesterID uuid.UUID, allowSelf, haveExamined bool) (bool, string) {
 	if !canApprove {
 		return false, "not_approver"
 	}
 	if actorID == requesterID && !allowSelf {
 		return false, "self_approval_forbidden"
+	}
+	if !haveExamined {
+		return false, "evidence_missing"
 	}
 	return true, ""
 }

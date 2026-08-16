@@ -98,7 +98,7 @@ func TestWaitingGateCarriesItsEvidence(t *testing.T) {
 		// is missing. Substituting some other artifact would show a human one
 		// thing and stamp another; failing the whole request would take the
 		// inbox down over one unfinished run.
-		run, _ := h.stageGateWithoutItsExaminedArtifact(t)
+		run, node := h.stageGateWithoutItsExaminedArtifact(t)
 		got := h.onlyApproval(t, "approver-tok", run)
 		if got.Evidence.ExaminedArtifactID != "" {
 			t.Errorf("examined_artifact_id = %q, want empty: the run produced none", got.Evidence.ExaminedArtifactID)
@@ -107,6 +107,43 @@ func TestWaitingGateCarriesItsEvidence(t *testing.T) {
 		// there — so the surface can say which kind of evidence is missing.
 		if got.Evidence.ExaminedArtifactType != runs.ArtifactKindPatch {
 			t.Errorf("examined_artifact_type = %q, want patch", got.Evidence.ExaminedArtifactType)
+		}
+		// And the caller is told NOT to try. approver-tok holds approve and did
+		// not request this run, so both caller-scoped refusals pass — the only
+		// thing standing between them and a 500 is this reason.
+		if got.Evidence.CanDecide {
+			t.Error("can_decide is true on a gate whose examined artifact does not exist")
+		}
+		if got.Evidence.CannotDecideReason != "evidence_missing" {
+			t.Errorf("cannot_decide_reason = %q, want evidence_missing", got.Evidence.CannotDecideReason)
+		}
+		// The oracle, again: what decideGate really answers. can_decide is only
+		// worth rendering if it predicts the endpoint, and a 500 is precisely
+		// the answer a client must never be invited to provoke.
+		if resp := h.do(t, http.MethodPost, decisionPath(run, node), "approver-tok",
+			runsapi.GateDecisionRequest{Decision: "approve"}); resp.StatusCode == http.StatusOK {
+			t.Errorf("decideGate = %d on a gate with no examined artifact; "+
+				"if it succeeds now, can_decide: false is the wrong answer", resp.StatusCode)
+		}
+	})
+
+	t.Run("a caller who is both the requester and short of approve is told the fixable one", func(t *testing.T) {
+		// Both caller-scoped refusals are true at once. The documented order
+		// (api.go) answers not_approver, because a grant can be raised and the
+		// requester of an existing run cannot stop being it. Without this case
+		// the order is free to invert unnoticed.
+		run, node := h.stageGateNoSelfApproval(t, "runner-tok") // run grant: below approve
+		got := h.onlyApproval(t, "runner-tok", run)
+		if got.Evidence.CanDecide {
+			t.Error("can_decide is true for a caller who is neither an approver nor allowed to self-approve")
+		}
+		if got.Evidence.CannotDecideReason != "not_approver" {
+			t.Errorf("cannot_decide_reason = %q, want not_approver (the grant is the fixable half)",
+				got.Evidence.CannotDecideReason)
+		}
+		if resp := h.do(t, http.MethodPost, decisionPath(run, node), "runner-tok",
+			runsapi.GateDecisionRequest{Decision: "approve"}); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("decideGate = %d, want 403", resp.StatusCode)
 		}
 	})
 
@@ -143,7 +180,7 @@ func TestWaitingGateCarriesItsEvidence(t *testing.T) {
 	})
 
 	t.Run("the requester of a no-self-approval run is refused all three, not just approve", func(t *testing.T) {
-		run, node := h.stageGateNoSelfApproval(t) // approver-tok is the requester
+		run, node := h.stageGateNoSelfApproval(t, "approver-tok") // and approver-tok is asking
 		got := h.onlyApproval(t, "approver-tok", run)
 		if got.Evidence.CanDecide {
 			t.Error("can_decide is true for the requester of a run that forbids self-approval")
@@ -278,11 +315,14 @@ func (h *harness) stageGateWithoutItsExaminedArtifact(t *testing.T) (uuid.UUID, 
 	return runID, "gate"
 }
 
-// stageGateNoSelfApproval parks a gate on a run the APPROVER requested, under a
-// policy that forbids deciding one's own gate.
-func (h *harness) stageGateNoSelfApproval(t *testing.T) (uuid.UUID, string) {
+// stageGateNoSelfApproval parks a gate on a run REQUESTED BY requester, under a
+// policy that forbids deciding one's own gate. The requester is a parameter
+// because which grant they hold is the whole difference between the two cases
+// that read this fixture: an approver hits self_approval_forbidden, and a caller
+// below approve hits not_approver first.
+func (h *harness) stageGateNoSelfApproval(t *testing.T, requester string) (uuid.UUID, string) {
 	t.Helper()
-	_, runID, _ := h.gatedRun(t, "approver-tok", h.repoID, "my own gate")
+	_, runID, _ := h.gatedRun(t, requester, h.repoID, "my own gate")
 	// The snapshot is pinned at intake from the shipped baseline, which permits
 	// self-approval, and Plan 09 is what will make it configurable. Editing the
 	// pinned document is how a run under the other policy is staged today; it is
