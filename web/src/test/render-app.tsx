@@ -64,7 +64,7 @@ export const pendingStream = () =>
  * call msw gives priority to the EARLIER argument, and a later `server.use`
  * call outranks an earlier one. So the caller's handlers are spread first and
  * the defaults behind them, and a test can override any single endpoint
- * without restating the other two. The tempting shape — tests calling
+ * without restating the other three. The tempting shape — tests calling
  * `server.use` themselves before `renderApp` — silently loses, because the
  * harness's own call would then be the later one.
  */
@@ -74,6 +74,7 @@ export function renderApp(path: string, handlers: RequestHandler[] = []) {
     ...handlers,
     http.get('/api/v1/auth/me', authenticatedMe),
     http.get('/api/v1/approvals', () => HttpResponse.json({ approvals: [] })),
+    http.get('/api/v1/runs', () => HttpResponse.json({ runs: [], next_cursor: null })),
     http.get('/api/v1/stream', silentStream),
   )
   // BOTH router arguments are load-bearing and neither is optional.
