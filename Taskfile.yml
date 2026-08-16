@@ -1,5 +1,15 @@
 version: '3'
 
+# EVERY NODE-USING LANE RUNS THROUGH scripts/with-node, whoever invoked it.
+#
+# That script carries the full reasoning. The short version: this machine's
+# DEFAULT nvm version is 20.9.0, `scripts/gate` therefore ran `npm ci` under npm
+# 10.1.0, and that installs a tree with no @rolldown/binding — which kills vitest
+# AND vite together. It destroyed web/node_modules on four gate runs.
+#
+# `env: PATH:` here does NOT work and was measured not to: go-task honours other
+# injected env vars but resolves commands against the parent environment, so a
+# global PATH injection looks right and changes nothing. Hence a wrapper.
 vars:
   GOLANGCI_LINT_VERSION: v1.64.8
   GOFUMPT_VERSION: v0.7.0
@@ -235,8 +245,8 @@ tasks:
     desc: "Regenerate web/src/api/schema.d.ts from the OpenAPI document"
     dir: web
     cmds:
-      - npm ci
-      - npm run api:gen
+      - ../scripts/with-node npm ci
+      - ../scripts/with-node npm run api:gen
 
   contracts:gen:
     desc: "Regenerate every generated contract artifact"
@@ -261,18 +271,18 @@ tasks:
   web:install:
     dir: web
     cmds:
-      - npm ci
+      - ../scripts/with-node npm ci
 
   web:lint:
     dir: web
     cmds:
-      - ./node_modules/.bin/biome ci .
+      - ../scripts/with-node ./node_modules/.bin/biome ci .
 
   web:typecheck:
     dir: web
     cmds:
-      - ./node_modules/.bin/tsc --noEmit
-      - node tools/check-mutants.mjs
+      - ../scripts/with-node ./node_modules/.bin/tsc --noEmit
+      - ../scripts/with-node node tools/check-mutants.mjs
 
   web:arch:
     desc: "The two constitution rules no per-file linter can express"
@@ -284,25 +294,25 @@ tasks:
       # WITH the .ts extension — MEASURED: node's ESM resolver does not complete
       # an extensionless TypeScript specifier (ERR_MODULE_NOT_FOUND), which is
       # why tsconfig.json sets allowImportingTsExtensions.
-      - node --experimental-strip-types tools/arch/main.ts
+      - ../scripts/with-node node --experimental-strip-types tools/arch/main.ts
 
   web:test:
     dir: web
     cmds:
       # Runs both vitest projects: `node` (pure/transport, no DOM globals) and
       # `dom` (jsdom + the React plugin). Never npx — see the pre-flight note.
-      - ./node_modules/.bin/vitest run
+      - ../scripts/with-node ./node_modules/.bin/vitest run
 
   web:pins:
     dir: web
     cmds:
-      - node tools/check-pins.mjs
+      - ../scripts/with-node node tools/check-pins.mjs
 
   web:routes:check:
     desc: "Regenerate routeTree.gen.ts and fail on drift"
     dir: web
     cmds:
-      - ./node_modules/.bin/tsr generate
+      - ../scripts/with-node ./node_modules/.bin/tsr generate
       - git diff --exit-code -- src/routeTree.gen.ts
       # git diff is blind to an untracked or already-staged path, so the drift
       # gate would be vacuous exactly when the generated tree is not committed.
@@ -312,7 +322,7 @@ tasks:
   web:build:
     dir: web
     cmds:
-      - ./node_modules/.bin/vite build
+      - ../scripts/with-node ./node_modules/.bin/vite build
 
   web:e2e:
     desc: "Playwright against the real backend (needs Docker for Postgres)"

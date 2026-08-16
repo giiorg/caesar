@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Run a command under the Node version web/.nvmrc pins.
+#
+# WHY THIS EXISTS. `scripts/gate` runs contracts:check -> contracts:ts -> `npm ci`
+# in web/, and go-task spawns that through its embedded shell, which resolves
+# whatever node is first on the invoking shell's PATH. This machine's DEFAULT nvm
+# version is 20.9.0, so the gate ran npm 10.1.0, which hits the
+# optional-dependency bug (npm/cli#4828) and installs a tree with no
+# @rolldown/binding-<platform>. vitest 4 and vite are both built on rolldown, so
+# BOTH die and it reads as a broken repository rather than one wrong Node. That
+# destroyed web/node_modules on four separate gate runs (waves 4, 5, 7, 8).
+#
+# It is not only the install. MEASURED: with a node_modules installed correctly
+# under 24, `./node_modules/.bin/vitest` still dies under node 20.9.0 with
+# `SyntaxError: The requested module 'node:util' does not provide an export named
+# 'styleText'` — rolldown needs a newer Node than 20. So every node-using lane
+# needs this, not just the ones that say `npm`.
+#
+# WHY NOT `env:` IN THE TASKFILE. MEASURED, twice: go-task honours injected env
+# vars (a canary arrives) but NOT PATH — it resolves the command against the
+# parent process environment, and the injected PATH does not reach the child
+# either, so even a tool invoked by explicit path runs its `#!/usr/bin/env node`
+# shebang against the old PATH. A global `env: PATH:` looks like it works and
+# changes nothing.
+#
+# WHY A SCRIPT AND NOT AN INLINE PREFIX. `PATH="..." cmd` does work, but it bakes
+# a machine-specific absolute path into every lane's echoed command line — and
+# `scripts/gate` asserts those lines character-for-character. This keeps them
+# stable and puts the resolution in one auditable place.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+pinned=$(tr -d '[:space:]' <"$root/web/.nvmrc")
+
+# Prefer the pinned version from nvm when it is installed. When it is not, leave
+# PATH exactly as it was rather than guessing: in CI, actions/setup-node has
+# already put the right Node first, and there is no nvm directory to find.
+nvm_bin="$HOME/.nvm/versions/node/v$pinned/bin"
+if [ -x "$nvm_bin/node" ]; then
+	PATH="$nvm_bin:$PATH"
+	export PATH
+fi
+
+# Then assert, whichever way PATH was arrived at. Without this the failure mode
+# is the styleText crash above — a stack trace inside rolldown that says nothing
+# about Node versions. web/.npmrc's engine-strict=true covers `npm ci`
+# specifically; this covers everything else, including every lane that only ever
+# runs an already-installed tool.
+have=$(node -v 2>/dev/null || echo "none")
+if [ "$have" != "v$pinned" ]; then
+	echo "with-node: this repository pins Node v$pinned (web/.nvmrc) but resolved $have" >&2
+	echo "with-node: install it with \`nvm install\` from web/, or put v$pinned first on PATH." >&2
+	echo "with-node: do NOT delete package-lock.json — that unpins all the versions web:pins guards." >&2
+	exit 1
+fi
+
+exec "$@"
