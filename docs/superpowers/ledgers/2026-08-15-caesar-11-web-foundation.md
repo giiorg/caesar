@@ -41,18 +41,16 @@ not after each task. Within a wave, tasks are committed in dependency order and 
 commits' greenness is asserted by construction rather than measured — stating that plainly because
 the plan's own rule is per-task.
 
-All web lanes green at `12c7d35`: `web:pins` (34 pinned), `web:lint`, `web:typecheck` (tsc + the
+All web lanes green at `116ffdc`: `web:pins` (34 pinned), `web:lint`, `web:typecheck` (tsc + the
 route-inference mutant), `web:arch`, `web:test` (**178** tests, 16 files), `web:routes:check`,
 `web:build`. Both Go twins green: `go test ./internal/...` and `go test -tags embedui
-./internal/webui/`. `task web:e2e` green too, three consecutive runs at ~3.2s. The gate itself
-still covers only the backend four — **the web lanes AND the E2E lane are run by hand until Task 14
-mirrors them into `scripts/gate`.**
+./internal/webui/`. `task web:e2e` green too.
 
-**Every web lane above was re-run AFTER the gate, not before**, because the gate corrupts
-`node_modules` on the way through (below). The sequence that produced this line is: lanes green →
-commit → `scripts/gate` PASS → `@rolldown/` down to `pluginutils` → `npm ci` under node 24 →
-lanes green again, `package-lock.json` byte-identical. Anyone reporting a green web lane from
-before a gate run is reporting it against a tree that no longer exists.
+**The gate now runs all of them itself — 21 lanes.** Up to and including wave 8 it ran four
+backend lanes, so every web lane had to be run by hand and, worse, re-run AFTER the gate, because
+the gate corrupted `node_modules` on the way through. Both facts are now historical: the
+corruption is fixed at its root (below), and a full gate run leaves `web:test` green with no
+repair. Anyone reading an older revision of this file will find the opposite instruction there.
 
 ### ~~DIAGNOSED~~ — **FIXED in `beee9ba`**, and the fix is measured both ways
 
