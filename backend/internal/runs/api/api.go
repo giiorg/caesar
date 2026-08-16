@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -55,10 +56,22 @@ type API struct {
 	// runs a handler. internal/app passes the live realtime surface. What a nil
 	// one costs at request time is streamRunEvents' first check.
 	streams StreamServer
+	// log records the one thing this layer swallows rather than reports: a
+	// label lookup that failed AFTER a mutation already committed (see
+	// handleRerunTask). Everything else here becomes a problem+json response,
+	// so this is the only writer.
+	log *slog.Logger
 }
 
-func New(svc *runs.Service, auth authn.SessionAuthenticator, authz authn.Authorizer, grants GrantSource, streams StreamServer) *API {
-	return &API{svc: svc, auth: auth, authz: authz, grants: grants, streams: streams}
+func New(svc *runs.Service, auth authn.SessionAuthenticator, authz authn.Authorizer, grants GrantSource, streams StreamServer, log *slog.Logger) *API {
+	// A nil logger is legal for the same reason a nil StreamServer is:
+	// internal/contracts builds this table with every dependency nil to
+	// generate metadata and never runs a handler. It defaults rather than
+	// stays nil so a future handler cannot nil-panic on it.
+	if log == nil {
+		log = slog.Default()
+	}
+	return &API{svc: svc, auth: auth, authz: authz, grants: grants, streams: streams, log: log}
 }
 
 // Operations is the spine's route table: mux registration (httpx.Mount)
@@ -366,16 +379,29 @@ func (a *API) handleRerunTask(w http.ResponseWriter, r *http.Request, sess authn
 		httpx.Problem(w, r, err)
 		return
 	}
-	labels, err := a.svc.LabelsForTask(r.Context(), task)
-	if err != nil {
-		httpx.Problem(w, r, err)
-		return
-	}
 	// A freshly minted run carries no phases, so no gate of it is projected and
 	// the empty viewer is the honest answer rather than a shortcut. The LABELS
 	// are still resolved: they belong to the task rather than to the run, and
 	// leaving them blank would ship a projection whose header renders nothing
 	// on the very screen a re-run lands you on.
+	//
+	// THIS PATH DEGRADES WHERE THE READ PATHS REPORT, and the asymmetry is the
+	// point. Rerun has already COMMITTED a run by the time labels are looked
+	// up; answering 500 would hand the client a failure for a mutation that
+	// succeeded, and the obvious client response — retry — walks straight into
+	// the one-live-run-per-task conflict and looks like a different bug. A
+	// header that renders three blank strings is recoverable by a refresh; a
+	// duplicate rerun attempt is not. GET /runs/{id} has nothing committed to
+	// protect, so it reports the fault instead.
+	labels, err := a.svc.LabelsForTask(r.Context(), task)
+	if err != nil {
+		a.log.WarnContext(r.Context(), "rerun labels unresolved; responding without them",
+			slog.String("run_id", run.ID.String()),
+			slog.String("task_id", task.ID.String()),
+			slog.String("correlation_id", httpx.CorrelationID(r.Context())),
+			slog.String("error", err.Error()))
+		labels = runs.RunLabels{}
+	}
 	httpx.JSON(w, http.StatusCreated, runResponse(runs.RunDetail{Run: run, Labels: labels}, noGateViewer()))
 }
 

@@ -239,7 +239,7 @@ func runServeWith(ctx context.Context, cfg config.Config, log *slog.Logger, opts
 	// already owns that URL, behind runs/api's StreamServer port, because runs
 	// and realtime are peers and neither may name the other.
 	streams := realtimeapi.New(rt.streamer, svc, streamGrants, log)
-	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc, streams))...)
+	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc, streams, log))...)
 	ops = append(ops, realtimeapi.Operations(streams)...)
 
 	// Plan 06: the real Docker runner when configured. Disabled by default —

@@ -25,9 +25,21 @@ type stagedRuns struct {
 	// newestInA is the project-A run the "a card needs no second request"
 	// subtest reads. It is the one with PARTIAL phases — see stageRunsForListing.
 	newestInA uuid.UUID
+	// noPhases is the project-A run with NO phase rows at all. A run whose
+	// attempt is 0 rather than 1 only exists while nothing has been claimed, and
+	// it is the only row that can tell "the newest phase attempt" apart from a
+	// projection that defaults the ordinal.
+	noPhases uuid.UUID
 	// taskWithRuns is a task id the task filter can be pointed at.
 	taskWithRuns uuid.UUID
 }
+
+// listPageWalkSize is the page size the paging subtest walks with, and it is a
+// constant because the fixture is TUNED to it: the two runs sharing a
+// created_at have to fall either side of one of this walk's page boundaries, or
+// the cursor's id half is never the thing that decides a page break. Change one
+// and assertSharedPairStraddlesAPageBoundary tells you to change the other.
+const listPageWalkSize = 2
 
 // stageRunsForListing builds the fixture the whole file runs against: five runs
 // in project A, two in project B, mixed statuses, one of them waiting.
@@ -36,10 +48,14 @@ type stagedRuns struct {
 // than assumed, because every one of them is a way for a subtest below to pass
 // while testing nothing:
 //
-//  1. TWO RUNS SHARE A created_at. The keyset predicate is a row-value
-//     comparison over (created_at, id); with every timestamp distinct, the id
-//     half is dead weight and a cursor that dropped it pages correctly anyway.
-//     The pair is placed mid-list so a two-row walk straddles it.
+//  1. TWO RUNS SHARE A created_at, AND A PAGE BOUNDARY FALLS BETWEEN THEM. The
+//     keyset predicate is a row-value comparison over (created_at, id); with
+//     every timestamp distinct, the id half is dead weight and a cursor that
+//     dropped it pages correctly anyway — but so does one where the shared pair
+//     sits wholly inside a single page, because then no cursor is ever minted
+//     from a timestamp another row also carries. Ranks are asserted, not
+//     described: this comment claimed the straddle for a round before anything
+//     checked it.
 //  2. The timestamps are otherwise DISTINCT and spread. The harness clock is a
 //     fake pinned to one instant, so every run intake writes gets the SAME
 //     created_at — which would make the ordering entirely id-driven and leave
@@ -57,6 +73,13 @@ func (h *harness) stageRunsForListing(t *testing.T) stagedRuns {
 	// agoMin per task, in creation order. The two 50s are the shared pair; the
 	// project-A list's newest is the unique 20, so the card subtest does not
 	// depend on how a tie breaks.
+	//
+	// Newest-first these read 20, 30, 40, 50, 50, 60, 70 — so the pair occupies
+	// ranks 4 and 5, and a two-row walk ends its second page between them. That
+	// placement is what assertSharedPairStraddlesAPageBoundary holds; moving the
+	// pair to 35/35 (ranks 3 and 4, both inside page two) keeps every other
+	// property of this fixture true and makes the paging subtest stop testing
+	// the id half of the cursor.
 	staged := []struct {
 		repo    uuid.UUID
 		title   string
@@ -88,6 +111,9 @@ func (h *harness) stageRunsForListing(t *testing.T) stagedRuns {
 			if err != nil {
 				t.Fatal(err)
 			}
+		}
+		if i == 3 {
+			out.noPhases = runID
 		}
 		if i == 4 {
 			out.newestInA = runID
@@ -156,6 +182,7 @@ func (h *harness) assertListingFixtureIsNotTheSimpleCase(t *testing.T, staged st
 		t.Fatalf("fixture has %d shared created_at values, want exactly 1 — "+
 			"the cursor's id half is untested without one", shared)
 	}
+	h.assertSharedPairStraddlesAPageBoundary(t)
 
 	var distinct, total int
 	if err := h.pool.QueryRow(ctx,
@@ -183,6 +210,63 @@ func (h *harness) assertListingFixtureIsNotTheSimpleCase(t *testing.T, staged st
 			"a projection that listed only materialized rows would satisfy the assertion otherwise",
 			materialized, nodes)
 	}
+
+	// And one run with NOTHING materialized, which is what makes "attempt is the
+	// newest phase attempt" distinguishable from "attempt starts at 1".
+	var untouched int
+	if err := h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM phase_runs WHERE run_id = $1`,
+		staged.noPhases).Scan(&untouched); err != nil {
+		t.Fatal(err)
+	}
+	if untouched != 0 {
+		t.Fatalf("the run staged as unclaimed has %d phase rows, want 0 — "+
+			"attempt 0 is only meaningful on a run nothing has claimed", untouched)
+	}
+}
+
+// assertSharedPairStraddlesAPageBoundary is the half of property 1 that the
+// duplicate count cannot see. A shared created_at only exercises the id half of
+// the keyset predicate when a PAGE ENDS BETWEEN the two rows that carry it:
+// that is the one moment a cursor is minted from a timestamp another run also
+// has, and a cursor missing its id half either re-emits that run or skips it.
+// A pair sitting wholly inside one page is invisible to the walk — the fixture
+// stays "not the simple case" by the duplicate count and tests nothing new.
+func (h *harness) assertSharedPairStraddlesAPageBoundary(t *testing.T) {
+	t.Helper()
+	rows, err := h.pool.Query(context.Background(),
+		`SELECT created_at FROM runs ORDER BY created_at DESC, id DESC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var ats []time.Time
+	for rows.Next() {
+		var at time.Time
+		if err := rows.Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		ats = append(ats, at)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	// Rows sharing a created_at are adjacent under this ORDER BY, so one pass
+	// over neighbours finds the pair.
+	for i := 0; i+1 < len(ats); i++ {
+		if !ats[i].Equal(ats[i+1]) {
+			continue
+		}
+		if (i+1)%listPageWalkSize != 0 {
+			t.Fatalf("the shared created_at pair sits at ranks %d and %d of %d, "+
+				"which a %d-row walk keeps inside one page — no cursor is ever minted "+
+				"from a timestamp two runs share, so the id half of the keyset goes untested. "+
+				"Re-tune the agoMin values in stageRunsForListing.",
+				i+1, i+2, len(ats), listPageWalkSize)
+		}
+		return
+	}
+	t.Fatalf("no two adjacent runs share a created_at over %d runs", len(ats))
 }
 
 // nodeCountOfWorkflow is the node count of the definition every staged task
@@ -314,7 +398,7 @@ func TestListRuns(t *testing.T) {
 		var seen []string
 		cursor := ""
 		for page := 0; page < 10; page++ {
-			got := h.listRunsPaged(t, "admin-tok", cursor, 2)
+			got := h.listRunsPaged(t, "admin-tok", cursor, listPageWalkSize)
 			for _, r := range got.Runs {
 				seen = append(seen, r.ID)
 			}
@@ -368,6 +452,21 @@ func TestListRuns(t *testing.T) {
 		// impl is on attempt 2 while plan is on 1.
 		if r.Attempt != 2 {
 			t.Errorf("run attempt = %d, want 2 (the newest phase attempt)", r.Attempt)
+		}
+		// And the other end of that rule: a run nothing has claimed reports 0,
+		// not 1. "Attempt 1" on a queued run tells a card the first try is
+		// already under way, and the fixture guard above holds this row empty.
+		var unclaimed *runsapi.RunSummaryResponse
+		for i := range got.Runs {
+			if got.Runs[i].ID == staged.noPhases.String() {
+				unclaimed = &got.Runs[i]
+			}
+		}
+		if unclaimed == nil {
+			t.Fatalf("the unclaimed run %s is not in the project-A list", staged.noPhases)
+		}
+		if unclaimed.Attempt != 0 {
+			t.Errorf("unclaimed run attempt = %d, want 0 (no phase row has an ordinal yet)", unclaimed.Attempt)
 		}
 	})
 

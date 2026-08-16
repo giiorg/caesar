@@ -174,7 +174,7 @@ func operationTables() [][]httpx.Operation {
 		identityapi.Operations(identityapi.New(nil, 0, nil)),
 		assetsapi.Operations(assetsapi.New(nil, nil, nil, nil)),
 		workflowsapi.Operations(workflowsapi.New(nil, nil)),
-		runsapi.Operations(runsapi.New(nil, nil, nil, nil, nil)),
+		runsapi.Operations(runsapi.New(nil, nil, nil, nil, nil, nil)),
 		realtimeapi.Operations(realtimeapi.New(nil, nil, nil, nil)),
 	}
 }

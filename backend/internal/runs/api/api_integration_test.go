@@ -121,7 +121,19 @@ func (p spinePorts) Repo(_ context.Context, id uuid.UUID) (runs.RepoRef, error) 
 // A missing id is an ABSENT entry and never an error — the port's contract, and
 // the reason a deleted repository does not take out the list of runs that name
 // it.
+// labelsUnavailable is the fault a real adapter reports when the store behind
+// it is unreachable — distinct from a missing id, which is an absent entry.
+func (p spinePorts) labelsUnavailable() error {
+	if p.h.labelsDown {
+		return xerrors.E(xerrors.ClassInternal, "label store unreachable")
+	}
+	return nil
+}
+
 func (p spinePorts) ProjectNames(_ context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	if err := p.labelsUnavailable(); err != nil {
+		return nil, err
+	}
 	names := map[uuid.UUID]string{p.h.projectID: "spine", p.h.projectB: "spine-b"}
 	out := map[uuid.UUID]string{}
 	for _, id := range ids {
@@ -133,6 +145,9 @@ func (p spinePorts) ProjectNames(_ context.Context, ids []uuid.UUID) (map[uuid.U
 }
 
 func (p spinePorts) RepoSlugs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	if err := p.labelsUnavailable(); err != nil {
+		return nil, err
+	}
 	out := map[uuid.UUID]string{}
 	for _, id := range ids {
 		r, err := p.Repo(ctx, id)
@@ -145,6 +160,9 @@ func (p spinePorts) RepoSlugs(ctx context.Context, ids []uuid.UUID) (map[uuid.UU
 }
 
 func (p spinePorts) WorkflowNames(_ context.Context, versionIDs []uuid.UUID) (map[uuid.UUID]string, error) {
+	if err := p.labelsUnavailable(); err != nil {
+		return nil, err
+	}
 	out := map[uuid.UUID]string{}
 	for _, vid := range versionIDs {
 		for _, v := range p.h.versions {
@@ -302,6 +320,11 @@ type harness struct {
 	approverB authn.Principal
 	viewer    authn.Principal
 	outsider  authn.Principal
+	// labelsDown makes every label lookup fail, which is the only way to reach
+	// the one branch in this package that swallows an error instead of
+	// reporting it (handleRerunTask). It is a field rather than a separate
+	// double because the port is answered by spinePorts, which holds *harness.
+	labelsDown bool
 }
 
 func seedUser(t *testing.T, pool *pgxpool.Pool, email string, role authn.Role) authn.Principal {
@@ -445,8 +468,8 @@ func newHarnessWithStreams(t *testing.T, streams runsapi.StreamServer) *harness 
 		fake.NewPublisher(nil), ports, runs.Params{Snapshot: runs.DefaultSnapshot(), Labels: ports})
 
 	mux := http.NewServeMux()
-	httpx.Mount(mux, runsapi.Operations(runsapi.New(svc, h.ports, h.ports, h.ports, streams)))
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	httpx.Mount(mux, runsapi.Operations(runsapi.New(svc, h.ports, h.ports, h.ports, streams, log)))
 	h.srv = httptest.NewServer(httpx.Chain(mux, httpx.WithCorrelationID, httpx.AccessLog(log), httpx.CheckOrigin("http://caesar.test")))
 	t.Cleanup(h.srv.Close)
 	return h
@@ -964,6 +987,7 @@ func TestRunsAPI_ReadEndpointsRequireViewGrant(t *testing.T) {
 		if run.ID != task.LatestRunID || run.TaskID != task.ID {
 			t.Errorf("run identity wrong: %+v", run)
 		}
+		assertRunLabels(t, "GET /runs/{id}", run, "ship it")
 		if run.Status != string(runs.RunPending) || run.DefinitionHash != "deadbeef" {
 			t.Errorf("run pins wrong: %+v", run)
 		}
@@ -985,7 +1009,30 @@ func TestRunsAPI_ReadEndpointsRequireViewGrant(t *testing.T) {
 		if len(list.Runs[0].Phases) != 0 || len(list.Runs[0].Artifacts) != 0 {
 			t.Errorf("list entries must stay shallow: %+v", list.Runs[0])
 		}
+		// Shallow means NO PHASES, not "no labels". Every row of this list is a
+		// card too, and the labels are resolved once for the whole list because
+		// every run of one task shares the task's.
+		assertRunLabels(t, "GET /tasks/{id}/runs", list.Runs[0], "ship it")
 	})
+}
+
+// assertRunLabels holds the three header labels of a RunResponse to their real
+// values. It exists because "required in the contract" pins the SHAPE and not
+// the content: RunResponse's task_title, repo_slug and workflow_name shipped
+// for a round emitted by three handlers and asserted by none, and deleting the
+// resolution from all three left the whole suite green. Blank is the failure
+// mode — a run whose header renders nothing — so blank is what this refuses.
+func assertRunLabels(t *testing.T, where string, run runsapi.RunResponse, wantTitle string) {
+	t.Helper()
+	if run.TaskTitle != wantTitle {
+		t.Errorf("%s task_title = %q, want %q", where, run.TaskTitle, wantTitle)
+	}
+	if run.RepoSlug != "spine/repo" {
+		t.Errorf("%s repo_slug = %q, want the staged repo's slug", where, run.RepoSlug)
+	}
+	if run.WorkflowName != workflowName {
+		t.Errorf("%s workflow_name = %q, want %q", where, run.WorkflowName, workflowName)
+	}
 }
 
 func TestRunsAPI_RerunSupersedesPendingAndRefusesLive(t *testing.T) {
@@ -1008,6 +1055,9 @@ func TestRunsAPI_RerunSupersedesPendingAndRefusesLive(t *testing.T) {
 		if second.ID == task.LatestRunID || second.Status != string(runs.RunPending) {
 			t.Fatalf("second run = %+v, want a new pending run", second)
 		}
+		// A re-run lands you on the run screen, so its header is rendered from
+		// this very response and never from a follow-up read.
+		assertRunLabels(t, "POST /tasks/{id}/runs", second, "ship it")
 		first := decodeInto[runsapi.RunResponse](t, h.do(t, http.MethodGet, "/api/v1/runs/"+task.LatestRunID, "runner-tok", nil))
 		if first.Status != string(runs.RunSuperseded) {
 			t.Errorf("first run = %q, want superseded", first.Status)
@@ -1026,6 +1076,49 @@ func TestRunsAPI_RerunSupersedesPendingAndRefusesLive(t *testing.T) {
 			t.Fatalf("rerun of a running run = %d, want 409", resp.StatusCode)
 		}
 	})
+}
+
+// TestRunsAPI_RerunDegradesRatherThanFailsOnALabelFault pins the one asymmetry
+// in this package: rerun swallows a label fault, the read paths report it.
+//
+// The reason is what has already happened when the lookup runs. Rerun has
+// COMMITTED a run; a 500 would tell the client its mutation failed when it
+// succeeded, and the retry that follows hits the one-live-run-per-task
+// constraint and surfaces as a 409 nobody can explain. A header rendering three
+// blank strings costs a refresh. GET has committed nothing, so it has nothing
+// to protect and reports the fault honestly.
+func TestRunsAPI_RerunDegradesRatherThanFailsOnALabelFault(t *testing.T) {
+	h := newHarness(t)
+	task := h.createTask(t, "admin-tok", "ship it")
+
+	h.labelsDown = true
+	t.Cleanup(func() { h.labelsDown = false })
+
+	resp := h.do(t, http.MethodPost, "/api/v1/tasks/"+task.ID+"/runs", "runner-tok", nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("rerun with the label store down = %d, want 201 — the run was already written",
+			resp.StatusCode)
+	}
+	created := decodeInto[runsapi.RunResponse](t, resp)
+	if created.TaskTitle != "" || created.RepoSlug != "" || created.WorkflowName != "" {
+		t.Errorf("degraded rerun invented labels: %q/%q/%q",
+			created.TaskTitle, created.RepoSlug, created.WorkflowName)
+	}
+
+	// The read path, same fault, same request second: still a fault.
+	if r := h.do(t, http.MethodGet, "/api/v1/runs/"+created.ID, "viewer-tok", nil); r.StatusCode != http.StatusInternalServerError {
+		t.Errorf("GET /runs/{id} with the label store down = %d, want 500 — "+
+			"a read has no committed write to protect and must not hide the fault", r.StatusCode)
+	}
+
+	// And the mutation really landed, which is the whole reason the 201 is
+	// right: the run is readable, pending, and labelled once the store is back.
+	h.labelsDown = false
+	run := decodeInto[runsapi.RunResponse](t, h.do(t, http.MethodGet, "/api/v1/runs/"+created.ID, "viewer-tok", nil))
+	if run.ID != created.ID || run.Status != string(runs.RunPending) {
+		t.Fatalf("the degraded rerun's run reads back as %+v, want a pending run", run)
+	}
+	assertRunLabels(t, "GET /runs/{id} after the fault cleared", run, "ship it")
 }
 
 func TestRunsAPI_ListRunEventsPagesByID(t *testing.T) {
