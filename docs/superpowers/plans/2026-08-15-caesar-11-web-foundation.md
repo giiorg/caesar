@@ -5156,11 +5156,42 @@ The most expensive task in this plan and the only construct that can prove the S
 
 **Read pre-flight findings 1–4 before starting.** A gate cannot be a root node, so the only substitution in this harness is `runs.Executor`; everything else — `Routes`, the `Orchestrator`, `materializeNode`, `appendEvents`, the outbox, the SSE stream — is production code.
 
+> **CORRECTED AGAINST EXECUTION (wave 8).** Five claims below were false as written; the text
+> that follows is fixed, and these are named so nobody reintroduces them.
+>
+> 1. **Step 2's harness invoked `npx playwright test`** — the exact ban pre-flight finding 1
+>    established, reintroduced inside a Go snippet. Wave 5 rewrote every *verify line* off `npx`
+>    and this one survived because it is not a verify line. It is
+>    `./node_modules/.bin/playwright` now.
+> 2. **The blast-radius test was vacuous.** `var zero serveOptions; if zero.executor != nil` asserts
+>    that Go zeroes struct fields — true of every program ever compiled, and still green after
+>    someone changes `runServe` to pass `serveOptions{executor: …}`, which is the property actually
+>    at issue. It reads `serve.go`'s AST now. Note for whoever mutates it: it reads the file from
+>    DISK at runtime, so `go test -overlay` cannot falsify it — a real edit can, and does.
+> 3. **`//go:build webe2e` alone does not compile.** The file uses `syncBuffer`, which lives in
+>    `serve_integration_test.go` behind the `integration` tag, and the failure reads as an undefined
+>    symbol rather than a missing tag. The tag is `webe2e && integration`.
+> 4. **`e2e/` was typechecked by nothing.** `tsconfig.json`'s include listed `playwright.config.ts`
+>    but not `e2e`, and vitest's globs are `src/**` / `tools/**`. MEASURED both ways: a probe type
+>    error in `e2e/` is caught with `e2e` in include and silent without it.
+> 5. **Playwright writes `test-results/` on every run, including a PASSING one** (`.last-run.json`),
+>    and **biome does not read `.gitignore`** — `web:lint` failed on that file's formatting. Both
+>    `web/.gitignore` and `biome.json`'s `files.includes` need telling, separately.
+>
+> Smaller: `WorkflowVersion: 1` is read back off `CreateVersion` rather than assumed, and
+> `e2eSeed`'s parameters are `(ctx, t, cfg)`.
+>
+> **The `listener` field's justification is now MEASURED rather than reasoned.** Setting
+> `AppOrigin` to a host the browser will not send produces a real `403` on
+> `POST /api/v1/auth/login`, and the spec dies at `getByRole('navigation')`. The ordering deadlock
+> the field exists for is real.
+
 **Files:**
 - Modify: `backend/internal/app/serve.go` (the `serveOptions` seam)
-- Create: `backend/internal/app/webe2e_test.go` (`//go:build webe2e`)
+- Modify: `backend/internal/app/serve_integration_test.go` (the blast-radius test)
+- Create: `backend/internal/app/webe2e_test.go` (`//go:build webe2e && integration`)
 - Create: `web/playwright.config.ts`, `web/e2e/approvals.spec.ts`
-- Modify: `Taskfile.yml`
+- Modify: `Taskfile.yml`, `scripts/gate`, `web/tsconfig.json`, `web/biome.json`, `web/.gitignore`
 
 **Interfaces:**
 - Consumes: everything above.
@@ -5235,31 +5266,36 @@ func runServeWith(ctx context.Context, cfg config.Config, log *slog.Logger, opts
 }
 ```
 
-Extend the blast-radius test to cover the second field — a seam with two overrides needs both pinned, or the next one gets added without one:
-
-```go
-	var zero serveOptions
-	if zero.executor != nil {
-		t.Fatal("the zero serveOptions must select the production executor")
-	}
-	if zero.listener != nil {
-		t.Fatal("the zero serveOptions must bind cfg.Server.Addr itself")
-	}
-```
-
-Add to `backend/internal/app/serve_integration_test.go`:
+Add the blast-radius test to `backend/internal/app/serve_integration_test.go`. It asserts on the
+CALL `runServe` makes, not on a zero value's fields — see corrective note 2:
 
 ```go
 // TestProductionServeNeverOverridesTheExecutor pins the seam's blast radius:
-// runServe — the only path cmd/caesar reaches — passes an empty serveOptions,
-// so no deployment can be talked into a fake executor by any config it accepts.
+// runServe — the only path cmd/caesar reaches — passes an EMPTY serveOptions,
+// so no deployment can be talked into a fake executor or a foreign listener by
+// any config it accepts.
 func TestProductionServeNeverOverridesTheExecutor(t *testing.T) {
-	var zero serveOptions
-	if zero.executor != nil {
-		t.Fatal("the zero serveOptions must select the production executor")
+	file, err := parser.ParseFile(token.NewFileSet(), "serve.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
+	var body []ast.Stmt
+	for _, d := range file.Decls {
+		if fn, ok := d.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == "runServe" {
+			body = fn.Body.List
+		}
+	}
+	if len(body) != 1 {
+		t.Fatalf("runServe has %d statements, want exactly one: a delegation to runServeWith", len(body))
+	}
+	// ... then: the one statement is a return of a four-arg call to
+	// runServeWith, whose fourth argument is a serveOptions COMPOSITE LITERAL
+	// (a variable could carry anything) with zero elements.
 }
 ```
+
+Needs `go/ast`, `go/parser` and `go/token` in the import block. MEASURED: adding any field to that
+literal turns it red; `go test -overlay` does NOT, because the test reads the file from disk.
 
 Run: `cd backend && go test -tags integration ./internal/app/ -run TestProductionServeNeverOverrides -v` → expect PASS.
 
@@ -5268,7 +5304,7 @@ Run: `cd backend && go test -tags integration ./internal/app/ -run TestProductio
 `backend/internal/app/webe2e_test.go`:
 
 ```go
-//go:build webe2e
+//go:build webe2e && integration
 
 package app
 
@@ -5373,7 +5409,7 @@ func TestWebE2E(t *testing.T) {
 
 	// 4. Bootstrap the admin THROUGH the production path, then seed the assets
 	//    the slice needs. Every one of these goes through the real services.
-	seed := e2eSeed(t, ctx, cfg) // admin email/password, project, credential,
+	seed := e2eSeed(ctx, t, cfg) // admin email/password, project, credential,
 	                             // harness, repo, workflow version
 
 	// 5. The control server. Playwright calls this BETWEEN assertions, which is
@@ -5390,7 +5426,7 @@ func TestWebE2E(t *testing.T) {
 		// materializes the GATE, inserted 'waiting_decision', with its
 		// gate.waiting event in the same appendEvents transaction.
 		if _, _, err := seed.runsSvc.CreateTask(r.Context(), seed.admin, runs.NewTask{
-			RepoID: seed.repoID, WorkflowID: seed.workflowID, WorkflowVersion: 1,
+			RepoID: seed.repoID, WorkflowID: seed.workflowID, WorkflowVersion: seed.workflowVersion,
 			Title: "E2E approval", Inputs: map[string]any{},
 		}); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -5401,7 +5437,10 @@ func TestWebE2E(t *testing.T) {
 	defer control.Close()
 
 	// 6. Hand it to Playwright.
-	cmd := exec.CommandContext(ctx, "npx", "playwright", "test")
+	// By PATH, never `npx`: npx reaches the public registry when the binary is
+	// missing locally, so a lane that lost its node_modules would silently run a
+	// DIFFERENT playwright than the one web/package.json pins.
+	cmd := exec.CommandContext(ctx, "./node_modules/.bin/playwright", "test")
 	cmd.Dir = "../../../web"
 	cmd.Env = append(os.Environ(),
 		"CAESAR_BASE_URL="+baseURL,
@@ -5500,12 +5539,13 @@ type e2eFixture struct {
 	admin              authn.Principal
 	email, password    string
 	repoID, workflowID uuid.UUID
+	workflowVersion    int32
 	runsSvc            *runs.Service
 }
 
 // e2eSeed builds the world through the REAL services — the same doors the admin
 // CLI and the HTTP handlers use. Nothing here writes SQL directly.
-func e2eSeed(t *testing.T, ctx context.Context, cfg config.Config) e2eFixture {
+func e2eSeed(ctx context.Context, t *testing.T, cfg config.Config) e2eFixture {
 	t.Helper()
 	pool, err := pgxpool.New(ctx, cfg.Database.URL)
 	if err != nil {
@@ -5563,7 +5603,11 @@ func e2eSeed(t *testing.T, ctx context.Context, cfg config.Config) e2eFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := workflowsSvc.CreateVersion(ctx, admin, wf.ID, []byte(e2eWorkflow)); err != nil {
+	// READ BACK rather than assumed to be 1: CreateTask resolves the definition
+	// by (workflow, version), so a hardcoded 1 that stopped matching would
+	// surface as a 404 at intake.
+	version, _, err := workflowsSvc.CreateVersion(ctx, admin, wf.ID, []byte(e2eWorkflow))
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -5576,7 +5620,8 @@ func e2eSeed(t *testing.T, ctx context.Context, cfg config.Config) e2eFixture {
 		gitPublisher{assets: assetsSvc, workDir: cfg.Forge.PublishWorkDir, endpoints: forgeEndpointsFrom(cfg.Forge)},
 		principalSource{svc: identitySvc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
 
-	return e2eFixture{admin: admin, email: email, password: password, repoID: repo.ID, workflowID: wf.ID, runsSvc: runsSvc}
+	return e2eFixture{admin: admin, email: email, password: password, repoID: repo.ID,
+		workflowID: wf.ID, workflowVersion: version.Version, runsSvc: runsSvc}
 }
 ```
 
@@ -5675,9 +5720,18 @@ Then update `scripts/gate`'s `LANE_CMDS` to the new resolved lines — the scrip
 
 ```bash
 task db:up
-cd web && ./node_modules/.bin/playwright install --with-deps chromium && ./node_modules/.bin/vite build
+# --with-deps installs OS packages via apt and is for the Linux CI job. On
+# macOS use the bare form; the browser download is ~95MB either way.
+cd web && ./node_modules/.bin/playwright install chromium && ./node_modules/.bin/vite build
 cd .. && task web:e2e
 ```
+
+Before this runs green, three config files need the new directory (corrective notes 4 and 5):
+`web/tsconfig.json` adds `e2e` to `include`, and `web/.gitignore` plus `biome.json`'s
+`files.includes` both exclude `test-results/` and `playwright-report/`.
+
+`go test` hides a passing subprocess's output, so a first green run says nothing about whether
+Playwright ran at all — confirm with `-v` once, expecting `1 passed`.
 
 Expected: PASS. When it fails, read the failure in this order — Playwright's own output, then the server log the harness captured, then `SELECT status FROM phase_runs` on the test database. If the gate never reached `waiting_decision`, the fault is in the seed (a harness the workflow references but does not exist is a 400 at `CreateTask`, not a hang), not in the client.
 

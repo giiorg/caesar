@@ -26,20 +26,23 @@ full session on this project.
 | 6 | 8 — app shell, the V1 page map, the connection indicator | `5073519` | **PASS** |
 | — | wave-6 plan corrections + ledger entry | `ea92410` | docs only |
 | 7 | 11 — invalidate-only cache bridge, the real `/approvals` | `63bbb1f` | **PASS** |
-| — | wave-7 plan corrections + this ledger entry | _(this commit)_ | docs only |
+| — | wave-7 plan corrections + ledger entry | `82e126f` | docs only |
+| 8 | 13 — the E2E lane, four beats against the real backend | `12c7d35` | **PASS** |
+| — | wave-8 plan corrections + this ledger entry | _(this commit)_ | docs only |
 
-**Done: Tasks 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12. Remaining: 13 → 14 (a chain).**
+**Done: Tasks 1–13. Remaining: 14.**
 
 The gate is `scripts/gate <abs-worktree> <sha> <branch>` and it ran green at each wave boundary,
 not after each task. Within a wave, tasks are committed in dependency order and their individual
 commits' greenness is asserted by construction rather than measured — stating that plainly because
 the plan's own rule is per-task.
 
-All web lanes green at `63bbb1f`: `web:pins` (34 pinned), `web:lint`, `web:typecheck` (tsc + the
+All web lanes green at `12c7d35`: `web:pins` (34 pinned), `web:lint`, `web:typecheck` (tsc + the
 route-inference mutant), `web:arch`, `web:test` (**178** tests, 16 files), `web:routes:check`,
 `web:build`. Both Go twins green: `go test ./internal/...` and `go test -tags embedui
-./internal/webui/`. The gate itself still covers only the backend four — **the web lanes are run
-by hand until Task 14 mirrors them into `scripts/gate`.**
+./internal/webui/`. `task web:e2e` green too, three consecutive runs at ~3.2s. The gate itself
+still covers only the backend four — **the web lanes AND the E2E lane are run by hand until Task 14
+mirrors them into `scripts/gate`.**
 
 **Every web lane above was re-run AFTER the gate, not before**, because the gate corrupts
 `node_modules` on the way through (below). The sequence that produced this line is: lanes green →
@@ -66,7 +69,7 @@ measured, not inferred:**
    enforces nothing.
 
 Proof: binding present and 113 tests green → `scripts/gate` (PASS) → `@rolldown/` holds only
-`pluginutils`. Reproduced twice. `npm ci` under npm 11.17.0 *or* 11.6.2 restores it and leaves
+`pluginutils`. Reproduced FOUR times (waves 4, 5, 7, 8). `npm ci` under npm 11.17.0 *or* 11.6.2 restores it and leaves
 `package-lock.json` byte-identical; the error message's own advice — delete the lock — would
 unpin all 34 versions `web:pins` exists to guard, and must not be followed.
 
@@ -89,7 +92,7 @@ Only the two braces parallelize; the file sets inside each are disjoint. Tasks 4
 overlap — Task 4 regenerates `schema.d.ts` out of `web/node_modules` while Task 1 rewrites
 `package.json` and reinstalls that same tree.
 
-**Both braces are now done. Everything left is strictly serial**, one task per wave: 13 → 14.
+**Both braces are now done. Everything left is strictly serial**, one task per wave: 14 alone.
 There is no more parallelism to find in this plan.
 
 Wave 5 (Task 7) was executed **inline by the orchestrator**, not through the per-wave Workflow the
@@ -401,6 +404,49 @@ that only the tests exercise.**
     `''` when the field is absent, while `frame.kind` is the record the backend stored and the
     thing `GET /approvals` is a projection of — so the fixture now makes them DISAGREE.
 
+Wave 8 added five, and the headline is a new shape: **the lane's own green first run proved
+nothing, because `go test` hides a passing subprocess's output.** Playwright's result was invisible
+until the run was repeated with `-v`.
+
+31. **The plan's harness shelled out to `npx playwright test`** — pre-flight finding 1's exact ban,
+    reintroduced inside a Go snippet. Wave 5 rewrote every *verify line* off `npx` and this one
+    survived precisely because it is not a verify line. Now `./node_modules/.bin/playwright`.
+    Worth generalising: a ban enforced by rewriting one syntactic category leaks into every other
+    category.
+32. **The plan's blast-radius test asserted that Go zeroes struct fields.** `var zero serveOptions;
+    if zero.executor != nil` is true of every program ever compiled, and stays green after someone
+    changes `runServe` to pass `serveOptions{executor: …}` — which is the entire property the test
+    is named for. It reads `serve.go`'s AST now and is falsifiable: adding any field to that
+    literal turns it red. A second fact fell out of trying to kill it — **`go test -overlay` cannot
+    falsify a test that reads its subject from disk at runtime.** The overlay is a compiler
+    substitution; `parser.ParseFile` opens the real file and reported the unmutated source, so the
+    mutant passed and looked like a surviving guard. Sixth appearance of the green-for-the-wrong-
+    reason shape (items 3, 12, 15, 20, 24, 27), and the first where the MUTATION TECHNIQUE, not the
+    test, was the defective instrument.
+33. **`//go:build webe2e` alone does not compile.** The harness uses `syncBuffer` from
+    `serve_integration_test.go`, which is `integration`-tagged, so a bare `-tags webe2e` fails as an
+    undefined symbol — a broken package rather than a missing tag. Tagged `webe2e && integration`.
+34. **`e2e/` was typechecked by nothing, and `test-results/` broke `web:lint`.** `tsconfig.json`
+    listed `playwright.config.ts` but not `e2e`, and vitest's globs are `src/**` / `tools/**` — so
+    the spec was checked by no lane at all. MEASURED both ways with a probe type error. Separately,
+    Playwright writes `test-results/.last-run.json` on every run INCLUDING a passing one, and
+    **biome does not read `.gitignore`** — measured, removing the `files.includes` exclusion brings
+    the formatting error straight back. Two files needed telling, not one.
+35. **The `listener` field's justification is now measured rather than reasoned.** The plan argued
+    at length that `CheckOrigin`'s exact-equality comparison forces bind-before-configure. Setting
+    `AppOrigin` to a host the browser will not send produces a real `403` on
+    `POST /api/v1/auth/login`, and the spec dies at `getByRole('navigation')`. The argument was
+    right, and it is now evidence — the same standard the `__Host-` cookie comment is still waiting
+    on.
+
+**What the lane is worth, stated as a mutant.** Making `createCacheBridge.onFrame` return early —
+a bridge that receives every frame and invalidates nothing — fails the spec at the badge assertion
+after 30s, while the harness's own diagnostic reports `impl = succeeded` and
+`gate = waiting_decision`. That is the whole point of the construct: the backend did its entire job
+through production code, and the failure is isolated to the client. No mocked stream can produce
+that discrimination. Beat 1's message is measured too — `scopeEmpty` is false for a bootstrapped
+admin, so "Nothing is waiting on you." is the right string rather than the grant-less one.
+
 Two smaller ones, both about claims rather than code. **The `/approvals` loader does not make
 `AppErrorBoundary`'s 401 branch reachable** — measured, removing the loader leaves every test in the
 file green, because `useSuspenseQuery` throws to the same boundary; what makes the branch reachable
@@ -414,6 +460,25 @@ Also measured and NOT adopted: the plan's second, disabled observer
 (`useQuery({ ...meQueryOptions, enabled: false })`) for background expiry. Both observers read
 the same cache entry and report the same error, so reading `error` off the existing
 `useSuspenseQuery` is equivalent — one hook fewer, no change to any test or fetch count.
+
+## What Task 14 inherits from wave 8
+
+- **`task web:e2e` runs in ZERO automated lanes today.** It is not in `scripts/gate` and not in CI —
+  the `web` job does not exist yet, which is Task 14's work. It is the third thing in that
+  position, alongside `backend:test:embedui` and `backend:static:embedui`.
+- **It deliberately has no `deps:`**, unlike `backend:test:embedui`. It needs TWO prerequisites —
+  the built bundle and a ~95MB browser download — and a lane that silently downloads a browser is
+  not one a developer should be able to trigger by accident. Task 14 makes
+  `./node_modules/.bin/playwright install --with-deps chromium` and `vite build` visible steps in
+  the workflow. `--with-deps` is the Linux form and is what CI needs; on macOS use the bare form.
+- **`webe2e` is now in the tag lists of `backend:vet`, `backend:analyze` and `backend:vuln`**, and
+  the three matching `LANE_CMDS` lines in `scripts/gate` were updated with them. `embedui` is still
+  deliberately absent from all three: `//go:embed all:dist` will not compile without a build, and
+  those lanes must stay Node-free.
+- **The E2E lane is fast and stable where it stands**: ~3.2s wall, three consecutive clean runs,
+  against a 30s assertion timeout. The knob is `PollInterval: 200ms`.
+- **`scripts/gate` ate `web/node_modules` a fourth time**, exactly as diagnosed. Same recovery,
+  `package-lock.json` byte-identical, every web lane re-run green afterwards.
 
 ## Open items
 
@@ -546,6 +611,22 @@ From wave 6:
 - ~~**`AppShell` is never rendered through a real route**~~ — **CLOSED in `63bbb1f`.** `AppLayout`
   now passes `connection` and `approvalCount` from live values, and mutating either is caught.
 
+From wave 8:
+
+- **The E2E asserts ONE happy path and no failure mode.** A stream that never opens, a `forbidden`
+  frame, a 500 from `/approvals`, a second gate on the same run — none are exercised. The lane's
+  cost is a browser download and a Docker Postgres, so breadth here is expensive by design.
+- **Nothing asserts the gate row's CONTENT**, only that the badge reads `1` and the title renders.
+  A gate materialized against the wrong run or node would satisfy the spec.
+- **`e2eDiagnose` runs only on failure**, so its own SQL is exercised only when something else is
+  already broken — it was measured once, by the cache-bridge mutant, and that is its only run.
+- **The lane never asserts the executor substitution took**, it infers it: `NotImplementedExecutor`
+  cannot produce a patch, so `impl = succeeded` could only have come from the fake. True, but it is
+  reasoning rather than an assertion.
+- **`awaitListening` duplicates the polling loop in `TestRunServe_BootsMigratesAndShutsDownOnCancel`
+  and the `servedProcess` method of the same name.** Three readiness waits in one package, behind
+  three different build tags.
+
 From wave 7:
 
 - **The `/approvals` loader is unfalsifiable.** Removing it leaves the whole suite green, because
@@ -595,6 +676,14 @@ because the next person to execute it will otherwise reintroduce exactly what wa
   with msw's precedence, `pendingStream`, the abort-signal fact and the retry timeout; the Files
   list gained `stream-status.test.tsx`, `render-app.tsx` and the `_app.test.tsx` modification; and
   the second Step 7 is now Step 8.
+- **Task 13** (wave 8). A corrective block at the top names all five false claims. Step 1's
+  blast-radius test is rewritten as an AST assertion over `serve.go` with the `-overlay` caveat
+  stated; Step 2's build tag is `webe2e && integration`, its Playwright invocation is by path, its
+  `e2eSeed` takes `(ctx, t, cfg)` and reads the workflow version back off `CreateVersion`, and
+  `e2eFixture` gained `workflowVersion`; Step 6 drops `--with-deps` for the macOS form, names the
+  three config files that need the new directory, and says to confirm with `-v` once because a
+  passing subprocess prints nothing. The Files list gained `serve_integration_test.go`,
+  `scripts/gate`, `web/tsconfig.json`, `web/biome.json` and `web/.gitignore`.
 - **Task 8** (wave 6). Step 1's harness is now `RouterContextProvider` over the real route tree
   with a `renderShell` helper, and its theme case stubs a dark OS preference; Step 2's expectation
   is FAIL-on-content rather than module-not-found, and names the test that passes against Task 7's
