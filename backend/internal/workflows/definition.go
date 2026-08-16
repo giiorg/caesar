@@ -17,9 +17,22 @@ import (
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
 
-// SchemaVersion is the only document schema this binary understands.
-// Bump it (and branch in ParseDocument) when the format evolves.
-const SchemaVersion = 1
+// SchemaVersion is the version NEW documents are written as. MinSchemaVersion
+// is the oldest this binary still parses.
+//
+// Schema 2 differs from 1 in exactly one way and it is not in this file: a
+// schema-2 document's agentic nodes are instructed in, and their declared
+// payloads validated against, the artifact payload schemas (Plan 12a §2.3).
+// The DOCUMENT shape is unchanged, which is why this is a version bump and not
+// a new type — and why an existing workflow opts in by registering a new
+// version rather than being migrated in place.
+//
+// Rollback is deploying the old binary: v1 runs are unaffected, and a v2
+// document is refused HERE at registration rather than mis-executed.
+const (
+	SchemaVersion    = 2
+	MinSchemaVersion = 1
+)
 
 // maxDocumentLen caps parsing before any allocation-heavy decode — the
 // API body cap (1 MiB) restated here so the parser is safe standalone.
@@ -118,9 +131,9 @@ func ParseDocument(raw []byte) (Document, error) {
 	if dec.More() {
 		return Document{}, xerrors.E(xerrors.ClassInvalid, "invalid definition document: trailing data")
 	}
-	if d.Schema != SchemaVersion {
+	if d.Schema < MinSchemaVersion || d.Schema > SchemaVersion {
 		return Document{}, xerrors.E(xerrors.ClassInvalid, "unsupported schema version").
-			WithFields(xerrors.FieldError{Field: "schema", Message: fmt.Sprintf("must be %d", SchemaVersion)})
+			WithFields(xerrors.FieldError{Field: "schema", Message: fmt.Sprintf("must be %d or %d", MinSchemaVersion, SchemaVersion)})
 	}
 	if len(d.Edges) == 0 {
 		d.Edges = nil

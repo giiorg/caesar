@@ -2769,6 +2769,41 @@
         ],
         "type": "object"
       },
+      "ApiPlanPayload": {
+        "properties": {
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/ApiPlanStep"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "ApiPlanStep": {
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      },
       "ApiProjectGrantResponse": {
         "properties": {
           "email": {
@@ -2919,6 +2954,52 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "ApiReviewFinding": {
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "line": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "message"
+        ],
+        "type": "object"
+      },
+      "ApiReviewVerdictPayload": {
+        "properties": {
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/ApiReviewFinding"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "tests": {
+            "$ref": "#/components/schemas/ApiTestOutcome"
+          },
+          "verdict": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "verdict",
+          "findings"
+        ],
         "type": "object"
       },
       "ApiRunEventResponse": {
@@ -3247,6 +3328,28 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "ApiTestOutcome": {
+        "properties": {
+          "details": {
+            "type": "string"
+          },
+          "failed": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "passed": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
         "type": "object"
       },
       "ApiUserListResponse": {

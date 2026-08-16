@@ -46,7 +46,7 @@ func pinnedFromVersion(v workflows.Version) (runs.PinnedDefinition, error) {
 	if err != nil {
 		return runs.PinnedDefinition{}, fmt.Errorf("app: stored definition %s unparseable: %w", v.ID, err)
 	}
-	mirror := runs.DefinitionDoc{}
+	mirror := runs.DefinitionDoc{Schema: doc.Schema}
 	for _, n := range doc.Nodes {
 		mn := runs.DefNode{
 			ID: n.ID, Kind: string(n.Type), Harness: n.Harness, Instructions: n.Instructions,

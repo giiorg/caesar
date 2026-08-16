@@ -42,8 +42,14 @@ func validEdgeArtifact(a string) bool {
 
 // DefinitionDoc is the runs-owned mirror of a stored definition.
 type DefinitionDoc struct {
-	Nodes []DefNode
-	Edges []DefEdge
+	// Schema is the document schema version the pinned definition was written
+	// with, mirrored verbatim. It is not the runtime's version and never
+	// defaults: payload validation is a property of THIS number
+	// (ValidateArtifactPayload), so a mirror that dropped it would switch the
+	// contract off for every run without failing anything.
+	Schema int
+	Nodes  []DefNode
+	Edges  []DefEdge
 }
 
 // DefRevision is the runs-owned mirror of a gate's bounded
@@ -92,6 +98,12 @@ type PlanNode struct {
 type ExecPlan struct {
 	Order []string
 	Nodes map[string]PlanNode
+	// SchemaVersion is the pinned document's schema version, carried through
+	// from DefinitionDoc.Schema. The orchestrator hands it to
+	// ValidateArtifactPayload: a node is judged against the payload shape its
+	// OWN pinned document promised, never against whatever this binary writes
+	// today.
+	SchemaVersion int
 	// gateFor maps a git-publish node to the gate whose approval authorizes
 	// it, and publishFor is its inverse. The document validator already
 	// proved the assignment exists and is one-to-one (workflows §2
@@ -229,7 +241,7 @@ func Compile(doc DefinitionDoc) (ExecPlan, error) {
 		})
 		nodes[n.ID] = pn
 	}
-	plan := ExecPlan{Order: order, Nodes: nodes}
+	plan := ExecPlan{Order: order, Nodes: nodes, SchemaVersion: doc.Schema}
 	if err := plan.assignGates(in); err != nil {
 		return ExecPlan{}, err
 	}

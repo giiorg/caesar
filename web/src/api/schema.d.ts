@@ -900,6 +900,14 @@ export interface components {
             node_type: string;
             status: null | string;
         };
+        ApiPlanPayload: {
+            steps: components["schemas"]["ApiPlanStep"][] | null;
+            summary: string;
+        };
+        ApiPlanStep: {
+            detail?: string;
+            title: string;
+        };
         ApiProjectGrantResponse: {
             email?: string;
             level?: string;
@@ -953,6 +961,18 @@ export interface components {
             slug?: string;
             /** Format: date-time */
             updated_at?: string;
+        };
+        ApiReviewFinding: {
+            file?: string;
+            /** Format: int32 */
+            line?: number;
+            message: string;
+            severity: string;
+        };
+        ApiReviewVerdictPayload: {
+            findings: components["schemas"]["ApiReviewFinding"][] | null;
+            tests?: components["schemas"]["ApiTestOutcome"];
+            verdict: string;
         };
         ApiRunEventResponse: {
             /** Format: int64 */
@@ -1040,6 +1060,14 @@ export interface components {
             status?: string;
             title?: string;
             workflow_version_id?: string;
+        };
+        ApiTestOutcome: {
+            details?: string;
+            /** Format: int32 */
+            failed?: number;
+            /** Format: int32 */
+            passed?: number;
+            status: string;
         };
         ApiUserListResponse: {
             users?: components["schemas"]["ApiUserResponse"][] | null;

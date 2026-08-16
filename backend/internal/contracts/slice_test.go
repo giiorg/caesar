@@ -103,6 +103,16 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 			"id", "node_id", "attempt", "generation", "type", "parent_ids", "created_at",
 		},
 		"ApiRunListResponse": {"runs"},
+		// The artifact payload contract (document schema 2). These five reach
+		// the document through contracts' extraSchemas list rather than through
+		// an operation, so this is also the pin that fails if that mechanism
+		// stops working: every wanted property reads as absent when the schema
+		// is missing entirely.
+		"ApiPlanPayload":          {"summary", "steps"},
+		"ApiPlanStep":             {"title"},
+		"ApiReviewVerdictPayload": {"verdict", "findings"},
+		"ApiReviewFinding":        {"severity", "message"},
+		"ApiTestOutcome":          {"status"},
 	}
 	for name, want := range wantRequired {
 		got := map[string]bool{}
@@ -140,6 +150,13 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 	wantNotRequired := map[string][]string{
 		"ApiPhaseResponse": {"evidence", "decision", "outcome"},
 		"ApiRunResponse":   {"outcome"},
+		// A review verdict's `tests` is the same trade one layer down, and the
+		// only one in 12a where the validator REQUIRES the key: the payload
+		// contract says tests must be present and may be null, and this
+		// generator cannot say "this object or null" for a named schema.
+		// payload_schema_test.go holds the two descriptions together across the
+		// exception.
+		"ApiReviewVerdictPayload": {"tests"},
 	}
 	for name, unwanted := range wantNotRequired {
 		schema, ok := doc.Components.Schemas[name]

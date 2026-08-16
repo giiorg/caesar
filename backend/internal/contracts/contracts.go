@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/swaggest/jsonschema-go"
 	"github.com/swaggest/openapi-go"
 	"github.com/swaggest/openapi-go/openapi31"
 
@@ -167,6 +168,60 @@ var altResponses = map[string][]altResponse{
 	"listRunEvents": {{Response: realtime.StreamFrame{}, ContentType: "text/event-stream"}},
 }
 
+// componentsSchemas is where a named schema lives in an OpenAPI 3.1 document.
+// The reflector uses the same prefix internally and does not export it.
+const componentsSchemas = "#/components/schemas/"
+
+// extraSchemas are types that must reach components.schemas WITHOUT an
+// operation referencing them. The artifact payload shapes are the first: a
+// declared payload travels as ArtifactPayloadResponse.Payload — a map, because
+// one endpoint serves plan, review_verdict, patch and log_ref alike — so no
+// response structure mentions PlanPayload, and a type nothing mentions is a
+// type the reflector never sees.
+//
+// The alternative was marker fields on ArtifactPayloadResponse that the server
+// never sets. This list is the same five lines and does not put two lies in a
+// response shape to get one truth into the document.
+func extraSchemas() []any {
+	return []any{
+		runsapi.PlanPayload{},
+		runsapi.ReviewVerdictPayload{},
+	}
+}
+
+// addExtraSchemas reflects each entry of extraSchemas into the document's
+// components, along with every type it references. It mirrors what the
+// reflector does for a response body — RootRef so the type itself becomes a
+// named definition rather than an inline schema, the components prefix so
+// nested $refs resolve — because the method that does it there is unexported.
+func addExtraSchemas(r *openapi31.Reflector) error {
+	for _, v := range extraSchemas() {
+		var collectErr error
+		collect := func(name string, schema jsonschema.Schema) {
+			if _, exists := r.SpecEns().ComponentsEns().Schemas[name]; exists {
+				return
+			}
+			sm, err := schema.ToSchemaOrBool().ToSimpleMap()
+			if err != nil {
+				collectErr = fmt.Errorf("contracts: extra schema %s: %w", name, err)
+				return
+			}
+			r.SpecEns().ComponentsEns().WithSchemasItem(name, sm)
+		}
+		if _, err := r.JSONSchemaReflector().Reflect(v,
+			jsonschema.RootRef,
+			jsonschema.DefinitionsPrefix(componentsSchemas),
+			jsonschema.CollectDefinitions(collect),
+		); err != nil {
+			return fmt.Errorf("contracts: extra schema %T: %w", v, err)
+		}
+		if collectErr != nil {
+			return collectErr
+		}
+	}
+	return nil
+}
+
 // operationTables collects every context's route table with nil
 // dependencies — metadata only; handlers never run during generation.
 func operationTables() [][]httpx.Operation {
@@ -229,6 +284,10 @@ func Build() ([]byte, error) {
 				return nil, fmt.Errorf("contracts: add %s: %w", op.Pattern, err)
 			}
 		}
+	}
+
+	if err := addExtraSchemas(r); err != nil {
+		return nil, err
 	}
 
 	raw, err := json.MarshalIndent(r.Spec, "", "  ")
