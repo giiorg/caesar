@@ -5,6 +5,9 @@ package app
 import (
 	"bytes"
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -197,6 +200,60 @@ func TestRunServe_RefusesToBootWithoutMasterKey(t *testing.T) {
 	err := runServe(context.Background(), cfg, discard())
 	if err == nil || !strings.Contains(err.Error(), "security.master_key") {
 		t.Fatalf("runServe = %v, want error mentioning security.master_key", err)
+	}
+}
+
+// TestProductionServeNeverOverridesTheExecutor pins the seam's blast radius:
+// runServe — the only path cmd/caesar reaches — passes an EMPTY serveOptions,
+// so no deployment can be talked into a fake executor or a foreign listener by
+// any config it accepts.
+//
+// It reads the source rather than the values, and that is the whole point. The
+// obvious spelling of this test is `var zero serveOptions; if zero.executor !=
+// nil {...}`, which asserts that Go zeroes struct fields — true of every
+// program ever compiled, and still green after someone changes runServe to
+// pass serveOptions{executor: somethingElse}. That is the property at issue,
+// so the assertion has to be about the call runServe actually makes.
+//
+// MEASURED: putting any field in that literal turns this red, and removing the
+// delegation entirely turns it red for a different reason.
+func TestProductionServeNeverOverridesTheExecutor(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "serve.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body []ast.Stmt
+	for _, d := range file.Decls {
+		if fn, ok := d.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == "runServe" {
+			body = fn.Body.List
+		}
+	}
+	if len(body) != 1 {
+		t.Fatalf("runServe has %d statements, want exactly one: a delegation to runServeWith. "+
+			"Anything else means production boot has grown a second path this test cannot see", len(body))
+	}
+	ret, ok := body[0].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) != 1 {
+		t.Fatalf("runServe's only statement is %T, want `return runServeWith(...)`", body[0])
+	}
+	call, ok := ret.Results[0].(*ast.CallExpr)
+	if !ok || len(call.Args) != 4 {
+		t.Fatalf("runServe does not return a four-argument call; got %#v", ret.Results[0])
+	}
+	if fn, ok := call.Fun.(*ast.Ident); !ok || fn.Name != "runServeWith" {
+		t.Fatalf("runServe delegates to %v, want runServeWith", call.Fun)
+	}
+	lit, ok := call.Args[3].(*ast.CompositeLit)
+	if !ok {
+		t.Fatalf("runServe's fourth argument is %T, want a serveOptions literal written at the "+
+			"call site — a variable could carry anything", call.Args[3])
+	}
+	if id, ok := lit.Type.(*ast.Ident); !ok || id.Name != "serveOptions" {
+		t.Fatalf("runServe passes a %v literal, want serveOptions", lit.Type)
+	}
+	if len(lit.Elts) != 0 {
+		t.Fatalf("runServe passes serveOptions with %d field(s) set, want none: production must "+
+			"select the configured executor and bind cfg.Server.Addr itself", len(lit.Elts))
 	}
 }
 

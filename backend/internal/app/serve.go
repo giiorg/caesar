@@ -99,9 +99,47 @@ func probeWritable(dir string) error {
 // through a struct tag, and a struct tag cannot be a const.
 const msgListening = "http server listening"
 
+// serveOptions are overrides no production path can set.
+//
+// It is UNEXPORTED and constructed only inside package app, so no config file,
+// flag or environment variable can reach it — the language is the enforcement,
+// not a convention. It exists for one reason: a gate can never be a root node
+// (workflows.validateConsumption requires it to examine exactly one plan or
+// patch), so reaching phase_runs.status = 'waiting_decision' means an agentic
+// phase must complete, and the web E2E lane substitutes the agent CONTAINER so
+// the orchestrator's real gate materialization can be observed. Everything
+// below that substitution is production code.
+type serveOptions struct {
+	// executor, when non-nil, replaces the executor the configuration selected.
+	executor runs.Executor
+	// listener, when non-nil, is served INSTEAD of binding cfg.Server.Addr.
+	//
+	// It exists because of a genuine ordering deadlock, not for convenience.
+	// Routes is constructed with cfg.Server.AppOrigin before net.Listen runs
+	// (below), and httpx.CheckOrigin compares a browser's Origin header to
+	// that string by EXACT equality on every unsafe method. With addr ":0" the
+	// port is the operating system's answer, known only after the bind — so a
+	// test that lets the OS choose cannot state the origin the browser will
+	// send, and a login POST from http://127.0.0.1:<port> gets a 403 from
+	// production middleware that is behaving exactly as designed.
+	//
+	// Handing the bound listener in inverts the order: the test binds, reads
+	// the real port, sets AppOrigin to match, and only then boots. A fixed port
+	// would be the other way out and is rejected — the lane must not collide
+	// with a developer's own server or with a parallel package under test.
+	listener net.Listener
+}
+
 // runServe boots the control plane: connect, migrate (advisory-locked),
 // serve HTTP until ctx is cancelled, then drain within the shutdown timeout.
+//
+// This is the only path cmd/caesar reaches, and it passes an empty
+// serveOptions — see runServeWith.
 func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
+	return runServeWith(ctx, cfg, log, serveOptions{})
+}
+
+func runServeWith(ctx context.Context, cfg config.Config, log *slog.Logger, opts serveOptions) error {
 	pool, err := pg.New(ctx, cfg.Database.URL)
 	if err != nil {
 		return err
@@ -218,6 +256,11 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		go func() { defer close(runnerDone); _ = rnr.Run(ctx) }()
 		log.Info("docker runner enabled", "data_root", cfg.Runner.DataRoot)
 	}
+	if opts.executor != nil {
+		// Last word, and deliberately after the runner branch: a lane that set
+		// both is a test that meant this one.
+		executor = opts.executor
+	}
 
 	orch := runs.NewOrchestrator(runsSvc, executor, admission, runsAssetSource{svc: assetsSvc}, runs.OrchestratorConfig{
 		Workers:           cfg.Orchestrator.Workers,
@@ -247,9 +290,17 @@ func runServe(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	// addr ":0", which the integration tests use so they never collide — the
 	// configured address is not the address, so the log line would otherwise
 	// record a port nothing is on.
-	ln, err := net.Listen("tcp", cfg.Server.Addr)
-	if err != nil {
-		return fmt.Errorf("http server: listen %s: %w", cfg.Server.Addr, err)
+	//
+	// An injected listener replaces the bind and nothing else: the log line,
+	// the deferred Close and everything after are untouched, so it travels the
+	// identical path — including msgListening, which is still where readiness
+	// is announced.
+	ln := opts.listener
+	if ln == nil {
+		ln, err = net.Listen("tcp", cfg.Server.Addr)
+		if err != nil {
+			return fmt.Errorf("http server: listen %s: %w", cfg.Server.Addr, err)
+		}
 	}
 	// Shutdown closes it on the ordinary path; this is for the returns that
 	// never get there.

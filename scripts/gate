@@ -179,14 +179,14 @@ fail() { printf '  - %s\n' "$1" >&2; FAILED=1; }
 # shellcheck disable=SC2016  # these are literal command lines, not expressions
 LANE_CMDS=(
 	'task: [backend:fmt:check] test -z "$(bin/gofumpt -l .)" || (bin/gofumpt -l . && exit 1)'
-	'task: [backend:vet] go vet -tags integration,property,runnerintegration ./...'
+	'task: [backend:vet] go vet -tags integration,property,runnerintegration,webe2e ./...'
 	'task: [backend:lint] bin/golangci-lint run'
 	'task: [backend:analyze] go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze'
-	'task: [backend:analyze] go vet -tags integration,property,runnerintegration -vettool=./bin/caesar-analyze ./...'
+	'task: [backend:analyze] go vet -tags integration,property,runnerintegration,webe2e -vettool=./bin/caesar-analyze ./...'
 	'task: [backend:test] go test -race  ./...'
 	'task: [backend:test:property] go test -race -tags property -count=1  ./internal/workflows/ ./internal/runs/ -rapid.seed=1 -rapid.checks=100'
 	'task: [backend:test:integration] go test -race -tags integration -count=1  ./...'
-	'task: [backend:vuln] bin/govulncheck -tags integration,property,runnerintegration ./...'
+	'task: [backend:vuln] bin/govulncheck -tags integration,property,runnerintegration,webe2e ./...'
 	'task: [backend:build] go build -trimpath -ldflags "-s -w -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Version='
 )
 RUNNER_CMDS=(

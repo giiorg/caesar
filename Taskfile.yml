@@ -41,7 +41,7 @@ tasks:
   backend:vet:
     dir: backend
     cmds:
-      - go vet -tags integration,property,runnerintegration ./...
+      - go vet -tags integration,property,runnerintegration,webe2e ./...
 
   backend:lint:
     deps: [tools]
@@ -53,7 +53,7 @@ tasks:
     deps: [tools]
     dir: backend
     cmds:
-      - bin/govulncheck -tags integration,property,runnerintegration ./...
+      - bin/govulncheck -tags integration,property,runnerintegration,webe2e ./...
 
   backend:build:
     dir: backend
@@ -167,7 +167,7 @@ tasks:
     dir: backend
     cmds:
       - go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze
-      - go vet -tags integration,property,runnerintegration -vettool=./bin/caesar-analyze ./...
+      - go vet -tags integration,property,runnerintegration,webe2e -vettool=./bin/caesar-analyze ./...
 
   backend:run:
     desc: "Run the control plane against the dev database (task db:up first)"
@@ -313,6 +313,29 @@ tasks:
     dir: web
     cmds:
       - ./node_modules/.bin/vite build
+
+  web:e2e:
+    desc: "Playwright against the real backend (needs Docker for Postgres)"
+    # NOT `deps: [web:build]`, unlike backend:test:embedui. This lane needs two
+    # prerequisites — the built bundle AND the browser binary
+    # (`./node_modules/.bin/playwright install --with-deps chromium`) — and a
+    # browser download is not something a lane should trigger silently on a
+    # developer's machine or in a job that never declared it. Task 14 makes both
+    # visible steps in the CI workflow. Run them by hand before this target:
+    #
+    #   task db:up
+    #   cd web && ./node_modules/.bin/playwright install --with-deps chromium
+    #   cd web && ./node_modules/.bin/vite build
+    #
+    # A missing bundle fails at compile time (//go:embed all:dist against an
+    # absent dist), and a missing browser fails inside Playwright with its own
+    # install instructions — both legible, neither silent.
+    dir: backend
+    cmds:
+      # embedui because the binary must serve the built UI; webe2e because the
+      # harness is tagged so it never runs in backend:test; integration because
+      # the harness reuses serve_integration_test.go's syncBuffer.
+      - go test -tags "integration,webe2e,embedui" -count=1 -timeout 15m ./internal/app/ -run TestWebE2E
 
   secrets:
     cmds:

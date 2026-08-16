@@ -8,7 +8,9 @@
       "!src/routeTree.gen.ts",
       "!**/dist",
       "!tools/arch/fixtures",
-      "!tools/mutants"
+      "!tools/mutants",
+      "!test-results",
+      "!playwright-report"
     ]
   },
   "plugins": ["./tools/lint/no-qualified-fetch.grit"],
