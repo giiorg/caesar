@@ -22,30 +22,23 @@ test('a gate opened by the backend moves the approvals badge with no user action
   // loads no Tailwind, so every component test sees both presentations fully
   // present and would pass against a rail that is visible on a phone.
   //
-  // The three assertions below are deliberately three different engines asked
-  // about the same links, and the ORDER is what makes each one falsifiable:
+  // Three engines, three DIFFERENT hiddenness models, each with its own
+  // measured mutant — no one of them subsumes another:
   //
-  //   1. a raw attribute selector — the DOM holds TWO Approvals links.
-  //   2. `toBeHidden` on the rail — one of the two is display:none.
-  //   3. a role query — so the accessibility tree, which a display:none
-  //      subtree has left, offers exactly ONE. That is what lets the click
-  //      below stay unscoped while every badge assertion is scoped to the bar:
-  //      `getByTestId` is a plain attribute selector and matches both.
+  //   1. a CSS selector, which reads the DOM and asks nothing else
+  //          delete the rail block  ->  1, not 2
+  //   2. `toBeHidden`, a BOUNDING BOX (types/test.d.ts:9049 — it also passes
+  //      on a locator resolving to no node at all, so it must follow (1))
+  //          unhide the rail        ->  visible
+  //   3. the role engine, which is ARIA — the property BEAT 1's unscoped
+  //      click depends on
+  //          rail sized to w-0 h-0  ->  2, not 1, with (1) and (2) still green
   //
-  // (1) IS NOT REDUNDANT WITH (2). `toBeHidden` passes on a locator that
-  // resolves to nothing at all — node_modules/playwright/types/test.d.ts:9049
-  // says so outright ("either does not resolve to any DOM node, or resolves to
-  // a non-visible one") — so on its own it cannot tell "hidden by CSS" from
-  // "deleted", and this comment's two-in-the-DOM claim would be unencoded.
-  // Deleting the rail block kills (1) first; unhiding it kills (2) first.
-  //
-  // (3) has no mutant of its own: anything that puts the rail in the
-  // accessibility tree also makes it visible, so (2) fails first. Stated
-  // rather than engineered around — it is here because it is the property
-  // BEAT 1's unscoped click depends on, not because it is independently
-  // guarded.
+  // `getByTestId` answers to none of the three: a plain attribute selector
+  // matches both presentations, which is why every badge assertion below is
+  // scoped to `bar`.
   const bar = page.getByTestId('phone-tabs')
-  await expect(page.locator('a[href="/approvals"]')).toHaveCount(2)
+  await expect(page.getByRole('navigation').locator('a[href="/approvals"]')).toHaveCount(2)
   await expect(page.getByTestId('desktop-rail')).toBeHidden()
   await expect(page.getByRole('link', { name: 'Approvals' })).toHaveCount(1)
 
