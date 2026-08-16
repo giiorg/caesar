@@ -135,6 +135,36 @@ func (p ExecPlan) ExaminedInput(gateNodeID string) (PlanInput, bool) {
 	return PlanInput{}, false
 }
 
+// SummaryInput is the review_verdict a gate consumes, where its graph has one.
+// It is the OTHER half of a gate's evidence: §3.5 orders the approval surface
+// summary-first, and the summary is a different artifact from the plan-or-patch
+// the gate examines — ExaminedInput deliberately selects only the latter.
+//
+// At most one can exist. workflows/validate.go:207 makes `verdicts > 1` a
+// validation violation and permits ZERO, so this returns a single input and
+// never a list.
+//
+// FALSE MEANS SOMETHING DIFFERENT HERE THAN IT DOES ON ExaminedInput, and the
+// two are easy to confuse because the signatures are identical. A gate with no
+// examined input is CORRUPTION — DecideGate says so and refuses. A gate with no
+// verdict is an ORDINARY workflow, and the caller renders "no summary" rather
+// than an empty block pretending to be one.
+//
+// Inputs are sorted at compile time on (Origin, Artifact, From), so the answer
+// is deterministic for the same document however its edges were written.
+func (p ExecPlan) SummaryInput(gateNodeID string) (PlanInput, bool) {
+	n, ok := p.Nodes[gateNodeID]
+	if !ok || n.Kind != KindGate {
+		return PlanInput{}, false
+	}
+	for _, in := range n.Inputs {
+		if in.Artifact == ArtifactKindReviewVerdict {
+			return in, true
+		}
+	}
+	return PlanInput{}, false
+}
+
 // Compile validates the mirror just enough to execute it and resolves
 // order and origins. A stored version that fails here is corruption:
 // callers surface internal_error, never a user-facing validation error.
