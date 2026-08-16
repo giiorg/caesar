@@ -28,13 +28,27 @@ func TestScriptedOutputsAreDeterministic(t *testing.T) {
 	ex := fake.NewExecutor()
 	ctx := context.Background()
 
-	plan1, err := ex.Execute(ctx, req(runs.KindPlan, "Plan the change."))
+	const planInstructions = "Plan the change."
+	plan1, err := ex.Execute(ctx, req(runs.KindPlan, planInstructions))
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan2, err := fake.NewExecutor().Execute(ctx, req(runs.KindPlan, "Plan the change."))
+	plan2, err := fake.NewExecutor().Execute(ctx, req(runs.KindPlan, planInstructions))
 	if err != nil {
 		t.Fatal(err)
+	}
+	// PINNED TO A LITERAL FIRST, and that ordering is the point. Comparing the
+	// two emissions to each other proves determinism — including the
+	// determinism of emitting NOTHING. MEASURED: deleting `content` from the
+	// fake's plan payload degraded this to nil == nil and left the whole
+	// backend suite, unit and integration, green. The literal is what makes one
+	// assertion here load-bearing on the emitted value.
+	//
+	// It is derived from planInstructions rather than written out, so the
+	// expectation cannot drift away from the request that produces it.
+	const wantContent = "plan: " + planInstructions
+	if got := plan1.Artifacts[0].Payload["content"]; got != wantContent {
+		t.Errorf("plan content = %v, want %q", got, wantContent)
 	}
 	if plan1.Artifacts[0].Payload["content"] != plan2.Artifacts[0].Payload["content"] {
 		t.Error("plan output must be deterministic")

@@ -235,12 +235,19 @@ func (e *Executor) scripted(req runs.ExecutionRequest) (runs.NewArtifact, error)
 			"tests":    map[string]any{"status": "passed", "passed": 1, "failed": 0},
 		}}, nil
 	default: // plan and anything agentic-shaped
-		// `content` is kept because REMOVING IT WOULD BREAK REAL ASSERTIONS —
-		// a stronger reason than `notes` above has, and it stands on its own.
-		// Five call sites read this key (fake/executor_test.go, the runner's
-		// lineage/execute/reconcile/gatenote suites), and none of them is about
-		// the payload contract; deleting it would fail them for a reason
-		// unrelated to what they test.
+		// `content` is kept for the same two reasons `notes` is above — churn on
+		// a double buys nothing, and an unknown key beside the required ones
+		// exercises the §2.3 extra-keys promise on the plan side too — plus one
+		// that is specific to it: deleting it would SILENTLY VACATE
+		// executor_test.go's determinism check rather than fail it, since that
+		// check compares two emissions to each other and nil == nil.
+		//
+		// MEASURED, not assumed. Deleting this key left every backend suite
+		// green, unit and integration alike. An earlier version of this comment
+		// claimed five suites would break; they do not, because the runner's
+		// `content` sites script their own payloads and never run this fake.
+		// executor_test.go now pins the emitted value against a literal, which
+		// is what makes the first sentence true going forward.
 		payload := map[string]any{
 			"content": "plan: " + firstLine,
 			"summary": "plan: " + firstLine,
