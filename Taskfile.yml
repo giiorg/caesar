@@ -114,12 +114,13 @@ tasks:
     # folding it in would break that job outright. It is in the root `ci:`
     # aggregate instead, which has needed Node since contracts:ts.
     #
-    # NO CI JOB AND NO scripts/gate INVOCATION REACHES IT. `grep -rn
-    # backend:test:embedui Taskfile.yml scripts/gate .github/` returns only
-    # Taskfile.yml, and scripts/gate runs four named lanes (backend:ci,
-    # contracts:check, image:build, backend:test:runner) — `ci:` is not one of
-    # them. So the assertions still tagged embedui are operator-run only. Same
-    # for backend:static:embedui below. Both are escalated to §14 by name.
+    # THIS LANE IS NOW WIRED, and the escalation below has landed. Until §14 it
+    # ran in no CI job and no scripts/gate invocation, so everything still
+    # tagged embedui was operator-run only. §14 fixed that in both places:
+    # scripts/gate runs it as a named lane with its resolved command asserted in
+    # EMBEDUI_TEST_CMDS, and .github/workflows/ci.yml's `web` job runs it after
+    # task web:build. Same for backend:static:embedui below. `task ci` naming
+    # them is still not what protects them — the two call sites above are.
     #
     # That residual is deliberately small. MEASURED with `go test -list '.*'`:
     # 6 of the package's 9 test functions run untagged and 8 run under the tag,
@@ -347,9 +348,15 @@ tasks:
     # developer's machine or in a job that never declared it. Task 14 makes both
     # visible steps in the CI workflow. Run them by hand before this target:
     #
-    #   task db:up
     #   cd web && ./node_modules/.bin/playwright install --with-deps chromium
     #   cd web && ./node_modules/.bin/vite build
+    #
+    # `task db:up` was listed here and was never a prerequisite: the harness
+    # gets its database from internal/platform/testdb, which starts its own
+    # postgres:18-alpine testcontainer on an ephemeral port and migrates it from
+    # scratch. MEASURED — the compose database on 5432 sits untouched for the
+    # whole run. Docker is still required, hence the desc; a compose stack is
+    # not.
     #
     # A missing bundle fails at compile time (//go:embed all:dist against an
     # absent dist), and a missing browser fails inside Playwright with its own
@@ -412,13 +419,15 @@ tasks:
       # need — this aggregate has required Node since Plan 02 added
       # contracts:ts, so the embedui lanes cost it no new dependency.
       #
-      # THIS IS NOT THE WIRING THE GUARDS NEED. `task ci` is the operator's
-      # local full-run; no CI job and no scripts/gate invocation reaches it
-      # (.github/workflows/ci.yml runs backend:ci, image:build,
-      # backend:test:runner, contracts:check, secrets and lint:actions as
-      # separate jobs, and scripts/gate runs four named lanes). Putting them
-      # here is strictly better than nowhere and is NOT a substitute for §14
-      # naming both lanes in scripts/gate.
+      # THIS IS NOT THE WIRING THE GUARDS NEED, and it never was. `task ci` is
+      # the operator's local full-run: no CI job and no scripts/gate invocation
+      # reaches this aggregate — still true, and it is the whole point of this
+      # note. Listing the lanes here was strictly better than nowhere and was
+      # never a substitute for §14 naming both of them in scripts/gate. §14 has
+      # since done exactly that, and added them to the `web` job as well, so
+      # what protects them now is those two call sites and not this one.
+      # Deliberately not re-enumerating ci.yml's jobs or the gate's lane count
+      # here: the previous version of this comment did, and both lists rotted.
       - task: backend:test:embedui
       - task: backend:static:embedui
       - task: secrets

@@ -114,6 +114,8 @@ CONTRACTS_LOG="$LOGDIR/contracts-check.log"
 IMAGE_LOG="$LOGDIR/image-build.log"
 RUNNER_LOG="$LOGDIR/backend-test-runner.log"
 WEB_LOG="$LOGDIR/web-ci.log"
+EMBEDUI_TEST_LOG="$LOGDIR/backend-test-embedui.log"
+EMBEDUI_STATIC_LOG="$LOGDIR/backend-static-embedui.log"
 WEBE2E_LOG="$LOGDIR/web-e2e.log"
 
 printf 'gate: %s @ %s (%s)\n' "$WT" "$HEAD_SHORT" "$BRANCH"
@@ -162,9 +164,49 @@ RUNNER_STATUS=$?
 # web/node_modules on the way past — go-task resolved whatever node the caller
 # had, which defaults to 20.9.0 here — and every lane below then ran against the
 # wreckage. Both are routed through scripts/with-node now.
+#
+# CAESAR_COMMIT is exported for the whole node-dependent block, and it is
+# load-bearing. web/vite.config.ts reads it (defaulting to 'dev') and its
+# caesar-commit-stamp plugin injects it as <meta name="caesar-commit">;
+# TestServedIndexCarriesTheBuildStamp in backend:test:embedui below compares the
+# served stamp against this variable ONLY when it is non-empty. Leave it unset
+# and that lane degrades to "there is a stamp and it is not the placeholder",
+# which is satisfied by a bundle whose stamp came from anywhere at all — so the
+# propagation from build environment to served document, which is exactly what
+# CI's image-serves-ui assertion depends on, would be unguarded here.
+#
+# It is exported BEFORE web:ci, not just before the embedui lanes, because
+# web:ci is what runs `vite build` first; the value the bundle is stamped with
+# and the value the test compares must be the same one.
+export CAESAR_COMMIT="$HEAD_SHORT"
+
 printf 'gate: running task web:ci ...\n'
 task web:ci >"$WEB_LOG" 2>&1
 WEB_STATUS=$?
+
+# The two embedui lanes. Until this edit they ran in ZERO automated places:
+# `task ci` is the only aggregate that names them and no CI job and no gate
+# invocation reaches `task ci`. What that left unrun is 3 test functions —
+# TestTheRealBundleSatisfiesTheRoutingContract,
+# TestEmbeddedIndexIsServedAndCarriesNoInlineScript and
+# TestServedIndexCarriesTheBuildStamp — plus vet, golangci-lint and the house
+# analyzers over ui_embed.go, which no untagged lane compiles at all.
+#
+# They must NOT be folded into backend:ci: that lane's Node-free-ness is why the
+# tagless twin ui_noembed.go exists, and CI's `backend` job has no setup-node.
+#
+# Position: after contracts:check, for the same reason the web block above is —
+# contracts:ts is what runs `npm ci`, and both lanes reach web/node_modules
+# through their `deps: [web:build]`. They do not need web:ci to have run (they
+# build the bundle themselves), but running them after it keeps the whole
+# node-dependent half of the gate in one block, and keeps web:e2e last.
+printf 'gate: running task backend:test:embedui ...\n'
+task backend:test:embedui >"$EMBEDUI_TEST_LOG" 2>&1
+EMBEDUI_TEST_STATUS=$?
+
+printf 'gate: running task backend:static:embedui ...\n'
+task backend:static:embedui >"$EMBEDUI_STATIC_LOG" 2>&1
+EMBEDUI_STATIC_STATUS=$?
 
 # web:e2e last: it is the only lane that needs a browser AND a Docker Postgres,
 # and it consumes the bundle web:ci just built.
@@ -185,6 +227,8 @@ fail() { printf '  - %s\n' "$1" >&2; FAILED=1; }
 [ "$IMAGE_STATUS" -eq 0 ]     || fail "task image:build exited $IMAGE_STATUS"
 [ "$RUNNER_STATUS" -eq 0 ]    || fail "task backend:test:runner exited $RUNNER_STATUS"
 [ "$WEB_STATUS" -eq 0 ]       || fail "task web:ci exited $WEB_STATUS"
+[ "$EMBEDUI_TEST_STATUS" -eq 0 ]   || fail "task backend:test:embedui exited $EMBEDUI_TEST_STATUS"
+[ "$EMBEDUI_STATIC_STATUS" -eq 0 ] || fail "task backend:static:embedui exited $EMBEDUI_STATIC_STATUS"
 [ "$WEBE2E_STATUS" -eq 0 ]    || fail "task web:e2e exited $WEBE2E_STATUS"
 
 # Lane identity AND the resolved command, not an ok count.
@@ -232,6 +276,36 @@ WEB_CMDS=(
 WEBE2E_CMDS=(
 	'task: [web:e2e] go test -tags "integration,webe2e,embedui" -count=1 -timeout 15m ./internal/app/ -run TestWebE2E'
 )
+# The two embedui lanes. Both lines below are what go-task ECHOED when the lanes
+# were run for this edit, not a hand-derivation from Taskfile.yml — the double
+# space in the `go test` line is an empty {{.CLI_ARGS}} and would not have been
+# guessed.
+#
+# The `web:build` line is asserted here and NOT in EMBEDUI_STATIC_CMDS, and the
+# asymmetry is deliberate. backend/internal/webui/dist is gitignored, so both
+# lanes carry `deps: [web:build]`. For the static lane dist is a compile
+# prerequisite: without it //go:embed does not build and the lane cannot exit 0,
+# so its absence is already caught by the status check. For the test lane a
+# STALE dist passes silently — TestServedIndexCarriesTheBuildStamp only compares
+# the stamp against $CAESAR_COMMIT when that is set, and this gate does not set
+# it — so the dep being echoed is the only evidence that the bundle under test
+# was built by this run. Losing the dep is exactly the Taskfile edit this array
+# exists to make visible.
+EMBEDUI_TEST_CMDS=(
+	'task: [web:build] ../scripts/with-node ./node_modules/.bin/vite build'
+	'task: [backend:test:embedui] go test -race -tags embedui  ./internal/webui/'
+)
+# `tools` is NOT asserted, and that was measured rather than assumed: it is a
+# status-gated task, so on any machine whose bin/ is current go-task prints
+# `task: Task "tools" is up to date` and echoes no command line at all. An
+# assertion on its commands would fail on every warm machine. backend:ci's lanes
+# dep on it the same way and LANE_CMDS above leaves it out for the same reason.
+EMBEDUI_STATIC_CMDS=(
+	'task: [backend:static:embedui] go vet -tags embedui ./internal/webui/'
+	'task: [backend:static:embedui] bin/golangci-lint run --build-tags embedui ./internal/webui/...'
+	'task: [backend:static:embedui] go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze'
+	'task: [backend:static:embedui] go vet -tags embedui -vettool=./bin/caesar-analyze ./internal/webui/'
+)
 RUNNER_CMDS=(
 	'task: [backend:test:runner] go test -race -tags runnerintegration -count=1 -timeout 20m -p 1  ./internal/runs/runner/... ./internal/runs/egress/... ./internal/app/'
 )
@@ -258,6 +332,8 @@ assert_lane() {
 for want in "${LANE_CMDS[@]}"; do assert_lane "$CI_LOG" "$want"; done
 for want in "${RUNNER_CMDS[@]}"; do assert_lane "$RUNNER_LOG" "$want"; done
 for want in "${WEB_CMDS[@]}"; do assert_lane "$WEB_LOG" "$want"; done
+for want in "${EMBEDUI_TEST_CMDS[@]}"; do assert_lane "$EMBEDUI_TEST_LOG" "$want"; done
+for want in "${EMBEDUI_STATIC_CMDS[@]}"; do assert_lane "$EMBEDUI_STATIC_LOG" "$want"; done
 for want in "${WEBE2E_CMDS[@]}"; do assert_lane "$WEBE2E_LOG" "$want"; done
 
 # The build lane stamps the sha it actually compiled. This is the only evidence
@@ -292,20 +368,43 @@ fi
 
 # Content checks. Exit status has been wrong before; these read the output.
 #
-# Every log, not just backend:ci — contracts:check was skipped here until now,
-# and the two new lanes would have arrived with the same hole.
+# The pattern set is NOT uniform across the logs, and that is the correction
+# this block most needed. Its comment used to claim "every log", and the loop
+# below it named four — WEB_LOG and WEBE2E_LOG were never in it. The comment
+# described coverage the code did not have, which is worse than the gap.
 #
 # "no tests to run" is the symptom half of the environment scrub above: a `-run`
 # filter reaching the lanes by any route the scrub did not anticipate (GOFLAGS,
 # a future var, a Taskfile edit) prints it for every package and exits 0. A full
 # gate run has no legitimate occurrence of it.
-for log in "$CI_LOG" "$CONTRACTS_LOG" "$IMAGE_LOG" "$RUNNER_LOG"; do
+#
+# These logs are go-test / docker / codegen output, where all four patterns have
+# a meaning. MEASURED on this branch: a green backend:test:embedui,
+# backend:static:embedui and web:e2e log each contain zero matches for all four,
+# so adding the three of them costs no false positive.
+for log in "$CI_LOG" "$CONTRACTS_LOG" "$IMAGE_LOG" "$RUNNER_LOG" \
+	"$EMBEDUI_TEST_LOG" "$EMBEDUI_STATIC_LOG" "$WEBE2E_LOG"; do
 	for pat in 'FAIL' 'panic:' 'DATA RACE' 'no tests to run'; do
 		if grep -qF "$pat" "$log"; then
 			fail "found '$pat' in $(basename "$log")"
 		fi
 	done
 done
+
+# WEB_LOG is biome / arch / tsc / vitest / tsr / vite output, so it gets 'FAIL'
+# alone. Both halves of that are measured, not reasoned:
+#   - a green `task web:ci` log (16 files, 178 tests) contains none of the four;
+#   - a deliberately failing vitest run prints uppercase ` FAIL  red.test.ts >
+#     deliberately red`, so the pattern is live here and not decoration.
+# The other three are go-test and race-detector vocabulary. No tool in this lane
+# can emit "DATA RACE" or go's "no tests to run" (vitest's own empty-suite
+# message is "No test files found" and exits non-zero, which the status check
+# already catches), and node reports a crash as a stack trace, not "panic:".
+# Carrying them here would be three assertions that cannot fire — which this
+# project treats as a defect in its own right — so they are omitted on purpose.
+if grep -qF 'FAIL' "$WEB_LOG"; then
+	fail "found 'FAIL' in $(basename "$WEB_LOG")"
+fi
 
 # Docker-unavailable is called out separately because it means the gate is red
 # through NO FAULT OF THE CODE, and this project has lost time twice to reading
@@ -314,8 +413,14 @@ done
 # says "rootless Docker not found, failed to create Docker provider" and never
 # the Docker CLI's "Cannot connect to the Docker daemon" — so the CLI phrasing
 # alone was an assertion that could not fire on the failure it was written for.
+#
+# WEBE2E_LOG is in the list because web:e2e stands up its Postgres through
+# testdb, which is testcontainers (internal/platform/testdb/testdb.go), so it
+# fails with exactly the second and third phrasings. WEB_LOG and the two embedui
+# logs are NOT: nothing in web:ci, backend:test:embedui or backend:static:embedui
+# touches Docker, so a match there is not reachable.
 DOCKER_DOWN='Cannot connect to the Docker daemon|failed to create Docker provider|rootless Docker not found'
-for log in "$CI_LOG" "$CONTRACTS_LOG" "$IMAGE_LOG" "$RUNNER_LOG"; do
+for log in "$CI_LOG" "$CONTRACTS_LOG" "$IMAGE_LOG" "$RUNNER_LOG" "$WEBE2E_LOG"; do
 	if grep -qE "$DOCKER_DOWN" "$log"; then
 		fail "Docker is unavailable — this gate is red through no fault of the code (see $log). Start Docker, wait for \`docker info\`, re-gate."
 	fi
@@ -327,6 +432,12 @@ if [ "$FAILED" -ne 0 ]; then
 	exit 1
 fi
 
+# LANE_COUNT is the number of RESOLVED COMMAND LINES asserted, not the number of
+# distinct lane names: several lanes contribute more than one line
+# (backend:analyze, web:typecheck, web:routes:check, backend:static:embedui) and
+# web:build is asserted twice, once in web:ci's log and once in
+# backend:test:embedui's, where it is a different invocation. The phrase below
+# is kept verbatim because ledgers across four plans quote it.
 printf 'GATE PASS  %s @ %s  (%d lanes resolved unnarrowed, Commit=%s stamped in the binary and in caesar-git:dev, contracts clean)\n' \
 	"$BRANCH" "$HEAD_SHORT" "$LANE_COUNT" "$HEAD_SHORT"
 printf 'logs: %s\n' "$LOGDIR"

@@ -80,9 +80,92 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: task contracts:check
 
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Load-bearing, not decoration. TestServedIndexCarriesTheBuildStamp
+      # (backend/internal/webui/ui_embed_test.go) compares the served stamp to
+      # this variable only `if want := os.Getenv("CAESAR_COMMIT"); want != ""`.
+      # With it unset the lane degrades to "there is a stamp and it is not the
+      # literal placeholder", and the one thing it exists to guard — that
+      # vite.config.ts's `process.env.CAESAR_COMMIT` really propagates through
+      # the caesar-commit-stamp plugin into the served <meta> — is untested
+      # before merge. The only other place that chain is checked is
+      # image-serves-ui's assertion 3, which runs on push to main ONLY. So a
+      # broken stamp would go green on the PR and red on main, after merge.
+      #
+      # It is a PROPAGATION guard, not a staleness guard: web:build declares no
+      # sources/generates, so go-task rebuilds the bundle on every invocation
+      # and a stale dist cannot survive here anyway.
+      #
+      # It must be job-level rather than per-step, because `task web:build` and
+      # the embedui lanes' own `deps: [web:build]` must see the SAME value —
+      # give it to the test but not the build and the exact comparison goes red
+      # against the 'dev' default.
+      CAESAR_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      # Go AND Node. `backend` deliberately has no setup-node — that Node-free
+      # -ness is the whole reason internal/webui/ui_noembed.go's tagless twin
+      # exists, and its doc comment claims it out loud — so the two embedui
+      # lanes below cannot live there. `contracts` does carry both toolchains,
+      # but it is the generator-drift job; these lanes want the
+      # web:install/web:build this job already performs.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: task web:install
+      # web:pins first: a drifted pin makes every later failure a red herring.
+      - run: task web:pins
+      - run: task web:lint
+      - run: task web:arch
+      - run: task web:typecheck
+      - run: task web:test
+      - run: task web:routes:check
+      - run: task web:build
+      # These two are NOT in the plan's snippet, and they are here deliberately.
+      # Before this job they ran in ZERO automated places: they are listed in
+      # the root `task ci` aggregate, which no CI job and no scripts/gate
+      # invocation reaches (Taskfile.yml says so in a comment at that spot). So
+      # 3 embedui-only test functions — including the no-inline-script assertion
+      # against the real Vite bundle and TestServedIndexCarriesTheBuildStamp,
+      # which is the guard on the stamp image-serves-ui reads — and 4 static
+      # checks were unprotected.
+      #
+      # After web:build, not before: backend:test:embedui declares
+      # `deps: [web:build]` and backend:static:embedui `deps: [tools, web:build]`
+      # because backend/internal/webui/dist is gitignored and //go:embed will
+      # not compile without it. The deps re-run vite build (Task does not
+      # deduplicate across separate `task` invocations); that is a few seconds,
+      # and the deps stay so the lanes remain runnable standalone.
+      - run: task backend:test:embedui
+      - run: task backend:static:embedui
+      # Never npx: MEASURED on this repo, npx and `npm exec --` both reach the
+      # public registry and can exit 0 having done nothing. Always the installed
+      # binary by path. `--with-deps` is the Linux form; on macOS use the bare
+      # form. web:e2e deliberately declares no deps for this download — a lane
+      # that silently pulls ~95MB of browser is not one a developer should
+      # trigger by accident — so the workflow makes it a visible step.
+      - run: ./node_modules/.bin/playwright install --with-deps chromium
+        working-directory: web
+      # No `task db:up` here: the harness gets Postgres from
+      # internal/platform/testdb, which runs its own testcontainer.
+      - run: task web:e2e
+
   ci-ok:
     # The single required status check; branch protection points here.
-    needs: [backend, runner, secrets, workflow-lint, contracts]
+    needs: [backend, runner, secrets, workflow-lint, contracts, web]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -90,13 +173,22 @@ jobs:
         run: |
           [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "false" ]
 
-  publish:
+  # Build once -> test THAT digest -> promote THAT digest. Three jobs, because
+  # the artifact under test has to be the artifact published. The previous shape
+  # was a single `publish` job that rebuilt from `context: .` after ci-ok, with
+  # no image and no digest crossing that boundary — so the thing any assertion
+  # looked at and the thing that reached ghcr.io were never the same bytes, and
+  # an embedui wired only into `task image:build` would leave every required
+  # check green while the pushed image carried a UI-less binary.
+  image:
     needs: [ci-ok]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -105,17 +197,257 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # ONE build, pushed under a candidate tag nobody deploys. The release tags
+      # are applied later, by re-tagging this digest, only after it has been
+      # proven to serve this commit's UI.
       - id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/giiorg/caesar:main
-            ghcr.io/giiorg/caesar:sha-${{ github.sha }}
+          tags: ghcr.io/giiorg/caesar:candidate-${{ github.sha }}
           build-args: |
             VERSION=sha-${{ github.sha }}
             COMMIT=${{ github.sha }}
             DATE=${{ github.event.head_commit.timestamp }}
-      - name: record digest (deploys pin this, never a tag)
-        run: echo "**image digest:** \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  image-serves-ui:
+    needs: [image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    # runServe connects to Postgres and applies migrations BEFORE it binds the
+    # listener (serve.go). So "the SPA fallback is static, therefore the binary
+    # needs no database" is FALSE for this check: without a reachable database
+    # nothing ever listens on 8080, and the job fails for a reason that has
+    # nothing to do with whether the UI is embedded. A green run has to mean the
+    # bundle is there, not merely that the container refused to boot. Do not
+    # delete this service.
+    services:
+      postgres:
+        # 18, not 17. The plan said `postgres:17` and that would have made this
+        # job a PERMANENT red that says nothing about the UI. MEASURED
+        # 2026-08-16, two ways:
+        #   - a real boot against postgres:17 dies in migrations with
+        #     `20260802144555_identity_foundations.sql: ... ERROR: function
+        #     uuidv7() does not exist (SQLSTATE 42883)`, so the listener never
+        #     binds and the health loop below burns its full 120s;
+        #   - directly: `select uuidv7()` on postgres 17.11 → `function
+        #     uuidv7() does not exist`; on postgres 18.3 → an actual UUID.
+        # uuidv7() is a PostgreSQL 18 builtin and the migrations depend on it.
+        # The rest of the repo already pins 18-alpine (compose.dev.yaml,
+        # internal/platform/testdb/testdb.go:43); this is the same pin.
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: caesar
+          POSTGRES_USER: caesar
+          POSTGRES_DB: caesar
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: the candidate DIGEST serves this commit's UI
+        env:
+          # By digest, never by tag: a tag is a moving pointer and the whole
+          # point of this job is that the bytes tested are the bytes promoted.
+          IMAGE: ghcr.io/giiorg/caesar@${{ needs.image.outputs.digest }}
+          # THE ORACLE COMES FROM OUTSIDE THE IMAGE. Reading a build stamp out
+          # of the candidate's own index.html and confirming the asset it names
+          # exists is satisfied perfectly by a stale-but-consistent build — the
+          # exact thing being tested for. So the comparison is against the SHA
+          # this workflow holds independently. It reaches the bundle as
+          # <meta name="caesar-commit"> via the Dockerfile's
+          # `RUN CAESAR_COMMIT=${COMMIT} ...vite build` and vite.config.ts's
+          # caesar-commit-stamp plugin.
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # An empty digest output would make IMAGE "…/caesar@" and docker run
+          # would say "invalid reference format", which reads as a typo rather
+          # than as "the build job produced no digest". Both are red, never a
+          # false green; this just names the real cause.
+          case "$IMAGE" in
+            *@sha256:*) ;;
+            *) echo "::error::the image job produced no digest (IMAGE=$IMAGE)"; exit 1 ;;
+          esac
+
+          # config.Load opens the path and fails if it is absent, so the file
+          # must exist; everything else this check needs comes from defaults and
+          # the two environment overrides Load already honours.
+          # NOT '{}'. With an empty document the defaults apply, and
+          # forge.publish_work_dir defaults to /var/lib/caesar/publish — which
+          # runServe creates (os.MkdirAll) AND write-probes (probeWritable),
+          # both in backend/internal/app/serve.go, before the net.Listen that
+          # binds the port. Symbols rather than line numbers on purpose: an
+          # earlier draft of this comment cited "serve.go:279" for the bind,
+          # which is a `Handler:` field inside the http.Server literal and
+          # binds nothing — the real call is ~100 lines further down, and the
+          # two neighbouring citations being exact gave a reader no cue that
+          # only one had drifted. The final image is distroless:nonroot running
+          # as uid 65532, and /var/lib is
+          # root-owned 0755, so MkdirAll fails, nothing ever listens, and both
+          # this check and its no-UI mutant die before reaching the thing they
+          # test. /tmp is 01777 in that image.
+          #
+          # MEASURED 2026-08-16 on a real container with '{}' and a healthy
+          # postgres 18: `"msg":"migrations applied"` then
+          #   "msg":"serve failed","error":"serve: publish work dir:
+          #    mkdir /var/lib/caesar: permission denied"
+          # and exit 1. Note the error names the PARENT, /var/lib/caesar, not
+          # /var/lib/caesar/publish — MkdirAll reports the first level it could
+          # not create.
+          echo '{"forge":{"publish_work_dir":"/tmp/caesar-publish"}}' > /tmp/config.json
+          # --network host is the ubuntu-latest form and is correct HERE: the
+          # service container above publishes 5432 on the runner's host netns,
+          # so the candidate reaches it at 127.0.0.1:5432. It does NOT transfer
+          # to a local macOS repro — MEASURED 2026-08-16 on Docker Desktop, a
+          # --network host container's published port is unreachable from the
+          # host (so the loop below would spin its full 120s) AND 127.0.0.1
+          # inside it reaches the DEVELOPER'S dev postgres, which a naive run
+          # would migrate. Reproduce locally on a user-defined bridge network,
+          # addressing postgres by container name, with -p 127.0.0.1:18080:8080
+          # (host 8080 is commonly already taken by a dev `caesar`, and a run
+          # that fails to bind it leaves the health loop talking to that stray
+          # process instead — a green run testing nothing).
+          docker run -d --name candidate --network host \
+            -v /tmp/config.json:/etc/caesar/config.json:ro \
+            -e DATABASE_URL='postgres://caesar:caesar@127.0.0.1:5432/caesar?sslmode=disable' \
+            -e CAESAR_MASTER_KEY='dev:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' \
+            "$IMAGE" serve -config /etc/caesar/config.json
+
+          # Every UI assertion routes through this so a red run carries the
+          # evidence with it. Without it the log says only which grep failed.
+          fail() {
+            echo "::error::$*"
+            echo "--- response headers ---"; cat /tmp/h || true
+            echo "--- response body (first 40 lines) ---"; head -40 /tmp/body || true
+            echo "--- container logs ---"; docker logs candidate || true
+            exit 1
+          }
+
+          # Boot first, UI second — and report them separately. /healthz answers
+          # only once migrations have applied and the listener is bound, so a
+          # timeout here is a BOOT failure and the logs say which; conflating it
+          # with the UI assertion is what made the previous shape unreadable.
+          #
+          # Bounded on purpose (60 x 2s): an unbounded `until curl …; do sleep 1;
+          # done` hangs forever when the container never listens, which is the
+          # single most likely failure here. The failing `curl … && break` does
+          # NOT trip errexit — MEASURED on bash 5.2, the loop runs to completion
+          # and the script continues — so the explicit re-check below is what
+          # turns a timeout into a red step.
+          for _ in $(seq 1 60); do curl -sf http://127.0.0.1:8080/healthz >/dev/null && break; sleep 2; done
+          if ! curl -sf http://127.0.0.1:8080/healthz >/dev/null; then
+            echo "candidate never became healthy — this is a BOOT failure, not a UI failure"
+            docker logs candidate
+            exit 1
+          fi
+
+          # No -f, so the status is observed rather than turned into a curl
+          # exit code: a UI-less binary answers 501 and this must report that,
+          # not "curl failed". errexit still covers a connection failure — the
+          # assignment takes the substitution's exit status (MEASURED:
+          # `set -e; CODE=$(false)` exits 1).
+          CODE=$(curl -sS -o /tmp/body -D /tmp/h -w '%{http_code}' http://127.0.0.1:8080/)
+
+          # Assertions 1-3 were each MEASURED to fire on a real UI-less image
+          # (2026-08-16): `docker build --build-arg GOTAGS= -t caesar:noui .`,
+          # booted against postgres:18-alpine with this same config. The
+          # mutation took — `strings` on the extracted binary shows 0 asset
+          # references and 0 `caesar-commit` against 69 and 1 for the normal
+          # build. GET / on that image answered:
+          #   HTTP/1.1 501 Not Implemented
+          #   Content-Type: application/problem+json
+          #   {"type":"/errors/not-implemented","title":"Not implemented",...}
+          # Against the normal image: 200, `Content-Type: text/html;
+          # charset=utf-8`, carrying <meta name="caesar-commit" content="<sha>">
+          # with the SHA passed as --build-arg COMMIT. So the chain from
+          # workflow SHA to served document is measured end to end, not reasoned.
+
+          # 1. The status. The tagless twin (internal/webui/ui_noembed.go)
+          #    answers 501 here. MEASURED to fire; nothing else asserted status
+          #    before this line existed, and `curl -sS` exits 0 on a 501.
+          [ "$CODE" = 200 ] || fail "GET / answered $CODE, want 200"
+
+          # 2. The media type, anchored to the start of a header line. The
+          #    tagless twin answers application/problem+json. MEASURED to fire
+          #    on the no-UI image, on its own.
+          grep -qi '^content-type: *text/html' /tmp/h || fail "GET / is not text/html"
+
+          # 3. The external oracle: this workflow's own SHA, in the served
+          #    document. A stale-but-consistent build fails here and only here.
+          #    MEASURED to fire on the no-UI image (no stamp at all) on its own.
+          #    The emptiness guard is not decoration: `grep -q ""` matches every
+          #    file, so an unset EXPECTED_SHA would turn the one assertion that
+          #    cannot be satisfied from inside the image into a rubber stamp.
+          [ -n "$EXPECTED_SHA" ] || fail "EXPECTED_SHA is empty; assertion 3 would match anything"
+          grep -q "$EXPECTED_SHA" /tmp/body || fail "served / does not carry $EXPECTED_SHA"
+
+          # 4. "Some HTML" is too weak on its own: the SPA fallback satisfies it
+          #    from almost any state. This rejects the typed refusal explicitly.
+          #
+          #    HONEST SCOPE: against TODAY's tagless twin this line is redundant
+          #    — assertions 1 and 2 each kill that mutant alone (measured
+          #    above), because the refusal is a 501 in application/problem+json.
+          #    It is kept for the shape they do not cover: a refusal that starts
+          #    being served as 200 text/html. It is NOT vacuous — MEASURED to
+          #    fire on the real refusal body, and MEASURED not to false-positive
+          #    on a real built dist (no file in backend/internal/webui/dist
+          #    matches this pattern, index.html included).
+          #
+          #    Both the obvious spellings of this assertion ARE vacuous, and both
+          #    were measured (bash 5.2 + GNU grep 3.11 on ubuntu:24.04):
+          #      `grep -qv 'not implemented'` exits 0 on a body that DOES contain
+          #      the phrase, because -v exits 0 when ANY line fails to match.
+          #      `! grep -q ...` never fails the step at all: set -e is ignored
+          #      for a pipeline preceded by '!', so the script sails past it
+          #      (`set -euo pipefail; ! grep -qi hit file; echo REACHED` prints
+          #      REACHED and exits 0). Hence if/then/fail.
+          #
+          #    -i and the [ -] class are load-bearing, and also measured: the
+          #    real refusal body is
+          #      {"type":"/errors/not-implemented","title":"Not implemented",...}
+          #    which contains no lowercase "not implemented" anywhere, so a
+          #    case-sensitive match for that phrase never fires on the one body
+          #    it exists to catch.
+          if grep -qiE 'not[ -]implemented' /tmp/body; then
+            fail "served / carries the tagless twin's refusal — this image has no UI embedded"
+          fi
+
+          echo "candidate digest serves $EXPECTED_SHA's UI"
+
+  publish:
+    needs: [image, image-serves-ui]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Promotion is a re-tag of the SAME digest — no rebuild can slip in
+      # between the assertion and the release tags. `imagetools create` is a
+      # registry-side operation and needs no builder instance, so this job
+      # deliberately has no setup-buildx-action step (MEASURED: `docker buildx
+      # imagetools inspect` succeeds under the plain `docker` driver).
+      - name: promote the tested digest
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag ghcr.io/giiorg/caesar:main \
+            --tag ghcr.io/giiorg/caesar:sha-${{ github.sha }} \
+            "ghcr.io/giiorg/caesar@${DIGEST}"
+          # Deploys pin the digest, never a tag.
+          echo "**image digest:** \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
