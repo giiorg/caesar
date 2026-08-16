@@ -87,17 +87,18 @@ func TestHub_FansOutToMatchingSubscribersOnly(t *testing.T) {
 	attention := h.Subscribe(Filter{Attention: true, Scope: Scope{Projects: []uuid.UUID{projB}}})
 
 	h.Publish([]Event{
-		hubEvent(1, projA, runA, "run.started"),   // perRun
-		hubEvent(2, projA, runB, "run.started"),   // another run, and outside attention's scope
-		hubEvent(3, projB, runB, "gate.waiting"),  // attention
-		hubEvent(4, projA, runA, "phase.started"), // perRun: a run stream carries phase noise too
-		hubEvent(5, projB, runB, "phase.started"), // neither: not attention-worthy
+		hubEvent(1, projA, runA, "run.started"),    // perRun
+		hubEvent(2, projA, runB, "run.started"),    // another run, and outside attention's scope
+		hubEvent(3, projB, runB, "gate.waiting"),   // attention
+		hubEvent(4, projA, runA, "phase.started"),  // perRun: in scope for it, out of scope for attention
+		hubEvent(5, projB, runB, "phase.started"),  // attention: Plan 12a carries phase transitions
+		hubEvent(6, projB, runB, "audit.recorded"), // neither: a kind in no attention namespace
 	})
 
 	if diff := cmp.Diff([]int64{1, 4}, drainIDs(perRun)); diff != "" {
 		t.Errorf("per-run subscriber received (-want +got):\n%s", diff)
 	}
-	if diff := cmp.Diff([]int64{3}, drainIDs(attention)); diff != "" {
+	if diff := cmp.Diff([]int64{3, 5}, drainIDs(attention)); diff != "" {
 		t.Errorf("attention subscriber received (-want +got):\n%s", diff)
 	}
 }
