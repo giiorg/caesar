@@ -14,6 +14,7 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppAdminRouteImport } from './routes/_app/admin'
 import { Route as AppApprovalsRouteImport } from './routes/_app/approvals'
+import { Route as AppMoreRouteImport } from './routes/_app/more'
 import { Route as AppReposRouteImport } from './routes/_app/repos'
 import { Route as AppRunsRouteImport } from './routes/_app/runs'
 import { Route as AppTasksRouteImport } from './routes/_app/tasks'
@@ -43,6 +44,11 @@ const AppApprovalsRoute = AppApprovalsRouteImport.update({
   path: '/approvals',
   getParentRoute: () => AppRoute,
 } as any)
+const AppMoreRoute = AppMoreRouteImport.update({
+  id: '/more',
+  path: '/more',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppReposRoute = AppReposRouteImport.update({
   id: '/repos',
   path: '/repos',
@@ -69,6 +75,7 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/admin': typeof AppAdminRoute
   '/approvals': typeof AppApprovalsRoute
+  '/more': typeof AppMoreRoute
   '/repos': typeof AppReposRoute
   '/runs': typeof AppRunsRoute
   '/tasks': typeof AppTasksRoute
@@ -78,6 +85,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/admin': typeof AppAdminRoute
   '/approvals': typeof AppApprovalsRoute
+  '/more': typeof AppMoreRoute
   '/repos': typeof AppReposRoute
   '/runs': typeof AppRunsRoute
   '/tasks': typeof AppTasksRoute
@@ -90,6 +98,7 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/_app/admin': typeof AppAdminRoute
   '/_app/approvals': typeof AppApprovalsRoute
+  '/_app/more': typeof AppMoreRoute
   '/_app/repos': typeof AppReposRoute
   '/_app/runs': typeof AppRunsRoute
   '/_app/tasks': typeof AppTasksRoute
@@ -103,6 +112,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/admin'
     | '/approvals'
+    | '/more'
     | '/repos'
     | '/runs'
     | '/tasks'
@@ -112,6 +122,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/admin'
     | '/approvals'
+    | '/more'
     | '/repos'
     | '/runs'
     | '/tasks'
@@ -123,6 +134,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/_app/admin'
     | '/_app/approvals'
+    | '/_app/more'
     | '/_app/repos'
     | '/_app/runs'
     | '/_app/tasks'
@@ -172,6 +184,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppApprovalsRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/more': {
+      id: '/_app/more'
+      path: '/more'
+      fullPath: '/more'
+      preLoaderRoute: typeof AppMoreRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/repos': {
       id: '/_app/repos'
       path: '/repos'
@@ -206,6 +225,7 @@ declare module '@tanstack/react-router' {
 interface AppRouteChildren {
   AppAdminRoute: typeof AppAdminRoute
   AppApprovalsRoute: typeof AppApprovalsRoute
+  AppMoreRoute: typeof AppMoreRoute
   AppReposRoute: typeof AppReposRoute
   AppRunsRoute: typeof AppRunsRoute
   AppTasksRoute: typeof AppTasksRoute
@@ -216,6 +236,7 @@ interface AppRouteChildren {
 const AppRouteChildren: AppRouteChildren = {
   AppAdminRoute: AppAdminRoute,
   AppApprovalsRoute: AppApprovalsRoute,
+  AppMoreRoute: AppMoreRoute,
   AppReposRoute: AppReposRoute,
   AppRunsRoute: AppRunsRoute,
   AppTasksRoute: AppTasksRoute,

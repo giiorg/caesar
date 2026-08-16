@@ -1,4 +1,4 @@
-import { screen } from '@testing-library/react'
+import { screen, within } from '@testing-library/react'
 import { HttpResponse, http } from 'msw'
 import { describe, expect, it } from 'vitest'
 import { noSession, renderApp } from '../../test/render-app'
@@ -52,7 +52,15 @@ describe('/approvals', () => {
     // No click, no refresh: the assertion is on the RENDERED badge, never on a
     // request count. A refetch is the mechanism, and forbidding it would assert
     // against the design.
-    expect(await screen.findByTestId('approvals-badge')).toHaveTextContent('1')
+    //
+    // Scoped to the phone tab bar because the shell renders BOTH presentations
+    // at once and CSS picks one; jsdom applies no media queries, so an unscoped
+    // query finds two badges and throws. The bar rather than the rail: this
+    // suite's subject is the flagship phone surface, which is also the only
+    // viewport e2e/approvals.spec.ts runs.
+    expect(
+      await within(screen.getByTestId('phone-tabs')).findByTestId('approvals-badge'),
+    ).toHaveTextContent('1')
     expect(await screen.findByText('Add a thing')).toBeInTheDocument()
   })
 
