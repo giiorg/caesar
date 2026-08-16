@@ -28,9 +28,13 @@ full session on this project.
 | 7 | 11 — invalidate-only cache bridge, the real `/approvals` | `63bbb1f` | **PASS** |
 | — | wave-7 plan corrections + ledger entry | `82e126f` | docs only |
 | 8 | 13 — the E2E lane, four beats against the real backend | `12c7d35` | **PASS** |
-| — | wave-8 plan corrections + this ledger entry | _(this commit)_ | docs only |
+| — | wave-8 plan corrections + ledger entry | `7c2c5f6` | docs only |
+| 9 | 14 (part) — the node_modules blocker, FIXED at the root | `beee9ba` | **PASS** |
+| 9 | 14 (part) — the web lanes folded into the gate | `116ffdc` | **PASS (21 lanes)** |
 
-**Done: Tasks 1–13. Remaining: 14.**
+**Done: Tasks 1–13, and Task 14's Steps 4–5. Remaining: Task 14 Steps 1–3 and 6** — the CI
+workflow (the `web` job, build-once/test-that-digest/promote-that-digest, and the mutation proving
+the image assertion can fail), plus the roadmap row and `web/README.md`.
 
 The gate is `scripts/gate <abs-worktree> <sha> <branch>` and it ran green at each wave boundary,
 not after each task. Within a wave, tasks are committed in dependency order and their individual
@@ -50,7 +54,33 @@ commit → `scripts/gate` PASS → `@rolldown/` down to `pluginutils` → `npm c
 lanes green again, `package-lock.json` byte-identical. Anyone reporting a green web lane from
 before a gate run is reporting it against a tree that no longer exists.
 
-### DIAGNOSED — `scripts/gate` is what breaks `web/node_modules`, every single run
+### ~~DIAGNOSED~~ — **FIXED in `beee9ba`**, and the fix is measured both ways
+
+The diagnosis below stood for four waves and is kept because the mechanism is worth knowing. What
+closed it, and what the diagnosis got slightly wrong:
+
+- **It is NOT only the install.** With a `node_modules` installed correctly under 24,
+  `./node_modules/.bin/vitest` still dies under node 20.9.0 — `SyntaxError: The requested module
+  'node:util' does not provide an export named 'styleText'`, because rolldown needs a newer Node.
+  So every node-using lane needs the pinned runtime, not merely the ones that say `npm`.
+- **`env: PATH:` in the Taskfile does not work, and that was measured rather than assumed.**
+  go-task honours injected env vars (a canary arrives intact) but resolves commands against the
+  PARENT environment, and the injection does not reach the child either — a tool invoked by
+  explicit path still ran its `#!/usr/bin/env node` shebang against the old PATH. A global
+  `env: PATH:` looks correct and changes nothing.
+- The fix is **`scripts/with-node`**, which every node lane now goes through. An inline
+  `PATH="…" cmd` also works but bakes a machine-specific nvm path into every echoed command line —
+  and `scripts/gate` asserts those lines character-for-character, so the wrapper is what keeps them
+  assertable. `web/.npmrc`'s `engine-strict=true` is the tripwire underneath.
+- **Both halves are falsifiable.** `with-node` exits 1 naming the pin when it cannot resolve it
+  (measured with a HOME that has no nvm), and a bare `npm ci` under node 20 now refuses with
+  `EBADENGINE` leaving the tree intact, where it used to install a broken one.
+
+**Acceptance criterion met**: a full `scripts/gate` run from a node-20 shell now leaves
+`@rolldown/binding-darwin-arm64` in place and `web:test` green (178/178) with no `npm ci` repair —
+the first time in this plan's history. The gate now runs **21 lanes**, web and E2E included.
+
+### The original diagnosis — `scripts/gate` is what breaks `web/node_modules`, every single run
 
 The rolldown-binding failure that ate an hour in wave 4 and recurred in wave 5 is not npm being
 flaky and not a stale checkout. **`scripts/gate` causes it, deterministically, and this is
@@ -73,16 +103,16 @@ Proof: binding present and 113 tests green → `scripts/gate` (PASS) → `@rolld
 `package-lock.json` byte-identical; the error message's own advice — delete the lock — would
 unpin all 34 versions `web:pins` exists to guard, and must not be followed.
 
-**This is Task 14's problem before it is anyone else's.** Task 14 mirrors the web lanes into
-`scripts/gate`; wired naively, `contracts:check` corrupts `node_modules` and then the web lanes
-run against the wreckage *inside the same gate invocation*. The ordering comment at
-`Taskfile.yml:362` already assumes `contracts:ts` is what provides `web/node_modules` — it is
-also what destroys it.
+~~**This is Task 14's problem before it is anyone else's.**~~ **CLOSED in `beee9ba` / `116ffdc`.**
+The concern was exact: wired naively, `contracts:check` corrupts `node_modules` and the web lanes
+then run against the wreckage inside the same gate invocation. That is why the blocker was fixed
+BEFORE the lanes were folded in, and why the gate orders them after `contracts:check`.
 
-Recommended fix, not applied here because it is outside Task 7 and changes gate behaviour:
-`engine-strict=true` in `web/.npmrc`, which turns EBADENGINE from a warning into a refusal, so a
-wrong-node `npm ci` fails loudly instead of silently shipping a broken tree. Whatever the fix,
-the acceptance criterion is that a full gate run leaves `web:test` green.
+The recommended `engine-strict=true` was necessary but **not sufficient on its own** — it converts
+a silent corruption into a hard refusal, which would have left the gate failing rather than green,
+so it does not meet its own stated acceptance criterion without something that actually supplies
+the pinned Node. sofo's ruling (2026-08-16) was lanes-self-resolve **plus** engine-strict, which is
+what shipped.
 
 ## The dependency graph, which is mostly a chain
 
@@ -92,7 +122,7 @@ Only the two braces parallelize; the file sets inside each are disjoint. Tasks 4
 overlap — Task 4 regenerates `schema.d.ts` out of `web/node_modules` while Task 1 rewrites
 `package.json` and reinstalls that same tree.
 
-**Both braces are now done. Everything left is strictly serial**, one task per wave: 14 alone.
+**Both braces are now done. Everything left is strictly serial**: the rest of Task 14 alone.
 There is no more parallelism to find in this plan.
 
 Wave 5 (Task 7) was executed **inline by the orchestrator**, not through the per-wave Workflow the
