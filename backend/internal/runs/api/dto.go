@@ -119,10 +119,12 @@ type ArtifactResponse struct {
 // non-nullability" rule does not bite here: the server sends all nine on every
 // 200. The generator still gives parent_ids and payload a null branch, because
 // a Go slice and a Go map can each marshal to null — but neither is ever null
-// FROM THIS ENDPOINT: the projection below builds parent_ids with make (an
-// artifact with no lineage ships []), and unmarshalMap answers an empty map
-// rather than nil for an empty column. A client must satisfy the null branch to
-// typecheck; it will not observe one.
+// FROM THIS ENDPOINT, and both are ENFORCED rather than assumed:
+// parentIDStrings builds with make, and ArtifactPayload normalizes a nil map to
+// an empty one. That second guard is not theoretical — a payload column holding
+// the jsonb literal `null` decodes to a nil map, and a harness that declares an
+// artifact with no payload key writes exactly that. A client must satisfy the
+// null branch to typecheck; it will not observe one.
 type ArtifactPayloadResponse struct {
 	ID         string    `json:"id" required:"true"`
 	RunID      string    `json:"run_id" required:"true"`
@@ -339,13 +341,9 @@ func runResponse(d runs.RunDetail, v gateViewer) RunResponse {
 		out.Phases = append(out.Phases, phase)
 	}
 	for _, a := range d.Artifacts {
-		parents := make([]string, 0, len(a.ParentIDs))
-		for _, id := range a.ParentIDs {
-			parents = append(parents, id.String())
-		}
 		out.Artifacts = append(out.Artifacts, ArtifactResponse{
 			ID: a.ID.String(), NodeID: a.NodeID, Attempt: a.Attempt, Generation: a.Generation,
-			Type: a.Type, ParentIDs: parents, CreatedAt: a.CreatedAt,
+			Type: a.Type, ParentIDs: parentIDStrings(a.ParentIDs), CreatedAt: a.CreatedAt,
 		})
 	}
 	for _, p := range d.Publications {
@@ -358,19 +356,27 @@ func runResponse(d runs.RunDetail, v gateViewer) RunResponse {
 	return out
 }
 
+// parentIDStrings projects an artifact's lineage for the wire. It builds with
+// make so a lineage-less artifact ships [] and NEVER null — an invariant both
+// artifact projections depend on and ArtifactPayloadResponse's doc comment
+// asserts, which is why one function holds it rather than two copies.
+func parentIDStrings(ids []uuid.UUID) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, id.String())
+	}
+	return out
+}
+
 // artifactPayloadResponse projects one artifact's content. The run id is passed
 // in rather than read off the artifact: the service has already required the two
 // to agree, so this echoes the run the CALLER addressed and there is no second
 // value that could disagree with it.
 func artifactPayloadResponse(runID uuid.UUID, a runs.ArtifactWithPayload) ArtifactPayloadResponse {
-	parents := make([]string, 0, len(a.ParentIDs))
-	for _, id := range a.ParentIDs {
-		parents = append(parents, id.String())
-	}
 	return ArtifactPayloadResponse{
 		ID: a.ID.String(), RunID: runID.String(), NodeID: a.NodeID,
 		Attempt: a.Attempt, Generation: a.Generation, Type: a.Type,
-		ParentIDs: parents, CreatedAt: a.CreatedAt, Payload: a.Payload,
+		ParentIDs: parentIDStrings(a.ParentIDs), CreatedAt: a.CreatedAt, Payload: a.Payload,
 	}
 }
 

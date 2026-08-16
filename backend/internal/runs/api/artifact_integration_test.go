@@ -5,12 +5,14 @@ package api_test
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/giiorg/caesar/backend/internal/runs"
 	runsapi "github.com/giiorg/caesar/backend/internal/runs/api"
 )
 
@@ -48,7 +50,7 @@ func (h *harness) stageRunWithPatchArtifact(t *testing.T) (uuid.UUID, uuid.UUID)
 		`SELECT base_sha FROM runs WHERE id = $1`, runID).Scan(&baseSHA); err != nil {
 		t.Fatal(err)
 	}
-	return runID, h.stageArtifact(t, runID, "impl", "patch", 1, 1, 5, diffPayload(baseSHA))
+	return runID, h.stageArtifact(t, runID, "impl", runs.ArtifactKindPatch, 1, 1, 5, diffPayload(baseSHA))
 }
 
 func (h *harness) getArtifact(t *testing.T, token string, runID, artifactID uuid.UUID) runsapi.ArtifactPayloadResponse {
@@ -116,6 +118,42 @@ func TestArtifactPayloadRetrieval(t *testing.T) {
 		resp := h.do(t, http.MethodGet, artifactPath(run, uuid.New()), "approver-tok", nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("unknown artifact = %d, want 404", resp.StatusCode)
+		}
+	})
+
+	t.Run("an artifact with no payload and no lineage ships {} and [], never null", func(t *testing.T) {
+		// NOT a hypothetical. `payload` is jsonb NOT NULL, which forbids SQL NULL
+		// and PERMITS 'null'::jsonb, and the production write path reaches it:
+		// declaredArtifact.Payload carries no presence check (runner/collect.go),
+		// so a harness whose .caesar declares {"type":"plan"} with no payload key
+		// marshals a nil map straight into this column.
+		//
+		// encoding/json stores the literal null into a map by NILLING it — the
+		// "null has no effect" rule is for primitives — so without the guard in
+		// ArtifactPayload this endpoint answers payload: null and the contract's
+		// "required" says nothing about it.
+		//
+		// The assertion is on the RAW BODY on purpose: {} and null both decode
+		// into a map[string]any, so a decoded value cannot tell them apart the way
+		// a client's JSON parser would.
+		id := h.stageArtifact(t, run, "plan", runs.ArtifactKindPlan, 1, 1, 4, "null")
+		resp := h.do(t, http.MethodGet, artifactPath(run, id), "viewer-tok", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("get artifact = %d, want 200", resp.StatusCode)
+		}
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(body["payload"]); got != "{}" {
+			t.Errorf("payload on the wire = %s, want {}", got)
+		}
+		// The other half of ArtifactPayloadResponse's nullability claim. This
+		// artifact's lineage is the column default '[]', so a projection that
+		// dropped parentIDStrings' make would ship null here and the DTO's doc
+		// comment would be false in the second of its two clauses.
+		if got := string(body["parent_ids"]); got != "[]" {
+			t.Errorf("parent_ids on the wire = %s, want []", got)
 		}
 	})
 

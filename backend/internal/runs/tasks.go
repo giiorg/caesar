@@ -664,6 +664,20 @@ func (s *Service) ArtifactPayload(ctx context.Context, runID, artifactID uuid.UU
 	if err != nil {
 		return ArtifactWithPayload{}, err
 	}
+	// unmarshalMap is nil-safe for an EMPTY column but not for the jsonb literal
+	// `null`, which encoding/json stores into a map by setting it to nil — the
+	// "null has no effect" rule covers primitives, not maps. `payload` is jsonb
+	// NOT NULL, which forbids SQL NULL and permits 'null'::jsonb, and the write
+	// path reaches it: declaredArtifact.Payload has no presence check
+	// (runner/collect.go), so a harness declaring {"type":"plan"} with no payload
+	// key marshals a nil map to the bytes `null`.
+	//
+	// An artifact with no content is an EMPTY payload, not an absent one. Pinning
+	// that here rather than in the DTO keeps the guarantee on the domain type, so
+	// no second projection of this value has to rediscover it.
+	if payload == nil {
+		payload = map[string]any{}
+	}
 	parents, err := parentIDsFromRow(row.ParentIds)
 	if err != nil {
 		return ArtifactWithPayload{}, err
