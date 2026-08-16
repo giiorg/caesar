@@ -113,6 +113,8 @@ CI_LOG="$LOGDIR/backend-ci.log"
 CONTRACTS_LOG="$LOGDIR/contracts-check.log"
 IMAGE_LOG="$LOGDIR/image-build.log"
 RUNNER_LOG="$LOGDIR/backend-test-runner.log"
+WEB_LOG="$LOGDIR/web-ci.log"
+WEBE2E_LOG="$LOGDIR/web-e2e.log"
 
 printf 'gate: %s @ %s (%s)\n' "$WT" "$HEAD_SHORT" "$BRANCH"
 printf 'gate: logs -> %s\n' "$LOGDIR"
@@ -151,6 +153,25 @@ printf 'gate: running task backend:test:runner ...\n'
 task backend:test:runner >"$RUNNER_LOG" 2>&1
 RUNNER_STATUS=$?
 
+# The web lanes. Until now they ran only by hand, so the client could go red
+# with this script reporting PASS. They run AFTER contracts:check deliberately:
+# contracts:ts regenerates web/src/api/schema.d.ts, and a web lane that ran
+# first would be checking the previous generation.
+#
+# These no longer need a repair afterwards. contracts:ts used to destroy
+# web/node_modules on the way past — go-task resolved whatever node the caller
+# had, which defaults to 20.9.0 here — and every lane below then ran against the
+# wreckage. Both are routed through scripts/with-node now.
+printf 'gate: running task web:ci ...\n'
+task web:ci >"$WEB_LOG" 2>&1
+WEB_STATUS=$?
+
+# web:e2e last: it is the only lane that needs a browser AND a Docker Postgres,
+# and it consumes the bundle web:ci just built.
+printf 'gate: running task web:e2e ...\n'
+task web:e2e >"$WEBE2E_LOG" 2>&1
+WEBE2E_STATUS=$?
+
 # ---------------------------------------------------------------------------
 # Verdict. Exit status alone is not the gate — collect every failure so one run
 # reports all of them.
@@ -163,6 +184,8 @@ fail() { printf '  - %s\n' "$1" >&2; FAILED=1; }
 [ "$CONTRACTS_STATUS" -eq 0 ] || fail "task contracts:check exited $CONTRACTS_STATUS"
 [ "$IMAGE_STATUS" -eq 0 ]     || fail "task image:build exited $IMAGE_STATUS"
 [ "$RUNNER_STATUS" -eq 0 ]    || fail "task backend:test:runner exited $RUNNER_STATUS"
+[ "$WEB_STATUS" -eq 0 ]       || fail "task web:ci exited $WEB_STATUS"
+[ "$WEBE2E_STATUS" -eq 0 ]    || fail "task web:e2e exited $WEBE2E_STATUS"
 
 # Lane identity AND the resolved command, not an ok count.
 #
@@ -189,6 +212,26 @@ LANE_CMDS=(
 	'task: [backend:vuln] bin/govulncheck -tags integration,property,runnerintegration,webe2e ./...'
 	'task: [backend:build] go build -trimpath -ldflags "-s -w -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Version='
 )
+# The web lanes, same rule: the RESOLVED line, so a narrowed or rerouted lane is
+# visible. Every one goes through ../scripts/with-node — that prefix is the
+# whole reason these lines are machine-independent enough to assert, since the
+# alternative (an inline PATH= assignment) would bake an absolute nvm path in.
+# shellcheck disable=SC2016
+WEB_CMDS=(
+	'task: [web:pins] ../scripts/with-node node tools/check-pins.mjs'
+	'task: [web:lint] ../scripts/with-node ./node_modules/.bin/biome ci .'
+	'task: [web:arch] ../scripts/with-node node --experimental-strip-types tools/arch/main.ts'
+	'task: [web:typecheck] ../scripts/with-node ./node_modules/.bin/tsc --noEmit'
+	'task: [web:typecheck] ../scripts/with-node node tools/check-mutants.mjs'
+	'task: [web:test] ../scripts/with-node ./node_modules/.bin/vitest run'
+	'task: [web:routes:check] ../scripts/with-node ./node_modules/.bin/tsr generate'
+	'task: [web:routes:check] git diff --exit-code -- src/routeTree.gen.ts'
+	'task: [web:build] ../scripts/with-node ./node_modules/.bin/vite build'
+)
+# shellcheck disable=SC2016
+WEBE2E_CMDS=(
+	'task: [web:e2e] go test -tags "integration,webe2e,embedui" -count=1 -timeout 15m ./internal/app/ -run TestWebE2E'
+)
 RUNNER_CMDS=(
 	'task: [backend:test:runner] go test -race -tags runnerintegration -count=1 -timeout 20m -p 1  ./internal/runs/runner/... ./internal/runs/egress/... ./internal/app/'
 )
@@ -214,6 +257,8 @@ assert_lane() {
 
 for want in "${LANE_CMDS[@]}"; do assert_lane "$CI_LOG" "$want"; done
 for want in "${RUNNER_CMDS[@]}"; do assert_lane "$RUNNER_LOG" "$want"; done
+for want in "${WEB_CMDS[@]}"; do assert_lane "$WEB_LOG" "$want"; done
+for want in "${WEBE2E_CMDS[@]}"; do assert_lane "$WEBE2E_LOG" "$want"; done
 
 # The build lane stamps the sha it actually compiled. This is the only evidence
 # that couples the gate's OUTPUT to the commit rather than to the shell's cwd.

@@ -324,6 +324,20 @@ tasks:
     cmds:
       - ../scripts/with-node ./node_modules/.bin/vite build
 
+  web:ci:
+    desc: "Every static web lane, in the order a failure is cheapest to read"
+    # web:build LAST: it is the slowest and the only one whose output another
+    # lane consumes (backend/internal/webui/dist). web:pins first because a
+    # drifted pin makes every later failure a red herring.
+    cmds:
+      - task: web:pins
+      - task: web:lint
+      - task: web:arch
+      - task: web:typecheck
+      - task: web:test
+      - task: web:routes:check
+      - task: web:build
+
   web:e2e:
     desc: "Playwright against the real backend (needs Docker for Postgres)"
     # NOT `deps: [web:build]`, unlike backend:test:embedui. This lane needs two
