@@ -6,6 +6,8 @@ package api
 import (
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/giiorg/caesar/backend/internal/runs"
 )
 
@@ -86,6 +88,15 @@ type PhaseResponse struct {
 	// Decision is present only on a gate attempt somebody decided. A revision
 	// leaves two gate attempts on the same node id, each carrying its own.
 	Decision *GateDecisionSummary `json:"decision"`
+	// Evidence is present only on a gate attempt still AWAITING a decision, so
+	// it and Decision are never both set. It is deliberately not marked
+	// required: the property really is null on every non-gate phase and on
+	// every decided one, and the generator cannot express "this object or null"
+	// for a named schema — a $ref property carries no null branch (see
+	// jsonschema-go's checkNullability, which only envelops when the reflector
+	// asks it to). Marking it required would tell openapi-typescript the object
+	// is always there, which is the one thing that is not true.
+	Evidence *GateEvidenceResponse `json:"evidence"`
 }
 
 type ArtifactResponse struct {
@@ -133,6 +144,42 @@ type ApprovalResponse struct {
 	Generation   int32     `json:"generation" required:"true"`
 	RequesterID  string    `json:"requester_id" required:"true"`
 	WaitingSince time.Time `json:"waiting_since" required:"true"`
+	// Evidence is always present: every row of this list is a gate awaiting a
+	// decision, which is exactly the state that has evidence.
+	Evidence GateEvidenceResponse `json:"evidence" required:"true"`
+}
+
+// GateEvidenceResponse is one gate's decision surface, answered server-side.
+// It is the SAME shape on a list row and on a run's gate phase because §3.4 and
+// §3.5 are one component with two hosts; a second shape would be a second
+// renderer, and the two would drift.
+type GateEvidenceResponse struct {
+	// ExaminedArtifactID is empty ONLY where the pinned definition binds an
+	// artifact the run never produced — a state decideGate also refuses. The
+	// surface says the evidence is missing; it does not render an empty diff.
+	ExaminedArtifactID string `json:"examined_artifact_id" required:"true"`
+	// A plan and a patch render differently and the client must know which
+	// before it fetches the payload.
+	ExaminedArtifactType string `json:"examined_artifact_type" required:"true"`
+	// Required AND nullable. "This gate has no verdict" is a value the client
+	// handles, not a key it fails to find.
+	SummaryArtifactID *string `json:"summary_artifact_id" required:"true"`
+	// CanDecide covers BOTH refusals in §5, which are independent: this
+	// endpoint lists gates for any grant while decideGate needs approve, and
+	// the run's policy may forbid the requester deciding their own gate.
+	// Where it is false the client suppresses ALL THREE controls — DecideGate
+	// refuses before it branches on decision type.
+	CanDecide bool `json:"can_decide" required:"true"`
+	// One of "", "not_approver", "self_approval_forbidden". Empty exactly when
+	// CanDecide is true.
+	CannotDecideReason string `json:"cannot_decide_reason" required:"true"`
+	// WallDeadline rides along because §5's third refusal is displayable BEFORE
+	// it bites: a run past its deadline can no longer be decided and the
+	// deadline is on the run, so a card can say "this expires in 20 minutes"
+	// instead of only reporting the 409 afterwards. It is NOT part of
+	// CanDecide — that would make the flag a function of the client's clock,
+	// and the database clock is the one that decides.
+	WallDeadline time.Time `json:"wall_deadline" required:"true"`
 }
 
 // Approvals is required AND nullable: the property is always present in the
@@ -192,7 +239,41 @@ func taskResponse(t runs.Task) TaskResponse {
 	}
 }
 
-func runResponse(d runs.RunDetail) RunResponse {
+// gateViewer is the CALLER's half of a gate's decidability: whether they hold
+// approve on the project, and who they are. The service knows the run and this
+// layer knows who is asking, so the same gate projects differently for two
+// principals on purpose.
+//
+// Its zero value is a caller who may decide nothing, which is what the two
+// shallow projections below pass — they carry no phases at all, so no gate of
+// theirs is ever projected.
+type gateViewer struct {
+	canApprove bool
+	actorID    uuid.UUID
+}
+
+func gateEvidenceResponse(ev runs.GateEvidence, v gateViewer) GateEvidenceResponse {
+	canDecide, reason := decidability(v.canApprove, v.actorID, ev.RequesterID, ev.AllowSelfApproval)
+	out := GateEvidenceResponse{
+		ExaminedArtifactType: ev.ExaminedArtifactType,
+		CanDecide:            canDecide,
+		CannotDecideReason:   reason,
+		WallDeadline:         ev.WallDeadline,
+	}
+	// A zero id is "the run never produced it", and the empty string is how
+	// that reaches a client — the all-zeroes uuid would read as an artifact
+	// they could go and fetch.
+	if ev.ExaminedArtifactID != uuid.Nil {
+		out.ExaminedArtifactID = ev.ExaminedArtifactID.String()
+	}
+	if ev.SummaryArtifactID != nil {
+		id := ev.SummaryArtifactID.String()
+		out.SummaryArtifactID = &id
+	}
+	return out
+}
+
+func runResponse(d runs.RunDetail, v gateViewer) RunResponse {
 	r := d.Run
 	out := RunResponse{
 		ID: r.ID.String(), TaskID: r.TaskID.String(), Status: string(r.Status),
@@ -206,11 +287,16 @@ func runResponse(d runs.RunDetail) RunResponse {
 		Publications: make([]PublicationResponse, 0, len(d.Publications)),
 	}
 	for _, p := range d.Phases {
-		out.Phases = append(out.Phases, PhaseResponse{
+		phase := PhaseResponse{
 			NodeID: p.NodeID, Attempt: p.Attempt, MaxAttempts: p.MaxAttempts, Status: string(p.Status),
 			Generation: p.Generation, Outcome: outcomeResponse(p.Outcome),
 			CreatedAt: p.CreatedAt, FinishedAt: p.FinishedAt, Decision: gateDecisionSummary(p.Decision),
-		})
+		}
+		if p.Evidence != nil {
+			ev := gateEvidenceResponse(*p.Evidence, v)
+			phase.Evidence = &ev
+		}
+		out.Phases = append(out.Phases, phase)
 	}
 	for _, a := range d.Artifacts {
 		parents := make([]string, 0, len(a.ParentIDs))
@@ -243,11 +329,12 @@ func gateDecisionSummary(d *runs.GateDecision) *GateDecisionSummary {
 	}
 }
 
-func approvalResponse(g runs.WaitingGate) ApprovalResponse {
+func approvalResponse(g runs.WaitingGate, v gateViewer) ApprovalResponse {
 	return ApprovalResponse{
 		RunID: g.RunID.String(), TaskID: g.TaskID.String(), ProjectID: g.ProjectID.String(),
 		TaskTitle: g.TaskTitle, NodeID: g.NodeID, Attempt: g.Attempt, Generation: g.Generation,
 		RequesterID: g.RequesterID.String(), WaitingSince: g.WaitingSince,
+		Evidence: gateEvidenceResponse(g.Evidence, v),
 	}
 }
 

@@ -2492,7 +2492,8 @@ func (q *Queries) ListUnsettledPublishIntents(ctx context.Context, runID uuid.UU
 
 const listWaitingGates = `-- name: ListWaitingGates :many
 SELECT pr.id, pr.run_id, pr.node_id, pr.attempt, pr.generation, pr.created_at,
-       t.id AS task_id, t.project_id, t.title, t.requester_id
+       t.id AS task_id, t.project_id, t.title, t.requester_id, t.workflow_version_id,
+       r.policy_snapshot, r.wall_deadline
 FROM phase_runs pr
 JOIN runs r ON r.id = pr.run_id
 JOIN tasks t ON t.id = r.task_id
@@ -2501,18 +2502,27 @@ ORDER BY pr.created_at
 `
 
 type ListWaitingGatesRow struct {
-	ID          uuid.UUID
-	RunID       uuid.UUID
-	NodeID      string
-	Attempt     int32
-	Generation  int32
-	CreatedAt   time.Time
-	TaskID      uuid.UUID
-	ProjectID   uuid.UUID
-	Title       string
-	RequesterID uuid.UUID
+	ID                uuid.UUID
+	RunID             uuid.UUID
+	NodeID            string
+	Attempt           int32
+	Generation        int32
+	CreatedAt         time.Time
+	TaskID            uuid.UUID
+	ProjectID         uuid.UUID
+	Title             string
+	RequesterID       uuid.UUID
+	WorkflowVersionID uuid.UUID
+	PolicySnapshot    []byte
+	WallDeadline      time.Time
 }
 
+// The three columns past the inbox's own fields are the gate's EVIDENCE
+// (Plan 12a §2.4), and all three come off the runs and tasks rows this query
+// already joins: the pinned version compiles to the plan that names the
+// examined artifact, the policy snapshot answers self-approval, and the wall
+// deadline is displayable before it bites. Reading them here is what keeps the
+// inbox one request instead of one plus N.
 func (q *Queries) ListWaitingGates(ctx context.Context) ([]ListWaitingGatesRow, error) {
 	rows, err := q.db.Query(ctx, listWaitingGates)
 	if err != nil {
@@ -2533,6 +2543,9 @@ func (q *Queries) ListWaitingGates(ctx context.Context) ([]ListWaitingGatesRow, 
 			&i.ProjectID,
 			&i.Title,
 			&i.RequesterID,
+			&i.WorkflowVersionID,
+			&i.PolicySnapshot,
+			&i.WallDeadline,
 		); err != nil {
 			return nil, err
 		}
@@ -2546,7 +2559,8 @@ func (q *Queries) ListWaitingGates(ctx context.Context) ([]ListWaitingGatesRow, 
 
 const listWaitingGatesByProjects = `-- name: ListWaitingGatesByProjects :many
 SELECT pr.id, pr.run_id, pr.node_id, pr.attempt, pr.generation, pr.created_at,
-       t.id AS task_id, t.project_id, t.title, t.requester_id
+       t.id AS task_id, t.project_id, t.title, t.requester_id, t.workflow_version_id,
+       r.policy_snapshot, r.wall_deadline
 FROM phase_runs pr
 JOIN runs r ON r.id = pr.run_id
 JOIN tasks t ON t.id = r.task_id
@@ -2555,16 +2569,19 @@ ORDER BY pr.created_at
 `
 
 type ListWaitingGatesByProjectsRow struct {
-	ID          uuid.UUID
-	RunID       uuid.UUID
-	NodeID      string
-	Attempt     int32
-	Generation  int32
-	CreatedAt   time.Time
-	TaskID      uuid.UUID
-	ProjectID   uuid.UUID
-	Title       string
-	RequesterID uuid.UUID
+	ID                uuid.UUID
+	RunID             uuid.UUID
+	NodeID            string
+	Attempt           int32
+	Generation        int32
+	CreatedAt         time.Time
+	TaskID            uuid.UUID
+	ProjectID         uuid.UUID
+	Title             string
+	RequesterID       uuid.UUID
+	WorkflowVersionID uuid.UUID
+	PolicySnapshot    []byte
+	WallDeadline      time.Time
 }
 
 func (q *Queries) ListWaitingGatesByProjects(ctx context.Context, projectIds []uuid.UUID) ([]ListWaitingGatesByProjectsRow, error) {
@@ -2587,6 +2604,9 @@ func (q *Queries) ListWaitingGatesByProjects(ctx context.Context, projectIds []u
 			&i.ProjectID,
 			&i.Title,
 			&i.RequesterID,
+			&i.WorkflowVersionID,
+			&i.PolicySnapshot,
+			&i.WallDeadline,
 		); err != nil {
 			return nil, err
 		}

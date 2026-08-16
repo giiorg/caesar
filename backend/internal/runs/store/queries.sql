@@ -661,8 +661,15 @@ WHERE publish_intents.id = sqlc.arg(id) AND publish_intents.status = sqlc.arg(st
   );
 
 -- name: ListWaitingGates :many
+-- The three columns past the inbox's own fields are the gate's EVIDENCE
+-- (Plan 12a §2.4), and all three come off the runs and tasks rows this query
+-- already joins: the pinned version compiles to the plan that names the
+-- examined artifact, the policy snapshot answers self-approval, and the wall
+-- deadline is displayable before it bites. Reading them here is what keeps the
+-- inbox one request instead of one plus N.
 SELECT pr.id, pr.run_id, pr.node_id, pr.attempt, pr.generation, pr.created_at,
-       t.id AS task_id, t.project_id, t.title, t.requester_id
+       t.id AS task_id, t.project_id, t.title, t.requester_id, t.workflow_version_id,
+       r.policy_snapshot, r.wall_deadline
 FROM phase_runs pr
 JOIN runs r ON r.id = pr.run_id
 JOIN tasks t ON t.id = r.task_id
@@ -671,7 +678,8 @@ ORDER BY pr.created_at;
 
 -- name: ListWaitingGatesByProjects :many
 SELECT pr.id, pr.run_id, pr.node_id, pr.attempt, pr.generation, pr.created_at,
-       t.id AS task_id, t.project_id, t.title, t.requester_id
+       t.id AS task_id, t.project_id, t.title, t.requester_id, t.workflow_version_id,
+       r.policy_snapshot, r.wall_deadline
 FROM phase_runs pr
 JOIN runs r ON r.id = pr.run_id
 JOIN tasks t ON t.id = r.task_id

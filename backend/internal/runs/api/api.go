@@ -343,7 +343,9 @@ func (a *API) handleRerunTask(w http.ResponseWriter, r *http.Request, sess authn
 		httpx.Problem(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, runResponse(runs.RunDetail{Run: run}))
+	// A freshly minted run carries no phases, so no gate of it is projected and
+	// the zero viewer is the honest answer rather than a shortcut.
+	httpx.JSON(w, http.StatusCreated, runResponse(runs.RunDetail{Run: run}, gateViewer{}))
 }
 
 func (a *API) handleListTaskRuns(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
@@ -358,14 +360,23 @@ func (a *API) handleListTaskRuns(w http.ResponseWriter, r *http.Request, sess au
 	}
 	out := RunListResponse{Runs: make([]RunResponse, 0, len(list))}
 	for _, run := range list {
-		out.Runs = append(out.Runs, runResponse(runs.RunDetail{Run: run}))
+		// List entries stay shallow — no phases, so no gate evidence.
+		out.Runs = append(out.Runs, runResponse(runs.RunDetail{Run: run}, gateViewer{}))
 	}
 	httpx.JSON(w, http.StatusOK, out)
 }
 
 func (a *API) handleGetRun(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
-	run, _, ok := a.runScoped(w, r, sess, authn.GrantView)
+	run, projectID, ok := a.runScoped(w, r, sess, authn.GrantView)
 	if !ok {
+		return
+	}
+	// The run is READABLE with view and DECIDABLE with approve, so a second
+	// question is asked of the same project: may this caller decide a gate they
+	// can see? Authorize answers it for an admin too, whose grants are empty.
+	canApprove, err := a.authz.Authorize(r.Context(), sess.Principal, projectID, authn.GrantApprove)
+	if err != nil {
+		httpx.Problem(w, r, err)
 		return
 	}
 	detail, err := a.svc.GetRunDetail(r.Context(), run.ID)
@@ -373,7 +384,26 @@ func (a *API) handleGetRun(w http.ResponseWriter, r *http.Request, sess authn.Au
 		httpx.Problem(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, runResponse(detail))
+	httpx.JSON(w, http.StatusOK, runResponse(detail, gateViewer{canApprove: canApprove, actorID: sess.UserID}))
+}
+
+// decidability answers §5 for one gate. It is SERVER-SIDE because neither half
+// is visible from the list: policy_snapshot is on the run (so a client would
+// fetch each one — the N+1 this endpoint exists to prevent) and the approve
+// grant is not in the response at all.
+//
+// ORDER MATTERS AND IS DELIBERATE. A caller who is both the requester and short
+// of approve gets "not_approver", because that is the one an operator can act
+// on: a grant can be raised, and self-approval is a property of a run already
+// created. Both are true; the message names the fixable one.
+func decidability(canApprove bool, actorID, requesterID uuid.UUID, allowSelf bool) (bool, string) {
+	if !canApprove {
+		return false, "not_approver"
+	}
+	if actorID == requesterID && !allowSelf {
+		return false, "self_approval_forbidden"
+	}
+	return true, ""
 }
 
 // handleDecideGate settles one gate. The project comes from the run, so the
@@ -431,8 +461,14 @@ func (a *API) handleListApprovals(w http.ResponseWriter, r *http.Request, sess a
 	var (
 		list []runs.WaitingGate
 		err  error
+		// levels is the caller's grant per project, built from the SAME
+		// GrantsForUser call the scoping below already makes — can_decide costs
+		// this handler no new query. It stays empty for an admin, whose
+		// authority comes from the role instead.
+		levels = map[uuid.UUID]authn.GrantLevel{}
 	)
-	if sess.Role == authn.RoleAdmin {
+	isAdmin := sess.Role == authn.RoleAdmin
+	if isAdmin {
 		list, err = a.svc.ListWaitingGates(r.Context(), nil, true)
 	} else {
 		var grants []authn.Grant
@@ -441,10 +477,12 @@ func (a *API) handleListApprovals(w http.ResponseWriter, r *http.Request, sess a
 			// The inbox shows what the caller can SEE; the decision endpoint
 			// is what enforces approve. A view-only member seeing that a gate
 			// is pending is information they already have from the run, and
-			// every other list endpoint here scopes the same way.
+			// every other list endpoint here scopes the same way — which is
+			// why each row then says whether they may decide it.
 			ids := make([]uuid.UUID, 0, len(grants))
 			for _, g := range grants {
 				ids = append(ids, g.ProjectID)
+				levels[g.ProjectID] = g.Level
 			}
 			list, err = a.svc.ListWaitingGates(r.Context(), ids, false)
 		}
@@ -455,7 +493,13 @@ func (a *API) handleListApprovals(w http.ResponseWriter, r *http.Request, sess a
 	}
 	out := ApprovalListResponse{Approvals: make([]ApprovalResponse, 0, len(list))}
 	for _, g := range list {
-		out.Approvals = append(out.Approvals, approvalResponse(g))
+		// An admin passes Authorize on every project regardless of grants, so
+		// deciding this from the map alone would report not_approver on every
+		// row of the one inbox that sees every row.
+		canApprove := isAdmin || levels[g.ProjectID].AtLeast(authn.GrantApprove)
+		out.Approvals = append(out.Approvals, approvalResponse(g, gateViewer{
+			canApprove: canApprove, actorID: sess.UserID,
+		}))
 	}
 	httpx.JSON(w, http.StatusOK, out)
 }

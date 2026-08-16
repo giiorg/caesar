@@ -64,7 +64,15 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 		"ApiUserResponse":         {"id", "email", "role", "active", "created_at", "updated_at"},
 		"ApiGrantResponse":        {"project_id", "level"},
 		"ApiApprovalListResponse": {"approvals"},
-		"ApiApprovalResponse":     {"run_id", "task_id", "task_title", "node_id", "project_id", "requester_id", "attempt", "generation", "waiting_since"},
+		"ApiApprovalResponse":     {"run_id", "task_id", "task_title", "node_id", "project_id", "requester_id", "attempt", "generation", "waiting_since", "evidence"},
+		// Every gate the approvals inbox lists is one awaiting a decision, so
+		// each of these is a value the server always sends. summary_artifact_id
+		// is required AND nullable: "this gate has no verdict" is a value the
+		// client branches on, not a key it fails to find.
+		"ApiGateEvidenceResponse": {
+			"examined_artifact_id", "examined_artifact_type", "summary_artifact_id",
+			"can_decide", "cannot_decide_reason", "wall_deadline",
+		},
 	}
 	for name, want := range wantRequired {
 		got := map[string]bool{}
@@ -74,6 +82,26 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 		for _, w := range want {
 			if !got[w] {
 				t.Errorf("%s: property %q is not required — openapi-typescript will render it optional", name, w)
+			}
+		}
+	}
+
+	// The other direction, and it is not symmetry for its own sake. A phase's
+	// evidence is null on every non-gate phase and on every decided gate, and a
+	// property that is a $ref carries NO null branch through this generator —
+	// jsonschema-go only envelops nullability around a reference when the
+	// reflector asks it to, which this one does not. Marking it required
+	// therefore renders `evidence: ApiGateEvidenceResponse` in TypeScript: not
+	// optional, not nullable, and wrong on most phases of most runs. Optional is
+	// the honest half-truth, because it makes the client narrow before it reads.
+	wantNotRequired := map[string][]string{"ApiPhaseResponse": {"evidence"}}
+	for name, unwanted := range wantNotRequired {
+		for _, r := range doc.Components.Schemas[name].Required {
+			for _, u := range unwanted {
+				if r == u {
+					t.Errorf("%s: property %q is required, but the server sends null for it; "+
+						"openapi-typescript renders a required $ref as non-nullable", name, u)
+				}
 			}
 		}
 	}

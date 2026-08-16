@@ -2047,6 +2047,9 @@
             "format": "int32",
             "type": "integer"
           },
+          "evidence": {
+            "$ref": "#/components/schemas/ApiGateEvidenceResponse"
+          },
           "generation": {
             "format": "int32",
             "type": "integer"
@@ -2083,7 +2086,8 @@
           "attempt",
           "generation",
           "requester_id",
-          "waiting_since"
+          "waiting_since",
+          "evidence"
         ],
         "type": "object"
       },
@@ -2314,6 +2318,41 @@
         },
         "type": "object"
       },
+      "ApiGateEvidenceResponse": {
+        "properties": {
+          "can_decide": {
+            "type": "boolean"
+          },
+          "cannot_decide_reason": {
+            "type": "string"
+          },
+          "examined_artifact_id": {
+            "type": "string"
+          },
+          "examined_artifact_type": {
+            "type": "string"
+          },
+          "summary_artifact_id": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "wall_deadline": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "examined_artifact_id",
+          "examined_artifact_type",
+          "summary_artifact_id",
+          "can_decide",
+          "cannot_decide_reason",
+          "wall_deadline"
+        ],
+        "type": "object"
+      },
       "ApiGrantListResponse": {
         "properties": {
           "grants": {
@@ -2464,6 +2503,9 @@
           },
           "decision": {
             "$ref": "#/components/schemas/ApiGateDecisionSummary"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/ApiGateEvidenceResponse"
           },
           "finished_at": {
             "format": "date-time",

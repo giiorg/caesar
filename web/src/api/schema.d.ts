@@ -674,6 +674,7 @@ export interface components {
         ApiApprovalResponse: {
             /** Format: int32 */
             attempt: number;
+            evidence: components["schemas"]["ApiGateEvidenceResponse"];
             /** Format: int32 */
             generation: number;
             node_id: string;
@@ -768,6 +769,15 @@ export interface components {
             note?: string;
             self_approval?: boolean;
         };
+        ApiGateEvidenceResponse: {
+            can_decide: boolean;
+            cannot_decide_reason: string;
+            examined_artifact_id: string;
+            examined_artifact_type: string;
+            summary_artifact_id: null | string;
+            /** Format: date-time */
+            wall_deadline: string;
+        };
         ApiGrantListResponse: {
             grants?: components["schemas"]["ApiProjectGrantResponse"][] | null;
         };
@@ -814,6 +824,7 @@ export interface components {
             /** Format: date-time */
             created_at?: string;
             decision?: components["schemas"]["ApiGateDecisionSummary"];
+            evidence?: components["schemas"]["ApiGateEvidenceResponse"];
             /** Format: date-time */
             finished_at?: null | string;
             /** Format: int32 */

@@ -77,6 +77,10 @@ type Phase struct {
 	// on the phase row's own id, so a revision's two gate attempts carry
 	// their own verdicts rather than sharing the newest.
 	Decision *GateDecision
+	// Evidence is present ONLY on a gate attempt still awaiting a decision.
+	// A decided gate carries its Decision instead, which already names the
+	// examined artifact; a non-gate phase has neither.
+	Evidence *GateEvidence
 }
 
 type ArtifactMeta struct {
@@ -575,6 +579,9 @@ func (s *Service) GetRunDetail(ctx context.Context, id uuid.UUID) (RunDetail, er
 		}
 		phases = append(phases, p)
 	}
+	if err := s.attachGateEvidence(ctx, q, run, phases); err != nil {
+		return RunDetail{}, err
+	}
 	artRows, err := q.ListArtifactsForRun(ctx, id)
 	if err != nil {
 		return RunDetail{}, fmt.Errorf("runs: list artifacts: %w", err)
@@ -607,6 +614,48 @@ func (s *Service) GetRunDetail(ctx context.Context, id uuid.UUID) (RunDetail, er
 		pubs = append(pubs, publicationFromRow(pi))
 	}
 	return RunDetail{Run: run, Phases: phases, Artifacts: arts, Publications: pubs}, nil
+}
+
+// attachGateEvidence fills in Evidence on every phase still awaiting a
+// decision, in place.
+//
+// It compiles the run's plan at most once — all phases of a run share one
+// definition — and does so ONLY when such a phase exists: a run with no waiting
+// gate must not pay for a task read and a definition read on every page load,
+// and most runs on most pages have none.
+func (s *Service) attachGateEvidence(ctx context.Context, q *store.Queries, run Run, phases []Phase) error {
+	var plan ExecPlan
+	var requesterID uuid.UUID
+	planLoaded := false
+	for i, p := range phases {
+		if p.Status != PhaseWaitingDecision {
+			continue
+		}
+		if !planLoaded {
+			task, err := q.GetTask(ctx, run.TaskID)
+			if err != nil {
+				return err
+			}
+			def, err := s.defs.DefinitionByVersionID(ctx, task.WorkflowVersionID)
+			if err != nil {
+				return err
+			}
+			if plan, err = compilePinned(def); err != nil {
+				return err
+			}
+			requesterID = task.RequesterID
+			planLoaded = true
+		}
+		ev, err := gateEvidence(ctx, q, gateEvidenceInput{
+			plan: plan, runID: run.ID, nodeID: p.NodeID, snapshot: run.Snapshot,
+			requesterID: requesterID, wallDeadline: run.WallDeadline,
+		})
+		if err != nil {
+			return err
+		}
+		phases[i].Evidence = &ev
+	}
+	return nil
 }
 
 // publicationFromRow flattens the receipt columns. Each is NULL until its
