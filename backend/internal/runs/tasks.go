@@ -106,7 +106,15 @@ type ArtifactWithPayload struct {
 // query set. It replaces GetRun's four return values, which had run out of
 // room the moment publications joined phases and artifacts.
 type RunDetail struct {
-	Run          Run
+	Run Run
+	// Labels is what the run page's header renders, and it is filled by the
+	// CALLER rather than by GetRunDetail. It lives here because runResponse
+	// projects one value, and it is not read from the database here because
+	// nothing in the domain needs it: a label is a presentation concern, the
+	// port that resolves one is wired only where a request is served, and every
+	// service-level reader of a run would otherwise have to wire a label source
+	// to observe a phase transition.
+	Labels       RunLabels
 	Phases       []Phase
 	Artifacts    []ArtifactMeta
 	Publications []Publication

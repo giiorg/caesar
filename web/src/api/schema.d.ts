@@ -372,6 +372,26 @@ export interface paths {
         patch: operations["updateRepo"];
         trace?: never;
     };
+    "/api/v1/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List runs on the projects the caller holds any grant on, newest first. Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["listRuns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/runs/{id}": {
         parameters: {
             query?: never;
@@ -724,15 +744,15 @@ export interface components {
         };
         ApiArtifactResponse: {
             /** Format: int32 */
-            attempt?: number;
+            attempt: number;
             /** Format: date-time */
-            created_at?: string;
+            created_at: string;
             /** Format: int32 */
-            generation?: number;
-            id?: string;
-            node_id?: string;
-            parent_ids?: string[] | null;
-            type?: string;
+            generation: number;
+            id: string;
+            node_id: string;
+            parent_ids: string[] | null;
+            type: string;
         };
         ApiChangePasswordRequest: {
             current_password?: string;
@@ -856,20 +876,29 @@ export interface components {
         };
         ApiPhaseResponse: {
             /** Format: int32 */
-            attempt?: number;
+            attempt: number;
             /** Format: date-time */
-            created_at?: string;
+            created_at: string;
             decision?: components["schemas"]["ApiGateDecisionSummary"];
             evidence?: components["schemas"]["ApiGateEvidenceResponse"];
             /** Format: date-time */
-            finished_at?: null | string;
+            finished_at: null | string;
             /** Format: int32 */
-            generation?: number;
+            generation: number;
             /** Format: int32 */
-            max_attempts?: number;
-            node_id?: string;
+            max_attempts: number;
+            node_id: string;
             outcome?: components["schemas"]["ApiOutcomeResponse"];
-            status?: string;
+            status: string;
+        };
+        ApiPhaseSummaryResponse: {
+            /** Format: int32 */
+            attempt: number;
+            /** Format: int32 */
+            generation: number;
+            node_id: string;
+            node_type: string;
+            status: null | string;
         };
         ApiProjectGrantResponse: {
             email?: string;
@@ -938,32 +967,61 @@ export interface components {
         ApiRunEventsResponse: {
             events?: components["schemas"]["ApiRunEventResponse"][] | null;
         };
+        ApiRunListPageResponse: {
+            next_cursor: null | string;
+            runs: components["schemas"]["ApiRunSummaryResponse"][] | null;
+        };
         ApiRunListResponse: {
-            runs?: components["schemas"]["ApiRunResponse"][] | null;
+            runs: components["schemas"]["ApiRunResponse"][] | null;
         };
         ApiRunResponse: {
-            artifacts?: components["schemas"]["ApiArtifactResponse"][] | null;
-            base_sha?: string;
+            artifacts: components["schemas"]["ApiArtifactResponse"][] | null;
+            base_sha: string;
             /** Format: date-time */
-            created_at?: string;
-            definition_hash?: string;
+            created_at: string;
+            definition_hash: string;
             /** Format: int64 */
-            execution_used_ms?: number;
+            execution_used_ms: number;
             /** Format: date-time */
-            finished_at?: null | string;
+            finished_at: null | string;
             /** Format: int32 */
-            generation?: number;
-            id?: string;
+            generation: number;
+            id: string;
             outcome?: components["schemas"]["ApiOutcomeResponse"];
-            phases?: components["schemas"]["ApiPhaseResponse"][] | null;
-            policy_snapshot?: components["schemas"]["RunsPolicySnapshot"];
-            publications?: components["schemas"]["ApiPublicationResponse"][] | null;
+            phases: components["schemas"]["ApiPhaseResponse"][] | null;
+            policy_snapshot: components["schemas"]["RunsPolicySnapshot"];
+            publications: components["schemas"]["ApiPublicationResponse"][] | null;
+            repo_slug: string;
             /** Format: date-time */
-            started_at?: null | string;
-            status?: string;
-            task_id?: string;
+            started_at: null | string;
+            status: string;
+            task_id: string;
+            task_title: string;
             /** Format: date-time */
-            wall_deadline?: string;
+            wall_deadline: string;
+            workflow_name: string;
+        };
+        ApiRunSummaryResponse: {
+            /** Format: int32 */
+            attempt: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            finished_at: null | string;
+            /** Format: int32 */
+            generation: number;
+            id: string;
+            phase_summary: components["schemas"]["ApiPhaseSummaryResponse"][] | null;
+            project_id: string;
+            project_name: string;
+            repo_slug: string;
+            requester_id: string;
+            /** Format: date-time */
+            started_at: null | string;
+            status: string;
+            task_id: string;
+            task_title: string;
+            workflow_name: string;
         };
         ApiTaskListResponse: {
             tasks?: components["schemas"]["ApiTaskResponse"][] | null;
@@ -2039,6 +2097,53 @@ export interface operations {
             };
             /** @description Bad Request */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    listRuns: {
+        parameters: {
+            query?: {
+                /** @description pending | running | waiting | succeeded | failed | superseded | dead */
+                status?: string;
+                /** @description only this task's runs (uuid) */
+                task_id?: string;
+                /** @description opaque; the previous page's next_cursor */
+                cursor?: string;
+                /** @description 1-200, default 50 */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiRunListPageResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -40,33 +40,120 @@ type TaskListResponse struct {
 
 // RunResponse carries phases, artifact metadata and publications inline on
 // the single-run read; list entries leave all three empty.
+//
+// EVERY property here is required except the three whose schema is a `$ref` to
+// a named component AND whose value is genuinely null on ordinary runs —
+// outcome on any live run, decision and evidence on a phase. This generator
+// gives a `$ref` property no null branch at all (jsonschema-go only envelops
+// nullability when the reflector asks it to, and contracts.go builds a bare
+// reflector), so `required` on one of those is a claim of NON-nullability that
+// would render `outcome: ApiOutcomeResponse` in TypeScript — not optional, not
+// nullable, and wrong on every run that has not ended. Scalars and slices are
+// unaffected: they really do render ["type","null"] while staying required.
 type RunResponse struct {
-	ID             string              `json:"id"`
-	TaskID         string              `json:"task_id"`
-	Status         string              `json:"status"`
-	DefinitionHash string              `json:"definition_hash"`
-	BaseSHA        string              `json:"base_sha"`
-	PolicySnapshot runs.PolicySnapshot `json:"policy_snapshot"`
+	ID     string `json:"id" required:"true"`
+	TaskID string `json:"task_id" required:"true"`
+	// The three labels a run page's header renders. They live only on the
+	// task, the repository and the workflow behind the pinned version, so a
+	// client without them is one fetch per label away from a title.
+	TaskTitle      string              `json:"task_title" required:"true"`
+	RepoSlug       string              `json:"repo_slug" required:"true"`
+	WorkflowName   string              `json:"workflow_name" required:"true"`
+	Status         string              `json:"status" required:"true"`
+	DefinitionHash string              `json:"definition_hash" required:"true"`
+	BaseSHA        string              `json:"base_sha" required:"true"`
+	PolicySnapshot runs.PolicySnapshot `json:"policy_snapshot" required:"true"`
 	// Generation is the revision round the run is on: 1 until a gate sends
 	// work back, one higher per round after that.
-	Generation      int32     `json:"generation"`
-	ExecutionUsedMS int64     `json:"execution_used_ms"`
-	WallDeadline    time.Time `json:"wall_deadline"`
+	Generation      int32     `json:"generation" required:"true"`
+	ExecutionUsedMS int64     `json:"execution_used_ms" required:"true"`
+	WallDeadline    time.Time `json:"wall_deadline" required:"true"`
 	// Outcome.Class on a terminal run can still read "transient" when the run
 	// died parked past its deadline over a settled publication. That is the
 	// orchestrator's classification, not this projection's — it predates the
 	// gate surface and is routed to Task 14; nothing here makes it worse.
+	//
+	// Deliberately NOT required: it is a $ref and it is null on every run that
+	// has not ended. See the type comment.
 	Outcome      *OutcomeResponse      `json:"outcome"`
-	CreatedAt    time.Time             `json:"created_at"`
-	StartedAt    *time.Time            `json:"started_at"`
-	FinishedAt   *time.Time            `json:"finished_at"`
-	Phases       []PhaseResponse       `json:"phases"`
-	Artifacts    []ArtifactResponse    `json:"artifacts"`
-	Publications []PublicationResponse `json:"publications"`
+	CreatedAt    time.Time             `json:"created_at" required:"true"`
+	StartedAt    *time.Time            `json:"started_at" required:"true"`
+	FinishedAt   *time.Time            `json:"finished_at" required:"true"`
+	Phases       []PhaseResponse       `json:"phases" required:"true"`
+	Artifacts    []ArtifactResponse    `json:"artifacts" required:"true"`
+	Publications []PublicationResponse `json:"publications" required:"true"`
 }
 
 type RunListResponse struct {
-	Runs []RunResponse `json:"runs"`
+	Runs []RunResponse `json:"runs" required:"true"`
+}
+
+// RunListPageResponse is one page. next_cursor is required AND nullable: null
+// means "this was the last page", which is a value the client branches on, not
+// a key it fails to find.
+type RunListPageResponse struct {
+	Runs       []RunSummaryResponse `json:"runs" required:"true"`
+	NextCursor *string              `json:"next_cursor" required:"true"`
+}
+
+// RunSummaryResponse is a run as a LIST ROW, and it is a different projection
+// from RunResponse on purpose: everything a Home or Tasks card renders is here,
+// so the card costs no second request. Reusing the reduced RunResponse — no
+// task title, no repo or workflow label, no phase summary — is what makes a
+// list of cards an N+1.
+type RunSummaryResponse struct {
+	ID          string `json:"id" required:"true"`
+	TaskID      string `json:"task_id" required:"true"`
+	TaskTitle   string `json:"task_title" required:"true"`
+	ProjectID   string `json:"project_id" required:"true"`
+	ProjectName string `json:"project_name" required:"true"`
+	RepoSlug    string `json:"repo_slug" required:"true"`
+	// WorkflowName is the workflow's CURRENT name, resolved through the version
+	// the task pinned. A rename is therefore visible on historical runs, which
+	// is the honest reading: the workflow is the thing that was renamed.
+	WorkflowName string `json:"workflow_name" required:"true"`
+	Status       string `json:"status" required:"true"`
+	// Attempt is the newest attempt ordinal among the run's materialized
+	// phases — what a card means by "attempt 2". It is 0 on a run nothing has
+	// materialized yet, because a run has no attempt of its own.
+	Attempt     int32  `json:"attempt" required:"true"`
+	Generation  int32  `json:"generation" required:"true"`
+	RequesterID string `json:"requester_id" required:"true"`
+	// Three real columns and no synthesized "updated_at": a card renders
+	// finished_at ?? started_at ?? created_at, and the choice stays visible.
+	CreatedAt  time.Time  `json:"created_at" required:"true"`
+	StartedAt  *time.Time `json:"started_at" required:"true"`
+	FinishedAt *time.Time `json:"finished_at" required:"true"`
+	// PhaseSummary is the run's whole SHAPE — one entry per node of the
+	// compiled definition, in topological order, materialized or not. A scalar
+	// "current phase" cannot render a row of dots, and a list that grew as the
+	// run advanced would draw a two-node run and a ten-node run identically.
+	PhaseSummary []PhaseSummaryResponse `json:"phase_summary" required:"true"`
+}
+
+// PhaseSummaryResponse is one dot in a card's phase row.
+type PhaseSummaryResponse struct {
+	NodeID string `json:"node_id" required:"true"`
+	// NodeType rides along because a gate dot is drawn differently from a work
+	// dot, and a client must not infer a node's type from its id string.
+	NodeType string `json:"node_type" required:"true"`
+	// Status is required AND nullable, and null is not "pending": `pending` is
+	// a real phase status meaning "materialized and claimable", while null
+	// means the orchestrator has not reached this node at all — a dim dot, not
+	// a queued one.
+	Status     *string `json:"status" required:"true"`
+	Attempt    int32   `json:"attempt" required:"true"`
+	Generation int32   `json:"generation" required:"true"`
+}
+
+// ListRunsQuery is the query string, declared as a struct so the parameters
+// reach the contract. Every field is `query`-tagged, so the reflector renders
+// parameters and no request body.
+type ListRunsQuery struct {
+	Status string `query:"status" description:"pending | running | waiting | succeeded | failed | superseded | dead"`
+	TaskID string `query:"task_id" description:"only this task's runs (uuid)"`
+	Cursor string `query:"cursor" description:"opaque; the previous page's next_cursor"`
+	Limit  int32  `query:"limit" description:"1-200, default 50"`
 }
 
 type OutcomeResponse struct {
@@ -77,16 +164,21 @@ type OutcomeResponse struct {
 }
 
 type PhaseResponse struct {
-	NodeID      string           `json:"node_id"`
-	Attempt     int32            `json:"attempt"`
-	MaxAttempts int32            `json:"max_attempts"`
-	Status      string           `json:"status"`
-	Generation  int32            `json:"generation"`
-	Outcome     *OutcomeResponse `json:"outcome"`
-	CreatedAt   time.Time        `json:"created_at"`
-	FinishedAt  *time.Time       `json:"finished_at"`
+	NodeID      string `json:"node_id" required:"true"`
+	Attempt     int32  `json:"attempt" required:"true"`
+	MaxAttempts int32  `json:"max_attempts" required:"true"`
+	Status      string `json:"status" required:"true"`
+	Generation  int32  `json:"generation" required:"true"`
+	// Outcome is null on every phase that has not ended, and it is a $ref —
+	// which this generator gives no null branch. Required would render it
+	// non-nullable in TypeScript; optional is the honest half-truth, because it
+	// makes the client narrow before it reads. Same reasoning as Evidence.
+	Outcome    *OutcomeResponse `json:"outcome"`
+	CreatedAt  time.Time        `json:"created_at" required:"true"`
+	FinishedAt *time.Time       `json:"finished_at" required:"true"`
 	// Decision is present only on a gate attempt somebody decided. A revision
-	// leaves two gate attempts on the same node id, each carrying its own.
+	// leaves two gate attempts on the same node id, each carrying its own. Not
+	// required, for the same $ref reason as Outcome and Evidence.
 	Decision *GateDecisionSummary `json:"decision"`
 	// Evidence is present only on a gate attempt still AWAITING a decision, so
 	// it and Decision are never both set. It is deliberately not marked
@@ -99,14 +191,19 @@ type PhaseResponse struct {
 	Evidence *GateEvidenceResponse `json:"evidence"`
 }
 
+// Every property is required and none is a $ref, so the "a required $ref claims
+// non-nullability" rule does not bite here: the server sends all seven on every
+// run projection. parent_ids keeps its null branch because a Go slice can
+// marshal to null — but parentIDStrings builds with make, so a client will
+// satisfy that branch and never observe one.
 type ArtifactResponse struct {
-	ID         string    `json:"id"`
-	NodeID     string    `json:"node_id"`
-	Attempt    int32     `json:"attempt"`
-	Generation int32     `json:"generation"`
-	Type       string    `json:"type"`
-	ParentIDs  []string  `json:"parent_ids"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID         string    `json:"id" required:"true"`
+	NodeID     string    `json:"node_id" required:"true"`
+	Attempt    int32     `json:"attempt" required:"true"`
+	Generation int32     `json:"generation" required:"true"`
+	Type       string    `json:"type" required:"true"`
+	ParentIDs  []string  `json:"parent_ids" required:"true"`
+	CreatedAt  time.Time `json:"created_at" required:"true"`
 }
 
 // ArtifactPayloadResponse is one artifact WITH its content. The metadata
@@ -319,6 +416,8 @@ func runResponse(d runs.RunDetail, v gateViewer) RunResponse {
 	r := d.Run
 	out := RunResponse{
 		ID: r.ID.String(), TaskID: r.TaskID.String(), Status: string(r.Status),
+		TaskTitle: d.Labels.TaskTitle, RepoSlug: d.Labels.RepoSlug,
+		WorkflowName:   d.Labels.WorkflowName,
 		DefinitionHash: r.DefinitionHash, BaseSHA: r.BaseSHA, PolicySnapshot: r.Snapshot,
 		Generation:      r.Generation,
 		ExecutionUsedMS: r.ExecutionUsedMS, WallDeadline: r.WallDeadline,
@@ -378,6 +477,41 @@ func artifactPayloadResponse(runID uuid.UUID, a runs.ArtifactWithPayload) Artifa
 		Attempt: a.Attempt, Generation: a.Generation, Type: a.Type,
 		ParentIDs: parentIDStrings(a.ParentIDs), CreatedAt: a.CreatedAt, Payload: a.Payload,
 	}
+}
+
+// runListPageResponse projects one page. next is the service's empty string for
+// "there is no next page", and it becomes a JSON null rather than an absent key
+// or an empty string: the client branches on the value, and "" is a cursor
+// shape it would have to know is special.
+func runListPageResponse(list []runs.RunSummary, next string) RunListPageResponse {
+	out := RunListPageResponse{Runs: make([]RunSummaryResponse, 0, len(list))}
+	if next != "" {
+		out.NextCursor = &next
+	}
+	for _, r := range list {
+		row := RunSummaryResponse{
+			ID: r.ID.String(), TaskID: r.TaskID.String(), TaskTitle: r.TaskTitle,
+			ProjectID: r.ProjectID.String(), ProjectName: r.ProjectName,
+			RepoSlug: r.RepoSlug, WorkflowName: r.WorkflowName,
+			Status: string(r.Status), Attempt: r.Attempt, Generation: r.Generation,
+			RequesterID: r.RequesterID.String(), CreatedAt: r.CreatedAt,
+			StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
+			PhaseSummary: make([]PhaseSummaryResponse, 0, len(r.Phases)),
+		}
+		for _, p := range r.Phases {
+			entry := PhaseSummaryResponse{
+				NodeID: p.NodeID, NodeType: p.NodeType,
+				Attempt: p.Attempt, Generation: p.Generation,
+			}
+			if p.Status != nil {
+				status := string(*p.Status)
+				entry.Status = &status
+			}
+			row.PhaseSummary = append(row.PhaseSummary, entry)
+		}
+		out.Runs = append(out.Runs, row)
+	}
+	return out
 }
 
 func gateDecisionSummary(d *runs.GateDecision) *GateDecisionSummary {

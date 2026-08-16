@@ -321,7 +321,10 @@ func e2eSeed(ctx context.Context, t *testing.T, cfg config.Config) e2eFixture {
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
 		newForgeAdapter(assetsSvc, forgeEndpointsFrom(cfg.Forge), &http.Client{Timeout: 5 * time.Second}),
 		gitPublisher{assets: assetsSvc, workDir: cfg.Forge.PublishWorkDir, endpoints: forgeEndpointsFrom(cfg.Forge)},
-		principalSource{svc: identitySvc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		principalSource{svc: identitySvc}, runs.Params{
+			Snapshot: runs.DefaultSnapshot(),
+			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
+		})
 
 	return e2eFixture{
 		admin: admin, email: email, password: password,

@@ -112,6 +112,50 @@ func (p spinePorts) Repo(_ context.Context, id uuid.UUID) (runs.RepoRef, error) 
 	}, nil
 }
 
+// ProjectNames, RepoSlugs and WorkflowNames are runs.RunLabelSource, served
+// from the same harness rows every other port here answers from. They are real
+// lookups rather than constants because the list endpoint's labels are exactly
+// what a caller cannot get anywhere else, and a double that invented them would
+// make "the row carries the labels a card renders" true of nothing.
+//
+// A missing id is an ABSENT entry and never an error — the port's contract, and
+// the reason a deleted repository does not take out the list of runs that name
+// it.
+func (p spinePorts) ProjectNames(_ context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	names := map[uuid.UUID]string{p.h.projectID: "spine", p.h.projectB: "spine-b"}
+	out := map[uuid.UUID]string{}
+	for _, id := range ids {
+		if n, ok := names[id]; ok {
+			out[id] = n
+		}
+	}
+	return out, nil
+}
+
+func (p spinePorts) RepoSlugs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := map[uuid.UUID]string{}
+	for _, id := range ids {
+		r, err := p.Repo(ctx, id)
+		if err != nil {
+			continue
+		}
+		out[id] = r.Slug
+	}
+	return out, nil
+}
+
+func (p spinePorts) WorkflowNames(_ context.Context, versionIDs []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := map[uuid.UUID]string{}
+	for _, vid := range versionIDs {
+		for _, v := range p.h.versions {
+			if v.id == vid {
+				out[vid] = workflowName
+			}
+		}
+	}
+	return out, nil
+}
+
 // Email is runs.PrincipalSource. The API suite never publishes, but loadPlan
 // and the publish path take the port, so a double has to exist.
 func (p spinePorts) Email(_ context.Context, userID uuid.UUID) (string, error) {
@@ -172,6 +216,12 @@ const (
 	planGateVersion    int32 = 2
 	verdictGateVersion int32 = 3
 )
+
+// workflowName is the one workflow every staged version belongs to. It is a
+// constant because the label port answers with it and the list assertions read
+// it back: a literal in two places is a test that agrees with itself by
+// coincidence.
+const workflowName = "spine-wf"
 
 // planGateDoc is a gate over a PLAN, with a review node hanging off the same
 // plan. The review finishes later, so "the newest artifact on the run" and "the
@@ -361,7 +411,7 @@ func newHarnessWithStreams(t *testing.T, streams runsapi.StreamServer) *harness 
 	}
 	h.repos = map[uuid.UUID]uuid.UUID{h.repoID: h.projectID, h.repoB: h.projectB}
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO workflows (name) VALUES ('spine-wf') RETURNING id`).Scan(&h.workflowID); err != nil {
+		`INSERT INTO workflows (name) VALUES ($1) RETURNING id`, workflowName).Scan(&h.workflowID); err != nil {
 		t.Fatal(err)
 	}
 	h.versionID = h.registerVersion(t, gatedVersion, "deadbeef", gatedDoc())
@@ -392,7 +442,7 @@ func newHarnessWithStreams(t *testing.T, streams runsapi.StreamServer) *harness 
 		h.repoB:  "basesha0000000000000000000000000000000000",
 	})
 	svc := runs.NewService(pool, c, audit.NewRecorder(c), ports, ports, ports, forge,
-		fake.NewPublisher(nil), ports, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		fake.NewPublisher(nil), ports, runs.Params{Snapshot: runs.DefaultSnapshot(), Labels: ports})
 
 	mux := http.NewServeMux()
 	httpx.Mount(mux, runsapi.Operations(runsapi.New(svc, h.ports, h.ports, h.ports, streams)))

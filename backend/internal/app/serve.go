@@ -213,7 +213,10 @@ func runServeWith(ctx context.Context, cfg config.Config, log *slog.Logger, opts
 
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		forgeSvc, publisher, principalSource{svc: svc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		forgeSvc, publisher, principalSource{svc: svc}, runs.Params{
+			Snapshot: runs.DefaultSnapshot(),
+			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
+		})
 
 	// Realtime (spec §4): ONE tailer, ONE hub, ONE Streamer for the whole
 	// process, started before anything can serve a request against them.

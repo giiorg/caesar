@@ -118,6 +118,80 @@ func (s runsAssetSource) StaleCredentialLeases(ctx context.Context, olderThan ti
 	return out, nil
 }
 
+// runsLabelSource adapts assets + workflows to runs.RunLabelSource. The loops
+// are over DISTINCT ids the caller already deduplicated, so this is O(distinct)
+// round trips per page and not O(rows) — and the port's shape leaves room for a
+// real batch query later without touching the runs context.
+//
+// A deleted asset is a MISSING LABEL and never a failed page: the run rows
+// outlive the repository and the workflow they name, and a list that 500s
+// because one of them was removed is a list nobody can use to find out what
+// happened.
+type runsLabelSource struct {
+	assets    *assets.Service
+	workflows *workflows.Service
+}
+
+// The port is consumed only through runs.Params, so this is what keeps a
+// signature drift from surviving until production wiring.
+var _ runs.RunLabelSource = runsLabelSource{}
+
+func (s runsLabelSource) ProjectNames(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	list, err := s.assets.ListProjectsByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uuid.UUID]string, len(list))
+	for _, p := range list {
+		out[p.ID] = p.Name
+	}
+	return out, nil
+}
+
+func (s runsLabelSource) RepoSlugs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := make(map[uuid.UUID]string, len(ids))
+	for _, id := range ids {
+		r, err := s.assets.GetRepo(ctx, id)
+		if err != nil {
+			// A deleted repo is a missing label, not a failed page.
+			if xerrors.ClassOf(err) == xerrors.ClassNotFound {
+				continue
+			}
+			return nil, err
+		}
+		out[id] = r.Slug
+	}
+	return out, nil
+}
+
+func (s runsLabelSource) WorkflowNames(ctx context.Context, versionIDs []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := make(map[uuid.UUID]string, len(versionIDs))
+	byWorkflow := map[uuid.UUID]string{}
+	for _, vid := range versionIDs {
+		v, err := s.workflows.GetVersionByID(ctx, vid)
+		if err != nil {
+			if xerrors.ClassOf(err) == xerrors.ClassNotFound {
+				continue
+			}
+			return nil, err
+		}
+		name, ok := byWorkflow[v.WorkflowID]
+		if !ok {
+			wf, err := s.workflows.GetWorkflow(ctx, v.WorkflowID)
+			if err != nil {
+				if xerrors.ClassOf(err) == xerrors.ClassNotFound {
+					continue
+				}
+				return nil, err
+			}
+			name = wf.Name
+			byWorkflow[v.WorkflowID] = name
+		}
+		out[vid] = name
+	}
+	return out, nil
+}
+
 // forgeAdapter implements runs.Forge over the platform clients. It is the
 // composition root's job because it needs BOTH the runs vocabulary and the
 // assets credential path, and no context may see both.

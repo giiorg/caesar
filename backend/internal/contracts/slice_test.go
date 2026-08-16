@@ -44,6 +44,9 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 		"/api/v1/auth/me":    {"get": {"200", "400", "401"}},
 		"/api/v1/approvals":  {"get": {"200", "400", "401"}},
 		"/api/v1/stream":     {"get": {"200", "400", "401"}},
+		// The run list scopes rather than refuses, exactly as /approvals does:
+		// an ungranted member gets 200 and an empty page, never a 403.
+		"/api/v1/runs": {"get": {"200", "400", "401"}},
 	}
 	for path, methods := range wantStatuses {
 		for method, codes := range methods {
@@ -74,6 +77,32 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 			"examined_artifact_id", "examined_artifact_type", "summary_artifact_id",
 			"can_decide", "cannot_decide_reason", "wall_deadline",
 		},
+		// The run list and the run page. next_cursor, started_at, finished_at
+		// and a phase summary's status are required AND nullable — every one of
+		// them is a value the client branches on, not a key it fails to find,
+		// and none of them is a $ref, so the generator really does render
+		// ["type","null"] beside the required entry.
+		"ApiRunListPageResponse":  {"runs", "next_cursor"},
+		"ApiPhaseSummaryResponse": {"node_id", "node_type", "status", "attempt", "generation"},
+		"ApiRunSummaryResponse": {
+			"id", "task_id", "task_title", "project_id", "project_name", "repo_slug",
+			"workflow_name", "status", "attempt", "generation", "requester_id",
+			"created_at", "started_at", "finished_at", "phase_summary",
+		},
+		"ApiRunResponse": {
+			"id", "task_id", "task_title", "repo_slug", "workflow_name", "status",
+			"definition_hash", "base_sha", "policy_snapshot", "generation",
+			"execution_used_ms", "wall_deadline", "created_at", "started_at",
+			"finished_at", "phases", "artifacts", "publications",
+		},
+		"ApiPhaseResponse": {
+			"node_id", "attempt", "max_attempts", "status", "generation",
+			"created_at", "finished_at",
+		},
+		"ApiArtifactResponse": {
+			"id", "node_id", "attempt", "generation", "type", "parent_ids", "created_at",
+		},
+		"ApiRunListResponse": {"runs"},
 	}
 	for name, want := range wantRequired {
 		got := map[string]bool{}
@@ -101,7 +130,17 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 	// required" vacuously, and the pin would go quiet exactly when the thing it
 	// pins moved. The loop above fails loudly on a missing schema for free —
 	// every wanted property reads as absent — and this one has to say so.
-	wantNotRequired := map[string][]string{"ApiPhaseResponse": {"evidence"}}
+	//
+	// The set has grown with Plan 12a's markup sweep and every entry is the
+	// same shape: a $ref-typed property the server genuinely sends as null.
+	// A phase's outcome is null until the attempt ends and its decision until
+	// somebody decides it; a run's outcome is null on every run still going.
+	// Marking any of them required renders `outcome: ApiOutcomeResponse` — not
+	// optional, not nullable, and wrong on most rows of most pages.
+	wantNotRequired := map[string][]string{
+		"ApiPhaseResponse": {"evidence", "decision", "outcome"},
+		"ApiRunResponse":   {"outcome"},
+	}
 	for name, unwanted := range wantNotRequired {
 		schema, ok := doc.Components.Schemas[name]
 		if !ok {

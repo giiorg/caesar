@@ -123,7 +123,10 @@ func newRunnerEnv(t *testing.T, engine *dockerapi.Client, spec envSpec) *runnerE
 	runsSvc := runs.NewService(pool, clk, rec,
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
 		forge, fake.NewPublisher(nil), principalSource{svc: identitySvc},
-		runs.Params{Snapshot: runs.DefaultSnapshot()})
+		runs.Params{
+			Snapshot: runs.DefaultSnapshot(),
+			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
+		})
 
 	project, err := assetsSvc.CreateProject(ctx, admin, spec.name, "")
 	if err != nil {

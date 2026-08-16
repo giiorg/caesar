@@ -1090,6 +1090,84 @@
         }
       }
     },
+    "/api/v1/runs": {
+      "get": {
+        "summary": "List runs on the projects the caller holds any grant on, newest first. Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "listRuns",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "pending | running | waiting | succeeded | failed | superseded | dead",
+            "schema": {
+              "description": "pending | running | waiting | succeeded | failed | superseded | dead",
+              "type": "string"
+            }
+          },
+          {
+            "name": "task_id",
+            "in": "query",
+            "description": "only this task's runs (uuid)",
+            "schema": {
+              "description": "only this task's runs (uuid)",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "opaque; the previous page's next_cursor",
+            "schema": {
+              "description": "opaque; the previous page's next_cursor",
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "1-200, default 50",
+            "schema": {
+              "description": "1-200, default 50",
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiRunListPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/runs/{id}": {
       "get": {
         "summary": "Get a run with phases and artifact metadata (view)",
@@ -2231,6 +2309,15 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "node_id",
+          "attempt",
+          "generation",
+          "type",
+          "parent_ids",
+          "created_at"
+        ],
         "type": "object"
       },
       "ApiChangePasswordRequest": {
@@ -2639,6 +2726,47 @@
             "type": "string"
           }
         },
+        "required": [
+          "node_id",
+          "attempt",
+          "max_attempts",
+          "status",
+          "generation",
+          "created_at",
+          "finished_at"
+        ],
+        "type": "object"
+      },
+      "ApiPhaseSummaryResponse": {
+        "properties": {
+          "attempt": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "generation": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "node_type": {
+            "type": "string"
+          },
+          "status": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "node_type",
+          "status",
+          "attempt",
+          "generation"
+        ],
         "type": "object"
       },
       "ApiProjectGrantResponse": {
@@ -2830,6 +2958,30 @@
         },
         "type": "object"
       },
+      "ApiRunListPageResponse": {
+        "properties": {
+          "next_cursor": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/ApiRunSummaryResponse"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "runs",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
       "ApiRunListResponse": {
         "properties": {
           "runs": {
@@ -2842,6 +2994,9 @@
             ]
           }
         },
+        "required": [
+          "runs"
+        ],
         "type": "object"
       },
       "ApiRunResponse": {
@@ -2907,6 +3062,9 @@
               "null"
             ]
           },
+          "repo_slug": {
+            "type": "string"
+          },
           "started_at": {
             "format": "date-time",
             "type": [
@@ -2920,11 +3078,121 @@
           "task_id": {
             "type": "string"
           },
+          "task_title": {
+            "type": "string"
+          },
           "wall_deadline": {
             "format": "date-time",
             "type": "string"
+          },
+          "workflow_name": {
+            "type": "string"
           }
         },
+        "required": [
+          "id",
+          "task_id",
+          "task_title",
+          "repo_slug",
+          "workflow_name",
+          "status",
+          "definition_hash",
+          "base_sha",
+          "policy_snapshot",
+          "generation",
+          "execution_used_ms",
+          "wall_deadline",
+          "created_at",
+          "started_at",
+          "finished_at",
+          "phases",
+          "artifacts",
+          "publications"
+        ],
+        "type": "object"
+      },
+      "ApiRunSummaryResponse": {
+        "properties": {
+          "attempt": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "generation": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "phase_summary": {
+            "items": {
+              "$ref": "#/components/schemas/ApiPhaseSummaryResponse"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "repo_slug": {
+            "type": "string"
+          },
+          "requester_id": {
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "task_title": {
+            "type": "string"
+          },
+          "workflow_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "task_id",
+          "task_title",
+          "project_id",
+          "project_name",
+          "repo_slug",
+          "workflow_name",
+          "status",
+          "attempt",
+          "generation",
+          "requester_id",
+          "created_at",
+          "started_at",
+          "finished_at",
+          "phase_summary"
+        ],
         "type": "object"
       },
       "ApiTaskListResponse": {

@@ -740,3 +740,37 @@ UPDATE phase_runs SET status = 'superseded', outcome = sqlc.arg(outcome), finish
 WHERE run_id = sqlc.arg(run_id) AND node_id = ANY(sqlc.arg(node_ids)::text[])
   AND status IN ('pending', 'running', 'waiting_decision', 'reconciling', 'succeeded')
 RETURNING id, node_id, attempt;
+
+-- name: ListRunsPage :many
+-- One page of the run list, newest first.
+--
+-- The keyset predicate is a ROW-VALUE comparison against the same two columns
+-- the ORDER BY names, in the same direction. That is what makes the cursor and
+-- the sort key incapable of disagreeing: with `created_at < $x OR (created_at =
+-- $x AND id < $y)` written out by hand, a later edit to one half silently drops
+-- or repeats the rows that share a timestamp — and uuidv7 ids come off a
+-- millisecond clock, so runs sharing one are the common case under load.
+--
+-- all_projects is passed rather than inferred from an empty array: an empty
+-- grant set is an EMPTY page, and `= ANY('{}')` gives exactly that, while an
+-- admin needs every row. Conflating them is how an ungranted member sees
+-- everything.
+SELECT sqlc.embed(r), t.title, t.project_id, t.repo_id, t.workflow_version_id, t.requester_id
+FROM runs r
+JOIN tasks t ON t.id = r.task_id
+WHERE (sqlc.arg(all_projects)::boolean OR t.project_id = ANY(sqlc.arg(project_ids)::uuid[]))
+  AND (sqlc.narg(status)::text IS NULL OR r.status = sqlc.narg(status)::text)
+  AND (sqlc.narg(task_id)::uuid IS NULL OR r.task_id = sqlc.narg(task_id)::uuid)
+  AND (sqlc.narg(cursor_created_at)::timestamptz IS NULL
+       OR (r.created_at, r.id) < (sqlc.narg(cursor_created_at)::timestamptz, sqlc.narg(cursor_id)::uuid))
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT sqlc.arg(page_limit);
+
+-- name: ListLatestPhasesForRuns :many
+-- The newest attempt row per (run, node) across a whole page — one query, not
+-- one per run. Ordered by PROVENANCE (generation, then attempt) for the same
+-- reason GetNodeArtifact is: created_at mixes two independent clocks.
+SELECT DISTINCT ON (run_id, node_id) run_id, node_id, attempt, generation, status
+FROM phase_runs
+WHERE run_id = ANY(sqlc.arg(run_ids)::uuid[])
+ORDER BY run_id, node_id, generation DESC, attempt DESC;

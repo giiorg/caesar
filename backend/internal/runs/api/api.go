@@ -101,6 +101,19 @@ func Operations(a *API) []httpx.Operation {
 			Handler: a.authenticated(a.handleListTaskRuns),
 		},
 		{
+			Pattern: "GET /api/v1/runs", ID: "listRuns",
+			Summary: "List runs on the projects the caller holds any grant on, newest first. " +
+				"Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.",
+			Request: ListRunsQuery{}, Response: RunListPageResponse{}, Status: http.StatusOK,
+			// 401 and no 403, exactly as listApprovals: authenticated() refuses
+			// a missing cookie before the handler runs, and the handler itself
+			// scopes rather than refuses — an ungranted member gets 200 and an
+			// empty page. Seeing nothing and being refused are different
+			// answers and this endpoint only ever gives the first.
+			Errors:  []int{http.StatusUnauthorized},
+			Handler: a.authenticated(a.handleListRuns),
+		},
+		{
 			Pattern: "GET /api/v1/runs/{id}", ID: "getRun", Summary: "Get a run with phases and artifact metadata (view)",
 			Response: RunResponse{}, Status: http.StatusOK,
 			Handler: a.authenticated(a.handleGetRun),
@@ -308,30 +321,31 @@ func (a *API) taskScoped(w http.ResponseWriter, r *http.Request, sess authn.Auth
 // It reads the run row only. The projection its one page-rendering caller
 // needs is five queries, and the event poll runs this on every tick.
 //
-// The project it authorized against is RETURNED rather than discarded. It cost
-// a query to learn and it is not recoverable from the run, so the one caller
-// that needs to pass it on would otherwise have to repeat both reads to obtain
-// a value this function already had in hand.
-func (a *API) runScoped(w http.ResponseWriter, r *http.Request, sess authn.AuthSession, min authn.GrantLevel) (runs.Run, uuid.UUID, bool) {
+// The TASK it authorized against is RETURNED rather than discarded. It cost a
+// query to learn, and neither the project it carries nor the three labels it
+// pins are recoverable from the run — so the callers that need either would
+// otherwise repeat both reads to obtain a value this function already had in
+// hand.
+func (a *API) runScoped(w http.ResponseWriter, r *http.Request, sess authn.AuthSession, min authn.GrantLevel) (runs.Run, runs.Task, bool) {
 	id, err := pathUUID(r, "no such run")
 	if err != nil {
 		httpx.Problem(w, r, err)
-		return runs.Run{}, uuid.Nil, false
+		return runs.Run{}, runs.Task{}, false
 	}
 	run, err := a.svc.GetRunSummary(r.Context(), id)
 	if err != nil {
 		httpx.Problem(w, r, err)
-		return runs.Run{}, uuid.Nil, false
+		return runs.Run{}, runs.Task{}, false
 	}
 	task, err := a.svc.GetTask(r.Context(), run.TaskID)
 	if err != nil {
 		httpx.Problem(w, r, err)
-		return runs.Run{}, uuid.Nil, false
+		return runs.Run{}, runs.Task{}, false
 	}
 	if !a.authorize(w, r, sess, task.ProjectID, min) {
-		return runs.Run{}, uuid.Nil, false
+		return runs.Run{}, runs.Task{}, false
 	}
-	return run, task.ProjectID, true
+	return run, task, true
 }
 
 func (a *API) handleGetTask(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
@@ -352,9 +366,17 @@ func (a *API) handleRerunTask(w http.ResponseWriter, r *http.Request, sess authn
 		httpx.Problem(w, r, err)
 		return
 	}
+	labels, err := a.svc.LabelsForTask(r.Context(), task)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
 	// A freshly minted run carries no phases, so no gate of it is projected and
-	// the empty viewer is the honest answer rather than a shortcut.
-	httpx.JSON(w, http.StatusCreated, runResponse(runs.RunDetail{Run: run}, noGateViewer()))
+	// the empty viewer is the honest answer rather than a shortcut. The LABELS
+	// are still resolved: they belong to the task rather than to the run, and
+	// leaving them blank would ship a projection whose header renders nothing
+	// on the very screen a re-run lands you on.
+	httpx.JSON(w, http.StatusCreated, runResponse(runs.RunDetail{Run: run, Labels: labels}, noGateViewer()))
 }
 
 func (a *API) handleListTaskRuns(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
@@ -367,16 +389,23 @@ func (a *API) handleListTaskRuns(w http.ResponseWriter, r *http.Request, sess au
 		httpx.Problem(w, r, err)
 		return
 	}
+	// Every run of one task shares that task's labels, so this is ONE
+	// resolution for the whole list rather than one per row.
+	labels, err := a.svc.LabelsForTask(r.Context(), task)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
 	out := RunListResponse{Runs: make([]RunResponse, 0, len(list))}
 	for _, run := range list {
 		// List entries stay shallow — no phases, so no gate evidence.
-		out.Runs = append(out.Runs, runResponse(runs.RunDetail{Run: run}, noGateViewer()))
+		out.Runs = append(out.Runs, runResponse(runs.RunDetail{Run: run, Labels: labels}, noGateViewer()))
 	}
 	httpx.JSON(w, http.StatusOK, out)
 }
 
 func (a *API) handleGetRun(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
-	run, projectID, ok := a.runScoped(w, r, sess, authn.GrantView)
+	run, task, ok := a.runScoped(w, r, sess, authn.GrantView)
 	if !ok {
 		return
 	}
@@ -391,12 +420,21 @@ func (a *API) handleGetRun(w http.ResponseWriter, r *http.Request, sess authn.Au
 	// other handler here avoids — to save one indexed single-row lookup
 	// (identity/service.go: GetGrantLevel, and free for an admin) on a page that
 	// has already run several queries.
-	canApprove, err := a.authz.Authorize(r.Context(), sess.Principal, projectID, authn.GrantApprove)
+	canApprove, err := a.authz.Authorize(r.Context(), sess.Principal, task.ProjectID, authn.GrantApprove)
 	if err != nil {
 		httpx.Problem(w, r, err)
 		return
 	}
 	detail, err := a.svc.GetRunDetail(r.Context(), run.ID)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	// The header's three labels, resolved off the task runScoped already read.
+	// GetRunDetail deliberately does not do this: a label is a presentation
+	// concern with a port of its own, and folding it into the domain read would
+	// make every service-level reader of a run wire a label source.
+	detail.Labels, err = a.svc.LabelsForTask(r.Context(), task)
 	if err != nil {
 		httpx.Problem(w, r, err)
 		return
@@ -511,6 +549,72 @@ func (a *API) handleDecideGate(w http.ResponseWriter, r *http.Request, sess auth
 	httpx.JSON(w, http.StatusOK, out)
 }
 
+// handleListRuns is the run list. It scopes exactly as the approvals inbox
+// does — the projects the caller holds ANY grant on, every project for an admin
+// — and it is PAGINATED from the outset because it is new: GET /tasks and
+// GET /approvals already have the unbounded cliff and there is no reason to
+// build a third.
+func (a *API) handleListRuns(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	filter, err := runListFilter(r)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	if sess.Role == authn.RoleAdmin {
+		filter.All = true
+	} else {
+		grants, err := a.grants.GrantsForUser(r.Context(), sess.UserID)
+		if err != nil {
+			httpx.Problem(w, r, err)
+			return
+		}
+		// Built even when it is empty, and passed as an empty set rather than
+		// as "no filter": an ungranted member sees NOTHING, and inferring the
+		// admin view from an empty list is how they would see everything.
+		ids := make([]uuid.UUID, 0, len(grants))
+		for _, g := range grants {
+			ids = append(ids, g.ProjectID)
+		}
+		filter.ProjectIDs = ids
+	}
+	list, next, err := a.svc.ListRuns(r.Context(), filter)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, runListPageResponse(list, next))
+}
+
+// runListFilter parses the query string. Every malformed value is a FIELD ERROR
+// naming the parameter: an unparseable task_id is neither a 404 (the caller
+// named no run) nor a silent ignore (which would answer with the whole list and
+// look like the filter did nothing), and a cursor this endpoint did not issue
+// is the same kind of mistake rather than a silent page one.
+func runListFilter(r *http.Request) (runs.RunListFilter, error) {
+	q := r.URL.Query()
+	f := runs.RunListFilter{Status: q.Get("status"), Cursor: q.Get("cursor")}
+	if raw := q.Get("task_id"); raw != "" {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return runs.RunListFilter{}, xerrors.E(xerrors.ClassInvalid, "validation failed").
+				WithFields(xerrors.FieldError{Field: "task_id", Message: "must be a uuid"})
+		}
+		f.TaskID = &id
+	}
+	if raw := q.Get("limit"); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil || n < 1 {
+			return runs.RunListFilter{}, xerrors.E(xerrors.ClassInvalid, "validation failed").
+				WithFields(xerrors.FieldError{Field: "limit", Message: "must be a positive integer"})
+		}
+		// An oversized limit is CLAMPED rather than refused: the cap is this
+		// server's protection, not a contract the caller agreed to, and a page
+		// of 200 is a complete answer to "give me 1000".
+		f.Limit = int32(n)
+	}
+	return f, nil
+}
+
 // handleListApprovals is the approvals inbox. It is unbounded by design at V1:
 // the waiting set is the size of a human's attention, not of the run history.
 func (a *API) handleListApprovals(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
@@ -566,7 +670,7 @@ func (a *API) handleListApprovals(w http.ResponseWriter, r *http.Request, sess a
 // outside their grants — the stream gives too, and neither branch can drift
 // from the other because there is only one check.
 func (a *API) handleListRunEvents(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
-	run, projectID, ok := a.runScoped(w, r, sess, authn.GrantView)
+	run, task, ok := a.runScoped(w, r, sess, authn.GrantView)
 	if !ok {
 		return
 	}
@@ -574,7 +678,7 @@ func (a *API) handleListRunEvents(w http.ResponseWriter, r *http.Request, sess a
 	// repeated headers, and Get would see only the first — which for a client
 	// that put its refusal in the second would be a stream it declined.
 	if acceptsEventStream(strings.Join(r.Header.Values("Accept"), ",")) {
-		a.streamRunEvents(w, r, sess, run.ID, projectID)
+		a.streamRunEvents(w, r, sess, run.ID, task.ProjectID)
 		return
 	}
 	after, err := eventCursor(r)
