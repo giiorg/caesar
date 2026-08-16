@@ -31,10 +31,14 @@ full session on this project.
 | — | wave-8 plan corrections + ledger entry | `7c2c5f6` | docs only |
 | 9 | 14 (part) — the node_modules blocker, FIXED at the root | `beee9ba` | **PASS** |
 | 9 | 14 (part) — the web lanes folded into the gate | `116ffdc` | **PASS (21 lanes)** |
+| 10 | 14 — the CI web job, the tested digest, the embedui lanes, the docs | `4c036fe` | **PASS (27 lanes)** |
 
-**Done: Tasks 1–13, and Task 14's Steps 4–5. Remaining: Task 14 Steps 1–3 and 6** — the CI
-workflow (the `web` job, build-once/test-that-digest/promote-that-digest, and the mutation proving
-the image assertion can fail), plus the roadmap row and `web/README.md`.
+**PLAN 11 IS COMPLETE. Tasks 1–14 all done, gated at `4c036fe` — 27 lanes.** Roadmap row 11 is
+flipped to done. The branch has not been pushed and no PR is open; that is sofo's call.
+
+One item from this plan is still open and **cannot be closed by an agent**: Task 12 Step 11, the
+operator-only `__Host-` cookie proof. See Open Items below — `web/README.md` and
+`web/vite.config.ts` both label that claim reasoned-not-measured, deliberately.
 
 The gate is `scripts/gate <abs-worktree> <sha> <branch>` and it ran green at each wave boundary,
 not after each task. Within a wave, tasks are committed in dependency order and their individual
@@ -196,11 +200,12 @@ suggestions:
 - **Task 8 wires `probeMe` against `MeProbe = { grants: readonly unknown[] | null }`.** The
   null is real — `ApiMeResponse.grants` is generated nullable. `unwrap(api.GET('/api/v1/auth/me'))`
   satisfies it as-is; do not narrow the type or add `?? []` at the call site.
-- **Task 14 must wire `backend:test:embedui` and `backend:static:embedui` into `scripts/gate`
-  by name, with their lines mirrored into `LANE_CMDS`.** Today **3 embedui test functions and
-  4 static checks run in ZERO automated lanes** — including the no-inline-script assertion
-  against the real Vite bundle and the build-stamp check. Verified non-vacuous by hand
-  (poisoning the embedded `index.html` does make it fail), but nothing automated runs them.
+- **~~Task 14 must wire `backend:test:embedui` and `backend:static:embedui` into `scripts/gate`~~
+  — DONE in `4c036fe`**, and in the CI `web` job as well. Until then **3 embedui test functions
+  and 4 static checks ran in ZERO automated lanes** — including the no-inline-script assertion
+  against the real Vite bundle and the build-stamp check. Wiring them exposed finding 40: the
+  build-stamp check's exact-oracle branch was dead in both new call sites until `CAESAR_COMMIT`
+  was exported. The traps below were all real and are preserved for anyone touching the wiring.
   Two traps: `backend/internal/webui/dist` is **gitignored**, so a bare `go test -tags embedui`
   fails to compile on a clean checkout — the lane declares `deps: [web:build]` and the gate
   line must keep it; and it must NOT fold into `backend:ci`, whose Node-free-ness is the whole
@@ -466,6 +471,52 @@ until the run was repeated with `-v`.
     `POST /api/v1/auth/login`, and the spec dies at `getByRole('navigation')`. The argument was
     right, and it is now evidence — the same standard the `__Host-` cookie comment is still waiting
     on.
+36. **`postgres:17` in the plan's `image-serves-ui` service would have failed 100% of runs, and
+    failed unreadably.** The migrations call `uuidv7()`, a PostgreSQL **18** builtin, so a real
+    boot dies at `20260802144555_identity_foundations.sql: ERROR: function uuidv7() does not exist
+    (SQLSTATE 42883)`, the listener never binds, and the job burns its full health-loop timeout —
+    a permanent red saying nothing whatever about the UI. The rest of the repo already pinned
+    `18-alpine` (`compose.dev.yaml`, `testdb.go`); the plan's snippet was the only place that did
+    not. **Caught only because the mutation proof actually booted a container.** No amount of
+    reading finds this.
+37. **The plan's last image assertion was dead three independent ways.**
+    `echo "$BODY" | grep -qv 'not implemented'`: `-v` inverts PER LINE, so it exits 0 for any
+    multi-line body regardless of content. The obvious repair, `! grep -q …`, **also never fails
+    the step** — `set -e` is specified to ignore a pipeline preceded by `!`, measured
+    (`set -euo pipefail; ! grep -qi hit file; echo REACHED` prints REACHED and exits 0). And the
+    phrase itself never matched: the real refusal is
+    `{"type":"/errors/not-implemented","title":"Not implemented",…}`, which contains no lowercase
+    `not implemented` anywhere. Three layers of vacuity in one line, in a plan that had been
+    reviewed four times. It is now `if grep -qiE 'not[ -]implemented'; then fail; fi`.
+38. **Nothing asserted the HTTP status at all**, and `curl -sS` (no `-f`) exits 0 on the mutant's
+    `501`. The typed refusal reached the greps as a success.
+39. **The plan's Step 3 local repro is Linux-only, and on macOS it is destructive.** `--network
+    host` publishes no ports on Docker Desktop, so the snippet's unbounded `until curl …` loop
+    spins forever — and from inside such a container `127.0.0.1:5432` reaches **the developer's
+    own dev Postgres**, which the run then migrates. Separately, host `8080` was already held by a
+    stray dev `caesar`: the first `-p 8080:8080` attempt failed to bind, no container started, and
+    the health loop got `200 OK` from the stray process — **a fully green boot testing nothing**.
+    That last one is the same self-consistent-when-wrong shape `scripts/gate` exists to prevent,
+    reappearing in a hand-run procedure.
+40. **Wiring `backend:test:embedui` exposed a dead branch inside the test it was wiring.**
+    `TestServedIndexCarriesTheBuildStamp` compares the served stamp to `$CAESAR_COMMIT` only
+    `if want != ""`, and neither new call site set it. So the lane asserted only "there is a stamp
+    and it is not the literal placeholder" — satisfied by a stamp from anywhere at all — while the
+    one place the workflow SHA is genuinely compared to the served document,
+    `image-serves-ui`'s assertion 3, runs on **push to `main` only**. A broken stamp would have
+    gone green on every PR and red on `main` after merge. Demonstrated three ways: bundle stamped
+    `aaa111` with oracle `aaa111` → ok; with oracle `bbb222` → FAIL; **with the oracle unset →
+    ok**, the same mismatched bundle. That third line is the hole. Both call sites now export it.
+    The generalisable form: **adding a lane is not the same as making its assertions live** — a
+    guard can be wired into two places and still be inert in both.
+41. **`scripts/gate`'s content-check comment described coverage the code did not have.** It read
+    "Every log, not just backend:ci … the two new lanes would have arrived with the same hole"
+    while the loop iterated over four of six logs. The fix is deliberately non-uniform: go-shaped
+    logs get all four patterns; `web-ci.log` gets `FAIL` only, in its own branch, because
+    `panic:` / `DATA RACE` / `no tests to run` are go vocabulary node cannot emit and three
+    assertions that cannot fire are worse than the gap they pretend to close. Both halves
+    measured — a deliberately-red vitest run prints uppercase ` FAIL `, so the one pattern kept is
+    live rather than decorative.
 
 **What the lane is worth, stated as a mutant.** Making `createCacheBridge.onFrame` return early —
 a bridge that receives every frame and invalidates nothing — fails the spec at the badge assertion
@@ -491,9 +542,9 @@ the same cache entry and report the same error, so reading `error` off the exist
 
 ## What Task 14 inherits from wave 8
 
-- **`task web:e2e` runs in ZERO automated lanes today.** It is not in `scripts/gate` and not in CI —
-  the `web` job does not exist yet, which is Task 14's work. It is the third thing in that
-  position, alongside `backend:test:embedui` and `backend:static:embedui`.
+- **~~`task web:e2e` runs in ZERO automated lanes today~~ — CLOSED.** It went into `scripts/gate`
+  in `116ffdc` and into the CI `web` job in `4c036fe`, alongside `backend:test:embedui` and
+  `backend:static:embedui`. All three of the lanes that sat in this position are now wired.
 - **It deliberately has no `deps:`**, unlike `backend:test:embedui`. It needs TWO prerequisites —
   the built bundle and a ~95MB browser download — and a lane that silently downloads a browser is
   not one a developer should be able to trigger by accident. Task 14 makes

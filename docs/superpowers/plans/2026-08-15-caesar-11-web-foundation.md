@@ -5783,10 +5783,25 @@ git commit -m "test(web): prove a real gate moves the badge with no user action"
       - run: task web:test
       - run: task web:routes:check
       - run: task web:build
+      # ADDED IN EXECUTION, not in this snippet as first written. Both lanes ran
+      # in ZERO automated places — `task ci` names them and nothing reaches
+      # `task ci` — leaving 3 embedui-only test functions and 4 static checks
+      # unprotected. This is the only job with Go, Node and a built bundle.
+      - run: task backend:test:embedui
+      - run: task backend:static:embedui
       - run: ./node_modules/.bin/playwright install --with-deps chromium
         working-directory: web
       - run: task web:e2e
 ```
+
+The job also needs `env: CAESAR_COMMIT: ${{ github.sha }}` at job level, and that is
+load-bearing rather than cosmetic. `TestServedIndexCarriesTheBuildStamp` compares the served
+stamp against that variable **only when it is non-empty**, so with it unset the lane degrades to
+"there is a stamp and it is not the placeholder" and the propagation from build environment to
+served `<meta>` is untested before merge — while `image-serves-ui`'s matching assertion runs on
+push to `main` only. A broken stamp would go green on the PR and red on `main` after merge.
+MEASURED: a bundle stamped `aaa111` passes with the variable unset, and fails with it set to
+`bbb222`. `scripts/gate` needs the same export for the same reason.
 
 Add `web` to `ci-ok`'s `needs` list. That is the line that makes all of the above required.
 
@@ -5841,7 +5856,13 @@ Replace the `publish` job so the artifact under test is the artifact published:
     # the bundle is there, not merely that the container refused to boot.
     services:
       postgres:
-        image: postgres:17
+        # CORRECTED 2026-08-16 (was `postgres:17`, which would have made this
+        # job a permanent red saying nothing about the UI). MEASURED: a real
+        # boot against 17 dies in migrations with `20260802144555_identity_
+        # foundations.sql: ... ERROR: function uuidv7() does not exist
+        # (SQLSTATE 42883)`. uuidv7() is a PostgreSQL 18 builtin; the rest of
+        # the repo already pins 18-alpine (compose.dev.yaml, testdb.go).
+        image: postgres:18-alpine
         env:
           POSTGRES_PASSWORD: caesar
           POSTGRES_USER: caesar
@@ -5886,17 +5907,40 @@ Replace the `publish` job so the artifact under test is the artifact published:
             docker logs candidate
             exit 1
           fi
-          BODY=$(curl -sS -D /tmp/h http://127.0.0.1:8080/)
-          grep -qi 'content-type: text/html' /tmp/h
+          # CORRECTED 2026-08-16. The status was never asserted at all, and
+          # `curl -sS` exits 0 on the mutant's 501 — so a typed refusal reached
+          # the greps below as "success".
+          CODE=$(curl -sS -o /tmp/body -D /tmp/h -w '%{http_code}' http://127.0.0.1:8080/)
+          [ "$CODE" = 200 ] || fail "GET / answered $CODE, want 200"
+          grep -qi '^content-type: *text/html' /tmp/h
           # THE ORACLE COMES FROM OUTSIDE THE IMAGE. Reading a build stamp out
           # of the candidate's own index.html and confirming the asset it names
           # exists is satisfied perfectly by a stale-but-consistent build — the
           # exact thing being tested for. So the comparison is against the SHA
           # this workflow holds independently.
-          echo "$BODY" | grep -q '${{ github.sha }}'
+          grep -q '${{ github.sha }}' /tmp/body
           # "Some HTML" is too weak on its own: the SPA fallback satisfies it
           # from almost any state, including a UI-less binary's typed refusal.
-          echo "$BODY" | grep -qv 'not implemented'
+          #
+          # CORRECTED 2026-08-16. This line was `echo "$BODY" | grep -qv 'not
+          # implemented'` and was dead in THREE independent ways, each measured
+          # on bash 5.2 + GNU grep 3.11:
+          #   - `-v` inverts PER LINE, so on any multi-line body it exits 0
+          #     regardless of content;
+          #   - `! grep -q ...` — the obvious repair — never fails the step
+          #     either, because set -e is ignored for a pipeline preceded by
+          #     `!`. Hence the if/then form;
+          #   - the real refusal body is {"type":"/errors/not-implemented",
+          #     "title":"Not implemented",...}, which contains no lowercase
+          #     "not implemented" anywhere, so the case-sensitive pattern could
+          #     never fire on the one body it existed to catch. Hence -qiE.
+          # HONEST SCOPE: against today's tagless twin this line is redundant —
+          # the status and content-type assertions each kill that mutant alone.
+          # It is kept for the shape they do not cover: a refusal that starts
+          # being served as 200 text/html.
+          if grep -qiE 'not[ -]implemented' /tmp/body; then
+            fail "served / carries the tagless twin's refusal"
+          fi
 
   publish:
     needs: [image, image-serves-ui]
@@ -5933,16 +5977,30 @@ and a tiny Vite `transformIndexHtml` plugin (or `define` + a script-free `<meta>
 
 An oracle nobody has seen fail is a rubber stamp. On a scratch branch, build the image **without** the `embedui` tag and run the `image-serves-ui` script against it locally:
 
+**THIS SNIPPET IS LINUX-ONLY AND MUST NOT BE RUN VERBATIM ON macOS — corrected 2026-08-16.**
+Three measured problems, the second of which is destructive. (1) `--network host` does not
+publish ports on Docker Desktop, so the unbounded `until curl …` loop below spins **forever**;
+give it the CI form's `seq 1 60` bound and an explicit boot-failure branch. (2) From inside a
+`--network host` container on macOS, `127.0.0.1:5432` reaches the **developer's own dev
+Postgres** — a naive run applies caesar's migrations to it while the health loop hangs. (3) Both
+fixed ports collide locally: `-p 5432:5432` with `task db:up`, and host `8080` with a running
+dev `caesar` — a run that fails to bind 8080 leaves the health loop talking to that stray
+process instead, a fully green "boot" testing nothing. The macOS form is a user-defined bridge
+network, Postgres addressed by container name, and `-p 127.0.0.1:18080:8080`.
+
 ```bash
 # GOTAGS is declared by the Dockerfile (Task 12 Step 10). Confirm the mutation
 # actually took before trusting the result: a build-arg Docker does not consume
 # is a warning, not an error, and the image would quietly still embed the UI.
+# MEASURED confirmation that does not involve HTTP: `strings` on the extracted
+# binary shows 0 `assets/<name>-<hash>` references and 0 `caesar-commit` for
+# caesar:noui, against 69 and 1 for the normal build.
 docker build --build-arg COMMIT=deadbeef --build-arg GOTAGS= -t caesar:noui .
 
 # The same boot the CI check performs — config file, database, master key —
 # because a container that never listens proves nothing either way.
 docker run -d --name pg -e POSTGRES_PASSWORD=caesar -e POSTGRES_USER=caesar \
-  -e POSTGRES_DB=caesar -p 5432:5432 postgres:17
+  -e POSTGRES_DB=caesar -p 5432:5432 postgres:18-alpine   # NOT 17: uuidv7()
 # See the CI job: '{}' would default publish_work_dir to /var/lib/caesar/publish,
 # which the distroless:nonroot uid cannot create, so the container never listens.
 echo '{"forge":{"publish_work_dir":"/tmp/caesar-publish"}}' > /tmp/config.json
@@ -5956,6 +6014,21 @@ curl -sS -D - http://127.0.0.1:8080/
 ```
 
 Expected: `/healthz` answers 200 — the binary boots fine, it simply has no UI — and `/` returns the typed `problem+json` refusal, `not implemented`, with no commit stamp. That is **the check failing for the one reason it exists to catch**, which is the point: a red run caused by a container that never started would have looked identical while testing nothing. Then build normally and confirm it passes. Record both outcomes in the commit message.
+
+**OBSERVED 2026-08-16, and it is exactly this.** `/healthz` on `caesar:noui` answered `200` with
+`{"status":"ok","db":"ok","version":"dev"}` in ~2s; `GET /` answered `501 Not Implemented`,
+`Content-Type: application/problem+json`, body
+`{"type":"/errors/not-implemented","title":"Not implemented","status":501,"detail":"webui: this binary was built without the embedui tag, so no web client is embedded",...}`.
+The normal build answered `200`, `text/html; charset=utf-8`, carrying
+`<meta name="caesar-commit" content="3fc35177aa1f29811a2a1e859b0f94e12532c198">` — the SHA passed
+as `--build-arg COMMIT`, so the external oracle really does close end to end. Assertions 1, 2 and
+3 each kill the mutant on their own.
+
+One correction to the `{}`-trap reasoning while it was being confirmed: with an empty config the
+container logs `"msg":"migrations applied"` and then
+`"error":"serve: publish work dir: mkdir /var/lib/caesar: permission denied"`. The mechanism is
+as described, but the error names the **parent** `/var/lib/caesar`, not `/var/lib/caesar/publish`
+— `MkdirAll` reports the first level it could not create.
 
 - [ ] **Step 4: Fold the web lanes into the gate**
 
