@@ -10,6 +10,12 @@ import (
 // payloadSchemaNames pairs an artifact type with the component the generator
 // publishes for it. The map is what makes this test address both directions:
 // the key indexes runs.RequiredPayloadKeys, the value indexes the document.
+//
+// It is a SECOND hand-written list of the constrained artifact types, so the
+// test asserts it covers runs.RequiredPayloadKeys exactly. Without that, a
+// third constrained type added to the validator would simply not be looked at
+// here — no failure, no published schema, and the drift this whole file exists
+// to catch happening in the one place nothing watches.
 var payloadSchemaNames = map[string]string{
 	"plan":           "ApiPlanPayload",
 	"review_verdict": "ApiReviewVerdictPayload",
@@ -61,6 +67,20 @@ func TestPayloadSchemasMatchTheValidator(t *testing.T) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)
 	}
+	// Every constrained artifact type has a published schema, and this file
+	// names no type the validator does not constrain. Both halves matter: the
+	// first is what stops a new entry escaping the tie in silence, the second
+	// is what stops this map outliving a type the validator dropped.
+	for artifactType := range runs.RequiredPayloadKeys {
+		if _, ok := payloadSchemaNames[artifactType]; !ok {
+			t.Errorf("the validator constrains %q and no schema is published for it; "+
+				"add it to payloadSchemaNames and to contracts' extraSchemas", artifactType)
+		}
+	}
+	if len(payloadSchemaNames) != len(runs.RequiredPayloadKeys) {
+		t.Errorf("payloadSchemaNames covers %d types, the validator constrains %d", len(payloadSchemaNames), len(runs.RequiredPayloadKeys))
+	}
+
 	for artifactType, schemaName := range payloadSchemaNames {
 		schema, ok := doc.Components.Schemas[schemaName]
 		if !ok {
@@ -77,6 +97,21 @@ func TestPayloadSchemasMatchTheValidator(t *testing.T) {
 				continue
 			}
 			if nullableRefKeys[artifactType][want] {
+				// The exemption's whole justification is that the property's
+				// schema is a $ref, which this generator gives no null branch.
+				// A SCALAR listed here would be exempted for a reason that does
+				// not apply to it — a scalar really does render ["string","null"]
+				// while staying required, so it should simply be required.
+				var prop struct {
+					Ref string `json:"$ref"`
+				}
+				if err := json.Unmarshal(schema.Properties[want], &prop); err != nil {
+					t.Errorf("%s: property %q: %v", schemaName, want, err)
+				} else if prop.Ref == "" {
+					t.Errorf("%s: property %q is exempted as a nullable $ref but its schema is %s — "+
+						"a non-$ref property can be required AND nullable, so this exemption is unearned",
+						schemaName, want, schema.Properties[want])
+				}
 				if required[want] {
 					t.Errorf("%s: property %q is required, but the server sends null for it; "+
 						"openapi-typescript renders a required $ref as non-nullable", schemaName, want)

@@ -190,7 +190,7 @@ func TestPinnedSchemaVersionIsWhatDecidesPayloadValidation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = runs.ValidateArtifactPayload(plan.SchemaVersion, runs.ArtifactKindPlan, legacy)
+		err = runs.ValidateArtifactPayload(plan.DocSchemaVersion, runs.ArtifactKindPlan, legacy)
 		if c.wantReject && err == nil {
 			t.Errorf("schema %d accepted a pre-contract plan payload; the contract is switched off", c.schema)
 		}

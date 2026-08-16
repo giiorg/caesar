@@ -203,7 +203,13 @@ func addExtraSchemas(r *openapi31.Reflector) error {
 			}
 			sm, err := schema.ToSchemaOrBool().ToSimpleMap()
 			if err != nil {
-				collectErr = fmt.Errorf("contracts: extra schema %s: %w", name, err)
+				// FIRST error wins: one Reflect call collects every nested
+				// definition, so a later success would otherwise overwrite the
+				// failure and Build would return a document missing a schema
+				// with nothing to say so.
+				if collectErr == nil {
+					collectErr = fmt.Errorf("contracts: extra schema %s: %w", name, err)
+				}
 				return
 			}
 			r.SpecEns().ComponentsEns().WithSchemasItem(name, sm)

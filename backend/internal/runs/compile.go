@@ -98,12 +98,20 @@ type PlanNode struct {
 type ExecPlan struct {
 	Order []string
 	Nodes map[string]PlanNode
-	// SchemaVersion is the pinned document's schema version, carried through
+	// DocSchemaVersion is the pinned DOCUMENT's schema version, carried through
 	// from DefinitionDoc.Schema. The orchestrator hands it to
 	// ValidateArtifactPayload: a node is judged against the payload shape its
 	// OWN pinned document promised, never against whatever this binary writes
 	// today.
-	SchemaVersion int
+	//
+	// `Doc` is in the name because runs holds a second, unrelated
+	// SchemaVersion — PolicySnapshot.SchemaVersion, the SNAPSHOT shape's
+	// version (policy.go's snapshotSchemaVersion). Both are visible at once in
+	// the orchestrator's evaluate path, both are ints, and both are 2 today, so
+	// handing the wrong one to ValidateArtifactPayload would compile and leave
+	// every test in this repo green. The names have to do the work the types
+	// cannot.
+	DocSchemaVersion int
 	// gateFor maps a git-publish node to the gate whose approval authorizes
 	// it, and publishFor is its inverse. The document validator already
 	// proved the assignment exists and is one-to-one (workflows §2
@@ -241,7 +249,7 @@ func Compile(doc DefinitionDoc) (ExecPlan, error) {
 		})
 		nodes[n.ID] = pn
 	}
-	plan := ExecPlan{Order: order, Nodes: nodes, SchemaVersion: doc.Schema}
+	plan := ExecPlan{Order: order, Nodes: nodes, DocSchemaVersion: doc.Schema}
 	if err := plan.assignGates(in); err != nil {
 		return ExecPlan{}, err
 	}

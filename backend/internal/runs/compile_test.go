@@ -348,8 +348,8 @@ func TestCompileCarriesTheDocumentSchemaVersion(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if plan.SchemaVersion != schema {
-			t.Errorf("SchemaVersion = %d, want %d", plan.SchemaVersion, schema)
+		if plan.DocSchemaVersion != schema {
+			t.Errorf("DocSchemaVersion = %d, want %d", plan.DocSchemaVersion, schema)
 		}
 	}
 }
