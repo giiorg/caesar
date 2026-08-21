@@ -27,6 +27,24 @@ diff --git a/README.md b/README.md
 +new
 `
 
+const SQL_COMMENTS = `diff --git a/db/schema.sql b/db/schema.sql
+--- a/db/schema.sql
++++ b/db/schema.sql
+@@ -1,4 +1,2 @@ create table runs
+ create table runs (
+--- legacy column: kept while the old reader was alive
+--- drop after the backfill
+ id bigint
+`
+
+const NESTED_ADD = `diff --git a/notes.md b/notes.md
+--- a/notes.md
++++ b/notes.md
+@@ -1 +1,2 @@
+ # heading
++++ nested marker
+`
+
 describe('decodePatch', () => {
   it('splits files and counts lines the way the hard-facts row reads them', () => {
     const got = decodePatch(b64text(TWO_FILES))
@@ -92,6 +110,61 @@ Binary files a/logo.png and b/logo.png differ
 `
     const [file] = decodePatch(b64text(p)).files
     expect(file).toMatchObject({ path: 'logo.png', binary: true, added: 0, removed: 0 })
+  })
+
+  it('keeps a deleted "-- " line inside its hunk instead of reading it as a header', () => {
+    // A deleted SQL comment renders as `--- …` — the del marker plus a line
+    // that itself begins `-- `, and this repo's own migrations are full of
+    // those. Read as a `---` file header it closes the hunk mid-content,
+    // loses the remaining counts and pushes a phantom file with an empty
+    // path; the owed-content guard is what keeps it a del line.
+    const got = decodePatch(b64text(SQL_COMMENTS))
+    expect(got.files.map((f) => f.path)).toEqual(['db/schema.sql'])
+    expect(got).toMatchObject({ added: 0, removed: 2 })
+    const [file] = got.files
+    expect(file?.hunks).toHaveLength(1)
+    // git appends the enclosing section after the trailing `@@`; the counts
+    // still parse and `header` keeps the whole line.
+    expect(file?.hunks[0]?.header).toBe('@@ -1,4 +1,2 @@ create table runs')
+    expect(file?.hunks[0]?.lines).toEqual([
+      { kind: 'context', text: 'create table runs (' },
+      { kind: 'del', text: '-- legacy column: kept while the old reader was alive' },
+      { kind: 'del', text: '-- drop after the backfill' },
+      { kind: 'context', text: 'id bigint' },
+    ])
+  })
+
+  it('counts an added line that begins "++ " instead of rewriting the path', () => {
+    // The `+++` half of the same defect: an added line whose text begins
+    // `++ ` renders as `+++ …`, and read as a header it rewrites the file's
+    // path instead of counting as an add.
+    const got = decodePatch(b64text(NESTED_ADD))
+    expect(got.files.map((f) => f.path)).toEqual(['notes.md'])
+    expect(got).toMatchObject({ added: 1, removed: 0 })
+    expect(got.files[0]?.hunks[0]?.lines).toEqual([
+      { kind: 'context', text: '# heading' },
+      { kind: 'add', text: '++ nested marker' },
+    ])
+  })
+
+  it('a "No newline at end of file" marker is neither content nor a count', () => {
+    const p = `diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-old
+\\ No newline at end of file
++new
+\\ No newline at end of file
+`
+    const got = decodePatch(b64text(p))
+    expect(got).toMatchObject({ added: 1, removed: 1 })
+    // The marker annotates the line before it; emitted as context it would
+    // put the text " No newline at end of file" inside the rendered diff.
+    expect(got.files[0]?.hunks[0]?.lines).toEqual([
+      { kind: 'del', text: 'old' },
+      { kind: 'add', text: 'new' },
+    ])
   })
 
   it('an empty or unparseable payload yields an empty patch, never a throw', () => {

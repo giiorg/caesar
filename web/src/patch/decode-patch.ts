@@ -64,6 +64,10 @@ function parseUnifiedDiff(text: string): { files: DiffFile[]; added: number; rem
   const files: DiffFile[] = []
   let file: DiffFile | undefined
   let hunk: DiffHunk | undefined
+  // What the open hunk's `@@` header still owes, per side. A line is hunk
+  // content while either of these is positive; headers can only begin at zero.
+  let oldRemaining = 0
+  let newRemaining = 0
 
   const lines = text.split('\n')
   // '\n' is a line terminator: a trailing one does not open a final empty line
@@ -71,6 +75,42 @@ function parseUnifiedDiff(text: string): { files: DiffFile[]; added: number; rem
   if (lines.at(-1) === '') lines.pop()
 
   for (const line of lines) {
+    if (hunk && line.startsWith('\\')) {
+      // `\ No newline at end of file` annotates the line before it: it counts
+      // toward neither side and is not content to render. It can also trail
+      // the hunk's LAST line, after both counts reach zero, so it is skipped
+      // whenever a hunk is open, not only while content is owed.
+      continue
+    }
+    if (file && hunk && (oldRemaining > 0 || newRemaining > 0)) {
+      // While the `@@` header's counts say the hunk is still owed content, a
+      // line is classified by its first character ALONE — never as a header.
+      // A deleted line whose own text begins `-- ` renders as `--- …`,
+      // exactly the file-header shape the checks below match; this repo's
+      // own SQL migrations are full of lines that begin that way.
+      if (line.startsWith('-')) {
+        oldRemaining -= 1
+        file.removed += 1
+        hunk.lines.push({ kind: 'del', text: line.slice(1) })
+        continue
+      }
+      if (line.startsWith('+')) {
+        newRemaining -= 1
+        file.added += 1
+        hunk.lines.push({ kind: 'add', text: line.slice(1) })
+        continue
+      }
+      if (line.startsWith(' ')) {
+        oldRemaining -= 1
+        newRemaining -= 1
+        hunk.lines.push({ kind: 'context', text: line.slice(1) })
+        continue
+      }
+      // Not hunk content, yet the header promised more: the counts were
+      // wrong. Close the debt and let the header checks read the line.
+      oldRemaining = 0
+      newRemaining = 0
+    }
     const git = /^diff --git a\/(.+) b\/(.+)$/.exec(line)
     if (git) {
       hunk = undefined
@@ -90,8 +130,9 @@ function parseUnifiedDiff(text: string): { files: DiffFile[]; added: number; rem
       file.binary = true
       hunk = undefined
     } else if (line.startsWith('--- ')) {
-      // `---` and `+++` are HEADERS, recognised before the +/- classification
-      // below so they are never counted as removed/added lines.
+      // A `---` HERE is a file header: while a hunk is owed content the
+      // branch above consumes `-…` lines first, so a deleted `-- …` line
+      // never reaches this check from inside a well-counted hunk.
       //
       // A `---` also opens a new file when none is open (a patch does not need
       // `diff --git` lines — the non-UTF-8 fixture has none) or when the
@@ -109,19 +150,25 @@ function parseUnifiedDiff(text: string): { files: DiffFile[]; added: number; rem
       if (next === '/dev/null') file.path = file.oldPath
       else file.path = next.startsWith('b/') ? next.slice(2) : next
     } else if (file && !file.binary && line.startsWith('@@')) {
-      // A hunk begins at `@@` and ends at the next `@@`, `diff --git`, `---`
-      // or `Binary files` line — every one of which is handled above — so a
-      // final hunk that runs to the end of the buffer still closes.
+      // The `@@ -a,b +c,d @@` counts say exactly how much content the hunk
+      // owes (an omitted count is 1). The pattern is not end-anchored because
+      // git appends the enclosing section heading after the trailing `@@`;
+      // `header` keeps that whole line.
+      const counts = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line)
+      oldRemaining = counts ? Number(counts[1] ?? '1') : 0
+      newRemaining = counts ? Number(counts[2] ?? '1') : 0
       hunk = { header: line, lines: [] }
       file.hunks.push(hunk)
     } else if (file && line.startsWith('+')) {
+      // From here down: lines no open hunk is owed. Real headers matched
+      // above, so this is content with malformed or missing counts —
+      // classified by marker, the way the pre-count parser classified it.
       file.added += 1
       hunk?.lines.push({ kind: 'add', text: line.slice(1) })
     } else if (file && line.startsWith('-')) {
       file.removed += 1
       hunk?.lines.push({ kind: 'del', text: line.slice(1) })
     } else if (hunk) {
-      // A context line carries a leading space: strip the marker, as for +/-.
       hunk.lines.push({ kind: 'context', text: line.slice(1) })
     }
   }
