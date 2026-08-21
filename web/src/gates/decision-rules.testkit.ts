@@ -81,9 +81,16 @@ function expectNoControls(): void {
  * only reason three hosts may re-run them sight unseen: case 2's suppression
  * check dies at `expectNoControls` on a component that suppresses the other
  * two reasons and not this one, and case 2's message check dies when
- * `self_approval_forbidden` is dropped from gate-controls.tsx's REASONS —
- * both measured against gate-controls.test.tsx, with case 1 and case 3 still
- * passing in each run.
+ * `self_approval_forbidden` is dropped from gate-controls.tsx's REASONS.
+ *
+ * Both were measured against gate-controls.test.tsx, and the two halves of
+ * each run are not symmetric: case 1 had already PASSED, while case 3 was
+ * never REACHED, because a failing assertion throws and the exception
+ * propagates straight out of this function. That asymmetry is the evidence.
+ * Case 1 passing on the same mutant is what shows the kill is scoped to the
+ * reason the mutant names rather than to the kit as a whole; case 3 not
+ * running is why neither mutant says anything about case 3, which M4 and M5
+ * cover instead.
  */
 export async function expectDecisionRules(render: (evidence: GateEvidence) => void): Promise<void> {
   // 1. Short of the approve grant. `GET /approvals` lists gates for any grant
