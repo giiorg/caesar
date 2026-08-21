@@ -2510,6 +2510,15 @@
             "type": "boolean"
           }
         },
+        "required": [
+          "decision",
+          "note",
+          "acted_by_id",
+          "acted_by_email",
+          "acted_at",
+          "self_approval",
+          "examined_artifact_id"
+        ],
         "type": "object"
       },
       "ApiGateEvidenceResponse": {

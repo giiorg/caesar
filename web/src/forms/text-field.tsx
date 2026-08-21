@@ -7,6 +7,13 @@ import { useFormContext } from 'react-hook-form'
  * body stays a list of fields, and so the accessibility wiring — label/htmlFor,
  * `aria-invalid`, `aria-describedby` pointing at the message element — is
  * written once here instead of being re-derived, and re-forgotten, per form.
+ *
+ * AT `forms/`, NOT IN A `fields/` SUBDIRECTORY, and the checker rather than
+ * taste decided that. `tools/arch/import-graph.ts` clamps a module with two or
+ * more consumers to its GROUP ROOT: a module below the root is told to move up
+ * to it. A registry entry has many consumers by definition, so `forms/fields/`
+ * was a home no second importer could survive — Task 11's gate note was the
+ * first, and `web:arch` reported the violation the moment it landed.
  */
 export function TextField(props: {
   name: string

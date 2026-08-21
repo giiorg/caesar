@@ -102,6 +102,13 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 		"ApiArtifactResponse": {
 			"id", "node_id", "attempt", "generation", "type", "parent_ids", "created_at",
 		},
+		// Absent or complete: gateDecisionSummary returns nil for an undecided
+		// gate and otherwise sets all seven, so the 409 surface reads them
+		// without branching on an absence the server cannot produce.
+		"ApiGateDecisionSummary": {
+			"decision", "note", "acted_by_id", "acted_by_email", "acted_at",
+			"self_approval", "examined_artifact_id",
+		},
 		"ApiRunListResponse": {"runs"},
 		// The artifact payload contract (document schema 2). These five reach
 		// the document through contracts' extraSchemas list rather than through

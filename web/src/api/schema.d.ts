@@ -817,13 +817,13 @@ export interface components {
         };
         ApiGateDecisionSummary: {
             /** Format: date-time */
-            acted_at?: string;
-            acted_by_email?: string;
-            acted_by_id?: string;
-            decision?: string;
-            examined_artifact_id?: string;
-            note?: string;
-            self_approval?: boolean;
+            acted_at: string;
+            acted_by_email: string;
+            acted_by_id: string;
+            decision: string;
+            examined_artifact_id: string;
+            note: string;
+            self_approval: boolean;
         };
         ApiGateEvidenceResponse: {
             can_decide: boolean;

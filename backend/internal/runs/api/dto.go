@@ -326,14 +326,24 @@ type ApprovalListResponse struct {
 // id and address are separate fields: a run is readable with view, so the
 // address reaches every member of the project and that has to be visible in
 // the contract rather than hidden inside one ambiguous "acted_by".
+//
+// Every field is required. The struct is either absent or complete: its one
+// constructor (gateDecisionSummary below) returns nil for a gate nobody has
+// decided and otherwise sets all seven from a runs.GateDecision, and every one
+// of them is an always-marshaled Go scalar. Without the tag openapi-typescript
+// renders each property optional, and the client's 409 surface — which reads
+// decision, acted_by_email and note to say who got to the gate first — would
+// have to branch on absences the server cannot produce. The property that
+// CARRIES this struct on PhaseResponse stays optional for the opposite reason:
+// it is a nullable $ref, and this generator gives a $ref no null branch.
 type GateDecisionSummary struct {
-	Decision           string    `json:"decision"`
-	Note               string    `json:"note"`
-	ActedByID          string    `json:"acted_by_id"`
-	ActedByEmail       string    `json:"acted_by_email"`
-	ActedAt            time.Time `json:"acted_at"`
-	SelfApproval       bool      `json:"self_approval"`
-	ExaminedArtifactID string    `json:"examined_artifact_id"`
+	Decision           string    `json:"decision" required:"true"`
+	Note               string    `json:"note" required:"true"`
+	ActedByID          string    `json:"acted_by_id" required:"true"`
+	ActedByEmail       string    `json:"acted_by_email" required:"true"`
+	ActedAt            time.Time `json:"acted_at" required:"true"`
+	SelfApproval       bool      `json:"self_approval" required:"true"`
+	ExaminedArtifactID string    `json:"examined_artifact_id" required:"true"`
 }
 
 // PublicationResponse projects one publish intent. absent_since is
