@@ -16,7 +16,7 @@ import { useStreamStatus } from '../../realtime/stream-status'
  * (router.ts) can start it on hover. No test in this tree distinguishes the two,
  * and that is recorded rather than papered over.
  */
-export const Route = createFileRoute('/_app/approvals')({
+export const Route = createFileRoute('/_app/approvals/')({
   loader: ({ context }) => context.queryClient.ensureQueryData(approvalsQueryOptions),
   component: Approvals,
 })

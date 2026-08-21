@@ -1,6 +1,8 @@
 import { screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { HttpResponse, http } from 'msw'
 import { describe, expect, it } from 'vitest'
+import type { Run } from '../../runs/run-query'
 import { noSession, renderApp } from '../../test/render-app'
 
 const approval = {
@@ -14,6 +16,113 @@ const approval = {
   generation: 1,
   waiting_since: '2026-08-15T00:00:00Z',
 }
+
+const evidence = {
+  examined_artifact_id: 'a1',
+  examined_artifact_type: 'patch',
+  summary_artifact_id: null,
+  can_decide: true,
+  cannot_decide_reason: '',
+  wall_deadline: '2099-01-01T00:00:00Z',
+}
+
+/**
+ * `GET /runs/run-1` as the deep link reads it: one waiting gate phase carrying
+ * the same evidence the inbox row carries.
+ *
+ * Annotated `Run` so a field added to or renamed on ApiRunResponse reddens
+ * `tsc --noEmit` here rather than arriving at the surface as a missing
+ * property. `evidence` is spread in as a separate literal because the
+ * generated `ApiGateEvidenceResponse` is what the phase's property is typed
+ * to, and writing it inline twice would be two places to keep true.
+ */
+const waitingRun = (): Run => ({
+  id: 'run-1',
+  task_id: 't1',
+  task_title: 'gate on A',
+  repo_slug: 'acme/app',
+  workflow_name: 'default',
+  status: 'running',
+  definition_hash: 'h1',
+  base_sha: 'abc',
+  policy_snapshot: {},
+  generation: 1,
+  execution_used_ms: 62_000,
+  wall_deadline: '2099-01-01T00:00:00Z',
+  created_at: '2026-08-20T00:00:00Z',
+  started_at: '2026-08-20T00:00:00Z',
+  finished_at: null,
+  artifacts: null,
+  publications: null,
+  phases: [
+    {
+      node_id: 'gate',
+      attempt: 1,
+      max_attempts: 1,
+      status: 'running',
+      generation: 1,
+      created_at: '2026-08-20T00:00:00Z',
+      finished_at: null,
+      evidence,
+    },
+  ],
+})
+
+const PATCH_B64 = btoa('--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old\n+new\n')
+
+/**
+ * A run as the WIRE carries it, which is not what the generated type can say.
+ *
+ * `dto.go:182` and `:191` declare a phase's `decision` and `evidence` as
+ * pointers with NO `omitempty`, so an absent one marshals to `null` and never
+ * to a missing key — the DTO's own comment says the property "really is null on
+ * every non-gate phase and on every decided one". The generated types render
+ * both optional-and-NON-nullable (a `$ref` property carries no null branch in
+ * this toolchain), so a `Run`-annotated fixture cannot write `null` at all.
+ *
+ * A fixture that leaves the key out instead is testing a body the server never
+ * sends, and it makes `!phase.evidence` and `phase.evidence !== undefined`
+ * indistinguishable — MEASURED: with the key merely absent, swapping the deep
+ * route to `=== undefined` left the whole suite green. This puts the true shape
+ * on the wire while the `Run` annotation above keeps every other field honest.
+ */
+const onTheWire = (run: Run) => ({
+  ...run,
+  // Spread LAST, so a phase that really carries one keeps it and only the
+  // absent ones become null.
+  phases: (run.phases ?? []).map((phase) => ({ decision: null, evidence: null, ...phase })),
+})
+
+/**
+ * Everything the deep link touches: the inbox row that renders the card, the
+ * run its loader reads, and the patch the surface decodes. Returned as an
+ * ARRAY and spread, because `renderApp` takes a handler list and this journey
+ * crosses three endpoints — one of which (`/runs/run-1`) has no default
+ * handler, and `onUnhandledRequest: 'error'` would fail the test somewhere far
+ * from the missing one.
+ */
+const oneWaitingGate = () => [
+  http.get('/api/v1/approvals', () =>
+    HttpResponse.json({
+      approvals: [
+        { ...approval, run_id: 'run-1', task_title: 'gate on A', node_id: 'gate', evidence },
+      ],
+    }),
+  ),
+  http.get('/api/v1/runs/run-1', () => HttpResponse.json(onTheWire(waitingRun()))),
+  http.get('/api/v1/runs/:id/artifacts/:artifactId', () =>
+    HttpResponse.json({
+      id: 'a1',
+      run_id: 'run-1',
+      node_id: 'gate',
+      type: 'patch',
+      attempt: 1,
+      generation: 1,
+      parent_ids: [],
+      payload: { diff: PATCH_B64 },
+    }),
+  ),
+]
 
 const frame = (id: number, kind: string) =>
   `id: ${id}\nevent: ${kind}\ndata: ${JSON.stringify({
@@ -131,6 +240,59 @@ describe('/approvals', () => {
     // same frame: 'stopped' is terminal, so the honest banner is "reload", not
     // "reconnecting".
     expect(await screen.findByText(/live updates stopped/i)).toBeInTheDocument()
+  })
+
+  it('a card opens the surface at a linkable URL', async () => {
+    // URL-AS-STATE, and the reason it is a URL rather than a drawer: this is
+    // the screen a notification sends somebody to, and a gate under review is
+    // exactly the thing they will want to send on to a colleague. The
+    // assertion is on `router.state.location.pathname` and NOT only on the
+    // rendered surface, because a modal opened from the card would render the
+    // same DOM while leaving the address bar on /approvals.
+    //
+    // `hard-facts` arriving is the second half: the deep route really loads
+    // the run, finds the phase whose node_id matches, and hands its evidence
+    // to the surface. A route that resolved but rendered nothing would still
+    // move the pathname.
+    const router = renderApp('/approvals', oneWaitingGate())
+    await userEvent.click(await screen.findByRole('link', { name: /gate on A/ }))
+    expect(router.state.location.pathname).toBe('/approvals/run-1/gate')
+    expect(await screen.findByTestId('hard-facts')).toBeInTheDocument()
+  })
+
+  it('names whoever decided a gate that is no longer waiting', async () => {
+    // The 409-after-the-fact case, reached by URL rather than by click: a
+    // notification arrives, the reader opens it, and somebody else has already
+    // decided. `ApiPhaseResponse.evidence` is absent on a phase that is no
+    // longer waiting (dto.go builds it only for a waiting gate), so the deep
+    // route has nothing to hand the surface — and an empty approval screen
+    // would read as a gate waiting on the reader.
+    const decided = waitingRun()
+    decided.phases = [
+      {
+        node_id: 'gate',
+        attempt: 1,
+        max_attempts: 1,
+        status: 'succeeded',
+        generation: 1,
+        created_at: '2026-08-20T00:00:00Z',
+        finished_at: '2026-08-20T00:01:00Z',
+        decision: {
+          decision: 'approve',
+          note: '',
+          acted_by_id: 'u2',
+          acted_by_email: 'alice@example.com',
+          acted_at: '2026-08-20T00:01:00Z',
+          self_approval: false,
+          examined_artifact_id: 'a1',
+        },
+      },
+    ]
+    renderApp('/approvals/run-1/gate', [
+      http.get('/api/v1/runs/run-1', () => HttpResponse.json(onTheWire(decided))),
+    ])
+    expect(await screen.findByText(/alice@example\.com/)).toBeInTheDocument()
+    expect(screen.queryByTestId('hard-facts')).toBeNull()
   })
 
   it("routes a 401 from THIS route's loader through /login", async () => {
