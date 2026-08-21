@@ -242,6 +242,13 @@ describe('the approval surface', () => {
     })
     expect(await screen.findByText('Add the table')).toBeInTheDocument()
     expect(screen.queryByTestId('file-accordion')).toBeNull()
+    // And the facts row carries NO files cell. A plan has no files and no ±
+    // lines, so `0 files · +0 · −0` would report a measurement of a patch that
+    // does not exist rather than the absence of one — the row's only other
+    // cells here are the tests sentence and the duration.
+    const row = screen.getByTestId('hard-facts')
+    expect(row).not.toHaveTextContent('+0')
+    expect(row).not.toHaveTextContent(/file/i)
   })
 
   it('says so when the examined artifact is missing rather than showing an empty diff', async () => {
@@ -274,11 +281,12 @@ describe('the approval surface', () => {
     expect(screen.queryByTestId('agent-summary')).toBeNull()
   })
 
-  it('keeps the diff when the verdict 404s, and the verdict when the diff 404s', async () => {
-    // Two fetches, two failure paths. The half that arrived is still worth
-    // showing: a person who can see the diff can still decide the gate, and a
-    // surface that took itself down because the OTHER query failed would turn
-    // one missing artifact into a screen nobody can act on.
+  it('keeps the diff and the hard facts when the VERDICT 404s', async () => {
+    // Two fetches, two failure paths; this is one of them and the case below
+    // is the other. The half that arrived is still worth showing: a person who
+    // can see the diff can still decide the gate, and a surface that took
+    // itself down because the OTHER query failed would turn one missing
+    // artifact into a screen nobody can act on.
     renderSurface({ evidence: { ...decidable, summary_artifact_id: 'gone' }, patch: TWO_FILES_B64 })
     const row = await screen.findByTestId('hard-facts')
     expect(row).toHaveTextContent('2 files')
@@ -290,6 +298,23 @@ describe('the approval surface', () => {
     expect(row).toHaveTextContent(/tests unknown/i)
     // `cid-404` is the correlation id of the 404 above: an error surface that
     // dropped it would leave a user with nothing to quote.
+    expect(screen.getByText('cid-404')).toBeInTheDocument()
+  })
+
+  it('keeps the summary and the controls when the EXAMINED artifact 404s', async () => {
+    // The other direction, and the one that needed no override to write: the
+    // handler answers `a1` with a 404 when no payload option is given, so this
+    // is the first case in the file where the examined query FETCHES and
+    // fails rather than being disabled by an empty id. A surface that blanked
+    // on it would take the summary and the controls down with the diff — the
+    // review is no longer readable and the gate is no longer decidable, over
+    // an artifact neither of those two things needs.
+    renderSurface({ evidence: decidable })
+    expect(await screen.findByTestId('agent-summary')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument()
+    // `cid-404` is this fetch's correlation id, and the examined block's error
+    // branch is what puts it on screen: `s1` answered 200 here. An error
+    // surface that dropped it would leave a user with nothing to quote.
     expect(screen.getByText('cid-404')).toBeInTheDocument()
   })
 
