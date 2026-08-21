@@ -102,6 +102,14 @@ export function GateControls(props: {
   runId: string
   nodeId: string
   evidence: GateEvidence
+  /**
+   * Fired on a decision the SERVER ACCEPTED, and on nothing else.
+   *
+   * A 409 also means this gate is gone, but it arrives on the error path and
+   * does not call this — so a host that closes a drawer here leaves it open on
+   * a conflict, deliberately: the panel naming whoever decided first renders
+   * inside these controls and closing the surface would take it with it.
+   */
   onDecided?: () => void
 }) {
   const [mode, setMode] = useState<Mode>('idle')
@@ -361,12 +369,12 @@ function ConflictPanel(props: { error: ApiError; runId: string; nodeId: string }
  * The newest decided attempt of one gate node.
  *
  * NEWEST BY (generation, attempt) RATHER THAN BY POSITION: request_changes
- * bumps the run's generation and re-materializes the slice below the gate
- * (`revisions.go:22-31`, steps 6 and 8), so the gate comes back under the same
- * node id and one run can carry several decided phases for it. Trusting the
- * array's order would make the answer depend on a SQL `ORDER BY` this file
- * cannot see. Nothing in the suite pins the tie-break: today's fixtures carry
- * one decided phase each.
+ * bumps the run's generation and supersedes every live row in the slice below
+ * the gate (`revisions.go:22-40`, steps 6 and 8), so the gate comes back under
+ * the same node id at a new generation and one run can carry several decided
+ * phases for it. Trusting the array's order would make the answer depend on a
+ * SQL `ORDER BY` this file cannot see. Nothing in the suite pins the
+ * tie-break: today's fixtures carry one decided phase each.
  */
 function latestDecision(run: Run | undefined, nodeId: string): GateDecisionSummary | null {
   let best: GateDecisionSummary | null = null

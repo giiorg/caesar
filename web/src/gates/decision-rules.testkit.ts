@@ -69,6 +69,21 @@ function expectNoControls(): void {
  * deleted: `Found multiple elements with the text: /approve grant/i` at case 3,
  * which re-renders the message case 1 left on screen. It fails deterministically
  * and it would fail this way in every host.
+ *
+ * THE LAST `cleanup()` UNMOUNTS THE HOST'S WHOLE TREE, not just case 3's
+ * render — `cleanup` unmounts every container in a module-level registry and
+ * then clears it (`@testing-library/react/dist/pure.js:301-314`), so it knows
+ * nothing about which render belongs to this kit. A host that renders
+ * anything else inside the same `it` must therefore call this kit LAST, or
+ * mount its own surface again after it returns.
+ *
+ * Every assertion below has been observed failing on its own, which is the
+ * only reason three hosts may re-run them sight unseen: case 2's suppression
+ * check dies at `expectNoControls` on a component that suppresses the other
+ * two reasons and not this one, and case 2's message check dies when
+ * `self_approval_forbidden` is dropped from gate-controls.tsx's REASONS —
+ * both measured against gate-controls.test.tsx, with case 1 and case 3 still
+ * passing in each run.
  */
 export async function expectDecisionRules(render: (evidence: GateEvidence) => void): Promise<void> {
   // 1. Short of the approve grant. `GET /approvals` lists gates for any grant

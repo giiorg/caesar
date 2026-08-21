@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { HttpResponse, http } from 'msw'
 import { describe, expect, it } from 'vitest'
 import { queryClient } from '../api/query-client'
+import type { Run } from '../runs/run-query'
 import { server } from '../test/msw'
 import type { GateEvidence } from './decide-gate'
 import { expectDecisionRules } from './decision-rules.testkit'
@@ -36,8 +37,15 @@ const serverError = (correlationId: string) =>
     { status: 500, headers: { 'content-type': 'application/problem+json' } },
   )
 
-/** `GET /runs/r1` as it reads once alice's approval has landed on the gate. */
-const decidedByAlice = () => ({
+/**
+ * `GET /runs/r1` as it reads once alice's approval has landed on the gate.
+ *
+ * Annotated `Run` rather than left to inference so that a field added to or
+ * renamed on ApiRunResponse reddens `tsc --noEmit` here — where the fixture is
+ * WRITTEN — instead of arriving at `latestDecision` as a missing property at
+ * runtime, on a path only the 409 tests reach.
+ */
+const decidedByAlice = (): Run => ({
   id: 'r1',
   task_id: 't1',
   task_title: 'Add a thing',
@@ -92,6 +100,14 @@ function renderControls(opts: {
   evidence: GateEvidence
   onPost?: (body: unknown) => void
   /**
+   * Spread conditionally below rather than passed as `onDecided={opts.onDecided}`:
+   * under `exactOptionalPropertyTypes` an optional prop refuses an explicit
+   * `undefined` (MEASURED: `TS2375 … Type 'undefined' is not assignable to type
+   * '() => void'`), and the tests that omit it are testing a host that did not
+   * wire it.
+   */
+  onDecided?: () => void
+  /**
    * The POST's reply, as a plain `Response`.
    *
    * `HttpResponse` is generic in its body type — MEASURED: naming it bare here
@@ -102,12 +118,12 @@ function renderControls(opts: {
    * this parameter's type follow the fixtures instead of constraining them.
    */
   reply?: Response
-  refetched?: unknown
+  refetched?: Run
   /**
    * A `['run', runId]` entry planted BEFORE the render — a host that is already
    * showing this run when the decision is posted.
    */
-  seedRun?: unknown
+  seedRun?: Run
 }) {
   queryClient.clear()
   if (opts.seedRun !== undefined) queryClient.setQueryData(['run', 'r1'], opts.seedRun)
@@ -129,7 +145,12 @@ function renderControls(opts: {
   )
   render(
     <QueryClientProvider client={queryClient}>
-      <GateControls runId="r1" nodeId="gate" evidence={opts.evidence} />
+      <GateControls
+        runId="r1"
+        nodeId="gate"
+        evidence={opts.evidence}
+        {...(opts.onDecided === undefined ? {} : { onDecided: opts.onDecided })}
+      />
     </QueryClientProvider>,
   )
 }
@@ -198,7 +219,7 @@ describe('gate controls', () => {
 
   it('request changes REQUIRES a note before it will post', async () => {
     // Not a UI nicety: `openRevision` seeds the revision target with the note
-    // as an artifact of its own (`revisions.go:22-31` step 9, kind
+    // as an artifact of its own (`revisions.go:22-40` step 9, kind
     // ArtifactKindGateNote at `:280`), and a revision with no note re-runs the
     // same work with the same information and reaches the same patch. The note
     // IS the new input, which is why `gates.go:98` refuses an empty one
@@ -314,6 +335,33 @@ describe('gate controls', () => {
     })
     await userEvent.click(await screen.findByRole('button', { name: /^approve$/i }))
     expect(await screen.findByText(/alice@example.com/)).toBeInTheDocument()
+  })
+
+  it('tells its host when a decision was accepted', async () => {
+    // The three hosts close a drawer, a sheet or a row on this. Without it the
+    // surface stays open on a gate that is no longer waiting.
+    const decided: string[] = []
+    renderControls({ evidence: decidable, onDecided: () => decided.push('fired') })
+    await userEvent.click(await screen.findByRole('button', { name: /^approve$/i }))
+    await waitFor(() => expect(decided).toEqual(['fired']))
+  })
+
+  it('does NOT tell its host on a 409, because the answer renders inside it', async () => {
+    // A 409 means this gate is gone too, so firing here reads as the obviously
+    // consistent thing to do — and it would close the host's surface over the
+    // panel naming whoever decided first, which is a child of these controls.
+    // The wait is what makes the absence assertion mean anything: alice on
+    // screen proves the mutation has settled and the error path has run.
+    const decided: string[] = []
+    renderControls({
+      evidence: decidable,
+      reply: conflict(),
+      refetched: decidedByAlice(),
+      onDecided: () => decided.push('fired'),
+    })
+    await userEvent.click(await screen.findByRole('button', { name: /^approve$/i }))
+    expect(await screen.findByText(/alice@example.com/)).toBeInTheDocument()
+    expect(decided).toEqual([])
   })
 
   it('says something when the request never reaches the server', async () => {
