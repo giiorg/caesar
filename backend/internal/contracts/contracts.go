@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/swaggest/jsonschema-go"
 	"github.com/swaggest/openapi-go"
 	"github.com/swaggest/openapi-go/openapi31"
 
@@ -97,6 +98,18 @@ type runEventsParams struct {
 	LastEventID string `header:"Last-Event-ID" description:"id of the last frame received; the text/event-stream response resumes above it"`
 }
 
+// artifactParams covers GET …/runs/{id}/artifacts/{artifact_id} — two path
+// parameters, no body.
+//
+// Without the entry generation SUCCEEDS and is silently wrong. requestStructure
+// panics only where {id} meets a non-nil Request; this operation declares none,
+// so it takes the idParams branch and the document loses artifact_id — an
+// operation the generated client could not address.
+type artifactParams struct {
+	idParams
+	ArtifactID string `path:"artifact_id" description:"artifact id (uuid)"`
+}
+
 // gateDecisionParams covers POST …/runs/{id}/gates/{node}/decision — two path
 // parameters plus a body.
 type gateDecisionParams struct {
@@ -120,6 +133,7 @@ var requestOverrides = map[string]any{
 	"updateWorkflow":         idAndUpdateWorkflow{},
 	"createWorkflowVersion":  idAndCreateWorkflowVersion{},
 	"getWorkflowVersion":     workflowVersionParams{},
+	"getArtifact":            artifactParams{},
 	"listRunEvents":          runEventsParams{},
 	"decideGate":             gateDecisionParams{},
 }
@@ -154,6 +168,66 @@ var altResponses = map[string][]altResponse{
 	"listRunEvents": {{Response: realtime.StreamFrame{}, ContentType: "text/event-stream"}},
 }
 
+// componentsSchemas is where a named schema lives in an OpenAPI 3.1 document.
+// The reflector uses the same prefix internally and does not export it.
+const componentsSchemas = "#/components/schemas/"
+
+// extraSchemas are types that must reach components.schemas WITHOUT an
+// operation referencing them. The artifact payload shapes are the first: a
+// declared payload travels as ArtifactPayloadResponse.Payload — a map, because
+// one endpoint serves plan, review_verdict, patch and log_ref alike — so no
+// response structure mentions PlanPayload, and a type nothing mentions is a
+// type the reflector never sees.
+//
+// The alternative was marker fields on ArtifactPayloadResponse that the server
+// never sets. This list is the same five lines and does not put two lies in a
+// response shape to get one truth into the document.
+func extraSchemas() []any {
+	return []any{
+		runsapi.PlanPayload{},
+		runsapi.ReviewVerdictPayload{},
+	}
+}
+
+// addExtraSchemas reflects each entry of extraSchemas into the document's
+// components, along with every type it references. It mirrors what the
+// reflector does for a response body — RootRef so the type itself becomes a
+// named definition rather than an inline schema, the components prefix so
+// nested $refs resolve — because the method that does it there is unexported.
+func addExtraSchemas(r *openapi31.Reflector) error {
+	for _, v := range extraSchemas() {
+		var collectErr error
+		collect := func(name string, schema jsonschema.Schema) {
+			if _, exists := r.SpecEns().ComponentsEns().Schemas[name]; exists {
+				return
+			}
+			sm, err := schema.ToSchemaOrBool().ToSimpleMap()
+			if err != nil {
+				// FIRST error wins: one Reflect call collects every nested
+				// definition, so a later success would otherwise overwrite the
+				// failure and Build would return a document missing a schema
+				// with nothing to say so.
+				if collectErr == nil {
+					collectErr = fmt.Errorf("contracts: extra schema %s: %w", name, err)
+				}
+				return
+			}
+			r.SpecEns().ComponentsEns().WithSchemasItem(name, sm)
+		}
+		if _, err := r.JSONSchemaReflector().Reflect(v,
+			jsonschema.RootRef,
+			jsonschema.DefinitionsPrefix(componentsSchemas),
+			jsonschema.CollectDefinitions(collect),
+		); err != nil {
+			return fmt.Errorf("contracts: extra schema %T: %w", v, err)
+		}
+		if collectErr != nil {
+			return collectErr
+		}
+	}
+	return nil
+}
+
 // operationTables collects every context's route table with nil
 // dependencies — metadata only; handlers never run during generation.
 func operationTables() [][]httpx.Operation {
@@ -161,7 +235,7 @@ func operationTables() [][]httpx.Operation {
 		identityapi.Operations(identityapi.New(nil, 0, nil)),
 		assetsapi.Operations(assetsapi.New(nil, nil, nil, nil)),
 		workflowsapi.Operations(workflowsapi.New(nil, nil)),
-		runsapi.Operations(runsapi.New(nil, nil, nil, nil, nil)),
+		runsapi.Operations(runsapi.New(nil, nil, nil, nil, nil, nil)),
 		realtimeapi.Operations(realtimeapi.New(nil, nil, nil, nil)),
 	}
 }
@@ -216,6 +290,10 @@ func Build() ([]byte, error) {
 				return nil, fmt.Errorf("contracts: add %s: %w", op.Pattern, err)
 			}
 		}
+	}
+
+	if err := addExtraSchemas(r); err != nil {
+		return nil, err
 	}
 
 	raw, err := json.MarshalIndent(r.Spec, "", "  ")

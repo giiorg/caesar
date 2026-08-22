@@ -11,17 +11,22 @@ import (
 	"github.com/giiorg/caesar/backend/internal/workflows"
 )
 
+// WorkflowResponse is required throughout, and LatestVersion is the reason it
+// had to be: the new-task form submits `workflow_version: latest_version`, and
+// an optional property there would make the client branch on an absence
+// `workflowResponse` cannot produce — it sets all six unconditionally and none
+// carries omitempty.
 type WorkflowResponse struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Description   string    `json:"description"`
-	LatestVersion int       `json:"latest_version"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID            string    `json:"id" required:"true"`
+	Name          string    `json:"name" required:"true"`
+	Description   string    `json:"description" required:"true"`
+	LatestVersion int       `json:"latest_version" required:"true"`
+	CreatedAt     time.Time `json:"created_at" required:"true"`
+	UpdatedAt     time.Time `json:"updated_at" required:"true"`
 }
 
 type WorkflowListResponse struct {
-	Workflows []WorkflowResponse `json:"workflows"`
+	Workflows []WorkflowResponse `json:"workflows" required:"true"`
 }
 
 type CreateWorkflowRequest struct {

@@ -111,6 +111,27 @@ type RepoSource interface {
 	Repo(ctx context.Context, id uuid.UUID) (RepoRef, error)
 }
 
+// RunLabelSource resolves the display labels a run LIST ROW carries. It is
+// separate from DefinitionSource and RepoSource on purpose: those are execution
+// ports read on the orchestrator's hot path, and a label is neither. Making
+// DefinitionByVersionID fetch a workflow name would put a second query on every
+// plan load and every gate decision to serve a string only a list renders.
+//
+// BATCHED BY CONSTRUCTION. The list resolves distinct ids once per page; the
+// per-row alternative is the N+1 this endpoint exists to remove, moved one
+// layer down where it is harder to see.
+//
+// A missing id is an ABSENT map entry and never an error: a repo deleted after
+// its runs finished must not take out the list that shows them. The caller
+// renders the id.
+type RunLabelSource interface {
+	ProjectNames(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error)
+	RepoSlugs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error)
+	// WorkflowNames is keyed by workflow VERSION id, because that is what a
+	// task pins; resolving the workflow behind it is the adapter's job.
+	WorkflowNames(ctx context.Context, versionIDs []uuid.UUID) (map[uuid.UUID]string, error)
+}
+
 type HarnessSource interface {
 	HarnessByName(ctx context.Context, name string) (HarnessRef, error)
 }

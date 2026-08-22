@@ -213,7 +213,10 @@ func runServeWith(ctx context.Context, cfg config.Config, log *slog.Logger, opts
 
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		forgeSvc, publisher, principalSource{svc: svc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		forgeSvc, publisher, principalSource{svc: svc}, runs.Params{
+			Snapshot: runs.DefaultSnapshot(),
+			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
+		})
 
 	// Realtime (spec §4): ONE tailer, ONE hub, ONE Streamer for the whole
 	// process, started before anything can serve a request against them.
@@ -236,7 +239,7 @@ func runServeWith(ctx context.Context, cfg config.Config, log *slog.Logger, opts
 	// already owns that URL, behind runs/api's StreamServer port, because runs
 	// and realtime are peers and neither may name the other.
 	streams := realtimeapi.New(rt.streamer, svc, streamGrants, log)
-	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc, streams))...)
+	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, svc, svc, svc, streams, log))...)
 	ops = append(ops, realtimeapi.Operations(streams)...)
 
 	// Plan 06: the real Docker runner when configured. Disabled by default —

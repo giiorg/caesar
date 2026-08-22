@@ -2,18 +2,25 @@ import type { QueryClient } from '@tanstack/react-query'
 import type { EventFrame } from './sse-connection'
 
 /**
- * The kinds that move the approvals inbox. Mirrors
+ * The kinds that move the approvals INBOX, and nothing else. Mirrors
  * backend/internal/runs/events.go — every string below is a constant there
  * (`EventGateWaiting`, `EventGateDecided`, `EventRunStarted`,
  * `EventRunSucceeded`, `EventRunFailed`, `EventRunDead`), checked rather than
  * remembered.
  *
- * A kind added there and not here costs a REFRESH, never correctness: the
- * bounded refresh floor in `api/query-client.ts` still catches it within the
- * stated interval, which is the same guarantee that covers a silent grant
- * narrowing. The reverse mistake is the expensive one — a kind here that the
- * server emits in bulk would turn a chatty run into a refetch loop — so this
- * set is deliberately the attention vocabulary and not the whole one.
+ * IT NO LONGER GOVERNS WHAT THE BRIDGE READS. Since Plan 12a every frame is
+ * routed to its run and to the runs list (see `onFrame`), because every frame
+ * belongs to a run and any frame may change what the list shows. This set
+ * decides one thing: whether the window also invalidates `['approvals']`.
+ *
+ * A kind added to the server and not here costs a REFRESH of the inbox, never
+ * correctness: the bounded refresh floor in `api/query-client.ts` still
+ * catches it within the stated interval, which is the same guarantee that
+ * covers a silent grant narrowing. The reverse mistake is the expensive one —
+ * a kind here that the server emits in bulk would turn a chatty run into a
+ * refetch loop on the one query rendered on every page. `phase.*` reached the
+ * attention stream in Plan 12a and is deliberately absent for that reason: the
+ * inbox does not change when a phase ticks.
  */
 export const ATTENTION_KINDS: ReadonlySet<string> = new Set([
   'gate.waiting',
@@ -32,8 +39,9 @@ const DEFAULT_DEBOUNCE_MS = 250
  *
  * THE BRIDGE INVALIDATES; IT NEVER RECONSTRUCTS. This is not a fallback for a
  * missing snapshot discriminator — it is the only correct reading of what the
- * server sends. A frame in the attention set invalidates the approvals query
- * and the badge follows from the refetched list.
+ * server sends. A frame invalidates the run it names and the runs list; a
+ * frame in the attention set also invalidates the approvals query, and the
+ * badge follows from the refetched list.
  *
  * THE DEBOUNCE TIMER IS THE ONLY WAY ANYTHING LEAVES THIS MODULE. The plan
  * also returned a `flush()` and every one of its tests called it; nothing in
@@ -54,22 +62,57 @@ export function createCacheBridge(
   const debounceMs = opts?.debounceMs ?? DEFAULT_DEBOUNCE_MS
   const later = opts?.setTimeoutImpl ?? setTimeout
   let scheduled = false
+  let inboxDirty = false
+  /**
+   * The runs named by frames in the open window. A SET, not the last id: runs
+   * in flight interleave, and keeping one would drop the others silently and
+   * only under concurrency. A Set rather than an array for the same reason the
+   * window exists — twenty phase transitions on one run are one invalidation.
+   */
+  const dirtyRuns = new Set<string>()
 
   function fire() {
     // Reset BEFORE the invalidation, so the next frame arms a new window. Left
     // set, the bridge goes permanently deaf after its first burst while every
     // single-burst test still passes.
     scheduled = false
-    void qc.invalidateQueries({ queryKey: ['approvals'] })
+    const runs = [...dirtyRuns]
+    const inbox = inboxDirty
+    dirtyRuns.clear()
+    inboxDirty = false
+
+    if (inbox) void qc.invalidateQueries({ queryKey: ['approvals'] })
+    // The LIST, unconditionally and prefix-matched across every filter
+    // variant: `['runs', {...}]` keys all start with `'runs'`, and a run that
+    // changed could enter or leave any of them. Unconditional because every
+    // frame belongs to a run and any frame may change the row that run renders
+    // as. This is also why the list query key puts its filters in a second
+    // element rather than in the string.
+    void qc.invalidateQueries({ queryKey: ['runs'] })
+    // THE TASK LIST, for the same reason and one more. `TaskResponse.Status` IS
+    // the latest run's status (runs/api/dto.go:22-23), so a frame that moves a
+    // run moves the TASK between the Tasks screen's four attention groups —
+    // and a task's group is the whole design of that screen. Without this the
+    // row sits in the wrong section until the bounded refresh floor fires a
+    // minute later, which is the shape of staleness nobody reports as a bug
+    // because the screen looks fine.
+    void qc.invalidateQueries({ queryKey: ['tasks'] })
+    for (const runId of runs) void qc.invalidateQueries({ queryKey: ['run', runId] })
   }
 
   return {
     onFrame(f: EventFrame): void {
-      if (!ATTENTION_KINDS.has(f.frame.kind)) return
-      // A run emitting twenty events costs one refetch. The guard is on the
-      // window, not on a `pending` flag: nothing arms a window except a frame
-      // that belongs in the inbox, so a window that exists always has
-      // something to say.
+      const runId = f.frame.run_id
+      // A frame that cannot be routed is dropped whole, rather than routed to
+      // `['run', undefined]`: the key would hash fine and invalidate a query
+      // nothing observes, so the mistake would never surface.
+      if (typeof runId !== 'string' || runId === '') return
+      dirtyRuns.add(runId)
+      if (ATTENTION_KINDS.has(f.frame.kind)) inboxDirty = true
+      // A run emitting twenty events costs one refetch per key. The guard is on
+      // the window, not on a `pending` flag: nothing arms a window except a
+      // frame that named a run, so a window that exists always has something
+      // to say.
       if (scheduled) return
       scheduled = true
       later(fire, debounceMs)

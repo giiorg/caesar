@@ -28,13 +28,27 @@ func TestScriptedOutputsAreDeterministic(t *testing.T) {
 	ex := fake.NewExecutor()
 	ctx := context.Background()
 
-	plan1, err := ex.Execute(ctx, req(runs.KindPlan, "Plan the change."))
+	const planInstructions = "Plan the change."
+	plan1, err := ex.Execute(ctx, req(runs.KindPlan, planInstructions))
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan2, err := fake.NewExecutor().Execute(ctx, req(runs.KindPlan, "Plan the change."))
+	plan2, err := fake.NewExecutor().Execute(ctx, req(runs.KindPlan, planInstructions))
 	if err != nil {
 		t.Fatal(err)
+	}
+	// PINNED TO A LITERAL FIRST, and that ordering is the point. Comparing the
+	// two emissions to each other proves determinism — including the
+	// determinism of emitting NOTHING. MEASURED: deleting `content` from the
+	// fake's plan payload degraded this to nil == nil and left the whole
+	// backend suite, unit and integration, green. The literal is what makes one
+	// assertion here load-bearing on the emitted value.
+	//
+	// It is derived from planInstructions rather than written out, so the
+	// expectation cannot drift away from the request that produces it.
+	const wantContent = "plan: " + planInstructions
+	if got := plan1.Artifacts[0].Payload["content"]; got != wantContent {
+		t.Errorf("plan content = %v, want %q", got, wantContent)
 	}
 	if plan1.Artifacts[0].Payload["content"] != plan2.Artifacts[0].Payload["content"] {
 		t.Error("plan output must be deterministic")
@@ -58,6 +72,39 @@ func TestScriptedOutputsAreDeterministic(t *testing.T) {
 	}
 	if rev.Artifacts[0].Payload["verdict"] != "approve" {
 		t.Errorf("review payload: %v", rev.Artifacts[0].Payload)
+	}
+}
+
+// scripted reads the FIRST LINE of the instructions it was handed, and since
+// Plan 12a the orchestrator appends an output-shape block to them. The two
+// facts meet on a node whose instructions are a single line with no trailing
+// newline — the ordinary case — where a block that did not open with its own
+// newline would be glued onto that line and every assertion about the fake's
+// plan content would shift.
+//
+// The REAL block is used, never a hand-written stand-in: the property under
+// test is a property of runs.OutputShapeInstruction's text, and a local copy
+// would keep passing after that text lost its leading blank line.
+func TestAppendedOutputShapeLeavesScriptedContentAlone(t *testing.T) {
+	const own = "Plan the change."
+	block := runs.OutputShapeInstruction(2, runs.KindPlan)
+	if block == "" {
+		t.Fatal("a schema-2 plan node gets no output-shape block; this test would be vacuous")
+	}
+	ctx := context.Background()
+
+	bare, err := fake.NewExecutor().Execute(ctx, req(runs.KindPlan, own))
+	if err != nil {
+		t.Fatal(err)
+	}
+	appended, err := fake.NewExecutor().Execute(ctx, req(runs.KindPlan, own+block))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"content", "summary"} {
+		if got, want := appended.Artifacts[0].Payload[key], bare.Artifacts[0].Payload[key]; got != want {
+			t.Errorf("%s = %q with the block appended, %q without", key, got, want)
+		}
 	}
 }
 

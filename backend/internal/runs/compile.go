@@ -42,8 +42,14 @@ func validEdgeArtifact(a string) bool {
 
 // DefinitionDoc is the runs-owned mirror of a stored definition.
 type DefinitionDoc struct {
-	Nodes []DefNode
-	Edges []DefEdge
+	// Schema is the document schema version the pinned definition was written
+	// with, mirrored verbatim. It is not the runtime's version and never
+	// defaults: payload validation is a property of THIS number
+	// (ValidateArtifactPayload), so a mirror that dropped it would switch the
+	// contract off for every run without failing anything.
+	Schema int
+	Nodes  []DefNode
+	Edges  []DefEdge
 }
 
 // DefRevision is the runs-owned mirror of a gate's bounded
@@ -92,6 +98,20 @@ type PlanNode struct {
 type ExecPlan struct {
 	Order []string
 	Nodes map[string]PlanNode
+	// DocSchemaVersion is the pinned DOCUMENT's schema version, carried through
+	// from DefinitionDoc.Schema. The orchestrator hands it to
+	// ValidateArtifactPayload: a node is judged against the payload shape its
+	// OWN pinned document promised, never against whatever this binary writes
+	// today.
+	//
+	// `Doc` is in the name because runs holds a second, unrelated
+	// SchemaVersion — PolicySnapshot.SchemaVersion, the SNAPSHOT shape's
+	// version (policy.go's snapshotSchemaVersion). Both are visible at once in
+	// the orchestrator's evaluate path, both are ints, and both are 2 today, so
+	// handing the wrong one to ValidateArtifactPayload would compile and leave
+	// every test in this repo green. The names have to do the work the types
+	// cannot.
+	DocSchemaVersion int
 	// gateFor maps a git-publish node to the gate whose approval authorizes
 	// it, and publishFor is its inverse. The document validator already
 	// proved the assignment exists and is one-to-one (workflows §2
@@ -129,6 +149,36 @@ func (p ExecPlan) ExaminedInput(gateNodeID string) (PlanInput, bool) {
 	}
 	for _, in := range n.Inputs {
 		if in.Artifact == ArtifactKindPlan || in.Artifact == ArtifactKindPatch {
+			return in, true
+		}
+	}
+	return PlanInput{}, false
+}
+
+// SummaryInput is the review_verdict a gate consumes, where its graph has one.
+// It is the OTHER half of a gate's evidence: §3.5 orders the approval surface
+// summary-first, and the summary is a different artifact from the plan-or-patch
+// the gate examines — ExaminedInput deliberately selects only the latter.
+//
+// At most one can exist. workflows/validate.go:207 makes `verdicts > 1` a
+// validation violation and permits ZERO, so this returns a single input and
+// never a list.
+//
+// FALSE MEANS SOMETHING DIFFERENT HERE THAN IT DOES ON ExaminedInput, and the
+// two are easy to confuse because the signatures are identical. A gate with no
+// examined input is CORRUPTION — DecideGate says so and refuses. A gate with no
+// verdict is an ORDINARY workflow, and the caller renders "no summary" rather
+// than an empty block pretending to be one.
+//
+// Inputs are sorted at compile time on (Origin, Artifact, From), so the answer
+// is deterministic for the same document however its edges were written.
+func (p ExecPlan) SummaryInput(gateNodeID string) (PlanInput, bool) {
+	n, ok := p.Nodes[gateNodeID]
+	if !ok || n.Kind != KindGate {
+		return PlanInput{}, false
+	}
+	for _, in := range n.Inputs {
+		if in.Artifact == ArtifactKindReviewVerdict {
 			return in, true
 		}
 	}
@@ -199,7 +249,7 @@ func Compile(doc DefinitionDoc) (ExecPlan, error) {
 		})
 		nodes[n.ID] = pn
 	}
-	plan := ExecPlan{Order: order, Nodes: nodes}
+	plan := ExecPlan{Order: order, Nodes: nodes, DocSchemaVersion: doc.Schema}
 	if err := plan.assignGates(in); err != nil {
 		return ExecPlan{}, err
 	}

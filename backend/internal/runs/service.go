@@ -20,8 +20,15 @@ import (
 
 // Params is the injected policy source until Plan 09's engine: app
 // wires DefaultSnapshot(); tests wire short budgets.
+//
+// Labels is the run READ path's label port. It is here rather than in
+// NewService's positional list because every existing call site would otherwise
+// have to be edited to pass a nil, and a nil in a positional argument list is
+// the kind of wiring omission that reads as intentional. A nil one is refused
+// loudly where it is needed (see labelsFor) and never degraded to ids.
 type Params struct {
 	Snapshot PolicySnapshot
+	Labels   RunLabelSource
 }
 
 type Service struct {

@@ -1,6 +1,7 @@
 package workflows_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -42,6 +43,38 @@ func TestParseDocument_AcceptsTheCanonicalConveyor(t *testing.T) {
 	}
 }
 
+// The compatibility rule that the whole payload contract rests on: this binary
+// parses BOTH versions, and the version it read is the version it reports. A
+// run pins its definition at intake, so a schema-1 document keeps being a
+// schema-1 document after the deploy that introduced schema 2 — which is why
+// no drain is needed and why validation can be a property of the pin.
+//
+// validDoc above is a schema-1 document and every other test in this package
+// parses it, so the v1 leg stays exercised by more than this one case.
+// The versions are LITERAL 1 and 2, not a loop from MinSchemaVersion to
+// SchemaVersion. Written the second way the test is a function of the two
+// constants it exists to pin: setting SchemaVersion back to 1 makes the loop
+// run one iteration and pass, which is the mutant this case has to kill.
+func TestParseDocument_AcceptsBothSchemaVersions(t *testing.T) {
+	for _, schema := range []int{1, 2} {
+		raw := fmt.Sprintf(`{"schema": %d, "nodes": [{"id": "a", "type": "plan", "harness": "cc", "instructions": "x"}]}`, schema)
+		d, err := workflows.ParseDocument([]byte(raw))
+		if err != nil {
+			t.Errorf("schema %d was rejected: %v", schema, err)
+			continue
+		}
+		if d.Schema != schema {
+			t.Errorf("schema %d parsed as %d; the pin a run is judged against is the one it was written with", schema, d.Schema)
+		}
+	}
+	// And the constants say the same thing, because everything downstream
+	// reads them rather than the literals above: runs' validator switches on
+	// the pinned version, and a new version is WRITTEN as SchemaVersion.
+	if workflows.MinSchemaVersion != 1 || workflows.SchemaVersion != 2 {
+		t.Errorf("min/current = %d/%d; want 1/2", workflows.MinSchemaVersion, workflows.SchemaVersion)
+	}
+}
+
 func TestParseDocument_RejectsMalformedInput(t *testing.T) {
 	cases := []struct {
 		name, raw, wantMsg string
@@ -50,7 +83,12 @@ func TestParseDocument_RejectsMalformedInput(t *testing.T) {
 		{"unknown top-level field", `{"schema": 1, "nodes": [], "surprise": true}`, "invalid definition document"},
 		{"unknown node field", `{"schema": 1, "nodes": [{"id": "a", "type": "plan", "prompt": "x"}]}`, "invalid definition document"},
 		{"trailing data", `{"schema": 1, "nodes": []}{"schema": 1}`, "invalid definition document"},
-		{"wrong schema version", `{"schema": 2, "nodes": []}`, "unsupported schema version"},
+		// 3, not 2: schema 2 is now ACCEPTED, and a rejection case that starts
+		// passing for a new reason is worse than one that fails. The rejected
+		// value has to sit outside [MinSchemaVersion, SchemaVersion] on the
+		// high side, and 0 below covers the low side.
+		{"schema version above the newest this binary writes", `{"schema": 3, "nodes": []}`, "unsupported schema version"},
+		{"schema version below the oldest this binary parses", `{"schema": 0, "nodes": []}`, "unsupported schema version"},
 		{"missing schema version", `{"nodes": []}`, "unsupported schema version"},
 	}
 	for _, c := range cases {

@@ -8,16 +8,21 @@ import (
 	"github.com/giiorg/caesar/backend/internal/assets"
 )
 
+// ProjectResponse and RepoResponse are required throughout, for the reason the
+// global constraint gives: the new-task form's project → repo cascade reads
+// these and an unmarked property renders optional in TypeScript. Both mappers
+// set every field unconditionally and neither struct carries an omitempty, so
+// no shape of either omits a key.
 type ProjectResponse struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          string    `json:"id" required:"true"`
+	Name        string    `json:"name" required:"true"`
+	Description string    `json:"description" required:"true"`
+	CreatedAt   time.Time `json:"created_at" required:"true"`
+	UpdatedAt   time.Time `json:"updated_at" required:"true"`
 }
 
 type ProjectListResponse struct {
-	Projects []ProjectResponse `json:"projects"`
+	Projects []ProjectResponse `json:"projects" required:"true"`
 }
 
 type CreateProjectRequest struct {
@@ -31,18 +36,18 @@ type UpdateProjectRequest struct {
 }
 
 type RepoResponse struct {
-	ID            string    `json:"id"`
-	ProjectID     string    `json:"project_id"`
-	Forge         string    `json:"forge"`
-	Slug          string    `json:"slug"`
-	DefaultBranch string    `json:"default_branch"`
-	CredentialID  string    `json:"credential_id"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID            string    `json:"id" required:"true"`
+	ProjectID     string    `json:"project_id" required:"true"`
+	Forge         string    `json:"forge" required:"true"`
+	Slug          string    `json:"slug" required:"true"`
+	DefaultBranch string    `json:"default_branch" required:"true"`
+	CredentialID  string    `json:"credential_id" required:"true"`
+	CreatedAt     time.Time `json:"created_at" required:"true"`
+	UpdatedAt     time.Time `json:"updated_at" required:"true"`
 }
 
 type RepoListResponse struct {
-	Repos []RepoResponse `json:"repos"`
+	Repos []RepoResponse `json:"repos" required:"true"`
 }
 
 type CreateRepoRequest struct {

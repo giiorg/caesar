@@ -487,43 +487,93 @@ type WaitingGate struct {
 	Generation   int32
 	RequesterID  uuid.UUID
 	WaitingSince time.Time
+	// Evidence is what the row's decision surface needs and cannot find for
+	// itself. Every row of this list is a gate awaiting a decision, so it is
+	// never absent (spec §2.4).
+	Evidence GateEvidence
 }
 
-func waitingGateFrom(phaseID, runID, taskID, projectID uuid.UUID, nodeID, title string,
-	attempt, generation int32, requesterID uuid.UUID, waitingSince time.Time,
-) WaitingGate {
+func waitingGateFrom(r store.ListWaitingGatesRow, ev GateEvidence) WaitingGate {
 	return WaitingGate{
-		PhaseID: phaseID, RunID: runID, TaskID: taskID, ProjectID: projectID,
-		NodeID: nodeID, TaskTitle: title, Attempt: attempt, Generation: generation,
-		RequesterID: requesterID, WaitingSince: waitingSince,
+		PhaseID: r.ID, RunID: r.RunID, TaskID: r.TaskID, ProjectID: r.ProjectID,
+		NodeID: r.NodeID, TaskTitle: r.Title, Attempt: r.Attempt, Generation: r.Generation,
+		RequesterID: r.RequesterID, WaitingSince: r.CreatedAt, Evidence: ev,
 	}
 }
 
 // ListWaitingGates is the approvals inbox. all=true is the admin view; a
 // member passes the project ids their grants cover, and an empty list is an
 // empty inbox rather than everything.
+//
+// It resolves each gate's EVIDENCE (spec §2.4), which costs one compiled plan
+// per distinct workflow version on the page — memoized, because an inbox is
+// usually several gates over one or two workflows — plus one or two artifact
+// reads per gate. The alternative is the client fetching each run, which is the
+// N+1 this endpoint exists to prevent.
 func (s *Service) ListWaitingGates(ctx context.Context, projectIDs []uuid.UUID, all bool) ([]WaitingGate, error) {
 	q := store.New(s.pool)
-	var out []WaitingGate
-	if all {
-		rows, err := q.ListWaitingGates(ctx)
+	// The two queries differ only in their WHERE clause, so sqlc's two row
+	// structs are field-for-field identical and one converts to the other. The
+	// conversion is deliberate rather than convenient: it makes "these two
+	// queries select the same columns" a COMPILE-TIME fact, and everything below
+	// — a compiled plan, two artifact reads, a projection — then happens in one
+	// loop that the admin and member paths cannot drift apart in.
+	var rows []store.ListWaitingGatesRow
+	switch {
+	case all:
+		found, err := q.ListWaitingGates(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("runs: list waiting gates: %w", err)
 		}
-		for _, r := range rows {
-			out = append(out, waitingGateFrom(r.ID, r.RunID, r.TaskID, r.ProjectID, r.NodeID, r.Title, r.Attempt, r.Generation, r.RequesterID, r.CreatedAt))
-		}
-		return out, nil
-	}
-	if len(projectIDs) == 0 {
+		rows = found
+	case len(projectIDs) == 0:
 		return []WaitingGate{}, nil
+	default:
+		found, err := q.ListWaitingGatesByProjects(ctx, projectIDs)
+		if err != nil {
+			return nil, fmt.Errorf("runs: list waiting gates: %w", err)
+		}
+		rows = make([]store.ListWaitingGatesRow, 0, len(found))
+		for _, r := range found {
+			rows = append(rows, store.ListWaitingGatesRow(r))
+		}
 	}
-	rows, err := q.ListWaitingGatesByProjects(ctx, projectIDs)
-	if err != nil {
-		return nil, fmt.Errorf("runs: list waiting gates: %w", err)
+
+	plans := map[uuid.UUID]ExecPlan{}
+	compiled := func(versionID uuid.UUID) (ExecPlan, error) {
+		if p, ok := plans[versionID]; ok {
+			return p, nil
+		}
+		def, err := s.defs.DefinitionByVersionID(ctx, versionID)
+		if err != nil {
+			return ExecPlan{}, err
+		}
+		p, err := compilePinned(def)
+		if err != nil {
+			return ExecPlan{}, err
+		}
+		plans[versionID] = p
+		return p, nil
 	}
+
+	out := make([]WaitingGate, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, waitingGateFrom(r.ID, r.RunID, r.TaskID, r.ProjectID, r.NodeID, r.Title, r.Attempt, r.Generation, r.RequesterID, r.CreatedAt))
+		snap, err := snapshotFromRow(r.PolicySnapshot)
+		if err != nil {
+			return nil, err
+		}
+		plan, err := compiled(r.WorkflowVersionID)
+		if err != nil {
+			return nil, err
+		}
+		ev, err := gateEvidence(ctx, q, gateEvidenceInput{
+			plan: plan, runID: r.RunID, nodeID: r.NodeID, snapshot: snap,
+			requesterID: r.RequesterID, wallDeadline: r.WallDeadline,
+		})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, waitingGateFrom(r, ev))
 	}
 	return out, nil
 }

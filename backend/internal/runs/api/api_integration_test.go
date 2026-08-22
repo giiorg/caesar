@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -73,23 +74,30 @@ type spinePorts struct {
 }
 
 func (p spinePorts) Definition(_ context.Context, workflowID uuid.UUID, version int32) (runs.PinnedDefinition, error) {
-	if workflowID != p.h.workflowID || version != 1 {
+	if workflowID != p.h.workflowID {
 		return runs.PinnedDefinition{}, xerrors.E(xerrors.ClassNotFound, "no such workflow version")
 	}
-	return p.pinned(), nil
+	for _, v := range p.h.versions {
+		if v.number == version {
+			return p.pinned(v), nil
+		}
+	}
+	return runs.PinnedDefinition{}, xerrors.E(xerrors.ClassNotFound, "no such workflow version")
 }
 
 func (p spinePorts) DefinitionByVersionID(_ context.Context, versionID uuid.UUID) (runs.PinnedDefinition, error) {
-	if versionID != p.h.versionID {
-		return runs.PinnedDefinition{}, xerrors.E(xerrors.ClassNotFound, "no such workflow version")
+	for _, v := range p.h.versions {
+		if v.id == versionID {
+			return p.pinned(v), nil
+		}
 	}
-	return p.pinned(), nil
+	return runs.PinnedDefinition{}, xerrors.E(xerrors.ClassNotFound, "no such workflow version")
 }
 
-func (p spinePorts) pinned() runs.PinnedDefinition {
+func (p spinePorts) pinned(v stagedVersion) runs.PinnedDefinition {
 	return runs.PinnedDefinition{
-		VersionID: p.h.versionID, WorkflowID: p.h.workflowID, Version: 1,
-		ContentHash: "deadbeef", Doc: gatedDoc(),
+		VersionID: v.id, WorkflowID: p.h.workflowID, Version: v.number,
+		ContentHash: v.contentHash, Doc: v.doc,
 	}
 }
 
@@ -102,6 +110,68 @@ func (p spinePorts) Repo(_ context.Context, id uuid.UUID) (runs.RepoRef, error) 
 		ID: id, ProjectID: projectID, Forge: "github",
 		Slug: "spine/repo", DefaultBranch: "main",
 	}, nil
+}
+
+// ProjectNames, RepoSlugs and WorkflowNames are runs.RunLabelSource, served
+// from the same harness rows every other port here answers from. They are real
+// lookups rather than constants because the list endpoint's labels are exactly
+// what a caller cannot get anywhere else, and a double that invented them would
+// make "the row carries the labels a card renders" true of nothing.
+//
+// A missing id is an ABSENT entry and never an error — the port's contract, and
+// the reason a deleted repository does not take out the list of runs that name
+// it.
+// labelsUnavailable is the fault a real adapter reports when the store behind
+// it is unreachable — distinct from a missing id, which is an absent entry.
+func (p spinePorts) labelsUnavailable() error {
+	if p.h.labelsDown {
+		return xerrors.E(xerrors.ClassInternal, "label store unreachable")
+	}
+	return nil
+}
+
+func (p spinePorts) ProjectNames(_ context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	if err := p.labelsUnavailable(); err != nil {
+		return nil, err
+	}
+	names := map[uuid.UUID]string{p.h.projectID: "spine", p.h.projectB: "spine-b"}
+	out := map[uuid.UUID]string{}
+	for _, id := range ids {
+		if n, ok := names[id]; ok {
+			out[id] = n
+		}
+	}
+	return out, nil
+}
+
+func (p spinePorts) RepoSlugs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	if err := p.labelsUnavailable(); err != nil {
+		return nil, err
+	}
+	out := map[uuid.UUID]string{}
+	for _, id := range ids {
+		r, err := p.Repo(ctx, id)
+		if err != nil {
+			continue
+		}
+		out[id] = r.Slug
+	}
+	return out, nil
+}
+
+func (p spinePorts) WorkflowNames(_ context.Context, versionIDs []uuid.UUID) (map[uuid.UUID]string, error) {
+	if err := p.labelsUnavailable(); err != nil {
+		return nil, err
+	}
+	out := map[uuid.UUID]string{}
+	for _, vid := range versionIDs {
+		for _, v := range p.h.versions {
+			if v.id == vid {
+				out[vid] = workflowName
+			}
+		}
+	}
+	return out, nil
 }
 
 // Email is runs.PrincipalSource. The API suite never publishes, but loadPlan
@@ -143,6 +213,80 @@ func gatedDoc() runs.DefinitionDoc {
 	return doc
 }
 
+// stagedVersion is one workflow version the definition port answers for. The
+// document COLUMN is never read — the port serves doc, and the row exists only
+// because tasks.workflow_version_id is a foreign key — so the two are kept
+// together here rather than left to be matched up by id at two call sites.
+type stagedVersion struct {
+	id          uuid.UUID
+	number      int32
+	contentHash string
+	doc         runs.DefinitionDoc
+}
+
+// The workflow versions this harness registers. Version 1 is gatedDoc, which
+// every test that does not ask for another graph runs on; the other two exist
+// because a gate's EVIDENCE is a property of the graph's shape, and the two
+// shapes gatedDoc cannot express are "the gate examines a plan" and "a review
+// verdict feeds the gate".
+const (
+	gatedVersion       int32 = 1
+	planGateVersion    int32 = 2
+	verdictGateVersion int32 = 3
+)
+
+// workflowName is the one workflow every staged version belongs to. It is a
+// constant because the label port answers with it and the list assertions read
+// it back: a literal in two places is a test that agrees with itself by
+// coincidence.
+const workflowName = "spine-wf"
+
+// planGateDoc is a gate over a PLAN, with a review node hanging off the same
+// plan. The review finishes later, so "the newest artifact on the run" and "the
+// artifact this gate examines" are different rows — which is the only shape in
+// which a projection that guessed at the examined artifact can be caught.
+func planGateDoc() runs.DefinitionDoc {
+	return runs.DefinitionDoc{
+		Nodes: []runs.DefNode{
+			{ID: "plan", Kind: runs.KindPlan, Harness: "cc", Instructions: "Plan the change."},
+			{ID: "review", Kind: runs.KindReview, Harness: "cc", Instructions: "Review the plan."},
+			{ID: "gate", Kind: runs.KindGate},
+		},
+		Edges: []runs.DefEdge{
+			{From: "plan", To: "review", Artifact: runs.ArtifactKindPlan},
+			{From: "plan", To: "gate", Artifact: runs.ArtifactKindPlan},
+			{From: "review", To: "gate", Artifact: runs.ArtifactKindReviewVerdict},
+		},
+	}
+}
+
+// verdictGateDoc is a gate that consumes a review verdict as well as the patch
+// it examines, and it carries a SECOND review node whose verdict the gate does
+// NOT consume.
+//
+// That second node is the whole point. With one verdict producer, "the verdict
+// the compiled plan names" and "the newest review_verdict on the run" are the
+// same row, and a projection that resolved the summary the second way would
+// pass every assertion. It is a legal graph — nothing requires a review to feed
+// a gate — and it is what a workflow with an advisory second reviewer looks
+// like.
+func verdictGateDoc() runs.DefinitionDoc {
+	return runs.DefinitionDoc{
+		Nodes: []runs.DefNode{
+			{ID: "impl", Kind: runs.KindImplement, Harness: "cc", Instructions: "Implement it."},
+			{ID: "review", Kind: runs.KindReview, Harness: "cc", Instructions: "Review the patch."},
+			{ID: "late", Kind: runs.KindReview, Harness: "cc", Instructions: "Review it again."},
+			{ID: "gate", Kind: runs.KindGate, Revision: &runs.DefRevision{Target: "impl", MaxRounds: 2}},
+		},
+		Edges: []runs.DefEdge{
+			{From: "impl", To: "review", Artifact: runs.ArtifactKindPatch},
+			{From: "impl", To: "late", Artifact: runs.ArtifactKindPatch},
+			{From: "impl", To: "gate", Artifact: runs.ArtifactKindPatch},
+			{From: "review", To: "gate", Artifact: runs.ArtifactKindReviewVerdict},
+		},
+	}
+}
+
 // harness mounts the real route table over the real service against a
 // real database: one admin, one member per grant level, and the asset
 // rows the spine's foreign keys point at.
@@ -161,13 +305,26 @@ type harness struct {
 	repoB      uuid.UUID
 	repos      map[uuid.UUID]uuid.UUID // repo id -> project id
 	workflowID uuid.UUID
-	versionID  uuid.UUID
-	admin      authn.Principal
-	runner     authn.Principal
-	approver   authn.Principal
-	approverB  authn.Principal
-	viewer     authn.Principal
-	outsider   authn.Principal
+	// versionID is version 1 — gatedDoc, what every test that does not ask for
+	// another graph runs on.
+	versionID uuid.UUID
+	// versions is every workflow version the definition port can answer for.
+	// One doc per harness was enough until a gate's evidence had to be read off
+	// graphs that differ in SHAPE — a gate over a plan, a gate with a review
+	// verdict feeding it, a gate with none — and a fixture cannot stage those
+	// against a single pinned definition.
+	versions  []stagedVersion
+	admin     authn.Principal
+	runner    authn.Principal
+	approver  authn.Principal
+	approverB authn.Principal
+	viewer    authn.Principal
+	outsider  authn.Principal
+	// labelsDown makes every label lookup fail, which is the only way to reach
+	// the one branch in this package that swallows an error instead of
+	// reporting it (handleRerunTask). It is a field rather than a separate
+	// double because the port is answered by spinePorts, which holds *harness.
+	labelsDown bool
 }
 
 func seedUser(t *testing.T, pool *pgxpool.Pool, email string, role authn.Role) authn.Principal {
@@ -277,16 +434,12 @@ func newHarnessWithStreams(t *testing.T, streams runsapi.StreamServer) *harness 
 	}
 	h.repos = map[uuid.UUID]uuid.UUID{h.repoID: h.projectID, h.repoB: h.projectB}
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO workflows (name) VALUES ('spine-wf') RETURNING id`).Scan(&h.workflowID); err != nil {
+		`INSERT INTO workflows (name) VALUES ($1) RETURNING id`, workflowName).Scan(&h.workflowID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx,
-		`INSERT INTO workflow_versions (workflow_id, version, content_hash, document)
-		 VALUES ($1, 1, 'deadbeef', '{"schema":1,"nodes":[]}'::jsonb) RETURNING id`,
-		h.workflowID,
-	).Scan(&h.versionID); err != nil {
-		t.Fatal(err)
-	}
+	h.versionID = h.registerVersion(t, gatedVersion, "deadbeef", gatedDoc())
+	h.registerVersion(t, planGateVersion, "deadbeef02", planGateDoc())
+	h.registerVersion(t, verdictGateVersion, "deadbeef03", verdictGateDoc())
 
 	h.admin = seedUser(t, pool, "root@example.com", authn.RoleAdmin)
 	h.runner = seedUser(t, pool, "runner@example.com", authn.RoleMember)
@@ -312,14 +465,31 @@ func newHarnessWithStreams(t *testing.T, streams runsapi.StreamServer) *harness 
 		h.repoB:  "basesha0000000000000000000000000000000000",
 	})
 	svc := runs.NewService(pool, c, audit.NewRecorder(c), ports, ports, ports, forge,
-		fake.NewPublisher(nil), ports, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		fake.NewPublisher(nil), ports, runs.Params{Snapshot: runs.DefaultSnapshot(), Labels: ports})
 
 	mux := http.NewServeMux()
-	httpx.Mount(mux, runsapi.Operations(runsapi.New(svc, h.ports, h.ports, h.ports, streams)))
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	httpx.Mount(mux, runsapi.Operations(runsapi.New(svc, h.ports, h.ports, h.ports, streams, log)))
 	h.srv = httptest.NewServer(httpx.Chain(mux, httpx.WithCorrelationID, httpx.AccessLog(log), httpx.CheckOrigin("http://caesar.test")))
 	t.Cleanup(h.srv.Close)
 	return h
+}
+
+// registerVersion inserts a workflow version row and teaches the definition
+// port the document it pins. content_hash is a parameter because the schema
+// makes it UNIQUE per workflow, so two versions cannot share one.
+func (h *harness) registerVersion(t *testing.T, number int32, contentHash string, doc runs.DefinitionDoc) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := h.pool.QueryRow(context.Background(),
+		`INSERT INTO workflow_versions (workflow_id, version, content_hash, document)
+		 VALUES ($1, $2, $3, '{"schema":1,"nodes":[]}'::jsonb) RETURNING id`,
+		h.workflowID, number, contentHash,
+	).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	h.versions = append(h.versions, stagedVersion{id: id, number: number, contentHash: contentHash, doc: doc})
+	return id
 }
 
 func (h *harness) do(t *testing.T, method, path, token string, body any) *http.Response {
@@ -399,8 +569,12 @@ func (h *harness) newTask(title string) runsapi.CreateTaskRequest {
 }
 
 func (h *harness) newTaskInRepo(repoID uuid.UUID, title string) runsapi.CreateTaskRequest {
+	return h.newTaskOnVersion(repoID, title, gatedVersion)
+}
+
+func (h *harness) newTaskOnVersion(repoID uuid.UUID, title string, version int32) runsapi.CreateTaskRequest {
 	return runsapi.CreateTaskRequest{
-		RepoID: repoID.String(), WorkflowID: h.workflowID.String(), WorkflowVersion: 1,
+		RepoID: repoID.String(), WorkflowID: h.workflowID.String(), WorkflowVersion: version,
 		Title: title, Inputs: map[string]any{"hint": "small"},
 	}
 }
@@ -413,7 +587,12 @@ func (h *harness) createTask(t *testing.T, token, title string) runsapi.TaskResp
 
 func (h *harness) createTaskInRepo(t *testing.T, token string, repoID uuid.UUID, title string) runsapi.TaskResponse {
 	t.Helper()
-	resp := h.do(t, http.MethodPost, "/api/v1/tasks", token, h.newTaskInRepo(repoID, title))
+	return h.createTaskOnVersion(t, token, repoID, title, gatedVersion)
+}
+
+func (h *harness) createTaskOnVersion(t *testing.T, token string, repoID uuid.UUID, title string, version int32) runsapi.TaskResponse {
+	t.Helper()
+	resp := h.do(t, http.MethodPost, "/api/v1/tasks", token, h.newTaskOnVersion(repoID, title, version))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create task = %d, want 201", resp.StatusCode)
 	}
@@ -443,6 +622,81 @@ type gateStamps struct {
 	priorActedAt time.Time // the SUPERSEDED attempt's decision's acted_at
 	priorPatchID string    // the artifact that superseded decision examined
 	livePatchID  string    // the artifact a decision on the live gate examines
+	wallDeadline time.Time // the run's deadline, as this fixture rewrote it
+}
+
+// parkAtGate puts a run in the state a materialized, undecided gate leaves it
+// in and hands back its base SHA.
+//
+// The wall deadline is rewritten off the DATABASE clock deliberately. Every
+// deciding predicate reads now() in the statement that mutates, while this
+// harness's app clock is pinned to a fixed date in 2026 — so a run left with
+// the deadline intake computed would be refused as expired on any day after it,
+// and every assertion below would be about the wrong refusal.
+//
+// Every timestamp a fixture writes afterwards is a distinct offset from that
+// same clock. Equal timestamps would let a projection read the wrong column and
+// still match.
+func (h *harness) parkAtGate(t *testing.T, runID uuid.UUID, generation int32) (string, time.Time) {
+	t.Helper()
+	var baseSHA string
+	var deadline time.Time
+	if err := h.pool.QueryRow(context.Background(),
+		`UPDATE runs SET status = 'waiting', generation = $2, started_at = now() - interval '90 minutes',
+		        wall_deadline = now() + interval '1 hour'
+		 WHERE id = $1 RETURNING base_sha, wall_deadline`,
+		runID, generation).Scan(&baseSHA, &deadline); err != nil {
+		t.Fatal(err)
+	}
+	return baseSHA, deadline
+}
+
+// stageArtifact writes one artifact row. Ages are passed as whole minutes and
+// turned into intervals in SQL, so every row's timestamp comes off the same
+// database clock as the run's deadline and no two of them collide.
+func (h *harness) stageArtifact(t *testing.T, runID uuid.UUID, node, artifactType string,
+	attempt, generation, agoMin int32, payload string,
+) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := h.pool.QueryRow(context.Background(),
+		`INSERT INTO artifacts (id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at)
+		 VALUES (uuidv7(), $1, $2, $3, $4, $5, $6::jsonb, '[]'::jsonb,
+		         now() - make_interval(mins => $7::int))
+		 RETURNING id`,
+		runID, node, attempt, generation, artifactType, payload, agoMin).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// stagePhase writes one phase_runs row. finishedMin is a *int32 rather than a
+// bool: make_interval of NULL is NULL, so the same expression writes the
+// timestamp or leaves the column unset.
+func (h *harness) stagePhase(t *testing.T, runID uuid.UUID, node, status string,
+	attempt, generation, agoMin int32, finishedMin *int32,
+) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := h.pool.QueryRow(context.Background(),
+		`INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, status, generation, finished_at, created_at)
+		 VALUES ($1, $2, $4, 3, $3, $5,
+		         now() - make_interval(mins => $6::int),
+		         now() - make_interval(mins => $7::int))
+		 RETURNING id`,
+		runID, node, status, attempt, generation, finishedMin, agoMin).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// mins boxes a whole-minute age for stagePhase's optional finished_at.
+func mins(m int32) *int32 { return &m }
+
+// patchPayload is what a patch artifact carries: mintAuthorization reads both
+// fields off it, and an approval over a patch that has neither is refused.
+func patchPayload(treeHash, baseSHA string) string {
+	return fmt.Sprintf(`{"tree_hash":%q,"base_sha":%q}`, treeHash, baseSHA)
 }
 
 // stageGate parks a run at a gate awaiting a decision, without a conveyor.
@@ -476,57 +730,20 @@ func (h *harness) stageGate(t *testing.T, task runsapi.TaskResponse) (uuid.UUID,
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The wall deadline is rewritten off the DATABASE clock deliberately. Every
-	// deciding predicate reads now() in the statement that mutates, while this
-	// harness's app clock is pinned to a fixed date in 2026 — so a run left with
-	// the deadline intake computed would be refused as expired on any day after
-	// it, and every assertion below would be about the wrong refusal.
-	//
-	// Every timestamp below is a distinct offset from that same clock. Equal
-	// timestamps would let a projection read the wrong column and still match.
-	var baseSHA string
-	if err := h.pool.QueryRow(ctx,
-		`UPDATE runs SET status = 'waiting', generation = 2, started_at = now() - interval '90 minutes',
-		        wall_deadline = now() + interval '1 hour'
-		 WHERE id = $1 RETURNING base_sha`,
-		runID).Scan(&baseSHA); err != nil {
-		t.Fatal(err)
-	}
+	var st gateStamps
+	baseSHA, wallDeadline := h.parkAtGate(t, runID, 2)
+	st.wallDeadline = wallDeadline
 
-	// Ages are passed as whole minutes and turned into intervals in SQL, so
-	// every row's timestamp comes off the same database clock as the deadline
-	// above and no two of them collide.
 	patch := func(attempt, generation, agoMin int32, hash string) uuid.UUID {
 		t.Helper()
-		var id uuid.UUID
-		if err := h.pool.QueryRow(ctx,
-			`INSERT INTO artifacts (id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at)
-			 VALUES (uuidv7(), $1, 'impl', $4, $5, 'patch',
-			         jsonb_build_object('tree_hash', $2::text, 'base_sha', $3::text), '[]'::jsonb,
-			         now() - make_interval(mins => $6::int))
-			 RETURNING id`,
-			runID, hash, baseSHA, attempt, generation, agoMin).Scan(&id); err != nil {
-			t.Fatal(err)
-		}
-		return id
+		return h.stageArtifact(t, runID, "impl", "patch", attempt, generation, agoMin,
+			patchPayload(hash, baseSHA))
 	}
-	// finished is a *int32 rather than a bool: make_interval of NULL is NULL, so
-	// the same expression writes the timestamp or leaves the column unset.
 	phase := func(node, status string, attempt, generation, agoMin int32, finishedMin *int32) uuid.UUID {
 		t.Helper()
-		var id uuid.UUID
-		if err := h.pool.QueryRow(ctx,
-			`INSERT INTO phase_runs (run_id, node_id, attempt, max_attempts, status, generation, finished_at, created_at)
-			 VALUES ($1, $2, $4, 3, $3, $5,
-			         now() - make_interval(mins => $6::int),
-			         now() - make_interval(mins => $7::int))
-			 RETURNING id`,
-			runID, node, status, attempt, generation, finishedMin, agoMin).Scan(&id); err != nil {
-			t.Fatal(err)
-		}
-		return id
+		return h.stagePhase(t, runID, node, status, attempt, generation, agoMin, finishedMin)
 	}
-	at := func(m int32) *int32 { return &m }
+	at := mins
 
 	// Generation 1: the implementation failed once, retried, produced a patch,
 	// and the gate sent the round back for changes.
@@ -535,7 +752,6 @@ func (h *harness) stageGate(t *testing.T, task runsapi.TaskResponse) (uuid.UUID,
 	// generation together, so without one extra attempt somewhere every row in
 	// this fixture would carry attempt == generation — and a projection that
 	// swapped the two columns would satisfy every assertion in this file.
-	var st gateStamps
 	phase("impl", "failed", 1, 1, 70, at(65))
 	priorPatch := patch(2, 1, 60, supersededTreeHash)
 	st.priorPatchID = priorPatch.String()
@@ -771,6 +987,7 @@ func TestRunsAPI_ReadEndpointsRequireViewGrant(t *testing.T) {
 		if run.ID != task.LatestRunID || run.TaskID != task.ID {
 			t.Errorf("run identity wrong: %+v", run)
 		}
+		assertRunLabels(t, "GET /runs/{id}", run, "ship it")
 		if run.Status != string(runs.RunPending) || run.DefinitionHash != "deadbeef" {
 			t.Errorf("run pins wrong: %+v", run)
 		}
@@ -792,7 +1009,30 @@ func TestRunsAPI_ReadEndpointsRequireViewGrant(t *testing.T) {
 		if len(list.Runs[0].Phases) != 0 || len(list.Runs[0].Artifacts) != 0 {
 			t.Errorf("list entries must stay shallow: %+v", list.Runs[0])
 		}
+		// Shallow means NO PHASES, not "no labels". Every row of this list is a
+		// card too, and the labels are resolved once for the whole list because
+		// every run of one task shares the task's.
+		assertRunLabels(t, "GET /tasks/{id}/runs", list.Runs[0], "ship it")
 	})
+}
+
+// assertRunLabels holds the three header labels of a RunResponse to their real
+// values. It exists because "required in the contract" pins the SHAPE and not
+// the content: RunResponse's task_title, repo_slug and workflow_name shipped
+// for a round emitted by three handlers and asserted by none, and deleting the
+// resolution from all three left the whole suite green. Blank is the failure
+// mode — a run whose header renders nothing — so blank is what this refuses.
+func assertRunLabels(t *testing.T, where string, run runsapi.RunResponse, wantTitle string) {
+	t.Helper()
+	if run.TaskTitle != wantTitle {
+		t.Errorf("%s task_title = %q, want %q", where, run.TaskTitle, wantTitle)
+	}
+	if run.RepoSlug != "spine/repo" {
+		t.Errorf("%s repo_slug = %q, want the staged repo's slug", where, run.RepoSlug)
+	}
+	if run.WorkflowName != workflowName {
+		t.Errorf("%s workflow_name = %q, want %q", where, run.WorkflowName, workflowName)
+	}
 }
 
 func TestRunsAPI_RerunSupersedesPendingAndRefusesLive(t *testing.T) {
@@ -815,6 +1055,9 @@ func TestRunsAPI_RerunSupersedesPendingAndRefusesLive(t *testing.T) {
 		if second.ID == task.LatestRunID || second.Status != string(runs.RunPending) {
 			t.Fatalf("second run = %+v, want a new pending run", second)
 		}
+		// A re-run lands you on the run screen, so its header is rendered from
+		// this very response and never from a follow-up read.
+		assertRunLabels(t, "POST /tasks/{id}/runs", second, "ship it")
 		first := decodeInto[runsapi.RunResponse](t, h.do(t, http.MethodGet, "/api/v1/runs/"+task.LatestRunID, "runner-tok", nil))
 		if first.Status != string(runs.RunSuperseded) {
 			t.Errorf("first run = %q, want superseded", first.Status)
@@ -833,6 +1076,49 @@ func TestRunsAPI_RerunSupersedesPendingAndRefusesLive(t *testing.T) {
 			t.Fatalf("rerun of a running run = %d, want 409", resp.StatusCode)
 		}
 	})
+}
+
+// TestRunsAPI_RerunDegradesRatherThanFailsOnALabelFault pins the one asymmetry
+// in this package: rerun swallows a label fault, the read paths report it.
+//
+// The reason is what has already happened when the lookup runs. Rerun has
+// COMMITTED a run; a 500 would tell the client its mutation failed when it
+// succeeded, and the retry that follows hits the one-live-run-per-task
+// constraint and surfaces as a 409 nobody can explain. A header rendering three
+// blank strings costs a refresh. GET has committed nothing, so it has nothing
+// to protect and reports the fault honestly.
+func TestRunsAPI_RerunDegradesRatherThanFailsOnALabelFault(t *testing.T) {
+	h := newHarness(t)
+	task := h.createTask(t, "admin-tok", "ship it")
+
+	h.labelsDown = true
+	t.Cleanup(func() { h.labelsDown = false })
+
+	resp := h.do(t, http.MethodPost, "/api/v1/tasks/"+task.ID+"/runs", "runner-tok", nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("rerun with the label store down = %d, want 201 — the run was already written",
+			resp.StatusCode)
+	}
+	created := decodeInto[runsapi.RunResponse](t, resp)
+	if created.TaskTitle != "" || created.RepoSlug != "" || created.WorkflowName != "" {
+		t.Errorf("degraded rerun invented labels: %q/%q/%q",
+			created.TaskTitle, created.RepoSlug, created.WorkflowName)
+	}
+
+	// The read path, same fault, same request second: still a fault.
+	if r := h.do(t, http.MethodGet, "/api/v1/runs/"+created.ID, "viewer-tok", nil); r.StatusCode != http.StatusInternalServerError {
+		t.Errorf("GET /runs/{id} with the label store down = %d, want 500 — "+
+			"a read has no committed write to protect and must not hide the fault", r.StatusCode)
+	}
+
+	// And the mutation really landed, which is the whole reason the 201 is
+	// right: the run is readable, pending, and labelled once the store is back.
+	h.labelsDown = false
+	run := decodeInto[runsapi.RunResponse](t, h.do(t, http.MethodGet, "/api/v1/runs/"+created.ID, "viewer-tok", nil))
+	if run.ID != created.ID || run.Status != string(runs.RunPending) {
+		t.Fatalf("the degraded rerun's run reads back as %+v, want a pending run", run)
+	}
+	assertRunLabels(t, "GET /runs/{id} after the fault cleared", run, "ship it")
 }
 
 func TestRunsAPI_ListRunEventsPagesByID(t *testing.T) {
@@ -1289,9 +1575,25 @@ func TestAPI_ApprovalsInboxIsScopedToGrants(t *testing.T) {
 			RunID: runA.String(), TaskID: taskA.ID, ProjectID: h.projectID.String(),
 			TaskTitle: "gate on A", NodeID: "gate", Attempt: 3, Generation: 2,
 			RequesterID: h.approver.UserID.String(), WaitingSince: got.WaitingSince,
+			// The approver requested this run and the shipped policy permits
+			// self-approval, so they may decide it; gatedDoc has no review node,
+			// so there is no summary to name.
+			Evidence: runsapi.GateEvidenceResponse{
+				ExaminedArtifactID: stampsA.livePatchID, ExaminedArtifactType: "patch",
+				SummaryArtifactID: nil, CanDecide: true, CannotDecideReason: "",
+				WallDeadline: got.Evidence.WallDeadline,
+			},
 		}
-		if got != want {
-			t.Errorf("entry = %+v, want %+v", got, want)
+		// cmp.Diff rather than !=: Evidence holds a *string, and == would compare
+		// it by ADDRESS — two decoded values that agree would still differ.
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("entry differs (-want +got):\n%s", diff)
+		}
+		// The deadline is excluded from the comparison above for the same reason
+		// WaitingSince is, and pinned here against the value stageGate wrote.
+		if !got.Evidence.WallDeadline.Equal(stampsA.wallDeadline) {
+			t.Errorf("wall_deadline = %s, want the run's %s",
+				got.Evidence.WallDeadline, stampsA.wallDeadline)
 		}
 		// WaitingSince is compared apart from the struct because time.Time
 		// equality includes the location pointer, and the value has been through

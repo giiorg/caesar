@@ -132,3 +132,74 @@ func TestPinnedFromVersion_LeavesNonGatesWithoutARevision(t *testing.T) {
 		t.Error("only gates carry a revision transition")
 	}
 }
+
+// The line the payload-contract compatibility rule rests on. Without it every
+// run looks like schema 0 to runs.ValidateArtifactPayload, nothing is ever
+// checked, and the feature is silently absent — the failure mode that leaves
+// no trace anywhere.
+//
+// Both versions are asserted with literals rather than workflows.SchemaVersion:
+// a schema-1 document must yield 1, not "whatever this binary now writes".
+func TestPinnedFromVersion_CarriesTheDocumentSchemaVersion(t *testing.T) {
+	for _, schema := range []int{1, 2} {
+		doc := workflows.Document{
+			Schema: schema,
+			Nodes:  []workflows.Node{{ID: "impl", Type: workflows.NodeImplement, Harness: "h", Instructions: "x"}},
+		}
+		got, err := pinnedFromVersion(workflows.Version{ID: uuid.New(), Document: doc.Canonical()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Doc.Schema != schema {
+			t.Errorf("Doc.Schema = %d, want %d", got.Doc.Schema, schema)
+		}
+	}
+}
+
+// The seam the payload contract rests on, end to end and in the one package
+// that can see both vocabularies: a document's schema version survives
+// parsing, the mirror, and compilation, and is still the number the payload
+// validator is handed.
+//
+// It also ties two constants that live in contexts which cannot import each
+// other — workflows.SchemaVersion, the version a new document is written as,
+// and runs' internal threshold at which payload validation switches on. A
+// binary where those disagree validates nothing while every test in both
+// packages stays green.
+func TestPinnedSchemaVersionIsWhatDecidesPayloadValidation(t *testing.T) {
+	// A plan payload in the pre-contract shape, WRITTEN OUT HERE rather than
+	// taken from a producer. It is the shape every harness wrote before Plan
+	// 12a taught them the contract, and it is a literal on purpose: this test
+	// pins the schema BOUNDARY, not any current producer's output. Sourcing it
+	// from the fake executor would have made it re-pass the moment the fake was
+	// migrated, which is exactly when the boundary most needs asserting.
+	legacy := map[string]any{"content": "plan: do the thing"}
+
+	for _, c := range []struct {
+		schema     int
+		wantReject bool
+	}{
+		{schema: 1, wantReject: false},
+		{schema: workflows.SchemaVersion, wantReject: true},
+	} {
+		doc := workflows.Document{
+			Schema: c.schema,
+			Nodes:  []workflows.Node{{ID: "plan", Type: workflows.NodePlan, Harness: "h", Instructions: "x"}},
+		}
+		pinned, err := pinnedFromVersion(workflows.Version{ID: uuid.New(), Document: doc.Canonical()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := runs.Compile(pinned.Doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = runs.ValidateArtifactPayload(plan.DocSchemaVersion, runs.ArtifactKindPlan, legacy)
+		if c.wantReject && err == nil {
+			t.Errorf("schema %d accepted a pre-contract plan payload; the contract is switched off", c.schema)
+		}
+		if !c.wantReject && err != nil {
+			t.Errorf("schema %d rejected a pre-contract plan payload: %v; a pinned v1 run must run exactly as it did", c.schema, err)
+		}
+	}
+}

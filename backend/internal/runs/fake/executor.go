@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,14 +85,47 @@ type Executor struct {
 	// switches the implement artifact from a synthetic patch to a PUBLISHABLE
 	// one — see scripted.
 	remotes map[uuid.UUID]string
+	// planPayload replaces the scripted plan payload wholesale; planExtra
+	// merges keys into whatever plan payload is emitted. They exist so a test
+	// can drive a real orchestrator with a payload of its own choosing —
+	// notably a pre-contract one — without a second executor.
+	planPayload map[string]any
+	planExtra   map[string]any
+	// lastInstructions is what Execute was HANDED, per node id. It is recorded
+	// rather than reconstructed: the point of asking is to see what the runner
+	// appended, and a reconstruction would be a copy of the rule under test.
+	lastInstructions map[string]string
 }
 
 func NewExecutor() *Executor {
 	return &Executor{
-		execCount: map[string]int{},
-		completed: map[runs.AttemptRef]runs.ExecutionResult{},
-		remotes:   map[uuid.UUID]string{},
+		execCount:        map[string]int{},
+		completed:        map[runs.AttemptRef]runs.ExecutionResult{},
+		remotes:          map[uuid.UUID]string{},
+		lastInstructions: map[string]string{},
 	}
+}
+
+// PlanPayload replaces the scripted plan payload with p.
+func (e *Executor) PlanPayload(p map[string]any) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.planPayload = p
+}
+
+// PlanExtra merges extra keys into whatever plan payload is emitted.
+func (e *Executor) PlanExtra(p map[string]any) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.planExtra = p
+}
+
+// LastInstructions reports the instructions Execute most recently received for
+// a node id, "" if it was never executed.
+func (e *Executor) LastInstructions(nodeID string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.lastInstructions[nodeID]
 }
 
 // Remote registers the local bare repository a repo id resolves to, which is
@@ -105,6 +139,13 @@ func (e *Executor) Remote(repoID uuid.UUID, bare string) {
 func nodeKey(ref runs.AttemptRef) string { return ref.RunID.String() + "/" + ref.NodeID }
 
 func (e *Executor) Execute(ctx context.Context, req runs.ExecutionRequest) (runs.ExecutionResult, error) {
+	// Recorded FIRST, before anything can divert this call: a hung or scripted-
+	// to-fail attempt was still told something, and that is what LastInstructions
+	// is asked about.
+	e.mu.Lock()
+	e.lastInstructions[req.Ref.NodeID] = req.Instructions
+	e.mu.Unlock()
+
 	d, err := parseDirective(req.Instructions)
 	if err != nil {
 		return runs.ExecutionResult{}, runs.OutcomeError{Outcome: runs.Outcome{
@@ -175,12 +216,50 @@ func (e *Executor) scripted(req runs.ExecutionRequest) (runs.NewArtifact, error)
 		}}, nil
 	case runs.KindReview:
 		return runs.NewArtifact{Type: runs.ArtifactKindReviewVerdict, Payload: map[string]any{
-			"verdict": "approve", "notes": "fake review",
+			// `notes` is kept alongside the schema-2 keys, and NOT because
+			// anything asserts on it — nothing does; this emission is its only
+			// occurrence in the tree. It stays for two reasons. Deleting a key
+			// the fake has always emitted is churn on a double, changing what a
+			// dozen suites observe to buy nothing. And an unknown key riding
+			// beside the required ones is exactly the case spec §2.3 promises to
+			// accept, so carrying one makes every fake-driven run exercise that
+			// promise instead of only the required set.
+			//
+			// The counts are untyped Go ints, which is what a payload built in
+			// Go really carries when nothing marshals it on the way to the
+			// orchestrator. runs.optionalNumber accepts them; converting them to
+			// float64 here would be the fake pretending to have been decoded.
+			"verdict":  "approve",
+			"notes":    "fake review",
+			"findings": []any{},
+			"tests":    map[string]any{"status": "passed", "passed": 1, "failed": 0},
 		}}, nil
 	default: // plan and anything agentic-shaped
-		return runs.NewArtifact{Type: runs.ArtifactKindPlan, Payload: map[string]any{
+		// `content` is kept for the same two reasons `notes` is above — churn on
+		// a double buys nothing, and an unknown key beside the required ones
+		// exercises the §2.3 extra-keys promise on the plan side too — plus one
+		// that is specific to it: deleting it would SILENTLY VACATE
+		// executor_test.go's determinism check rather than fail it, since that
+		// check compares two emissions to each other and nil == nil.
+		//
+		// MEASURED, not assumed. Deleting this key left every backend suite
+		// green, unit and integration alike. An earlier version of this comment
+		// claimed five suites would break; they do not, because the runner's
+		// `content` sites script their own payloads and never run this fake.
+		// executor_test.go now pins the emitted value against a literal, which
+		// is what makes the first sentence true going forward.
+		payload := map[string]any{
 			"content": "plan: " + firstLine,
-		}}, nil
+			"summary": "plan: " + firstLine,
+			"steps":   []any{map[string]any{"title": firstLine}},
+		}
+		e.mu.Lock()
+		if e.planPayload != nil {
+			payload = maps.Clone(e.planPayload)
+		}
+		maps.Copy(payload, e.planExtra)
+		e.mu.Unlock()
+		return runs.NewArtifact{Type: runs.ArtifactKindPlan, Payload: payload}, nil
 	}
 }
 

@@ -930,8 +930,15 @@ func (o *Orchestrator) harnessBinding(ctx context.Context, node PlanNode) (uuid.
 // origin, the seeds a revision handed this node, and the harness binding.
 func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node PlanNode, ref AttemptRef, deadline time.Time) (ExecutionRequest, error) {
 	req := ExecutionRequest{
-		Ref: ref, Kind: node.Kind, Repo: cp.repo, Instructions: node.Instructions,
-		TaskInputs: cp.taskInputs, BaseSHA: cp.baseSHA, Deadline: deadline,
+		Ref: ref, Kind: node.Kind, Repo: cp.repo,
+		// APPENDED, never substituted. The node's own instructions come first
+		// and unchanged; a model that reads only the opening lines still reads
+		// the task it was given. This is the ONE place that holds both the node
+		// and the schema version its run pinned, so every harness — the Docker
+		// runner, the fake executor the acceptance lane runs on, and any future
+		// one — is told the same thing from the same source.
+		Instructions: node.Instructions + OutputShapeInstruction(cp.plan.DocSchemaVersion, node.Kind),
+		TaskInputs:   cp.taskInputs, BaseSHA: cp.baseSHA, Deadline: deadline,
 	}
 	harnessID, binding, err := o.harnessBinding(ctx, node)
 	if err != nil {
@@ -1011,6 +1018,22 @@ func collapsePatchInputs(in []ArtifactInput) []ArtifactInput {
 func (o *Orchestrator) evaluate(ctx context.Context, workerID string, cp cachedPlan,
 	c claimed, fromStatus PhaseStatus, res ExecutionResult, execErr error,
 ) {
+	// THE PAYLOAD CHECK LIVES HERE, before the transaction, and here is the
+	// only place it can live once and cover everything.
+	//
+	// Not in the runner: collect.go builds artifacts inside a process that does
+	// not know which document version the run pinned, and the adoption path
+	// reaches this function having never run collect at all. Not inside the
+	// transaction: turning a success into a failure after finishPhase has
+	// already moved the row would mean unwinding a state machine that has one
+	// entry point for exactly this reason.
+	//
+	// Converting the success into an execErr hands it to evaluateFailure, which
+	// is the machinery that already knows how a permanent outcome terminalizes
+	// a node — so this adds a rule, not a second failure path.
+	if execErr == nil {
+		execErr = validateResultPayloads(cp.plan.DocSchemaVersion, res)
+	}
 	now := o.svc.clock.Now()
 	var runFinished bool
 	err := pg.WithTx(ctx, o.svc.pool, func(tx pgx.Tx) error {
@@ -1041,6 +1064,31 @@ func (o *Orchestrator) evaluate(ctx context.Context, workerID string, cp cachedP
 	if runFinished {
 		o.dropPlan(c.Ref.RunID)
 	}
+}
+
+// validateResultPayloads refuses an attempt whose declared payloads do not
+// match the shape its own pinned document promised (spec §2.3).
+//
+// PERMANENT, matching how collect.go already treats an undeclarable artifact
+// type: retrying reaches the same harness with the same instructions and the
+// same answer, so a transient classification would burn the node's whole
+// attempt budget to arrive back here.
+//
+// The rejected payload is still PERSISTED — evaluateFailure stores
+// res.Artifacts on both its branches — and that is deliberate: it is the
+// evidence for why the node failed, and a permanently-failed node opens no
+// gate and completes no run, so nothing downstream consumes it.
+func validateResultPayloads(schemaVersion int, res ExecutionResult) error {
+	for _, a := range res.Artifacts {
+		if err := ValidateArtifactPayload(schemaVersion, a.Type, a.Payload); err != nil {
+			return OutcomeError{Outcome: Outcome{
+				Class: OutcomePermanent, Code: CodeInvalidOutput,
+				Message: fmt.Sprintf("declared %s payload does not match the shape this workflow's schema %d promises: %v",
+					a.Type, schemaVersion, err),
+			}}
+		}
+	}
+	return nil
 }
 
 // evaluateSuccess reports whether this transaction terminalized the run,

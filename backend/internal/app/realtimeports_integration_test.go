@@ -36,7 +36,43 @@ type seededRun struct {
 	projectID uuid.UUID
 }
 
+// seededTask is everything a run needs to exist EXCEPT the run row. It is
+// separate because one test — TestStream_CarriesAnOrchestratedPhaseTransition —
+// has to insert its run only once a stream is already live, and the rows below
+// it are the orchestrator's inputs rather than the subject.
+type seededTask struct {
+	taskID    uuid.UUID
+	projectID uuid.UUID
+}
+
+// emptyWorkflowDocument is what a run whose graph nothing compiles gets. Every
+// test that only appends events by hand seeds through it, and what it buys is
+// a run NOTHING WILL EVER MATERIALIZE A PHASE FOR.
+//
+// Not because no orchestrator looks: the bootServe'd tests in the two files
+// beside this one run a real janitor, and these rows are exactly what it goes
+// looking for — ListRunsAwaitingMaterialization selects a 'running' run with
+// no live phase, which every run seeded here is. It loads them on each poll,
+// `Compile` refuses the empty node list ("runs: compile: no nodes",
+// compile.go:192), and materializeResumedRuns logs "resumed plan load" and
+// moves to the next id. The pass is a no-op every time.
+//
+// So a node list would be worse than decoration: it would let that janitor
+// materialize a root node and append a real phase.* event to a run some test
+// is asserting the exact event set of.
+const emptyWorkflowDocument = `{"schema":1,"nodes":[]}`
+
 func seedRealtimeRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool, name string) seededRun {
+	t.Helper()
+	task := seedRealtimeTask(ctx, t, pool, name, emptyWorkflowDocument)
+	return seededRun{runID: insertRealtimeRun(ctx, t, pool, task, "running"), projectID: task.projectID}
+}
+
+// seedRealtimeTask writes the user, project, credential, repo, workflow,
+// version and task one run hangs off. document is the workflow version's
+// stored definition: a run the orchestrator will START needs one that
+// compiles, and every other caller passes emptyWorkflowDocument.
+func seedRealtimeTask(ctx context.Context, t *testing.T, pool *pgxpool.Pool, name, document string) seededTask {
 	t.Helper()
 	scan := func(step string, row pgx.Row) uuid.UUID {
 		t.Helper()
@@ -63,20 +99,32 @@ func seedRealtimeRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool, name
 		`INSERT INTO workflows (name) VALUES ($1) RETURNING id`, name+"-wf"))
 	versionID := scan("workflow version", pool.QueryRow(ctx,
 		`INSERT INTO workflow_versions (workflow_id, version, content_hash, document)
-		 VALUES ($1, 1, 'deadbeef', '{"schema":1,"nodes":[]}'::jsonb) RETURNING id`,
-		workflowID))
+		 VALUES ($1, 1, 'deadbeef', $2::jsonb) RETURNING id`,
+		workflowID, document))
 	taskID := scan("task", pool.QueryRow(ctx,
 		`INSERT INTO tasks (project_id, repo_id, workflow_version_id, title, requester_id, created_at)
 		 VALUES ($1, $2, $3, $4, $5, now()) RETURNING id`,
 		projectID, repoID, versionID, name+" task", userID))
-	runID := scan("run", pool.QueryRow(ctx,
+	return seededTask{taskID: taskID, projectID: projectID}
+}
+
+// insertRealtimeRun adds one run row in the given status. 'pending' is the
+// status the orchestrator's janitor acts on; every other caller wants
+// 'running', which it never touches.
+func insertRealtimeRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool, task seededTask, status string) uuid.UUID {
+	t.Helper()
+	var runID uuid.UUID
+	if err := pool.QueryRow(ctx,
 		`INSERT INTO runs (task_id, status, definition_hash, base_sha, policy_snapshot,
 		                   execution_budget_ms, wall_deadline, created_at)
-		 VALUES ($1, 'running', 'deadbeef', 'abc123',
+		 VALUES ($1, $2, 'deadbeef', 'abc123',
 		         '{"schema":2,"max_attempts":3,"execution_budget_ms":7200000,"wall_clock_ms":86400000}'::jsonb,
 		         7200000, now() + interval '1 day', now()) RETURNING id`,
-		taskID))
-	return seededRun{runID: runID, projectID: projectID}
+		task.taskID, status,
+	).Scan(&runID); err != nil {
+		t.Fatalf("seed %s run: %v", status, err)
+	}
+	return runID
 }
 
 // seededEvent is one row a test wrote. The tests keep the whole set so the
@@ -378,6 +426,18 @@ func TestSince_HandsTheTailerEveryEventOldestFirst(t *testing.T) {
 	}
 }
 
+// unattendedKind is an event kind in NONE of the attention namespaces, and
+// this fixture cannot do its job without one.
+//
+// Plan 12a added `phase.` to the prefixes, which made every kind
+// runs/events.go defines attention-worthy — so a fixture seeded from that
+// vocabulary alone would be selected in full by a query that dropped the kind
+// test altogether, and the SQL-vs-Matches comparison below would pass on a
+// snapshot that carries everything. It is a literal rather than a constant
+// from runs precisely because no production writer may emit it: the moment one
+// does, this row stops testing the exclusion and has to be replaced.
+const unattendedKind = "audit.recorded"
+
 // TestAttentionStream_SelectsExactlyWhatMatchesSelects pins the two gaps the
 // attention query has to close in SQL: the kind prefixes the global stream
 // is defined by, and the admin case that no project-id list can express.
@@ -394,15 +454,15 @@ func TestAttentionStream_SelectsExactlyWhatMatchesSelects(t *testing.T) {
 	log := newEventLog(pool)
 	for _, kind := range []string{
 		runs.EventRunStarted,        // 1 attention
-		runs.EventPhaseMaterialized, // 2 NOT attention
+		runs.EventPhaseMaterialized, // 2 attention (Plan 12a)
 		runs.EventGateWaiting,       // 3 attention
-		runs.EventPhaseStarted,      // 4 NOT attention
+		unattendedKind,              // 4 NOT attention
 		runs.EventPublishPushed,     // 5 attention
 	} {
 		log.append(ctx, t, runA, kind)
 	}
 	log.append(ctx, t, runB, runs.EventRunStarted) // 6 attention, other project
-	log.append(ctx, t, runB, runs.EventPhaseDead)  // 7 neither
+	log.append(ctx, t, runB, unattendedKind)       // 7 neither
 
 	src := newRealtimeEventSource(pool, 500)
 

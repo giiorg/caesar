@@ -77,6 +77,10 @@ type Phase struct {
 	// on the phase row's own id, so a revision's two gate attempts carry
 	// their own verdicts rather than sharing the newest.
 	Decision *GateDecision
+	// Evidence is present ONLY on a gate attempt still awaiting a decision.
+	// A decided gate carries its Decision instead, which already names the
+	// examined artifact; a non-gate phase has neither.
+	Evidence *GateEvidence
 }
 
 type ArtifactMeta struct {
@@ -89,11 +93,28 @@ type ArtifactMeta struct {
 	CreatedAt  time.Time
 }
 
+// ArtifactWithPayload is one artifact including its content. It is separate
+// from ArtifactMeta because the run projection deliberately carries metadata
+// only: a run with twenty artifacts would otherwise ship every patch on every
+// page load.
+type ArtifactWithPayload struct {
+	ArtifactMeta
+	Payload map[string]any
+}
+
 // RunDetail is the single-run read: everything the run page renders, from one
 // query set. It replaces GetRun's four return values, which had run out of
 // room the moment publications joined phases and artifacts.
 type RunDetail struct {
-	Run          Run
+	Run Run
+	// Labels is what the run page's header renders, and it is filled by the
+	// CALLER rather than by GetRunDetail. It lives here because runResponse
+	// projects one value, and it is not read from the database here because
+	// nothing in the domain needs it: a label is a presentation concern, the
+	// port that resolves one is wired only where a request is served, and every
+	// service-level reader of a run would otherwise have to wire a label source
+	// to observe a phase transition.
+	Labels       RunLabels
 	Phases       []Phase
 	Artifacts    []ArtifactMeta
 	Publications []Publication
@@ -575,23 +596,18 @@ func (s *Service) GetRunDetail(ctx context.Context, id uuid.UUID) (RunDetail, er
 		}
 		phases = append(phases, p)
 	}
+	if err := s.attachGateEvidence(ctx, q, run, phases); err != nil {
+		return RunDetail{}, err
+	}
 	artRows, err := q.ListArtifactsForRun(ctx, id)
 	if err != nil {
 		return RunDetail{}, fmt.Errorf("runs: list artifacts: %w", err)
 	}
 	arts := make([]ArtifactMeta, 0, len(artRows))
 	for _, ar := range artRows {
-		var parentStrs []string
-		if err := json.Unmarshal(ar.ParentIds, &parentStrs); err != nil {
-			return RunDetail{}, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
-		}
-		parents := make([]uuid.UUID, 0, len(parentStrs))
-		for _, ps := range parentStrs {
-			pid, err := uuid.Parse(ps)
-			if err != nil {
-				return RunDetail{}, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
-			}
-			parents = append(parents, pid)
+		parents, err := parentIDsFromRow(ar.ParentIds)
+		if err != nil {
+			return RunDetail{}, err
 		}
 		arts = append(arts, ArtifactMeta{
 			ID: ar.ID, NodeID: ar.NodeID, Attempt: ar.Attempt, Generation: ar.Generation,
@@ -607,6 +623,122 @@ func (s *Service) GetRunDetail(ctx context.Context, id uuid.UUID) (RunDetail, er
 		pubs = append(pubs, publicationFromRow(pi))
 	}
 	return RunDetail{Run: run, Phases: phases, Artifacts: arts, Publications: pubs}, nil
+}
+
+// parentIDsFromRow decodes an artifact's lineage column — jsonb NOT NULL
+// DEFAULT '[]', an array of uuid strings. A row that fails either half is
+// corruption, not a caller's mistake: nothing writes that column but this
+// system, which is why both failures are plain errors and neither is a 400.
+//
+// It returns an empty slice rather than nil for a lineage-less artifact, so the
+// two projections that call it both put [] on the wire and never null.
+//
+// Extracted from GetRunDetail so the payload read below decodes lineage the same
+// way: a client reads provenance off both responses, and one decoder is one
+// answer.
+func parentIDsFromRow(raw []byte) ([]uuid.UUID, error) {
+	var strs []string
+	if err := json.Unmarshal(raw, &strs); err != nil {
+		return nil, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
+	}
+	out := make([]uuid.UUID, 0, len(strs))
+	for _, s := range strs {
+		id, err := uuid.Parse(s)
+		if err != nil {
+			return nil, fmt.Errorf("runs: artifact lineage corrupt: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+// ArtifactPayload reads one artifact of one run.
+//
+// The RUN ID IS PART OF THE PREDICATE and not merely of the path. Authorization
+// upstream is scoped on the run, so an artifact fetched by bare id would let
+// one project's run id authorize another project's artifact. Belt and braces:
+// the caller checks the run, this checks the artifact belongs to it.
+func (s *Service) ArtifactPayload(ctx context.Context, runID, artifactID uuid.UUID) (ArtifactWithPayload, error) {
+	row, err := store.New(s.pool).GetArtifactByID(ctx, artifactID)
+	if err != nil {
+		return ArtifactWithPayload{}, notFound(err, "no such artifact")
+	}
+	if row.RunID != runID {
+		// 404 rather than 403: the caller has been authorized for THIS run, and
+		// telling them an id exists elsewhere is an existence oracle.
+		return ArtifactWithPayload{}, xerrors.E(xerrors.ClassNotFound, "no such artifact")
+	}
+	payload, err := unmarshalMap(row.Payload)
+	if err != nil {
+		return ArtifactWithPayload{}, err
+	}
+	// unmarshalMap is nil-safe for an EMPTY column but not for the jsonb literal
+	// `null`, which encoding/json stores into a map by setting it to nil — the
+	// "null has no effect" rule covers primitives, not maps. `payload` is jsonb
+	// NOT NULL, which forbids SQL NULL and permits 'null'::jsonb, and the write
+	// path reaches it: declaredArtifact.Payload has no presence check
+	// (runner/collect.go), so a harness declaring {"type":"plan"} with no payload
+	// key marshals a nil map to the bytes `null`.
+	//
+	// An artifact with no content is an EMPTY payload, not an absent one. Pinning
+	// that here rather than in the DTO keeps the guarantee on the domain type, so
+	// no second projection of this value has to rediscover it.
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	parents, err := parentIDsFromRow(row.ParentIds)
+	if err != nil {
+		return ArtifactWithPayload{}, err
+	}
+	return ArtifactWithPayload{
+		ArtifactMeta: ArtifactMeta{
+			ID: row.ID, NodeID: row.NodeID, Attempt: row.Attempt, Generation: row.Generation,
+			Type: row.Type, ParentIDs: parents, CreatedAt: row.CreatedAt,
+		},
+		Payload: payload,
+	}, nil
+}
+
+// attachGateEvidence fills in Evidence on every phase still awaiting a
+// decision, in place.
+//
+// It compiles the run's plan at most once — all phases of a run share one
+// definition — and does so ONLY when such a phase exists: a run with no waiting
+// gate must not pay for a task read and a definition read on every page load,
+// and most runs on most pages have none.
+func (s *Service) attachGateEvidence(ctx context.Context, q *store.Queries, run Run, phases []Phase) error {
+	var plan ExecPlan
+	var requesterID uuid.UUID
+	planLoaded := false
+	for i, p := range phases {
+		if p.Status != PhaseWaitingDecision {
+			continue
+		}
+		if !planLoaded {
+			task, err := q.GetTask(ctx, run.TaskID)
+			if err != nil {
+				return err
+			}
+			def, err := s.defs.DefinitionByVersionID(ctx, task.WorkflowVersionID)
+			if err != nil {
+				return err
+			}
+			if plan, err = compilePinned(def); err != nil {
+				return err
+			}
+			requesterID = task.RequesterID
+			planLoaded = true
+		}
+		ev, err := gateEvidence(ctx, q, gateEvidenceInput{
+			plan: plan, runID: run.ID, nodeID: p.NodeID, snapshot: run.Snapshot,
+			requesterID: requesterID, wallDeadline: run.WallDeadline,
+		})
+		if err != nil {
+			return err
+		}
+		phases[i].Evidence = &ev
+	}
+	return nil
 }
 
 // publicationFromRow flattens the receipt columns. Each is NULL until its

@@ -139,12 +139,15 @@ func TestGoldenSet_MonthOneLoopThroughRealRoutes(t *testing.T) {
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
 		forge, fake.NewPublisher(nil), principalSource{svc: identitySvc},
-		runs.Params{Snapshot: runs.DefaultSnapshot()})
+		runs.Params{
+			Snapshot: runs.DefaultSnapshot(),
+			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
+		})
 
 	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc))
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, identitySvc, identitySvc, identitySvc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, identitySvc))...)
-	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil))...)
+	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil, discard()))...)
 	srv := httptest.NewServer(Routes(discard(), pool, ops, "http://caesar.test", webui.Handler()))
 	t.Cleanup(srv.Close)
 
@@ -453,12 +456,15 @@ func newGoldenEnv(t *testing.T) *goldenEnv {
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
 		forge, publisher, principalSource{svc: identitySvc},
-		runs.Params{Snapshot: runs.DefaultSnapshot()})
+		runs.Params{
+			Snapshot: runs.DefaultSnapshot(),
+			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
+		})
 
 	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc))
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, identitySvc, identitySvc, identitySvc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, identitySvc))...)
-	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil))...)
+	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil, discard()))...)
 	srv := httptest.NewServer(Routes(discard(), pool, ops, "http://caesar.test", webui.Handler()))
 	t.Cleanup(srv.Close)
 

@@ -332,3 +332,24 @@ func TestAttemptRefString(t *testing.T) {
 		t.Errorf("ref string = %q", got)
 	}
 }
+
+// The schema version is the ONE thing Compile carries through untouched, and
+// the whole payload-contract compatibility rule rests on it: ValidateArtifactPayload
+// is asked which document version this run pinned, and a plan that answered 0
+// for every run would silently switch validation off everywhere.
+//
+// The versions are literal, not runs' or workflows' constants: a test that
+// reads the constant it is pinning cannot fail when the constant is wrong.
+func TestCompileCarriesTheDocumentSchemaVersion(t *testing.T) {
+	for _, schema := range []int{1, 2} {
+		doc := conveyor()
+		doc.Schema = schema
+		plan, err := runs.Compile(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan.DocSchemaVersion != schema {
+			t.Errorf("DocSchemaVersion = %d, want %d", plan.DocSchemaVersion, schema)
+		}
+	}
+}

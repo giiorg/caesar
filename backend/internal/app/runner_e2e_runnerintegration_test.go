@@ -131,7 +131,10 @@ func TestRunnerE2E_TaskThroughRealContainerToPatch(t *testing.T) {
 	runsSvc := runs.NewService(pool, clk, rec,
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
 		forge, fake.NewPublisher(nil), principalSource{svc: identitySvc},
-		runs.Params{Snapshot: runs.DefaultSnapshot()})
+		runs.Params{
+			Snapshot: runs.DefaultSnapshot(),
+			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
+		})
 
 	// The admin sets the stage through the real services.
 	project, err := assetsSvc.CreateProject(ctx, admin, "runner-e2e", "")

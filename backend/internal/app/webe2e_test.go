@@ -11,11 +11,19 @@ package app
 // appendEvents (ordered ids under the counter lock, the outbox envelope and the
 // NOTIFY, all in one transaction), the tailer, the hub and the SSE wire.
 //
-// What is faked: runs.Executor, and nothing else. Raw SQL insertion of a gate
+// What is faked: runs.Executor and the forge stub named above — which answers
+// with the head SHA of the same bare repository the executor is pointed at —
+// and nothing else. Raw SQL insertion of a gate
 // row is BANNED and this file must never grow one — appendEvents allocates the
 // ids the resume path depends on, so a hand-written INSERT desynchronises the
 // counter and leaves later resume behaviour broken in a way no assertion in
-// this lane would catch.
+// this lane would catch. That ban covers the RESET as much as the setup:
+// /fixture/quiesce decides leftover gates through runs.Service rather than
+// deleting their rows.
+//
+// The executor is faked but its OUTPUT is not approximated: it is pointed at a
+// real bare repository so the patch it returns is the canonical wire form,
+// which is the only form the web client can decode. See step 1.
 //
 // The build tag names BOTH webe2e and integration, which the plan's `//go:build
 // webe2e` did not. This file reaches for syncBuffer, which lives in
@@ -35,6 +43,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -55,33 +64,78 @@ import (
 	"github.com/giiorg/caesar/backend/internal/workflows"
 )
 
-// e2eWorkflow is the smallest definition that can reach a waiting gate: one
-// agentic node the fake executor answers, and a gate examining its patch.
+// e2eWorkflow is the smallest definition that reaches a waiting gate AND
+// produces the evidence the approval surface renders: an implement node the
+// fake answers with a patch, a review node that answers with a schema-2
+// verdict, and a gate examining the patch with the verdict beside it.
 // A gate cannot be a root node — workflows.validateConsumption requires it to
 // examine exactly one plan or patch — which is the whole reason this lane
 // substitutes the executor rather than inserting a gate row.
+//
+// SCHEMA 2, deliberately. This lane is 12a's acceptance path, so it must run
+// with payload validation ON — a lane pinned at schema 1 would prove the
+// screens work against payloads nothing checks.
 const e2eWorkflow = `{
-  "schema": 1,
+  "schema": 2,
   "nodes": [
     {"id": "impl", "type": "implement", "harness": "e2e", "instructions": "Write the change."},
-    {"id": "gate", "type": "gate"}
+    {"id": "review", "type": "review", "harness": "e2e", "instructions": "Review the change."},
+    {"id": "gate", "type": "gate", "on_request_changes": {"target": "impl", "max_rounds": 2}}
   ],
-  "edges": [{"from": "impl", "to": "gate", "artifact": "patch"}]
+  "edges": [
+    {"from": "impl", "to": "review", "artifact": "patch"},
+    {"from": "impl", "to": "gate", "artifact": "patch"},
+    {"from": "review", "to": "gate", "artifact": "review_verdict"}
+  ]
 }`
 
 func TestWebE2E(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 1. The forge stub. resolveIntake calls ResolveHead on the way to every
+	// 1. A REAL BARE REPOSITORY, because the gate's evidence has to be a patch
+	//    the client can decode.
+	//
+	//    The fake executor has two implement branches. Without a registered
+	//    remote it emits the historical SYNTHETIC patch, whose `diff` is raw
+	//    diff text — and the wire form is base64 (`fake/git.go:71-85`,
+	//    `collect.go`), because a patch is arbitrary bytes and JSON string
+	//    encoding would mangle a file in a legacy encoding silently. The web
+	//    client decodes accordingly (`patch/decode-patch.ts:37-48`, atob then
+	//    TextDecoder) and returns an EMPTY patch when that throws.
+	//
+	//    MEASURED, and it is why this exists: with the synthetic patch the
+	//    approval surface rendered `0 files · +0 · −0` and no file rows at all
+	//    for a patch that adds a line, so the gate screen showed nothing to
+	//    examine. A lane whose acceptance path is "open the gate and read what
+	//    it examines" cannot run against a payload shape production never
+	//    produces — the executor is the ONE thing faked here, and a fake that
+	//    differs from the real thing in the field under test is not a fake, it
+	//    is a different subject.
+	//
+	//    Registering the remote takes the publishable branch: the canonical
+	//    base64 wire form, a real `git write-tree` id, and one added file named
+	//    per node (`CAESAR-<node_id>.md`).
+	bareDir := t.TempDir()
+	baseSHA, err := fake.InitBareRepo(bareDir)
+	if err != nil {
+		t.Fatalf("bare repo: %v", err)
+	}
+	bare := filepath.Join(bareDir, "bare.git")
+	executor := fake.NewExecutor()
+
+	// 2. The forge stub. resolveIntake calls ResolveHead on the way to every
 	//    task, and the GitHub client wants {"sha": ...} from
-	//    GET {base}/repos/{slug}/commits/{branch}.
+	//    GET {base}/repos/{slug}/commits/{branch}. It answers the BARE REPO'S
+	//    head rather than a zero sha: `approvedTree` checks that commit out to
+	//    build the tree id the patch pins, and a sha the repository does not
+	//    contain fails the implement node instead of the gate.
 	forgeStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]string{"sha": "0000000000000000000000000000000000000000"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"sha": baseSHA})
 	}))
 	defer forgeStub.Close()
 
-	// 2. Bind FIRST, then configure. The port must be known before AppOrigin
+	// 3. Bind FIRST, then configure. The port must be known before AppOrigin
 	//    is set: CheckOrigin compares the browser's Origin header to it by
 	//    exact equality on the login POST, and a browser always sends the port.
 	//    Port 0 lets the OS pick, so the lane never collides.
@@ -92,14 +146,14 @@ func TestWebE2E(t *testing.T) {
 	baseURL := "http://" + ln.Addr().String()
 	cfg := e2eConfig(t, testdb.NewURL(t), forgeStub.URL, baseURL)
 
-	// 3. Boot the production server with the ONE substitution. The listener is
+	// 4. Boot the production server with the ONE substitution. The listener is
 	//    a test seam, not a second fake: production Serve receives the same
 	//    *net.TCPListener it would have bound itself.
 	logBuf := &syncBuffer{}
 	done := make(chan error, 1)
 	go func() {
 		done <- runServeWith(ctx, cfg, e2eLogger(logBuf), serveOptions{
-			executor: fake.NewExecutor(),
+			executor: executor,
 			listener: ln,
 		})
 	}()
@@ -108,35 +162,22 @@ func TestWebE2E(t *testing.T) {
 	// than a refusal. Wait for the server to say it is serving.
 	awaitListening(t, logBuf, done)
 
-	// 4. Bootstrap the admin THROUGH the production path, then seed the assets
+	// 5. Bootstrap the admin THROUGH the production path, then seed the assets
 	//    the slice needs. Every one of these goes through the real services.
 	seed := e2eSeed(ctx, t, cfg)
+	// The repo id only exists once the seed has run, and the first execution
+	// only happens once Playwright calls the control server — so telling the
+	// executor here is in time. Without this line every implement node falls
+	// back to the synthetic patch and the gate screen has nothing to show.
+	executor.Remote(seed.repoID, bare)
 
-	// 5. The control server. Playwright calls this BETWEEN assertions, which is
+	// 6. The control server. Playwright calls this BETWEEN assertions, which is
 	//    what makes beat 2 happen while the browser is watching. It is part of
 	//    the harness and never part of caesar's routes.
-	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/fixture/open-gate" {
-			http.NotFound(w, r)
-			return
-		}
-		// CreateTask -> insertRun (pending) -> the Orchestrator's
-		// startPendingRuns materializes the root -> a worker claims it -> the
-		// FAKE executor returns a patch -> the orchestrator records it and
-		// materializes the GATE, inserted 'waiting_decision', with its
-		// gate.waiting event in the same appendEvents transaction.
-		if _, _, err := seed.runsSvc.CreateTask(r.Context(), seed.admin, runs.NewTask{
-			RepoID: seed.repoID, WorkflowID: seed.workflowID, WorkflowVersion: seed.workflowVersion,
-			Title: "E2E approval", Inputs: map[string]any{},
-		}); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
-	}))
+	control := httptest.NewServer(e2eFixtures(seed))
 	defer control.Close()
 
-	// 6. Hand it to Playwright. By PATH, never `npx`: npx reaches the public
+	// 7. Hand it to Playwright. By PATH, never `npx`: npx reaches the public
 	//    registry when the binary is missing locally, so a lane that lost its
 	//    node_modules would silently run a DIFFERENT playwright than the one
 	//    web/package.json pins.
@@ -162,6 +203,166 @@ func TestWebE2E(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("runServe did not shut down")
 	}
+}
+
+// e2eFixtures is the control surface, and every endpoint on it goes through
+// runs.Service. The file header's ban on raw SQL covers the RESET as much as
+// the setup: `/fixture/quiesce` decides leftover gates through DecideGate
+// rather than deleting or updating their rows, because a hand-written write
+// desynchronises the id counter appendEvents allocates and leaves later resume
+// behaviour broken in a way no assertion in this lane would catch.
+//
+// WHY A RESET EXISTS AT ALL. One server and one database serve the whole
+// Playwright run, so the approvals inbox is shared mutable state across spec
+// files: a spec that opens a gate and does not decide it leaves that gate
+// waiting for every spec that follows. `/fixture/quiesce` is what lets a spec
+// assert "the badge shows exactly 1" instead of a count relative to whatever
+// the previous file left behind. It is paired with `workers: 1` in
+// playwright.config.ts — with two workers, each one's reset would clear the
+// other's gate.
+func e2eFixtures(seed e2eFixture) http.Handler {
+	mux := http.NewServeMux()
+
+	// The gate opener, answering 202 exactly as it always has. What is new is
+	// the BODY: a spec that cannot name its own run cannot tell its gate card
+	// from a leftover one, and `page.getByTestId('gate-card')` strict-fails the
+	// moment two gates wait. The existing approvals.spec asserts only the
+	// status, so a body is compatible with it.
+	mux.HandleFunc("POST /fixture/open-gate", func(w http.ResponseWriter, r *http.Request) {
+		// CreateTask -> insertRun (pending) -> the Orchestrator's
+		// startPendingRuns materializes the root -> a worker claims it -> the
+		// FAKE executor returns a patch -> the orchestrator records it and
+		// materializes the GATE, inserted 'waiting_decision', with its
+		// gate.waiting event in the same appendEvents transaction.
+		_, run, err := seed.runsSvc.CreateTask(r.Context(), seed.admin, runs.NewTask{
+			RepoID: seed.repoID, WorkflowID: seed.workflowID, WorkflowVersion: seed.workflowVersion,
+			Title: "E2E approval", Inputs: map[string]any{},
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		e2eJSON(w, http.StatusAccepted, map[string]any{"run_id": run.ID.String()})
+	})
+
+	// What the create-task form's three selects will show. LABELS, NOT IDS:
+	// the form renders native <select>s whose options are labelled by project
+	// name, repo slug and workflow name (new-task-form.tsx:150,168,182), and a
+	// spec drives them with `selectOption({ label })`. Serving the labels from
+	// the seed rather than hard-coding them in the spec is what makes renaming
+	// the seed repo a red lane instead of a silent miss.
+	mux.HandleFunc("GET /fixture/seed", func(w http.ResponseWriter, _ *http.Request) {
+		e2eJSON(w, http.StatusOK, map[string]any{
+			"project": seed.projectName, "repo": seed.repoSlug, "workflow": seed.workflowName,
+		})
+	})
+
+	// THE BACKEND ORACLE. "A new generation opened" is a backend fact, and a
+	// spec that read it only off the run header would pass against a screen
+	// that re-rendered generation 1 under a new label — which is a mutant this
+	// task measured, not a hypothetical.
+	mux.HandleFunc("GET /fixture/run/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		run, phases, _, err := seed.runsSvc.GetRun(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		rows := make([]map[string]any, 0, len(phases))
+		for _, p := range phases {
+			rows = append(rows, map[string]any{
+				"node_id": p.NodeID, "status": string(p.Status),
+				"attempt": p.Attempt, "generation": p.Generation,
+			})
+		}
+		e2eJSON(w, http.StatusOK, map[string]any{
+			"generation": run.Generation, "status": string(run.Status), "phases": rows,
+		})
+	})
+
+	mux.HandleFunc("POST /fixture/quiesce", func(w http.ResponseWriter, r *http.Request) {
+		decided, err := e2eQuiesce(r.Context(), seed)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		e2eJSON(w, http.StatusOK, map[string]any{"decided": decided})
+	})
+
+	return mux
+}
+
+func e2eJSON(w http.ResponseWriter, status int, body map[string]any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// e2eQuiesce returns the world to "no gate is waiting and no run is in
+// flight", and reports how many gates it had to decide to get there.
+//
+// It APPROVES rather than rejects: approve is the decision that finishes this
+// workflow, while request_changes would open another round and reject would
+// leave every quiesced run `failed` — a status the specs' own screens render,
+// so the reset would be seeding the fixtures of whichever spec ran next.
+//
+// The loop is over BOTH conditions and not just the gates. A run the previous
+// spec left mid-revision is still `running`, and it will materialize a gate
+// seconds later — inside the next spec's assertions, moving a badge that spec
+// is counting. Waiting for the run list to go quiet is what makes the count a
+// spec reads at its first beat a count nothing else can change.
+func e2eQuiesce(ctx context.Context, seed e2eFixture) (int, error) {
+	deadline := time.Now().Add(90 * time.Second)
+	decided := 0
+	for {
+		gates, err := seed.runsSvc.ListWaitingGates(ctx, nil, true)
+		if err != nil {
+			return decided, fmt.Errorf("quiesce: list waiting gates: %w", err)
+		}
+		for _, g := range gates {
+			if _, err := seed.runsSvc.DecideGate(ctx, seed.admin, runs.GateDecisionInput{
+				RunID: g.RunID, NodeID: g.NodeID, Decision: runs.DecisionApprove,
+				Note: "quiesced between specs",
+			}); err != nil {
+				return decided, fmt.Errorf("quiesce: decide %s/%s: %w", g.RunID, g.NodeID, err)
+			}
+			decided++
+		}
+		live, err := e2eLiveRuns(ctx, seed)
+		if err != nil {
+			return decided, err
+		}
+		if len(gates) == 0 && len(live) == 0 {
+			return decided, nil
+		}
+		if time.Now().After(deadline) {
+			return decided, fmt.Errorf("quiesce: still live after 90s: %s", strings.Join(live, ", "))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// e2eLiveRuns names every run that has not settled. One page of 100 is the
+// whole world here: the specs create a handful of runs between them, and a
+// lane that ever exceeded the page would report a quiet world that is not one
+// — which fails loudly at the next spec's first beat rather than silently.
+func e2eLiveRuns(ctx context.Context, seed e2eFixture) ([]string, error) {
+	rows, _, err := seed.runsSvc.ListRuns(ctx, runs.RunListFilter{All: true, Limit: 100})
+	if err != nil {
+		return nil, fmt.Errorf("quiesce: list runs: %w", err)
+	}
+	var live []string
+	for _, r := range rows {
+		switch r.Status {
+		case runs.RunPending, runs.RunRunning, runs.RunWaiting:
+			live = append(live, fmt.Sprintf("%s=%s", r.ID, r.Status))
+		}
+	}
+	return live, nil
 }
 
 // e2eLogger writes the server's log to a buffer awaitListening reads AND to
@@ -242,7 +443,11 @@ type e2eFixture struct {
 	email, password    string
 	repoID, workflowID uuid.UUID
 	workflowVersion    int32
-	runsSvc            *runs.Service
+	// What the create-task form's three selects LABEL their options with, so
+	// `/fixture/seed` can serve them and the Path-2 spec can pick by label
+	// instead of hard-coding names this file owns.
+	projectName, repoSlug, workflowName string
+	runsSvc                             *runs.Service
 }
 
 // e2eSeed builds the world through the REAL services — the same doors the admin
@@ -321,11 +526,16 @@ func e2eSeed(ctx context.Context, t *testing.T, cfg config.Config) e2eFixture {
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
 		newForgeAdapter(assetsSvc, forgeEndpointsFrom(cfg.Forge), &http.Client{Timeout: 5 * time.Second}),
 		gitPublisher{assets: assetsSvc, workDir: cfg.Forge.PublishWorkDir, endpoints: forgeEndpointsFrom(cfg.Forge)},
-		principalSource{svc: identitySvc}, runs.Params{Snapshot: runs.DefaultSnapshot()})
+		principalSource{svc: identitySvc}, runs.Params{
+			Snapshot: runs.DefaultSnapshot(),
+			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
+		})
 
 	return e2eFixture{
 		admin: admin, email: email, password: password,
-		repoID: repo.ID, workflowID: wf.ID, workflowVersion: version.Version, runsSvc: runsSvc,
+		repoID: repo.ID, workflowID: wf.ID, workflowVersion: version.Version,
+		projectName: project.Name, repoSlug: repo.Slug, workflowName: wf.Name,
+		runsSvc: runsSvc,
 	}
 }
 

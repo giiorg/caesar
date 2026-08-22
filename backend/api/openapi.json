@@ -1090,6 +1090,84 @@
         }
       }
     },
+    "/api/v1/runs": {
+      "get": {
+        "summary": "List runs on the projects the caller holds any grant on, newest first. Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "listRuns",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "pending | running | waiting | succeeded | failed | superseded | dead",
+            "schema": {
+              "description": "pending | running | waiting | succeeded | failed | superseded | dead",
+              "type": "string"
+            }
+          },
+          {
+            "name": "task_id",
+            "in": "query",
+            "description": "only this task's runs (uuid)",
+            "schema": {
+              "description": "only this task's runs (uuid)",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "opaque; the previous page's next_cursor",
+            "schema": {
+              "description": "opaque; the previous page's next_cursor",
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "1-200, default 50",
+            "schema": {
+              "description": "1-200, default 50",
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiRunListPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/runs/{id}": {
       "get": {
         "summary": "Get a run with phases and artifact metadata (view)",
@@ -1114,6 +1192,57 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/artifacts/{artifact_id}": {
+      "get": {
+        "summary": "Read one artifact of a run, including its payload (view). A `patch` payload carries `diff` as base64 by contract — a patch is arbitrary bytes and JSON string encoding would replace invalid UTF-8 silently. Decode once for display; never round-trip it.",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "getArtifact",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "resource id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "resource id (uuid)",
+              "type": "string"
+            }
+          },
+          {
+            "name": "artifact_id",
+            "in": "path",
+            "description": "artifact id (uuid)",
+            "required": true,
+            "schema": {
+              "description": "artifact id (uuid)",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiArtifactPayloadResponse"
                 }
               }
             }
@@ -2047,6 +2176,9 @@
             "format": "int32",
             "type": "integer"
           },
+          "evidence": {
+            "$ref": "#/components/schemas/ApiGateEvidenceResponse"
+          },
           "generation": {
             "format": "int32",
             "type": "integer"
@@ -2083,7 +2215,64 @@
           "attempt",
           "generation",
           "requester_id",
-          "waiting_since"
+          "waiting_since",
+          "evidence"
+        ],
+        "type": "object"
+      },
+      "ApiArtifactPayloadResponse": {
+        "properties": {
+          "attempt": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "generation": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "parent_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "payload": {
+            "additionalProperties": {},
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "run_id",
+          "node_id",
+          "attempt",
+          "generation",
+          "type",
+          "parent_ids",
+          "created_at",
+          "payload"
         ],
         "type": "object"
       },
@@ -2120,6 +2309,15 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "node_id",
+          "attempt",
+          "generation",
+          "type",
+          "parent_ids",
+          "created_at"
+        ],
         "type": "object"
       },
       "ApiChangePasswordRequest": {
@@ -2312,6 +2510,50 @@
             "type": "boolean"
           }
         },
+        "required": [
+          "decision",
+          "note",
+          "acted_by_id",
+          "acted_by_email",
+          "acted_at",
+          "self_approval",
+          "examined_artifact_id"
+        ],
+        "type": "object"
+      },
+      "ApiGateEvidenceResponse": {
+        "properties": {
+          "can_decide": {
+            "type": "boolean"
+          },
+          "cannot_decide_reason": {
+            "type": "string"
+          },
+          "examined_artifact_id": {
+            "type": "string"
+          },
+          "examined_artifact_type": {
+            "type": "string"
+          },
+          "summary_artifact_id": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "wall_deadline": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "examined_artifact_id",
+          "examined_artifact_type",
+          "summary_artifact_id",
+          "can_decide",
+          "cannot_decide_reason",
+          "wall_deadline"
+        ],
         "type": "object"
       },
       "ApiGrantListResponse": {
@@ -2465,6 +2707,9 @@
           "decision": {
             "$ref": "#/components/schemas/ApiGateDecisionSummary"
           },
+          "evidence": {
+            "$ref": "#/components/schemas/ApiGateEvidenceResponse"
+          },
           "finished_at": {
             "format": "date-time",
             "type": [
@@ -2490,6 +2735,82 @@
             "type": "string"
           }
         },
+        "required": [
+          "node_id",
+          "attempt",
+          "max_attempts",
+          "status",
+          "generation",
+          "created_at",
+          "finished_at"
+        ],
+        "type": "object"
+      },
+      "ApiPhaseSummaryResponse": {
+        "properties": {
+          "attempt": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "generation": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "node_type": {
+            "type": "string"
+          },
+          "status": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "node_type",
+          "status",
+          "attempt",
+          "generation"
+        ],
+        "type": "object"
+      },
+      "ApiPlanPayload": {
+        "properties": {
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/ApiPlanStep"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "ApiPlanStep": {
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
         "type": "object"
       },
       "ApiProjectGrantResponse": {
@@ -2518,6 +2839,9 @@
             ]
           }
         },
+        "required": [
+          "projects"
+        ],
         "type": "object"
       },
       "ApiProjectResponse": {
@@ -2540,6 +2864,13 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "created_at",
+          "updated_at"
+        ],
         "type": "object"
       },
       "ApiPublicationResponse": {
@@ -2573,6 +2904,13 @@
             "type": "string"
           }
         },
+        "required": [
+          "node_id",
+          "status",
+          "branch",
+          "target_branch",
+          "base_sha"
+        ],
         "type": "object"
       },
       "ApiRegisterHarnessRequest": {
@@ -2611,6 +2949,9 @@
             ]
           }
         },
+        "required": [
+          "repos"
+        ],
         "type": "object"
       },
       "ApiRepoResponse": {
@@ -2642,6 +2983,62 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "project_id",
+          "forge",
+          "slug",
+          "default_branch",
+          "credential_id",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "ApiReviewFinding": {
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "line": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "message"
+        ],
+        "type": "object"
+      },
+      "ApiReviewVerdictPayload": {
+        "properties": {
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/ApiReviewFinding"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "tests": {
+            "$ref": "#/components/schemas/ApiTestOutcome"
+          },
+          "verdict": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "verdict",
+          "findings"
+        ],
         "type": "object"
       },
       "ApiRunEventResponse": {
@@ -2665,6 +3062,12 @@
             ]
           }
         },
+        "required": [
+          "id",
+          "kind",
+          "payload",
+          "occurred_at"
+        ],
         "type": "object"
       },
       "ApiRunEventsResponse": {
@@ -2679,6 +3082,33 @@
             ]
           }
         },
+        "required": [
+          "events"
+        ],
+        "type": "object"
+      },
+      "ApiRunListPageResponse": {
+        "properties": {
+          "next_cursor": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/ApiRunSummaryResponse"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "runs",
+          "next_cursor"
+        ],
         "type": "object"
       },
       "ApiRunListResponse": {
@@ -2693,6 +3123,9 @@
             ]
           }
         },
+        "required": [
+          "runs"
+        ],
         "type": "object"
       },
       "ApiRunResponse": {
@@ -2758,6 +3191,9 @@
               "null"
             ]
           },
+          "repo_slug": {
+            "type": "string"
+          },
           "started_at": {
             "format": "date-time",
             "type": [
@@ -2771,11 +3207,121 @@
           "task_id": {
             "type": "string"
           },
+          "task_title": {
+            "type": "string"
+          },
           "wall_deadline": {
             "format": "date-time",
             "type": "string"
+          },
+          "workflow_name": {
+            "type": "string"
           }
         },
+        "required": [
+          "id",
+          "task_id",
+          "task_title",
+          "repo_slug",
+          "workflow_name",
+          "status",
+          "definition_hash",
+          "base_sha",
+          "policy_snapshot",
+          "generation",
+          "execution_used_ms",
+          "wall_deadline",
+          "created_at",
+          "started_at",
+          "finished_at",
+          "phases",
+          "artifacts",
+          "publications"
+        ],
+        "type": "object"
+      },
+      "ApiRunSummaryResponse": {
+        "properties": {
+          "attempt": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "generation": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "phase_summary": {
+            "items": {
+              "$ref": "#/components/schemas/ApiPhaseSummaryResponse"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "repo_slug": {
+            "type": "string"
+          },
+          "requester_id": {
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "task_title": {
+            "type": "string"
+          },
+          "workflow_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "task_id",
+          "task_title",
+          "project_id",
+          "project_name",
+          "repo_slug",
+          "workflow_name",
+          "status",
+          "attempt",
+          "generation",
+          "requester_id",
+          "created_at",
+          "started_at",
+          "finished_at",
+          "phase_summary"
+        ],
         "type": "object"
       },
       "ApiTaskListResponse": {
@@ -2790,6 +3336,9 @@
             ]
           }
         },
+        "required": [
+          "tasks"
+        ],
         "type": "object"
       },
       "ApiTaskResponse": {
@@ -2830,6 +3379,40 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "project_id",
+          "repo_id",
+          "workflow_version_id",
+          "title",
+          "inputs",
+          "requester_id",
+          "status",
+          "latest_run_id",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ApiTestOutcome": {
+        "properties": {
+          "details": {
+            "type": "string"
+          },
+          "failed": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "passed": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
         "type": "object"
       },
       "ApiUserListResponse": {
@@ -2891,6 +3474,9 @@
             ]
           }
         },
+        "required": [
+          "workflows"
+        ],
         "type": "object"
       },
       "ApiWorkflowResponse": {
@@ -2916,6 +3502,14 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "latest_version",
+          "created_at",
+          "updated_at"
+        ],
         "type": "object"
       },
       "ApiWorkflowVersionListResponse": {

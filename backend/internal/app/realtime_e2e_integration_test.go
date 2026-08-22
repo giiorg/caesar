@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -581,9 +582,11 @@ func TestStream_ScopedToGrants(t *testing.T) {
 	}
 	token := p.login(t, "member@example.com")
 
-	// The backlog. Attention kinds throughout — the global stream is defined by
-	// the gate./publish./run. prefixes, so a phase.* event would be excluded by
-	// the kind test and prove nothing about scope.
+	// The backlog. Attention kinds throughout — an event the global stream's
+	// kind test excludes would be absent for a reason that is not scope, and
+	// would prove nothing here. (Until Plan 12a a phase.* kind was such an
+	// event; it no longer is, and these kinds are unchanged because gate. and
+	// run. are what an attention stream exists to carry.)
 	appendRuntimeEvent(t, p.pool, runB.runID, runs.EventRunStarted)
 	appendRuntimeEvent(t, p.pool, runA.runID, runs.EventRunStarted)
 	appendRuntimeEvent(t, p.pool, runB.runID, runs.EventGateWaiting)
@@ -633,6 +636,70 @@ func TestStream_ScopedToGrants(t *testing.T) {
 		forbidden[id] = true
 	}
 	assertNoneForbidden(t, "the live phase", awaitIDs(t, resumed, liveA[len(liveA)-1]), forbidden)
+}
+
+// TestStream_CarriesAnOrchestratedPhaseTransition is the end-to-end half of
+// Plan 12a's live phase dots: a phase transition THE ORCHESTRATOR PRODUCED
+// reaches the global stream while a client is connected to it.
+//
+// NOTHING IS HAND-APPENDED HERE, and that is the whole point of the test.
+// Every other assertion in this file writes its events with
+// appendRuntimeEvent, which proves the transport and the filter but says
+// nothing about whether any production writer emits a kind the filter now
+// carries. What produces the frame below is the real janitor loop
+// (orchestrator.go:346 startPendingRuns) inside the booted process: it lists
+// the pending run, compiles its pinned definition, materializes the root node
+// and appends phase.materialized in that node's own transaction. The test
+// supplies the run row and nothing else.
+//
+// NO EXECUTOR IS NEEDED and none is wired: bootServe leaves cfg.Runner
+// disabled, so serve.go:248 hands the orchestrator NotImplementedExecutor.
+// Materialization happens on the janitor, before any worker claims anything,
+// which is what makes this the cheapest real producer in the tree — and what
+// keeps the test off Docker.
+//
+// The run is inserted AFTER awaitLive. A heartbeat is the one frame only the
+// live path can write, so an event that commits after it cannot have arrived
+// by snapshot or by catch-up; the assertion is about the live path or it is
+// about nothing.
+func TestStream_CarriesAnOrchestratedPhaseTransition(t *testing.T) {
+	ctx := context.Background()
+	p := bootServe(t, nil)
+	if _, err := p.svc.Bootstrap(ctx, "root@example.com", testPassword); err != nil {
+		t.Fatal(err)
+	}
+	// One implement node, no edges: the smallest graph compilePinned accepts,
+	// and its single root is the node the janitor materializes.
+	task := seedRealtimeTask(ctx, t, p.pool, "orchestrated",
+		`{"schema":1,"nodes":[{"id":"impl","type":"implement","harness":"cc","instructions":"do it"}]}`)
+	token := p.login(t, "root@example.com")
+
+	stream, cancel := openStream(t, p, "/api/v1/stream", token, 60*time.Second)
+	defer cancel()
+	stream.awaitLive(t)
+
+	runID := insertRealtimeRun(ctx, t, p.pool, task, "pending")
+
+	stream.await(t, "a "+runs.EventPhaseMaterialized+" frame", func(l string) bool {
+		return l == "event: "+runs.EventPhaseMaterialized
+	})
+	data := stream.await(t, "that frame's data line", func(l string) bool {
+		return strings.HasPrefix(l, "data: ")
+	})
+	// The run id is checked because the process is shared: a frame for some
+	// other run would satisfy the kind test above and prove nothing about the
+	// run this test started.
+	var frame struct {
+		RunID string `json:"run_id"`
+		Kind  string `json:"kind"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(data, "data: ")), &frame); err != nil {
+		t.Fatalf("frame data is not JSON: %v\n%s", err, data)
+	}
+	if frame.Kind != runs.EventPhaseMaterialized || frame.RunID != runID.String() {
+		t.Fatalf("the frame carries kind %q for run %s, want %q for %s",
+			frame.Kind, frame.RunID, runs.EventPhaseMaterialized, runID)
+	}
 }
 
 // assertNoneForbidden fails if any id the caller may not see reached the wire.

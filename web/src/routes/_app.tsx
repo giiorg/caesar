@@ -17,9 +17,15 @@ import { AppShell } from '../shell/app-shell'
 
 /**
  * Every protected route nests under this layout, and its loader resolves the
- * session BEFORE anything renders. Without it a stub route makes no request,
- * so nothing would be rejected and the full shell would render to an
- * unauthenticated visitor.
+ * session BEFORE anything renders.
+ *
+ * A route that fetches nothing of its own — /more, /admin, /repos — gives a
+ * per-fetch 401 guard nothing to act on, so the session has to be resolved by
+ * the layout rather than by the routes. Without this loader the visitor still
+ * reaches /login, but only once AppLayout has rendered and its own query has
+ * thrown, and then from the error boundary onto a PUSHED entry with the
+ * unviewable route sitting behind it. `_app.test.tsx`'s first two cases assert
+ * the replace-not-push that doing it here buys, on both route shapes.
  */
 export const Route = createFileRoute('/_app')({
   loader: async ({ context }) => {

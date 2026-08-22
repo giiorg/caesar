@@ -19,7 +19,36 @@ import (
 // carries. Plan 08 deliberately gave gates and publications their own
 // namespaces (see runs/events.go) so this filter is a prefix test and
 // never an enumeration that rots as kinds are added.
-var attentionPrefixes = []string{"gate.", "publish.", "run."}
+//
+// `phase.` joined in Plan 12a because live phase dots and a live run timeline
+// need transitions, and the alternative — a per-run stream on run detail —
+// would open a second connection against the one-stream-per-tab invariant
+// (_app.tsx) or replace the global one and silently kill the cross-run
+// approvals badge on the very screen where a decision is about to be made.
+//
+// IT WIDENS WHAT EVERY CONNECTED CLIENT RECEIVES, and by a lot: a run in
+// flight emits far more phase transitions than gate or publish events, and
+// `phase.log_truncated` / `phase.egress_denied` are capped per attempt rather
+// than rare. The client's debounce in the cache bridge is what keeps that from
+// becoming a refetch storm — one invalidation PASS per window, not one per
+// frame, and a pass costs one refetch per key the bridge owns rather than one
+// per frame received — and that debounce is now load-bearing rather than an
+// optimization.
+//
+// It also widens the SNAPSHOT, which is the consequence that is easy to miss:
+// a fresh open primes from the most recent N MATCHING events, so phase traffic
+// on a busy run can now push older gate and publish events out of the window a
+// client is primed with. The snapshot has never been a history — the client
+// fetches its lists over HTTP and the stream only invalidates them — but it is
+// the reason SnapshotEvents is a configured number rather than a small one.
+//
+// With `phase.` here, every kind runs/events.go defines is attention-worthy.
+// The list is still a filter and not a formality: it is what a NEW namespace
+// has to be added to before it reaches a client, and the tests that pin it
+// (realtime_test.go, and the SQL-vs-Matches comparison in
+// app/realtimeports_integration_test.go) seed a kind outside every prefix so
+// the exclusion stays falsifiable.
+var attentionPrefixes = []string{"gate.", "publish.", "run.", "phase."}
 
 // AttentionKindPatterns is attentionPrefixes as SQL LIKE patterns, for the
 // EventSource implementation to push the kind test down into the query.

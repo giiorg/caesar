@@ -344,8 +344,15 @@ CREATE TABLE gate_decisions (
     node_id              text NOT NULL,
     generation           integer NOT NULL CHECK (generation >= 1),
     decision             text NOT NULL CHECK (decision IN ('approve', 'request_changes', 'reject')),
-    -- The immutable artifact the human examined. Approval authorizes exactly
-    -- this id and nothing newer (spec §3 artifact flow).
+    -- A SERVER-SELECTED EVIDENCE BINDING, not a record of human examination.
+    -- DecideGate resolves it from the run's pinned definition
+    -- (ExecPlan.ExaminedInput) immediately before the stamp, whether or not
+    -- anybody looked at it — so it names the artifact the decision was ABOUT.
+    -- Approval authorizes exactly this id and nothing newer (spec §3 artifact
+    -- flow). The system's real guarantee is that publication waits for a
+    -- person to act, which holds wherever that person acts from; see Plan 12a
+    -- §10.2 for why no reachable design closes the gap between "evidence
+    -- rendered" and "evidence read".
     examined_artifact_id uuid NOT NULL REFERENCES artifacts (id) ON DELETE RESTRICT,
     note                 text NOT NULL DEFAULT '',
     acted_by             uuid NOT NULL REFERENCES users (id) ON DELETE RESTRICT,

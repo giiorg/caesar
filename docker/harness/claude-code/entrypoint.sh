@@ -9,4 +9,8 @@
 # The credential arrives in this image's environment as the CLI's OWN
 # variables; see ../README.md for why nothing here reads CAESAR_BROKER_*.
 set -eu
+# The output-shape contract is NOT appended here. It rides on the instructions
+# this script receives (runs.OutputShapeInstruction, appended in
+# Orchestrator.buildRequest), so every harness — and the fake executor the
+# acceptance lane runs on — gets the identical text from one source.
 exec claude -p "$(cat /workspace/.caesar/in/instructions.md)" --dangerously-skip-permissions

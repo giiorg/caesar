@@ -1782,6 +1782,50 @@ func (q *Queries) ListGateDecisionsForRun(ctx context.Context, runID uuid.UUID) 
 	return items, nil
 }
 
+const listLatestPhasesForRuns = `-- name: ListLatestPhasesForRuns :many
+SELECT DISTINCT ON (run_id, node_id) run_id, node_id, attempt, generation, status
+FROM phase_runs
+WHERE run_id = ANY($1::uuid[])
+ORDER BY run_id, node_id, generation DESC, attempt DESC
+`
+
+type ListLatestPhasesForRunsRow struct {
+	RunID      uuid.UUID
+	NodeID     string
+	Attempt    int32
+	Generation int32
+	Status     string
+}
+
+// The newest attempt row per (run, node) across a whole page — one query, not
+// one per run. Ordered by PROVENANCE (generation, then attempt) for the same
+// reason GetNodeArtifact is: created_at mixes two independent clocks.
+func (q *Queries) ListLatestPhasesForRuns(ctx context.Context, runIds []uuid.UUID) ([]ListLatestPhasesForRunsRow, error) {
+	rows, err := q.db.Query(ctx, listLatestPhasesForRuns, runIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLatestPhasesForRunsRow
+	for rows.Next() {
+		var i ListLatestPhasesForRunsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.NodeID,
+			&i.Attempt,
+			&i.Generation,
+			&i.Status,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingRunIDs = `-- name: ListPendingRunIDs :many
 SELECT id FROM runs WHERE status = 'pending' ORDER BY created_at LIMIT $1
 `
@@ -2232,6 +2276,99 @@ func (q *Queries) ListRunsForTask(ctx context.Context, taskID uuid.UUID) ([]Run,
 	return items, nil
 }
 
+const listRunsPage = `-- name: ListRunsPage :many
+SELECT r.id, r.task_id, r.status, r.definition_hash, r.base_sha, r.policy_snapshot, r.generation, r.execution_budget_ms, r.execution_used_ms, r.wall_deadline, r.outcome, r.created_at, r.started_at, r.finished_at, t.title, t.project_id, t.repo_id, t.workflow_version_id, t.requester_id
+FROM runs r
+JOIN tasks t ON t.id = r.task_id
+WHERE ($1::boolean OR t.project_id = ANY($2::uuid[]))
+  AND ($3::text IS NULL OR r.status = $3::text)
+  AND ($4::uuid IS NULL OR r.task_id = $4::uuid)
+  AND ($5::timestamptz IS NULL
+       OR (r.created_at, r.id) < ($5::timestamptz, $6::uuid))
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT $7
+`
+
+type ListRunsPageParams struct {
+	AllProjects     bool
+	ProjectIds      []uuid.UUID
+	Status          pgtype.Text
+	TaskID          uuid.NullUUID
+	CursorCreatedAt *time.Time
+	CursorID        uuid.NullUUID
+	PageLimit       int32
+}
+
+type ListRunsPageRow struct {
+	Run               Run
+	Title             string
+	ProjectID         uuid.UUID
+	RepoID            uuid.UUID
+	WorkflowVersionID uuid.UUID
+	RequesterID       uuid.UUID
+}
+
+// One page of the run list, newest first.
+//
+// The keyset predicate is a ROW-VALUE comparison against the same two columns
+// the ORDER BY names, in the same direction. That is what makes the cursor and
+// the sort key incapable of disagreeing: with `created_at < $x OR (created_at =
+// $x AND id < $y)` written out by hand, a later edit to one half silently drops
+// or repeats the rows that share a timestamp — and uuidv7 ids come off a
+// millisecond clock, so runs sharing one are the common case under load.
+//
+// all_projects is passed rather than inferred from an empty array: an empty
+// grant set is an EMPTY page, and `= ANY('{}')` gives exactly that, while an
+// admin needs every row. Conflating them is how an ungranted member sees
+// everything.
+func (q *Queries) ListRunsPage(ctx context.Context, arg ListRunsPageParams) ([]ListRunsPageRow, error) {
+	rows, err := q.db.Query(ctx, listRunsPage,
+		arg.AllProjects,
+		arg.ProjectIds,
+		arg.Status,
+		arg.TaskID,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListRunsPageRow
+	for rows.Next() {
+		var i ListRunsPageRow
+		if err := rows.Scan(
+			&i.Run.ID,
+			&i.Run.TaskID,
+			&i.Run.Status,
+			&i.Run.DefinitionHash,
+			&i.Run.BaseSha,
+			&i.Run.PolicySnapshot,
+			&i.Run.Generation,
+			&i.Run.ExecutionBudgetMs,
+			&i.Run.ExecutionUsedMs,
+			&i.Run.WallDeadline,
+			&i.Run.Outcome,
+			&i.Run.CreatedAt,
+			&i.Run.StartedAt,
+			&i.Run.FinishedAt,
+			&i.Title,
+			&i.ProjectID,
+			&i.RepoID,
+			&i.WorkflowVersionID,
+			&i.RequesterID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSeedArtifacts = `-- name: ListSeedArtifacts :many
 SELECT id, run_id, node_id, attempt, generation, type, payload, parent_ids, created_at FROM artifacts
 WHERE run_id = $1 AND node_id = $2 AND attempt = 0
@@ -2492,7 +2629,8 @@ func (q *Queries) ListUnsettledPublishIntents(ctx context.Context, runID uuid.UU
 
 const listWaitingGates = `-- name: ListWaitingGates :many
 SELECT pr.id, pr.run_id, pr.node_id, pr.attempt, pr.generation, pr.created_at,
-       t.id AS task_id, t.project_id, t.title, t.requester_id
+       t.id AS task_id, t.project_id, t.title, t.requester_id, t.workflow_version_id,
+       r.policy_snapshot, r.wall_deadline
 FROM phase_runs pr
 JOIN runs r ON r.id = pr.run_id
 JOIN tasks t ON t.id = r.task_id
@@ -2501,18 +2639,27 @@ ORDER BY pr.created_at
 `
 
 type ListWaitingGatesRow struct {
-	ID          uuid.UUID
-	RunID       uuid.UUID
-	NodeID      string
-	Attempt     int32
-	Generation  int32
-	CreatedAt   time.Time
-	TaskID      uuid.UUID
-	ProjectID   uuid.UUID
-	Title       string
-	RequesterID uuid.UUID
+	ID                uuid.UUID
+	RunID             uuid.UUID
+	NodeID            string
+	Attempt           int32
+	Generation        int32
+	CreatedAt         time.Time
+	TaskID            uuid.UUID
+	ProjectID         uuid.UUID
+	Title             string
+	RequesterID       uuid.UUID
+	WorkflowVersionID uuid.UUID
+	PolicySnapshot    []byte
+	WallDeadline      time.Time
 }
 
+// The three columns past the inbox's own fields are the gate's EVIDENCE
+// (Plan 12a §2.4), and all three come off the runs and tasks rows this query
+// already joins: the pinned version compiles to the plan that names the
+// examined artifact, the policy snapshot answers self-approval, and the wall
+// deadline is displayable before it bites. Reading them here is what keeps the
+// inbox one request instead of one plus N.
 func (q *Queries) ListWaitingGates(ctx context.Context) ([]ListWaitingGatesRow, error) {
 	rows, err := q.db.Query(ctx, listWaitingGates)
 	if err != nil {
@@ -2533,6 +2680,9 @@ func (q *Queries) ListWaitingGates(ctx context.Context) ([]ListWaitingGatesRow, 
 			&i.ProjectID,
 			&i.Title,
 			&i.RequesterID,
+			&i.WorkflowVersionID,
+			&i.PolicySnapshot,
+			&i.WallDeadline,
 		); err != nil {
 			return nil, err
 		}
@@ -2546,7 +2696,8 @@ func (q *Queries) ListWaitingGates(ctx context.Context) ([]ListWaitingGatesRow, 
 
 const listWaitingGatesByProjects = `-- name: ListWaitingGatesByProjects :many
 SELECT pr.id, pr.run_id, pr.node_id, pr.attempt, pr.generation, pr.created_at,
-       t.id AS task_id, t.project_id, t.title, t.requester_id
+       t.id AS task_id, t.project_id, t.title, t.requester_id, t.workflow_version_id,
+       r.policy_snapshot, r.wall_deadline
 FROM phase_runs pr
 JOIN runs r ON r.id = pr.run_id
 JOIN tasks t ON t.id = r.task_id
@@ -2555,16 +2706,19 @@ ORDER BY pr.created_at
 `
 
 type ListWaitingGatesByProjectsRow struct {
-	ID          uuid.UUID
-	RunID       uuid.UUID
-	NodeID      string
-	Attempt     int32
-	Generation  int32
-	CreatedAt   time.Time
-	TaskID      uuid.UUID
-	ProjectID   uuid.UUID
-	Title       string
-	RequesterID uuid.UUID
+	ID                uuid.UUID
+	RunID             uuid.UUID
+	NodeID            string
+	Attempt           int32
+	Generation        int32
+	CreatedAt         time.Time
+	TaskID            uuid.UUID
+	ProjectID         uuid.UUID
+	Title             string
+	RequesterID       uuid.UUID
+	WorkflowVersionID uuid.UUID
+	PolicySnapshot    []byte
+	WallDeadline      time.Time
 }
 
 func (q *Queries) ListWaitingGatesByProjects(ctx context.Context, projectIds []uuid.UUID) ([]ListWaitingGatesByProjectsRow, error) {
@@ -2587,6 +2741,9 @@ func (q *Queries) ListWaitingGatesByProjects(ctx context.Context, projectIds []u
 			&i.ProjectID,
 			&i.Title,
 			&i.RequesterID,
+			&i.WorkflowVersionID,
+			&i.PolicySnapshot,
+			&i.WallDeadline,
 		); err != nil {
 			return nil, err
 		}

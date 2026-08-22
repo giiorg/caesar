@@ -21,7 +21,8 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 		} `json:"paths"`
 		Components struct {
 			Schemas map[string]struct {
-				Required []string `json:"required"`
+				Required   []string                   `json:"required"`
+				Properties map[string]json.RawMessage `json:"properties"`
 			} `json:"schemas"`
 		} `json:"components"`
 	}
@@ -43,6 +44,9 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 		"/api/v1/auth/me":    {"get": {"200", "400", "401"}},
 		"/api/v1/approvals":  {"get": {"200", "400", "401"}},
 		"/api/v1/stream":     {"get": {"200", "400", "401"}},
+		// The run list scopes rather than refuses, exactly as /approvals does:
+		// an ungranted member gets 200 and an empty page, never a 403.
+		"/api/v1/runs": {"get": {"200", "400", "401"}},
 	}
 	for path, methods := range wantStatuses {
 		for method, codes := range methods {
@@ -64,7 +68,102 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 		"ApiUserResponse":         {"id", "email", "role", "active", "created_at", "updated_at"},
 		"ApiGrantResponse":        {"project_id", "level"},
 		"ApiApprovalListResponse": {"approvals"},
-		"ApiApprovalResponse":     {"run_id", "task_id", "task_title", "node_id", "project_id", "requester_id", "attempt", "generation", "waiting_since"},
+		"ApiApprovalResponse":     {"run_id", "task_id", "task_title", "node_id", "project_id", "requester_id", "attempt", "generation", "waiting_since", "evidence"},
+		// Every gate the approvals inbox lists is one awaiting a decision, so
+		// each of these is a value the server always sends. summary_artifact_id
+		// is required AND nullable: "this gate has no verdict" is a value the
+		// client branches on, not a key it fails to find.
+		"ApiGateEvidenceResponse": {
+			"examined_artifact_id", "examined_artifact_type", "summary_artifact_id",
+			"can_decide", "cannot_decide_reason", "wall_deadline",
+		},
+		// The run list and the run page. next_cursor, started_at, finished_at
+		// and a phase summary's status are required AND nullable — every one of
+		// them is a value the client branches on, not a key it fails to find,
+		// and none of them is a $ref, so the generator really does render
+		// ["type","null"] beside the required entry.
+		"ApiRunListPageResponse":  {"runs", "next_cursor"},
+		"ApiPhaseSummaryResponse": {"node_id", "node_type", "status", "attempt", "generation"},
+		"ApiRunSummaryResponse": {
+			"id", "task_id", "task_title", "project_id", "project_name", "repo_slug",
+			"workflow_name", "status", "attempt", "generation", "requester_id",
+			"created_at", "started_at", "finished_at", "phase_summary",
+		},
+		"ApiRunResponse": {
+			"id", "task_id", "task_title", "repo_slug", "workflow_name", "status",
+			"definition_hash", "base_sha", "policy_snapshot", "generation",
+			"execution_used_ms", "wall_deadline", "created_at", "started_at",
+			"finished_at", "phases", "artifacts", "publications",
+		},
+		"ApiPhaseResponse": {
+			"node_id", "attempt", "max_attempts", "status", "generation",
+			"created_at", "finished_at",
+		},
+		"ApiArtifactResponse": {
+			"id", "node_id", "attempt", "generation", "type", "parent_ids", "created_at",
+		},
+		// Absent or complete: gateDecisionSummary returns nil for an undecided
+		// gate and otherwise sets all seven, so the 409 surface reads them
+		// without branching on an absence the server cannot produce.
+		"ApiGateDecisionSummary": {
+			"decision", "note", "acted_by_id", "acted_by_email", "acted_at",
+			"self_approval", "examined_artifact_id",
+		},
+		"ApiRunListResponse": {"runs"},
+		// The run-detail publication panel, and FIVE of its nine properties.
+		// head_sha, pr_number, pr_url and halt_reason each carry omitempty in
+		// dto.go, so the key really is absent on the wire for a publication
+		// that has not pushed, has opened no PR, or did not halt; optional is
+		// what the client should see for those four and their absence from
+		// this list is the decision, not an omission. Nothing in this file
+		// asserts that absence — it is recorded here, not pinned.
+		"ApiPublicationResponse": {"node_id", "status", "branch", "target_branch", "base_sha"},
+		// The run-detail event log. `events` is required AND nullable (a Go
+		// nil slice marshals to null), and all four fields of an event row are
+		// always-marshaled scalars or a map — no omitempty, no $ref — so each
+		// is a key the client reads without testing for it. `payload` keeps its
+		// null branch beside the required entry because a nil map marshals to
+		// null; it is a map, not a named component, so the generator really
+		// does render ["object","null"].
+		"ApiRunEventsResponse": {"events"},
+		"ApiRunEventResponse":  {"id", "kind", "payload", "occurred_at"},
+		// The Tasks screen and the new-task form. `inputs` is required AND
+		// nullable for the same reason `payload` above is: a Go nil map marshals
+		// to null and a map is not a named component, so the generator renders
+		// ["object","null"] beside the required entry. Everything else here is a
+		// scalar or a slice that its mapper sets unconditionally.
+		//
+		// `ApiCreateTaskRequest` is deliberately absent. Four of its five fields
+		// are unconditional, but `inputs` carries omitempty (runs/api/dto.go), so
+		// the request really does go out without the key when there is nothing to
+		// put in it — and a list here that named only the other four would read as
+		// an oversight rather than as the decision it is.
+		"ApiTaskListResponse": {"tasks"},
+		"ApiTaskResponse": {
+			"id", "project_id", "repo_id", "workflow_version_id", "title", "inputs",
+			"requester_id", "status", "latest_run_id", "created_at",
+		},
+		"ApiWorkflowListResponse": {"workflows"},
+		"ApiWorkflowResponse": {
+			"id", "name", "description", "latest_version", "created_at", "updated_at",
+		},
+		"ApiProjectListResponse": {"projects"},
+		"ApiProjectResponse":     {"id", "name", "description", "created_at", "updated_at"},
+		"ApiRepoListResponse":    {"repos"},
+		"ApiRepoResponse": {
+			"id", "project_id", "forge", "slug", "default_branch", "credential_id",
+			"created_at", "updated_at",
+		},
+		// The artifact payload contract (document schema 2). These five reach
+		// the document through contracts' extraSchemas list rather than through
+		// an operation, so this is also the pin that fails if that mechanism
+		// stops working: every wanted property reads as absent when the schema
+		// is missing entirely.
+		"ApiPlanPayload":          {"summary", "steps"},
+		"ApiPlanStep":             {"title"},
+		"ApiReviewVerdictPayload": {"verdict", "findings"},
+		"ApiReviewFinding":        {"severity", "message"},
+		"ApiTestOutcome":          {"status"},
 	}
 	for name, want := range wantRequired {
 		got := map[string]bool{}
@@ -74,6 +173,60 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 		for _, w := range want {
 			if !got[w] {
 				t.Errorf("%s: property %q is not required — openapi-typescript will render it optional", name, w)
+			}
+		}
+	}
+
+	// The other direction, and it is not symmetry for its own sake. A phase's
+	// evidence is null on every non-gate phase and on every decided gate, and a
+	// property that is a $ref carries NO null branch through this generator —
+	// jsonschema-go only envelops nullability around a reference when the
+	// reflector asks it to, which this one does not. Marking it required
+	// therefore renders `evidence: ApiGateEvidenceResponse` in TypeScript: not
+	// optional, not nullable, and wrong on most phases of most runs. Optional is
+	// the honest half-truth, because it makes the client narrow before it reads.
+	//
+	// This loop asserts an ABSENCE, so it has to prove it is looking at
+	// something: a renamed schema or a renamed property would satisfy "not in
+	// required" vacuously, and the pin would go quiet exactly when the thing it
+	// pins moved. The loop above fails loudly on a missing schema for free —
+	// every wanted property reads as absent — and this one has to say so.
+	//
+	// The set has grown with Plan 12a's markup sweep and every entry is the
+	// same shape: a $ref-typed property the server genuinely sends as null.
+	// A phase's outcome is null until the attempt ends and its decision until
+	// somebody decides it; a run's outcome is null on every run still going.
+	// Marking any of them required renders `outcome: ApiOutcomeResponse` — not
+	// optional, not nullable, and wrong on most rows of most pages.
+	wantNotRequired := map[string][]string{
+		"ApiPhaseResponse": {"evidence", "decision", "outcome"},
+		"ApiRunResponse":   {"outcome"},
+		// A review verdict's `tests` is the same trade one layer down, and the
+		// only one in 12a where the validator REQUIRES the key: the payload
+		// contract says tests must be present and may be null, and this
+		// generator cannot say "this object or null" for a named schema.
+		// payload_schema_test.go holds the two descriptions together across the
+		// exception.
+		"ApiReviewVerdictPayload": {"tests"},
+	}
+	for name, unwanted := range wantNotRequired {
+		schema, ok := doc.Components.Schemas[name]
+		if !ok {
+			t.Errorf("%s: no such schema — this pin asserts an absence and cannot do it against nothing", name)
+			continue
+		}
+		required := map[string]bool{}
+		for _, r := range schema.Required {
+			required[r] = true
+		}
+		for _, u := range unwanted {
+			if _, ok := schema.Properties[u]; !ok {
+				t.Errorf("%s: no property %q — renamed or dropped, and this pin no longer pins it", name, u)
+				continue
+			}
+			if required[u] {
+				t.Errorf("%s: property %q is required, but the server sends null for it; "+
+					"openapi-typescript renders a required $ref as non-nullable", name, u)
 			}
 		}
 	}

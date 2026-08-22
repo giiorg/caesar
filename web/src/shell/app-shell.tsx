@@ -37,8 +37,15 @@ export function AppShell(props: {
         </div>
       </header>
       <ConnectionIndicator state={props.connection ?? 'live'} />
-      <main className="flex-1 p-4">{props.children}</main>
-      <Nav approvalCount={props.approvalCount ?? 0} />
+      {/* DOM ORDER IS header, indicator, main, nav — deliberately, and it does
+          not change with the viewport. On a phone that puts the tab bar last in
+          the tab sequence, where a thumb-zone control belongs; on a wide
+          viewport `md:order-first` on the <nav> moves the rail to the left of
+          <main> visually, which is a paint decision and not a reading order. */}
+      <div className="flex flex-1 flex-col md:flex-row">
+        <main className="flex-1 p-4">{props.children}</main>
+        <Nav approvalCount={props.approvalCount ?? 0} />
+      </div>
     </div>
   )
 }
