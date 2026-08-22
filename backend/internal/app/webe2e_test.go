@@ -11,7 +11,9 @@ package app
 // appendEvents (ordered ids under the counter lock, the outbox envelope and the
 // NOTIFY, all in one transaction), the tailer, the hub and the SSE wire.
 //
-// What is faked: runs.Executor, and nothing else. Raw SQL insertion of a gate
+// What is faked: runs.Executor and the forge stub named above — which answers
+// with the head SHA of the same bare repository the executor is pointed at —
+// and nothing else. Raw SQL insertion of a gate
 // row is BANNED and this file must never grow one — appendEvents allocates the
 // ids the resume path depends on, so a hand-written INSERT desynchronises the
 // counter and leaves later resume behaviour broken in a way no assertion in

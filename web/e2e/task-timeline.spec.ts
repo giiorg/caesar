@@ -30,9 +30,14 @@ test('creating a task produces a run whose timeline advances live', async ({ pag
   // next assertions about a LIVE timeline rather than about a fresh page load.
   await expect(page.getByTestId('phase-timeline')).toBeVisible({ timeout: 30_000 })
 
-  // ADVANCES WITHOUT A RELOAD. Both rows start not-started and must reach these
-  // states on this same DOM, driven by the stream through the cache bridge.
-  // Asserted on `data-state` because the whole content of a dot is colour.
+  // ADVANCES WITHOUT A RELOAD: both rows reach these states on the same DOM the
+  // create-task navigation landed on, driven by the stream through the cache
+  // bridge. The gate row is not even in the DOM when this starts — the timeline
+  // maps the phases the run HAS, and the gate phase materializes only once impl
+  // finishes.
+  //
+  // `data-state` is the attribute mutant M2b killed both of these on: pinning
+  // the row's state to a constant in `runs.$runId.tsx` fails them.
   await expect(page.getByTestId('phase-impl')).toHaveAttribute('data-state', 'succeeded', {
     timeout: 60_000,
   })

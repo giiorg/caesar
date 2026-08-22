@@ -3,7 +3,9 @@ import { openGate, quiesce, runState, signIn } from './harness'
 
 /**
  * The gate, end to end on a phone: it arrives, it opens to the artifact it
- * examines, and both decisions a person can reach from Home do what they say.
+ * examines, and the two decisions these tests cover — approve, and
+ * request_changes with its note — do what they say. `GateControls` offers a
+ * third from idle, Reject, which nothing here exercises.
  *
  * Every assertion below that names a gate names the run it belongs to. One
  * database serves the whole Playwright run, and a bare

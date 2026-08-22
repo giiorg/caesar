@@ -26,7 +26,12 @@ export default defineConfig({
   // assertions cannot outlive the test that contains them — a 30s default
   // silently caps them at 30s and turns a stated timeout into a fiction. The
   // Go lane allows 15m for everything (`Taskfile.yml`, web:e2e), so this is
-  // generous rather than tight; the per-assertion timeouts stay the real
-  // deadlines.
+  // generous rather than tight, and no single assertion's budget is capped by
+  // it. It does not cover their SUM: `task-timeline.spec.ts` states 150s across
+  // three waits, so a test that spent every one of them in full would still be
+  // cut off here. That is a test already failing, and the alternative is worse
+  // — a ceiling above 150s puts a handful of hung tests within reach of the
+  // lane's own 15m, where the failure arrives as a killed lane with no
+  // Playwright report rather than as a named assertion.
   timeout: 120_000,
 })
