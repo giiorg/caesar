@@ -18,8 +18,10 @@ work 12b has not started.
 ## Where execution stands
 
 The gate is `scripts/gate <abs-worktree> <sha> <branch>` and it ran green on **every commit**
-below, not merely at wave boundaries — 27 lanes each time. Measured at `dcd9c75`: **298 vitest
-tests across 25 files**, and **4 Playwright tests across 3 spec files** in `task web:e2e`.
+below, not merely at wave boundaries — 27 lanes each time. Two of them took a second run to get
+there: `b014ce5` on the parked-row flake (item 40) and `cfab5e9` on a Docker-down red the gate
+itself diagnosed. Measured at `dcd9c75`: **298 vitest tests across 25 files**, and **4 Playwright
+tests across 3 spec files** in `task web:e2e`.
 
 | Wave | Task | Commits | Fix rounds | The story in one line |
 |---|---|---|---|---|
@@ -172,7 +174,10 @@ third-party dissent on Task 4 were upheld as well. The ones with consequences be
 
 ### The vacuous tests, and what found each one
 
-Not one of these was found by a green suite. In every case the finder was a mutant.
+Every one of these produced a green suite and proved nothing, so running the tests is not what
+found any of them. In each case a mutant is what settled it — usually by surviving when it should
+have died. Two more entries in this family sit under the environment heading below (45 and 46),
+because in those the mutant was the *subject* rather than the finder.
 
 22. **Task 1** — the brief's third subtest passed with the `!ok || Kind != KindGate` guard deleted.
     A fourth subtest was added to kill the mutant.
@@ -203,47 +208,39 @@ Not one of these was found by a green suite. In every case the finder was a muta
     status of `succeeded` made the pre-frame and post-frame timelines identical, so the
     load-bearing `['run', runId]` bridge proof passed **for a mutated key** through RED, through
     GREEN, and through a full 27-lane gate. Only the mutant found it.
-30. **Task 8** — mutant 8 survived its first run and read as a dead guard. The cause was not the
-    code: `task web:e2e` has no `deps: [web:build]` (deliberately — a ~95MB browser download and a
-    bundle build should not fire as a silent side effect), so a **hand-run** lane tests the
-    previous bundle. Harmless inside `scripts/gate`, which builds first, and a standing trap
-    outside it. Always `task web:build && task web:e2e`.
-31. **Task 8, caught before it was recorded** — an unanchored `s/PHONE_TABS.slice(0, 4)/(0, 5)/`
-    hit the *doc comment* above `RAIL`, not the code, and the green run would have read as "the
-    mutant survived". The same string appears in both.
 
 ### The prose pattern, which is this plan's dominant defect
 
-32. **Eight of the ten wave-1 tasks drew a blocking finding, and in six of them the blocking
+30. **Eight of the ten wave-1 tasks drew a blocking finding, and in six of them the blocking
     finding was a false sentence rather than wrong behaviour.** Tasks 8 (both fix rounds), 9, 11
     (in its own fix diff), 14, 15 and 17. The exceptions: Task 10's was a real parser defect,
     Task 11's first was a missing mutation record, and Task 12's was a genuinely missing test —
     though that one surfaced because the test's own *name* claimed two directions while the
     fixture exercised one.
-33. **The forms it took, in order of arrival.** First code comments (Tasks 6, 7, 8, 9), then test
+31. **The forms it took, in order of arrival.** First code comments (Tasks 6, 7, 8, 9), then test
     titles (Tasks 14 and 15 — `_app.test.tsx`'s "STUB route" premise, and a dictated "exactly
     once" that names a redirect count no assertion separates from what it does prove), then a
     dictated rationale carried verbatim from a brief onto a path a dissent in the same task had
     just proved the subject was not on (Task 17's `task-timeline.spec.ts` comment, framed around
     `PhaseDots` when D2 had shown the dots are not on the run-detail path at all).
-34. **The mechanism, diagnosed by an implementer about its own work:** it argued *for* the
+32. **The mechanism, diagnosed by an implementer about its own work:** it argued *for* the
     unconditional `['runs']` invalidation in §6 of its own report and then wrote a doc comment
     denying it existed, in the same commit. Intent and prose diverged inside one head, in one
     sitting. Nothing typechecks prose.
-35. **The rule that would have caught all of it**, adopted mid-plan in Task 8 and worth carrying
+33. **The rule that would have caught all of it**, adopted mid-plan in Task 8 and worth carrying
     forward: **a claim stays in a test comment only if a mutant has killed the assertion it
     describes.** Everything else — ordering narration, meta-commentary about what is and is not
     guarded, restatements of the mechanism — is surface area to be wrong on, and it will be.
-36. **The corollary, learned the hard way twice:** adopting the rule in a report does not apply it.
+34. **The corollary, learned the hard way twice:** adopting the rule in a report does not apply it.
     A violating sentence survived in the same file whose own report had just adopted it, and was
     found by the next reviewer. Re-read the whole file against the rule, not just the lines you
     touched.
-37. **A "MEASURED" claim whose probe was deleted is worse than the reasoned claim it replaced**,
+35. **A "MEASURED" claim whose probe was deleted is worse than the reasoned claim it replaced**,
     because it stops the next reader from checking. Task 9 rewrote a comment from reasoned to
     MEASURED after probing react-query's prefix matching, then deleted the probe. The re-reviewer
     re-ran it and it reproduced exactly — but the shape is the point: the comment now asserts an
     act, and the act left no artifact in the tree.
-38. **A note about accuracy can itself be inaccurate.** Task 9's report carried a correction saying
+36. **A note about accuracy can itself be inaccurate.** Task 9's report carried a correction saying
     every line number in §3 "reads 1–3 low, add 1–3". That was false for 3 of 10 citations and two
     ran the opposite way; a reader applying it to one citation lands inside a different test. The
     stated cause was incomplete too — the amendment deleted a three-line assertion as well as
@@ -252,15 +249,17 @@ Not one of these was found by a green suite. In every case the finder was a muta
 
 ### The environment, the tooling, and things that look like bugs and are not
 
-39. **Stale IDE diagnostics described a dead tree eight separate times, and not one was real.**
-    Recorded at Tasks 8, 8 (round 2), 9, 9 (fix round), 10, 12, 17 and 17 (fix round), across
-    sessions 77 and 80. The recurring shapes were "`ApiRunSummaryResponse` does not exist",
-    "`/api/v1/runs` is not a valid path", "/more is absent from the route union", and phantom
-    diagnostics for probe files that `git status` proves are not in the tree. Every one was
+37. **Stale IDE diagnostics described a dead tree eight times before this wave's own ninth, and
+    not one of the nine was real.** The eight were recorded at Tasks 8, 8 (round 2), 9, 9 (fix
+    round), 10, 12, 17 and 17 (fix round), across sessions 77 and 80; the ninth arrived during
+    this documentation wave and is at `progress.md:417`. The recurring shapes were
+    "`ApiRunSummaryResponse` does not exist", "`/api/v1/runs` is not a valid path", "/more is
+    absent from the route union", and phantom diagnostics for probe files that `git status`
+    proves are not in the tree. Every one was
     settled the same way: run `tsc --noEmit` (exit 0) and `git status --porcelain
     --untracked-files=all` (empty). **Do not act on a mid-task editor diagnostic without running
     the real typechecker.**
-40. **`exactOptionalPropertyTypes` produced six distinct consequences on this plan**, none of them
+38. **`exactOptionalPropertyTypes` produced six distinct consequences on this plan**, none of them
     anticipated: a literal `params.query` object that will not compile (Task 9), an unwritable
     `body: { decision, note: v.note }` where `note?: string` (Task 11), `if (phase.evidence)`
     narrowing correctly while `if (phase.evidence !== undefined)` narrows to the object over a
@@ -268,34 +267,45 @@ Not one of these was found by a green suite. In every case the finder was a muta
     search-updater that must return the whole next object so closing a phase *drops* the key
     rather than setting it undefined (Task 16), and typed fixtures forcing the honest wire shape
     (Task 13). Build by assignment; do not fight it with literals.
-41. **The scratchpad is shared across agents and sessions, and a reviewer's mutant copy outlives
+39. **The scratchpad is shared across agents and sessions, and a reviewer's mutant copy outlives
     the reviewer.** By Task 9 there were three stale `cp -a` copies of `web/` sitting there — one
     344M, one pinned at a superseded commit, and one with a **live mutant still applied**. Task 9's
     re-reviewer copied into a path that landed *inside* one and briefly measured a false 183/186
     before tracing the cause. Copy to a uniquely-named path, delete it when done, confirm what
     commit a copy is at before trusting any measurement from it, and sweep at task close.
-42. **`TestDelayedRetry_ParkedRowSurvivesRestart` failed under gate load for the second time on a
+40. **`TestDelayedRetry_ParkedRowSurvivesRestart` failed under gate load for the second time on a
     second plan**, on a 15s wall-clock deadline. The implementer reported it rather than burying it
     and argued unreachability; the argument was upheld on two independent grounds, the decisive one
     being that the commit's entire diff was one comment hunk and one test-file edit — zero
     production-behaviour change from a sha that had already gated green. A green re-run alone is
     **not** evidence a flake is unrelated. The suite's seven 5–20s wall-clock deadlines are the
     standing cause.
-43. **There is no `go mod tidy` lane anywhere** — not in `Taskfile.yml`, not in `scripts/gate`, not
+41. **There is no `go mod tidy` lane anywhere** — not in `Taskfile.yml`, not in `scripts/gate`, not
     in `.github/workflows`. That is why 27 green lanes missed a `// indirect` marker on a module
     `contracts.go` imports directly. Still open.
-44. **No index serves `ORDER BY (created_at DESC, id DESC)` on `runs`**, so every page of a
+42. **No index serves `ORDER BY (created_at DESC, id DESC)` on `runs`**, so every page of a
     deliberately-paginated endpoint is a scan-and-sort. Task 9 made this reachable in practice:
     after it, every frame arms a debounce window, so `['runs']` is invalidated once per 250ms
     window during any active run. Intended design, unindexed table.
-45. **The gate refuses a dirty tree**, so any step ordering that gates before committing cannot run
+43. **The gate refuses a dirty tree**, so any step ordering that gates before committing cannot run
     as written — commit, then gate, then amend if it reddens. And never mutate a file with
     uncommitted work in it and revert with `git checkout -- <file>`; it wipes the implementation
     along with the mutant.
-46. **Scope a mutation regex to the function you mean to break.** `ExaminedInput`'s and
+44. **Scope a mutation regex to the function you mean to break.** `ExaminedInput`'s and
     `SummaryInput`'s guards are character-identical, so a non-anchored substitution hits the first
     one and mutates a function the test does not cover — a green run that reads as "the mutant
     survived" when it was never made. Verify with `git diff` which function you actually changed.
+45. **The same trap in its other form, caught before it was recorded** (Task 8). An unanchored
+    `s/PHONE_TABS.slice(0, 4)/(0, 5)/` hit the *doc comment* above `RAIL` rather than the code —
+    the string appears in both — so the green run would have read as "the mutant survived". No
+    mutant found this one and none could: the finder was the implementer re-reading its own
+    `git diff` before writing the record down, which is the only thing that catches it.
+46. **A hand-run e2e lane tests the previous bundle** (Task 8). `task web:e2e` has no
+    `deps: [web:build]` — deliberately, since a ~95MB browser download and a bundle build should
+    not fire as a silent side effect — so mutant 8 survived its first run and read as a dead
+    guard when the real cause was a stale bundle. Harmless inside `scripts/gate`, which builds
+    first, and a standing trap outside it. Always `task web:build && task web:e2e`, and treat a
+    surviving mutant as a question about the harness before it is an answer about the code.
 47. **Two hiddenness models live inside one tool.** Playwright's `toBeHidden` is bounding-box
     visibility; the role engine uses ARIA hiddenness. A zero-size element (`w-0 h-0
     overflow-hidden`) is Playwright-hidden and ARIA-present at once — which is how Task 8's
@@ -319,6 +329,22 @@ Not one of these was found by a green suite. In every case the finder was a muta
     "reader" scripted its own payload and never touched the fake. Deleting the key and running the
     suite is what settled it. **Check a claim about the test suite regardless of who it came
     from — it is one command away.**
+51. **The import-graph clamp moves files, it does not just reject imports** (Task 11).
+    `web/src/forms/fields/text-field.tsx` had to be `git mv`'d to the forms group root the moment
+    it gained a second consumer. The rule (`web/tools/arch/import-graph.ts:109-140`): a module
+    with two or more importers must sit at their common ancestor, clamped to its own group root —
+    and once the importers are `routes/login.tsx` and `gates/gate-controls.tsx`, that ancestor is
+    `src`, outside `forms/`, so the required home is `forms/` itself. The move was verified forced
+    rather than preferred, and `fields/` came out cleanly. Expect the clamp to demand file moves
+    as the client grows; it is design feedback about who shares what, not an obstacle.
+52. **After a successful mutation, a partial answer beats an honest 500** (Task 4). The reviewer
+    found that `task_title`, `repo_slug` and `workflow_name` are emitted by three handlers and
+    asserted by none — deleting all three fill-ins left the suite green, because a contract pin
+    checks shape and not value. Filling that gap raised the question of what `handleRerunTask`
+    should do when label resolution fails *after* the rerun has already been created, and the
+    controller ruled: degrade to empty labels plus a `slog` warning, never 500. A 500 invites a
+    retry, and a retry runs into the one-live-run-per-task constraint. **An under-reported label
+    is recoverable; a duplicate run is not.**
 
 ## Deferred minors, for the final whole-branch review to triage
 
@@ -389,7 +415,7 @@ nobody reads is a silent discard. Items already fixed in a fix round are not her
 - Deadline-first suppression makes the client's clock a suppressor with no override — brief-mandated, and `GateEvidenceResponse`'s own doc comment argues the opposite design for `can_decide` itself (computed server-side, in `decideGate`'s order, so it names the refusal the caller would actually receive). **Parked for the final review / sofo.** Its supporting comment also cites `gates.go` where the `not_approver` caller is in fact refused earlier, in `api.go`, before `DecideGate` is entered.
 - `ConflictPanel`'s `isPending` arm renders text no assertion names.
 - The full vitest run prints "Not implemented: Window's scrollTo()" several times — pre-existing; suite output should be pristine.
-- **Follow-up for a later task:** the 8192-byte gate note renders in a single-line input; a `TextAreaField` registry entry is wanted.
+- **Follow-up for a later task:** the 8192-byte gate note renders in a single-line input; a `TextAreaField` registry entry is wanted. **Half-closed since it was written:** Task 14 built `web/src/forms/textarea-field.tsx` for the new-task form, so what remains is switching the gate note (`gates/gate-controls.tsx:233`, still a `TextField`) over to it.
 
 **Task 12**
 - The typo'd-deep-link branch and the evidence-null/decision-null branch are honest but untested — coverage, not correctness. Only the summary/facts pair is position-pinned; accordion and controls are presence-only.
@@ -451,9 +477,13 @@ Each with the one-line reason it was decided that way.
 
 The rule this project follows: when execution proves a plan claim wrong, **correct the plan**,
 because the next person to execute it will otherwise reintroduce exactly what was just removed.
-Each site below carries a `(corrected in execution — see ledger)` marker in
+Each correction below carries a `(corrected in execution — see ledger)` marker in
 `docs/superpowers/plans/2026-08-16-caesar-12a-web-critical-path.md`; none of the original text was
-silently rewritten.
+silently rewritten. **Fifteen markers stand in the plan and they cover eleven distinct
+corrections**: one correction can span a section header, a dictated code comment and a mutant
+bullet, and each of those carries its own marker, which is why
+`grep -c 'corrected in execution — see ledger'` returns fifteen. The entries below group them by
+the claim being corrected, so there are fewer entries than either number.
 
 - **Task 13's Home loader.** The `Promise.all` + suspense shape is marked as what hangs the app,
   with the redirect-loop mechanism, the measured 44s OOM, and the sofo ratification of per-section
@@ -486,8 +516,13 @@ silently rewritten.
 brief listed "§6.3's newest-first event log" as a plan claim to correct. It is not one. The plan
 says "flat chronological log" in every place it describes the event log (Task 16's prose, its test
 name, and its Step-6 mutant), and its three "newest first" occurrences are all about the **run
-list**, which really is `ORDER BY created_at DESC, id DESC`. The false sentence lived in Task 16's
-*report* §6.3 and was already controller-corrected there on 2026-08-22. Verified against
+list**, whose SQL really is `ORDER BY created_at DESC, id DESC`. That vindicates the SQL and
+nothing else — in particular not plan :4223's "Recent, newest first", which the bullet above
+corrects: the order is real, and `created_at` is when a run was *requested*, so the caption is
+still true of nothing the page shows.
+
+The false sentence lived in Task 16's *report* §6.3 and was already controller-corrected there on
+2026-08-22. Verified against
 `store/queries.sql`: `ListRunEventsAfter` and `ListRunEventsForRunAfter` are both `ORDER BY id`
 ascending, consistent with the `after` resume cursor.
 

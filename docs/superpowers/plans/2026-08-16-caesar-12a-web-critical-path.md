@@ -4607,8 +4607,8 @@ it('sends an unauthenticated visit to a loader-bearing route to /login, on a REP
   // they cannot see and re-runs the whole failed load.
   //
   // Without this line the test is VACUOUS — MEASURED: neuter _app's
-  // ensureQueryData and it still passes, and (corrected in execution — see
-  // ledger) NOT for the reason written here originally. The mutant's stderr
+  // ensureQueryData and it still passes, and (corrected in execution — see ledger)
+  // NOT for the reason written here originally. The mutant's stderr
   // blames AppLayout's useSuspenseQuery, which throws the same 401 with no data
   // to fall back on, and AppErrorBoundary navigates to the same place — not
   // Tasks' own loader. Decisively: the same mutant also kills the /more test
@@ -4668,7 +4668,7 @@ cd web
 #    instead; the shipped record has five.
 ```
 
-Record them. Proof 1 is the one that was measured to be missing before `router.history.length` was added, and the rehoming is what puts it at risk again. **(corrected in execution.)** Proof 1's stderr does *not* blame `/tasks`' loader — it blames `AppLayout`'s `useSuspenseQuery`, which throws the same 401 with no data to fall back on. The decisive evidence is that the same mutant also kills the `/more` test, which has no child loader at all.
+Record them. Proof 1 is the one that was measured to be missing before `router.history.length` was added, and the rehoming is what puts it at risk again. **(corrected in execution — see ledger.)** Proof 1's stderr does *not* blame `/tasks`' loader — it blames `AppLayout`'s `useSuspenseQuery`, which throws the same 401 with no data to fall back on. The decisive evidence is that the same mutant also kills the `/more` test, which has no child loader at all.
 
 - [ ] **Step 4: Gate and commit**
 
