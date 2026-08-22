@@ -1,17 +1,20 @@
 import { expect, test } from '@playwright/test'
+import { openGate, quiesce, signIn } from './harness'
 
-const CONTROL = process.env.CAESAR_CONTROL_URL ?? ''
+test.beforeEach(async ({ request }) => {
+  // BEAT 1 and BEAT 3 below are ABSOLUTE claims about the inbox, and this file
+  // is no longer the only one that opens gates: `gate-decision.spec.ts` and
+  // `task-timeline.spec.ts` both leave runs behind in the one database this
+  // lane's one server serves. See `harness.ts`'s `quiesce`.
+  await quiesce(request)
+})
 
 test('a gate opened by the backend moves the approvals badge with no user action', async ({
   page,
   request,
 }) => {
   // --- login -> shell ---
-  await page.goto('/login')
-  await page.getByLabel('Email').fill(process.env.CAESAR_EMAIL ?? '')
-  await page.getByLabel('Password').fill(process.env.CAESAR_PASSWORD ?? '')
-  await page.getByRole('button', { name: 'Sign in' }).click()
-  await expect(page.getByRole('navigation')).toBeVisible()
+  await signIn(page)
 
   // --- the two presentations, at the ONE viewport this project runs ---
   //
@@ -54,8 +57,7 @@ test('a gate opened by the backend moves the approvals badge with no user action
   // invalidate the query, trigger the refetch, and return the identical list:
   // the badge would not move and the spec would prove nothing while looking
   // like it passed.
-  const opened = await request.post(`${CONTROL}/fixture/open-gate`)
-  expect(opened.status()).toBe(202)
+  await openGate(request)
 
   // --- BEATS 3 and 4: SSE invalidates; REST returns N+1 ---
   // No click, no reload, no navigation between here and the assertion. The
