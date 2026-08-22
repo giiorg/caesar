@@ -112,7 +112,7 @@ export function scriptedStream() {
  * call msw gives priority to the EARLIER argument, and a later `server.use`
  * call outranks an earlier one. So the caller's handlers are spread first and
  * the defaults behind them, and a test can override any single endpoint
- * without restating the other three. The tempting shape — tests calling
+ * without restating the others. The tempting shape — tests calling
  * `server.use` themselves before `renderApp` — silently loses, because the
  * harness's own call would then be the later one.
  */
@@ -143,6 +143,12 @@ export function renderApp(path: string, handlers: RequestHandler[] = []) {
     // fetches this, and `onUnhandledRequest: 'error'` turns a missing default
     // into a failure far from the missing handler.
     http.get('/api/v1/runs/:id/events', () => HttpResponse.json({ events: null })),
+    // `tasks: null`, for the third time and the same reason: the contract marks
+    // it required AND nullable because a Go nil slice marshals to null,
+    // `handleListTasks` happens to build a non-nil slice today, and the null
+    // branch in `tasksQueryOptions` would otherwise be unreachable from every
+    // test in the tree.
+    http.get('/api/v1/tasks', () => HttpResponse.json({ tasks: null })),
     http.get('/api/v1/stream', silentStream),
   )
   // BOTH router arguments are load-bearing and neither is optional.

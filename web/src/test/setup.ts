@@ -55,3 +55,26 @@ function noPreferenceMatchMedia(query: string): MediaQueryList {
 if (typeof window.matchMedia !== 'function') {
   window.matchMedia = noPreferenceMatchMedia
 }
+
+// jsdom implements NO PART of the Pointer Capture API — `setPointerCapture`,
+// `releasePointerCapture` and `hasPointerCapture` are all absent from
+// `Element.prototype` (MEASURED under the jsdom this project pins). Every real
+// browser has all three, so this closes a gap in the fake rather than giving it
+// a capability reality lacks.
+//
+// It is not optional decoration. `vaul`'s drawer arms a pointer-drag on its
+// content, so the FIRST `userEvent.type` inside the new-task sheet throws
+// `event.target.setPointerCapture is not a function` — asynchronously, out of a
+// React event handler, where no assertion can catch it. MEASURED before this
+// was added: `tasks.test.tsx` reported 11 tests PASSED and 19 unhandled errors,
+// and vitest exited 1. A suite that is green and failing at once is the worst
+// available outcome, because the exit code is the only thing that says so.
+//
+// `hasPointerCapture` returns false rather than tracking state: nothing in this
+// tree reads it back after setting it, and a real implementation would be a
+// second, untested one.
+if (typeof Element.prototype.setPointerCapture !== 'function') {
+  Element.prototype.setPointerCapture = () => {}
+  Element.prototype.releasePointerCapture = () => {}
+  Element.prototype.hasPointerCapture = () => false
+}

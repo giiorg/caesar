@@ -2839,6 +2839,9 @@
             ]
           }
         },
+        "required": [
+          "projects"
+        ],
         "type": "object"
       },
       "ApiProjectResponse": {
@@ -2861,6 +2864,13 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "created_at",
+          "updated_at"
+        ],
         "type": "object"
       },
       "ApiPublicationResponse": {
@@ -2939,6 +2949,9 @@
             ]
           }
         },
+        "required": [
+          "repos"
+        ],
         "type": "object"
       },
       "ApiRepoResponse": {
@@ -2970,6 +2983,16 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "project_id",
+          "forge",
+          "slug",
+          "default_branch",
+          "credential_id",
+          "created_at",
+          "updated_at"
+        ],
         "type": "object"
       },
       "ApiReviewFinding": {
@@ -3313,6 +3336,9 @@
             ]
           }
         },
+        "required": [
+          "tasks"
+        ],
         "type": "object"
       },
       "ApiTaskResponse": {
@@ -3353,6 +3379,18 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "project_id",
+          "repo_id",
+          "workflow_version_id",
+          "title",
+          "inputs",
+          "requester_id",
+          "status",
+          "latest_run_id",
+          "created_at"
+        ],
         "type": "object"
       },
       "ApiTestOutcome": {
@@ -3436,6 +3474,9 @@
             ]
           }
         },
+        "required": [
+          "workflows"
+        ],
         "type": "object"
       },
       "ApiWorkflowResponse": {
@@ -3461,6 +3502,14 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "latest_version",
+          "created_at",
+          "updated_at"
+        ],
         "type": "object"
       },
       "ApiWorkflowVersionListResponse": {

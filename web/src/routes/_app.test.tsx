@@ -182,7 +182,12 @@ describe('the layout as the single stream owner', () => {
       ),
     ])
     await screen.findByRole('navigation')
-    await screen.findByText(/not built yet/i)
+    // The PAGE rendered too, not only the chrome — otherwise a shell wrapped
+    // around a route that never resolved would satisfy this test. It was
+    // `/not built yet/` while `/tasks` was a stub; Plan 12a gave the route a
+    // loader over `GET /tasks` and `GET /runs`, neither of which this test
+    // touches, so the heading is the same assertion against a real screen.
+    await screen.findByRole('heading', { name: 'Up next' })
     expect(screen.queryByTestId('approvals-badge')).not.toBeInTheDocument()
   })
 

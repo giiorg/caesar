@@ -914,16 +914,16 @@ export interface components {
             user_id?: string;
         };
         ApiProjectListResponse: {
-            projects?: components["schemas"]["ApiProjectResponse"][] | null;
+            projects: components["schemas"]["ApiProjectResponse"][] | null;
         };
         ApiProjectResponse: {
             /** Format: date-time */
-            created_at?: string;
-            description?: string;
-            id?: string;
-            name?: string;
+            created_at: string;
+            description: string;
+            id: string;
+            name: string;
             /** Format: date-time */
-            updated_at?: string;
+            updated_at: string;
         };
         ApiPublicationResponse: {
             base_sha: string;
@@ -948,19 +948,19 @@ export interface components {
             provider_endpoint?: string;
         };
         ApiRepoListResponse: {
-            repos?: components["schemas"]["ApiRepoResponse"][] | null;
+            repos: components["schemas"]["ApiRepoResponse"][] | null;
         };
         ApiRepoResponse: {
             /** Format: date-time */
-            created_at?: string;
-            credential_id?: string;
-            default_branch?: string;
-            forge?: string;
-            id?: string;
-            project_id?: string;
-            slug?: string;
+            created_at: string;
+            credential_id: string;
+            default_branch: string;
+            forge: string;
+            id: string;
+            project_id: string;
+            slug: string;
             /** Format: date-time */
-            updated_at?: string;
+            updated_at: string;
         };
         ApiReviewFinding: {
             file?: string;
@@ -1044,22 +1044,22 @@ export interface components {
             workflow_name: string;
         };
         ApiTaskListResponse: {
-            tasks?: components["schemas"]["ApiTaskResponse"][] | null;
+            tasks: components["schemas"]["ApiTaskResponse"][] | null;
         };
         ApiTaskResponse: {
             /** Format: date-time */
-            created_at?: string;
-            id?: string;
-            inputs?: {
+            created_at: string;
+            id: string;
+            inputs: {
                 [key: string]: unknown;
             } | null;
-            latest_run_id?: string;
-            project_id?: string;
-            repo_id?: string;
-            requester_id?: string;
-            status?: string;
-            title?: string;
-            workflow_version_id?: string;
+            latest_run_id: string;
+            project_id: string;
+            repo_id: string;
+            requester_id: string;
+            status: string;
+            title: string;
+            workflow_version_id: string;
         };
         ApiTestOutcome: {
             details?: string;
@@ -1083,17 +1083,17 @@ export interface components {
             updated_at: string;
         };
         ApiWorkflowListResponse: {
-            workflows?: components["schemas"]["ApiWorkflowResponse"][] | null;
+            workflows: components["schemas"]["ApiWorkflowResponse"][] | null;
         };
         ApiWorkflowResponse: {
             /** Format: date-time */
-            created_at?: string;
-            description?: string;
-            id?: string;
-            latest_version?: number;
-            name?: string;
+            created_at: string;
+            description: string;
+            id: string;
+            latest_version: number;
+            name: string;
             /** Format: date-time */
-            updated_at?: string;
+            updated_at: string;
         };
         ApiWorkflowVersionListResponse: {
             versions?: components["schemas"]["ApiWorkflowVersionMetaResponse"][] | null;

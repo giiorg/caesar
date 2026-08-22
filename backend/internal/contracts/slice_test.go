@@ -127,6 +127,33 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 		// does render ["object","null"].
 		"ApiRunEventsResponse": {"events"},
 		"ApiRunEventResponse":  {"id", "kind", "payload", "occurred_at"},
+		// The Tasks screen and the new-task form. `inputs` is required AND
+		// nullable for the same reason `payload` above is: a Go nil map marshals
+		// to null and a map is not a named component, so the generator renders
+		// ["object","null"] beside the required entry. Everything else here is a
+		// scalar or a slice that its mapper sets unconditionally.
+		//
+		// `ApiCreateTaskRequest` is deliberately absent. Four of its five fields
+		// are unconditional, but `inputs` carries omitempty (runs/api/dto.go), so
+		// the request really does go out without the key when there is nothing to
+		// put in it — and a list here that named only the other four would read as
+		// an oversight rather than as the decision it is.
+		"ApiTaskListResponse": {"tasks"},
+		"ApiTaskResponse": {
+			"id", "project_id", "repo_id", "workflow_version_id", "title", "inputs",
+			"requester_id", "status", "latest_run_id", "created_at",
+		},
+		"ApiWorkflowListResponse": {"workflows"},
+		"ApiWorkflowResponse": {
+			"id", "name", "description", "latest_version", "created_at", "updated_at",
+		},
+		"ApiProjectListResponse": {"projects"},
+		"ApiProjectResponse":     {"id", "name", "description", "created_at", "updated_at"},
+		"ApiRepoListResponse":    {"repos"},
+		"ApiRepoResponse": {
+			"id", "project_id", "forge", "slug", "default_branch", "credential_id",
+			"created_at", "updated_at",
+		},
 		// The artifact payload contract (document schema 2). These five reach
 		// the document through contracts' extraSchemas list rather than through
 		// an operation, so this is also the pin that fails if that mechanism

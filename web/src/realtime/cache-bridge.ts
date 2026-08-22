@@ -89,6 +89,14 @@ export function createCacheBridge(
     // as. This is also why the list query key puts its filters in a second
     // element rather than in the string.
     void qc.invalidateQueries({ queryKey: ['runs'] })
+    // THE TASK LIST, for the same reason and one more. `TaskResponse.Status` IS
+    // the latest run's status (runs/api/dto.go:22-23), so a frame that moves a
+    // run moves the TASK between the Tasks screen's four attention groups —
+    // and a task's group is the whole design of that screen. Without this the
+    // row sits in the wrong section until the bounded refresh floor fires a
+    // minute later, which is the shape of staleness nobody reports as a bug
+    // because the screen looks fine.
+    void qc.invalidateQueries({ queryKey: ['tasks'] })
     for (const runId of runs) void qc.invalidateQueries({ queryKey: ['run', runId] })
   }
 

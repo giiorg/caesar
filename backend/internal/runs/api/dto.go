@@ -21,21 +21,29 @@ type CreateTaskRequest struct {
 
 // TaskResponse projects a task with its newest run: Status is that run's
 // status, which is what a task list renders.
+//
+// EVERY property is required. `taskResponse` sets all ten unconditionally and
+// none carries omitempty, so there is no shape of this struct in which a key is
+// absent — and an unmarked property renders optional in TypeScript, which makes
+// the Tasks screen branch on a case the server cannot produce. Inputs is the
+// only nullable one: a Go nil map marshals to null and it is a map rather than a
+// $ref, so the generator really does render ["object","null"] beside the
+// required entry.
 type TaskResponse struct {
-	ID                string         `json:"id"`
-	ProjectID         string         `json:"project_id"`
-	RepoID            string         `json:"repo_id"`
-	WorkflowVersionID string         `json:"workflow_version_id"`
-	Title             string         `json:"title"`
-	Inputs            map[string]any `json:"inputs"`
-	RequesterID       string         `json:"requester_id"`
-	Status            string         `json:"status"`
-	LatestRunID       string         `json:"latest_run_id"`
-	CreatedAt         time.Time      `json:"created_at"`
+	ID                string         `json:"id" required:"true"`
+	ProjectID         string         `json:"project_id" required:"true"`
+	RepoID            string         `json:"repo_id" required:"true"`
+	WorkflowVersionID string         `json:"workflow_version_id" required:"true"`
+	Title             string         `json:"title" required:"true"`
+	Inputs            map[string]any `json:"inputs" required:"true"`
+	RequesterID       string         `json:"requester_id" required:"true"`
+	Status            string         `json:"status" required:"true"`
+	LatestRunID       string         `json:"latest_run_id" required:"true"`
+	CreatedAt         time.Time      `json:"created_at" required:"true"`
 }
 
 type TaskListResponse struct {
-	Tasks []TaskResponse `json:"tasks"`
+	Tasks []TaskResponse `json:"tasks" required:"true"`
 }
 
 // RunResponse carries phases, artifact metadata and publications inline on

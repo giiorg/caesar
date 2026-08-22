@@ -52,7 +52,7 @@ function fakeTimer() {
  * Every query key handed to `invalidateQueries`, in call order.
  *
  * A READER over the spy this file already uses, not a second recording
- * mechanism: the bridge now invalidates three different keys per window, and
+ * mechanism: the bridge now invalidates several different keys per window, and
  * `toHaveBeenCalledTimes(n)` cannot say WHICH. Keeping one spy means the count
  * assertions and the key assertions are reading the same source.
  */
@@ -72,7 +72,7 @@ describe('createCacheBridge', () => {
     b.onFrame(frame(1, 'gate.waiting'))
     expect(spy).not.toHaveBeenCalled() // not until the window closes
     t.run()
-    expect(invalidated(spy)).toEqual([['approvals'], ['runs'], ['run', 'r1']])
+    expect(invalidated(spy)).toEqual([['approvals'], ['runs'], ['tasks'], ['run', 'r1']])
   })
 
   it('NEVER writes cache data from an event payload', () => {
@@ -103,11 +103,12 @@ describe('createCacheBridge', () => {
     // debounce exists to avoid.
     expect(t.count).toBe(1)
     t.run()
-    // Three, not twenty-two: the inbox, the list, and the one run these twenty
-    // frames all named. MEASURED: with `dirtyRuns` an array rather than a Set,
-    // this assertion reports 22 — the window coalesces the timers and not the
-    // invalidations, which is half the saving and none of the point.
-    expect(spy).toHaveBeenCalledTimes(3)
+    // Four, not twenty-three: the inbox, the run list, the task list, and the
+    // one run these twenty frames all named. MEASURED: with `dirtyRuns` an
+    // array rather than a Set, this assertion reports 23 — the window coalesces
+    // the timers and not the invalidations, which is half the saving and none
+    // of the point.
+    expect(spy).toHaveBeenCalledTimes(4)
   })
 
   it('opens a NEW window for a frame that arrives after the last one closed', () => {
@@ -124,7 +125,7 @@ describe('createCacheBridge', () => {
     b.onFrame(frame(2, 'gate.decided'))
     expect(t.count).toBe(1) // a second window was armed
     t.run()
-    expect(spy).toHaveBeenCalledTimes(6) // two windows, three keys each
+    expect(spy).toHaveBeenCalledTimes(8) // two windows, four keys each
   })
 
   it('is idempotent under a replayed backlog', () => {
@@ -136,7 +137,7 @@ describe('createCacheBridge', () => {
     t.run()
     b.onFrame(frame(5, 'gate.waiting')) // the same event, re-delivered on resume
     t.run()
-    expect(spy).toHaveBeenCalledTimes(6) // two windows of three, one truth
+    expect(spy).toHaveBeenCalledTimes(8) // two windows of four, one truth
   })
 
   it('debounces on real timers with no injection at all', () => {
@@ -153,7 +154,7 @@ describe('createCacheBridge', () => {
     vi.advanceTimersByTime(249)
     expect(spy).not.toHaveBeenCalled()
     vi.advanceTimersByTime(1)
-    expect(spy).toHaveBeenCalledTimes(3)
+    expect(spy).toHaveBeenCalledTimes(4)
   })
 
   it('reads the kind from the frame BODY, not from the SSE event name', () => {
@@ -178,8 +179,8 @@ describe('createCacheBridge', () => {
     t.run()
     // The INBOX by name, because the inbox is the only key the kind decides.
     // MEASURED: with `f.event` in place of `f.frame.kind`, this window carries
-    // exactly `['runs']` and `['run','r1']` — the run and the list are routed
-    // from `run_id` and would go out under either reading.
+    // exactly `['runs']`, `['tasks']` and `['run','r1']` — the two lists and the
+    // run are routed from `run_id` and would go out under either reading.
     expect(invalidated(spy)).toContainEqual(['approvals'])
   })
 
@@ -220,7 +221,7 @@ describe('routing a frame to its run', () => {
     expect(invalidated(spy)).toEqual([]) // nothing leaves before the window closes
     expect(t.count).toBe(1)
     t.run()
-    expect(invalidated(spy)).toEqual([['runs'], ['run', 'r1']])
+    expect(invalidated(spy)).toEqual([['runs'], ['tasks'], ['run', 'r1']])
   })
 
   it('invalidates only the runs the window itself saw', () => {
@@ -235,13 +236,15 @@ describe('routing a frame to its run', () => {
     const b = createCacheBridge(qc, { debounceMs: 10, setTimeoutImpl: t.impl })
     b.onFrame(frame(1, 'phase.started', 'r1'))
     t.run()
-    expect(invalidated(spy)).toEqual([['runs'], ['run', 'r1']])
+    expect(invalidated(spy)).toEqual([['runs'], ['tasks'], ['run', 'r1']])
     b.onFrame(frame(2, 'phase.started', 'r2'))
     t.run()
     expect(invalidated(spy)).toEqual([
       ['runs'],
+      ['tasks'],
       ['run', 'r1'],
       ['runs'],
+      ['tasks'],
       ['run', 'r2'], // r1 is not here: the closed window took its runs with it
     ])
   })

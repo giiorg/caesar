@@ -16,7 +16,13 @@ export const runCardTime = (run: RunSummary): string =>
   run.finished_at ?? run.started_at ?? run.created_at
 
 /**
- * One run as a LIST ROW, and the only card Home, the runs list and Tasks use.
+ * One run as a LIST ROW, and the only card Home and the runs list use.
+ *
+ * NOT TASKS, and the reason is a data fact rather than a taste one: that list
+ * is keyed on the TASK, whose latest run may not be on the one page of runs the
+ * screen holds — `GET /tasks` is unpaginated and `GET /runs` is not — so there
+ * is no `RunSummary` to hand this component for some of its rows. `TaskRow` in
+ * `routes/_app/tasks.tsx` is what renders them.
  *
  * EVERYTHING IT RENDERS IS ON `RunSummaryResponse`, which is the whole point of
  * that projection existing beside `RunResponse`: a card that had to fetch the
