@@ -6,8 +6,10 @@ import type { RunSummary } from './runs-query'
  * The relevant timestamp of a run, and the reason the DTO carries three real
  * columns instead of a synthesized `updated_at`.
  *
- * `dto.go:122-125` says it in the contract: "a card renders
- * finished_at ?? started_at ?? created_at, and the choice stays visible".
+ * `dto.go` says it in the contract, on `RunSummaryResponse`'s timestamp block:
+ * "a card renders finished_at ?? started_at ?? created_at, and the choice stays
+ * visible". Cited by that sentence and not by a line number, which has gone
+ * stale twice: the sentence is what a grep finds after the next insertion.
  * Exported because Home's "Recent" section ORDERS by the same value it
  * displays — a section ordered by one timestamp and captioned with another is
  * one whose order a reader cannot check.
@@ -27,7 +29,8 @@ export const runCardTime = (run: RunSummary): string =>
  * EVERYTHING IT RENDERS IS ON `RunSummaryResponse`, which is the whole point of
  * that projection existing beside `RunResponse`: a card that had to fetch the
  * task title, the repo label or its phase shape per row is the N+1 that
- * `GET /runs` was widened to remove (`dto.go:97-102`).
+ * `GET /runs` was widened to remove — `dto.go` on `RunSummaryResponse`:
+ * "Reusing the reduced RunResponse … is what makes a list of cards an N+1".
  *
  * THE WHOLE CARD IS THE LINK, matching `ApprovalList`: on the phone this list
  * exists for, a target the size of a card is the difference between one tap and

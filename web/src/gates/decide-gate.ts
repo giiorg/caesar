@@ -18,9 +18,11 @@ export type DecisionInput = { nodeId: string; decision: Decision; note?: string 
  * One gate decision.
  *
  * WHAT IT INVALIDATES IS THE WHOLE OF ITS CACHE CONTRACT, and it is deliberately
- * the same three keys the stream's bridge invalidates
- * (`realtime/cache-bridge.ts:84-92`): the inbox (this gate left it), the run
- * list (the run's status changed) and this run. Writing the new state into the cache instead would be the client
+ * the same four keys the stream's bridge invalidates (the `fire()` in
+ * `realtime/cache-bridge.ts:84-100`): the inbox (this gate left it), the run
+ * list (the run's status changed), the TASK list — `TaskResponse.Status` IS the
+ * latest run's status, so a decision moves the task between the Tasks screen's
+ * four attention groups — and this run. Writing the new state into the cache instead would be the client
  * reconstructing an orchestrator transition it did not perform — approve
  * resumes the run, request_changes opens a generation and rewinds a slice, and
  * neither is derivable from the response.
@@ -60,6 +62,7 @@ export function useDecideGate(runId: string) {
       // name the decision that beat this caller to it.
       void qc.invalidateQueries({ queryKey: ['approvals'] })
       void qc.invalidateQueries({ queryKey: ['runs'] })
+      void qc.invalidateQueries({ queryKey: ['tasks'] })
       void qc.invalidateQueries({ queryKey: ['run', runId] })
     },
   })

@@ -209,8 +209,10 @@ where a decision is about to be made.
 far more phase transitions than gate or publish events, and
 `phase.log_truncated` / `phase.egress_denied` are capped per attempt rather than
 rare. The 250ms debounce in `src/realtime/cache-bridge.ts` is what turns that
-into one invalidation per window instead of one per frame, so **that debounce is
-load-bearing rather than an optimization** — changing it is a product decision
+into one invalidation *pass* per window instead of one per frame — a pass costs
+one refetch per key the bridge owns, not one per frame received — so **that
+debounce is load-bearing rather than an optimization** — changing it is a
+product decision
 about refetch volume, not a tuning knob. `ATTENTION_KINDS` in the same file did
 *not* gain `phase.*` and must not: it decides one thing, whether the window also
 invalidates `['approvals']`, and the inbox does not change when a phase ticks. A

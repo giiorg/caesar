@@ -30,8 +30,10 @@ import (
 // flight emits far more phase transitions than gate or publish events, and
 // `phase.log_truncated` / `phase.egress_denied` are capped per attempt rather
 // than rare. The client's debounce in the cache bridge is what keeps that from
-// becoming a refetch storm — one refetch per window, not one per frame — and
-// that debounce is now load-bearing rather than an optimization.
+// becoming a refetch storm — one invalidation PASS per window, not one per
+// frame, and a pass costs one refetch per key the bridge owns rather than one
+// per frame received — and that debounce is now load-bearing rather than an
+// optimization.
 //
 // It also widens the SNAPSHOT, which is the consequence that is easy to miss:
 // a fresh open primes from the most recent N MATCHING events, so phase traffic

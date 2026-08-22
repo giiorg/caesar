@@ -2,7 +2,7 @@ import { QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { HttpResponse, http } from 'msw'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { queryClient } from '../api/query-client'
 import type { Run } from '../runs/run-query'
 import { server } from '../test/msw'
@@ -380,5 +380,31 @@ describe('gate controls', () => {
     renderControls({ evidence: decidable, reply: serverError('cid-77') })
     await userEvent.click(await screen.findByRole('button', { name: /^approve$/i }))
     expect(await screen.findByText('cid-77')).toBeInTheDocument()
+  })
+
+  it('invalidates all four keys of its cache contract, the TASK list among them', async () => {
+    // A SPY on the key set, where every other test in this file asserts through
+    // a rendered surface, and the reason is that three of these four keys have
+    // no host here to observe them: `['tasks']` belongs to a screen these
+    // controls never mount, so a behavioural proof would mean rendering the
+    // Tasks list around a gate decision to watch one refetch. What the contract
+    // actually says is which keys go out, and that is what this reads.
+    //
+    // The set is asserted WHOLE rather than with a `toContainEqual` per key.
+    // The keys are a set the stream's bridge must match — a decision and the
+    // frames that follow it are idempotent only if both invalidate the same
+    // things — so a key silently dropped from either side is the failure worth
+    // catching, and only an equality assertion catches a drop.
+    const spy = vi.spyOn(queryClient, 'invalidateQueries')
+    renderControls({ evidence: decidable })
+    await userEvent.click(await screen.findByRole('button', { name: /^approve$/i }))
+    await waitFor(() =>
+      expect(spy.mock.calls.map((c) => c[0]?.queryKey)).toEqual([
+        ['approvals'],
+        ['runs'],
+        ['tasks'],
+        ['run', 'r1'],
+      ]),
+    )
   })
 })

@@ -46,8 +46,20 @@ type seededTask struct {
 }
 
 // emptyWorkflowDocument is what a run whose graph nothing compiles gets. Every
-// test here that only appends events by hand uses it: no orchestrator ever
-// loads these runs, so a node list would be decoration.
+// test that only appends events by hand seeds through it, and what it buys is
+// a run NOTHING WILL EVER MATERIALIZE A PHASE FOR.
+//
+// Not because no orchestrator looks: the bootServe'd tests in the two files
+// beside this one run a real janitor, and these rows are exactly what it goes
+// looking for — ListRunsAwaitingMaterialization selects a 'running' run with
+// no live phase, which every run seeded here is. It loads them on each poll,
+// `Compile` refuses the empty node list ("runs: compile: no nodes",
+// compile.go:192), and materializeResumedRuns logs "resumed plan load" and
+// moves to the next id. The pass is a no-op every time.
+//
+// So a node list would be worse than decoration: it would let that janitor
+// materialize a root node and append a real phase.* event to a run some test
+// is asserting the exact event set of.
 const emptyWorkflowDocument = `{"schema":1,"nodes":[]}`
 
 func seedRealtimeRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool, name string) seededRun {
