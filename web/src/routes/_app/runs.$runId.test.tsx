@@ -463,6 +463,89 @@ describe('run detail', () => {
     expect(screen.queryByTestId('agent-output')).toBeNull()
   })
 
+  /**
+   * §7's desktop sentence — "timeline becomes a left rail with the open phase's
+   * detail on the right" — and the three tests below are what is falsifiable
+   * about it HERE. jsdom loads no Tailwind (`app-shell.test.tsx` and
+   * `e2e/approvals.spec.ts:21-23` say the same thing about the shell's two
+   * presentations), so both are fully present and none of these assertions is
+   * about geometry. What they pin is the structure the CSS reflows: two
+   * regions neither of which contains the other, every phase reachable from
+   * the rail, and the detail rendered ONCE.
+   */
+  it('offers every phase from a rail that is a distinct region from the detail pane', async () => {
+    renderApp('/runs/run-1', [run(threePhases())])
+    const rail = await screen.findByTestId('phase-rail')
+    const detail = screen.getByTestId('phase-detail')
+    // NEITHER contains the other. A rail nested inside the pane is a rail that
+    // scrolls away with the thing it indexes, and a pane inside the rail is
+    // the phone layout wearing two testids.
+    expect(rail).not.toContainElement(detail)
+    expect(detail).not.toContainElement(rail)
+    // On hrefs and not on labels: the rail's whole job is to move `?phase=`,
+    // and a list of <span>s carrying the right words does none of it.
+    expect(
+      within(rail)
+        .getAllByRole('link')
+        .map((a) => a.getAttribute('href')),
+    ).toEqual(['/runs/run-1?phase=impl', '/runs/run-1?phase=review', '/runs/run-1?phase=gate'])
+  })
+
+  it('renders the open phase’s detail in the pane, once', async () => {
+    renderApp('/runs/run-1?phase=gate', [run(threePhases()), artifact(patchPayload())])
+    const detail = await screen.findByTestId('phase-detail')
+    expect(await within(detail).findByRole('button', { name: /^approve$/i })).toBeInTheDocument()
+    // ONCE, ACROSS THE WHOLE SCREEN, and this is the assertion that decides the
+    // mechanism. The obvious way to build two presentations is two subtrees
+    // that both render the open phase — Task 8's nav does exactly that with its
+    // badge — but this body hosts `<ApprovalSurface>`, and
+    // `decision-rules.testkit.ts` asserts with UNSCOPED `screen` queries on
+    // behalf of three hosts. A second mount would make the kit's
+    // `findByText(/approve grant/i)` throw on multiple matches in the test
+    // below, so the two presentations here share one body rather than each
+    // owning one.
+    expect(screen.getAllByRole('button', { name: /^approve$/i })).toHaveLength(1)
+  })
+
+  it('drives both presentations from the one ?phase= param', async () => {
+    const router = renderApp('/runs/run-1?phase=impl', [
+      run(threePhases()),
+      artifact(patchPayload()),
+    ])
+    const rail = await screen.findByTestId('phase-rail')
+    // `"page"` and not `"true"`, and the value is MEASURED: `<Link>` marks the
+    // row it considers active and `activeOptions.includeSearch` defaults true,
+    // so the marked row is the one whose `?phase=` matches the address bar. An
+    // explicit `aria-current` on the link was overridden by the router — see
+    // `PhaseRail`. This assertion is the only thing in the tree pinning that
+    // default: without it, a router upgrade that stopped comparing search would
+    // mark every row current and nothing would fail.
+    expect(within(rail).getByRole('link', { name: /impl/ })).toHaveAttribute('aria-current', 'page')
+    expect(within(rail).getByRole('link', { name: /gate/ })).not.toHaveAttribute('aria-current')
+
+    // The rail SETS the param where the phone row toggles it: on a master
+    // detail layout, clicking the row you are already reading must not empty
+    // the pane you are reading it in.
+    await userEvent.click(within(rail).getByRole('link', { name: /gate/ }))
+    await waitFor(() => expect(router.state.location.search).toEqual({ phase: 'gate' }))
+    const detail = screen.getByTestId('phase-detail')
+    expect(await within(detail).findByRole('button', { name: /^approve$/i })).toBeInTheDocument()
+    expect(within(rail).getByRole('link', { name: /gate/ })).toHaveAttribute('aria-current', 'page')
+    expect(within(rail).getByRole('link', { name: /impl/ })).not.toHaveAttribute('aria-current')
+  })
+
+  it('says a run has materialized nothing once, not once per presentation', async () => {
+    // `phases: null` is a body the server really sends — a run created but not
+    // yet compiled — and BOTH surfaces have something to say about it: the
+    // timeline reports the empty graph, and the pane's caption would otherwise
+    // invite a person to pick from a rail with nothing in it. The rail renders
+    // nothing at all here, and the caption is suppressed with it.
+    renderApp('/runs/run-1', [run({ phases: null })])
+    expect(await screen.findByText(/nothing of its graph has been materialized/i)).toBeVisible()
+    expect(screen.queryByTestId('phase-rail')).toBeNull()
+    expect(screen.queryByText(/pick a phase/i)).toBeNull()
+  })
+
   it('carries the decision rules of every host', async () => {
     // The SAME assertions Task 11 exports, run against this host. §7 asks for
     // them on all three surfaces because §5's all-or-nothing rule is what a

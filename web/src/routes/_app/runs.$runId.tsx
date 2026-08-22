@@ -1,5 +1,5 @@
 import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, Link } from '@tanstack/react-router'
 import { z } from 'zod'
 import { ApiError } from '../../api/errors'
 import { ApprovalSurface } from '../../approvals/approval-surface'
@@ -57,9 +57,110 @@ function RunDetail() {
   return (
     <section className="flex flex-col gap-4">
       <RunHeader run={run} />
-      <PhaseTimeline run={run} spine={spine} openPhase={openPhase} onToggle={toggle} />
+      {/* THE TWO PRESENTATIONS OF ONE TIMELINE (decisions §7, run detail A):
+          phone reads top to bottom with each phase expanding in place; wide
+          viewports get the same spine as a left rail with the open phase's
+          detail beside it. CSS chooses, exactly as `shell/nav.tsx` does — jsdom
+          applies no media queries, so both are present in every component test
+          and every test that could otherwise match across them is scoped by
+          testid.
+
+          WHAT IS DUPLICATED IS THE SUMMARY, NEVER THE BODY. The rail restates
+          each phase's one-line summary (`PhaseSummary`, rendered by both hosts
+          so the two cannot drift); the expanded body — which mounts
+          `<ApprovalSurface>` — renders once, inside the pane. See the "once"
+          assertion in this route's suite for why that is a hard constraint and
+          not a preference. */}
+      <div className="md:flex md:items-start md:gap-4">
+        <PhaseRail runId={runId} spine={spine} openPhase={openPhase} />
+        <div data-testid="phase-detail" className="min-w-0 md:flex-1">
+          <PhaseTimeline run={run} spine={spine} openPhase={openPhase} onToggle={toggle} />
+          {spine.length > 0 && !spine.some((p) => p.node_id === openPhase) && (
+            /* `md:` ONLY: on a phone a closed timeline is the resting state
+               and needs no caption, while on a wide viewport the pane beside
+               the rail would otherwise be an unexplained empty column. The
+               `spine.length` guard is not redundant with the `some`: with no
+               phases at all `some` is false too, and `PhaseTimeline` is
+               already saying that this run has materialized nothing — two
+               messages for one condition, on the desktop surface only. */
+            <p className="text-text-muted hidden pt-3 text-sm md:block">
+              Pick a phase to see what it did.
+            </p>
+          )}
+        </div>
+      </div>
       <EventLog runId={runId} />
     </section>
+  )
+}
+
+/**
+ * THE RAIL IS THE SPINE RESTATED AS NAVIGATION, and the change of control is
+ * deliberate. A phone row is a disclosure — it owns the thing it opens, so it
+ * is a `<button>` with `aria-expanded` that toggles. A rail row selects what
+ * fills a pane somewhere else on the screen: that is a destination, so it is a
+ * `<Link>` with an href somebody can copy, open in a new tab, or land on from
+ * Home's gate cards. It SETS `?phase=` rather than toggling it, because
+ * clicking the row you are already reading must not empty the pane you are
+ * reading it in.
+ *
+ * Every `to`/`search` here is checked by the compiler through Task 1's
+ * `Register` augmentation, the same property `shell/nav.tsx` leans on.
+ *
+ * WHICH ROW READS AS CURRENT IS THE ROUTER'S ANSWER, NOT THIS FILE'S, and that
+ * is measured rather than assumed. `<Link>` writes `aria-current="page"` on the
+ * link it considers active, and `activeOptions.includeSearch` defaults TRUE —
+ * so with every row pointing at the same route, the marked row is the one whose
+ * `?phase=` matches the address bar, which is exactly the open phase. MEASURED
+ * twice: an explicit `aria-current={open ? 'true' : undefined}` here rendered
+ * `"page"` on the open row and nothing on the others — i.e. the router
+ * overrode the prop — and deleting the prop changed neither. It is left out
+ * because a prop with no effect on the DOM is a claim the code does not make;
+ * "drives both presentations from the one ?phase= param" is what pins the
+ * default, and it fails loudly if a router upgrade ever stops including search.
+ */
+function PhaseRail(props: { runId: string; spine: Phase[]; openPhase: string | undefined }) {
+  if (props.spine.length === 0) return null
+  return (
+    <ol
+      data-testid="phase-rail"
+      aria-label="Phases"
+      className="border-border hidden w-64 shrink-0 flex-col rounded-md border md:flex"
+    >
+      {props.spine.map((phase) => {
+        const open = props.openPhase === phase.node_id
+        return (
+          <li key={phase.node_id} className="border-border border-b last:border-b-0">
+            <Link
+              to="/runs/$runId"
+              params={{ runId: props.runId }}
+              search={{ phase: phase.node_id }}
+              className={`flex flex-col gap-1 px-3 py-2 text-sm ${open ? 'bg-surface text-text' : 'text-text-muted'}`}
+            >
+              <PhaseSummary phase={phase} />
+            </Link>
+          </li>
+        )
+      })}
+    </ol>
+  )
+}
+
+/**
+ * One phase in one line, rendered by BOTH hosts. Two copies of these three
+ * fields would drift the first time one gains a field, and the surface that
+ * lost it would be whichever one the author was not looking at.
+ */
+function PhaseSummary(props: { phase: Phase }) {
+  const { phase } = props
+  return (
+    <>
+      <span className="font-mono">{phase.node_id}</span>
+      <span className="text-text-muted font-mono text-xs">{phase.status}</span>
+      <span className="text-text-muted font-mono text-xs">
+        attempt {phase.attempt}/{phase.max_attempts}
+      </span>
+    </>
   )
 }
 
@@ -113,6 +214,12 @@ function RunHeader(props: { run: Run }) {
  * order, each a disclosure that expands IN PLACE. The timeline is the screen,
  * not an index into other screens, which is what locked run detail (A) decides.
  *
+ * ON A WIDE VIEWPORT THIS ELEMENT IS THE DETAIL PANE, and it is the same list
+ * either way: `PhaseRail` shows the spine beside it and every closed row here
+ * drops out, so what remains in the pane is the open phase's body. The rows do
+ * not stop existing — `data-state` and the `phase-*` testids are what the
+ * live-update tests read, at both widths.
+ *
  * NO LIVE AGENT OUTPUT, anywhere in here. §10.4: no route serves an agent's
  * log. What the run records instead is a `log_ref` artifact
  * (`runs/compile.go:22`) pointing at bytes on the runner's disk, and serving
@@ -133,7 +240,10 @@ function PhaseTimeline(props: {
     )
   }
   return (
-    <ol data-testid="phase-timeline" className="border-border flex flex-col rounded-md border">
+    <ol
+      data-testid="phase-timeline"
+      className="border-border flex flex-col rounded-md border md:rounded-none md:border-0"
+    >
       {props.spine.map((phase) => {
         const open = props.openPhase === phase.node_id
         return (
@@ -142,22 +252,23 @@ function PhaseTimeline(props: {
             data-testid={`phase-${phase.node_id}`}
             data-node-id={phase.node_id}
             data-state={phase.status}
-            className="border-border border-b last:border-b-0"
+            // A CLOSED ROW IS THE RAIL'S JOB ON A WIDE VIEWPORT, so it leaves
+            // the pane rather than stacking N empty bordered strips above the
+            // one body the pane exists to show. The row is still in the DOM,
+            // still carries `data-state`, and is still what the live-update
+            // tests read — `md:hidden` is a paint decision.
+            className={`border-border border-b last:border-b-0 md:border-b-0 ${open ? '' : 'md:hidden'}`}
           >
             <button
               type="button"
               onClick={() => props.onToggle(phase.node_id)}
               aria-expanded={open}
-              className="text-text flex w-full items-center gap-2 px-3 py-3 text-left text-sm"
+              className="text-text flex w-full items-center gap-2 px-3 py-3 text-left text-sm md:hidden"
             >
-              <span className="font-mono">{phase.node_id}</span>
-              <span className="text-text-muted font-mono text-xs">{phase.status}</span>
-              <span className="text-text-muted font-mono text-xs">
-                attempt {phase.attempt}/{phase.max_attempts}
-              </span>
+              <PhaseSummary phase={phase} />
             </button>
             {open && (
-              <div className="border-border border-t px-3 py-3">
+              <div className="border-border border-t px-3 py-3 md:rounded-md md:border">
                 <PhaseBody run={props.run} phase={phase} />
               </div>
             )}
