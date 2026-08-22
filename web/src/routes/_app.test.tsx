@@ -16,7 +16,7 @@ import {
 // caller would fail the first test in this file rather than pass it quietly.
 
 describe('the protected layout', () => {
-  it('sends an unauthenticated visit to a loader-bearing route to /login, exactly once', async () => {
+  it('sends an unauthenticated visit to a loader-bearing route to /login, on a REPLACED entry', async () => {
     // THIS TEST CHANGED ITS MEANING IN PLAN 12a AND THE CHANGE IS THE POINT.
     //
     // It used to navigate to /tasks BECAUSE that route issued no request of its

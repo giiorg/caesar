@@ -67,10 +67,11 @@ export function Nav(props: { approvalCount: number }) {
 
        THE TWO PRESENTATIONS ARE CSS, NOT TWO <nav> ELEMENTS. jsdom applies no
        media queries, so a second nav would be present in every component test
-       and would make getByRole('navigation') ambiguous in _app.test.tsx's ten
-       call sites and in e2e/approvals.spec.ts. Both presentations therefore
-       render the badge: which one a person sees is a viewport's decision, and a
-       badge in only one of them is a badge missing on one of the two surfaces. */
+       and would make the 'navigation' role ambiguous in _app.test.tsx's nine
+       findByRole call sites and e2e/approvals.spec.ts's two getByRole ones.
+       Both presentations therefore render the badge: which one a person sees is
+       a viewport's decision, and a badge in only one of them is a badge missing
+       on one of the two surfaces. */
     <nav aria-label="Sections" className="md:order-first">
       <div data-testid="phone-tabs" className="border-border bg-surface flex border-t md:hidden">
         {PHONE_TABS.map((item) => (

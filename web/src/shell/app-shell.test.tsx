@@ -123,12 +123,13 @@ describe('the phone tab bar', () => {
   })
 
   it('keeps one navigation landmark', () => {
-    // _app.test.tsx finds the shell with getByRole('navigation') in ten places
-    // and e2e/approvals.spec.ts in one. A second <nav> for the desktop rail
-    // would make every one of those ambiguous — and jsdom applies no media
-    // queries, so both would be present regardless of viewport. The two
-    // presentations are CSS inside ONE landmark, which is why this is asserted
-    // here rather than left to whichever unrelated test happened to break.
+    // _app.test.tsx finds the shell with findByRole('navigation') in nine
+    // places and e2e/approvals.spec.ts with getByRole in two. A second <nav>
+    // for the desktop rail would make every one of those ambiguous — and jsdom
+    // applies no media queries, so both would be present regardless of
+    // viewport. The two presentations are CSS inside ONE landmark, which is why
+    // this is asserted here rather than left to whichever unrelated test
+    // happened to break.
     renderShell()
     expect(screen.getAllByRole('navigation')).toHaveLength(1)
   })
