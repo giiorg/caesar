@@ -205,10 +205,10 @@ describe('the layout as the single stream owner', () => {
       ),
     ])
     await screen.findByRole('navigation')
-    // On the router's own state, not on rendered text: "Home" appears twice
-    // once you land there — the nav link and the stub panel — and a text query
-    // would fail with "found multiple elements" for a reason that has nothing
-    // to do with the session.
+    // On the router's own state, not on rendered text. The subject here is
+    // WHERE the tab ended up, and Home's rendering is Task 13's business —
+    // asserting on whatever it happens to say would make this session test go
+    // red for a reason that has nothing to do with the session.
     await waitFor(() => expect(router.state.location.pathname).toBe('/'))
   })
 

@@ -23,9 +23,20 @@ import { type Run, runQueryOptions } from '../../runs/run-query'
  * while `?phase=42` arrives as the NUMBER 42 — MEASURED, and pinned by
  * "survives a phase param that is not even a string" in this route's suite.
  * `parse` would throw on it and take the whole run screen down over a link
- * somebody mistyped. An unparseable search reads as no phase named, which lands
- * on the timeline: the same place a param naming a node this run does not have
- * lands.
+ * somebody mistyped.
+ *
+ * WHAT `safeParse` BUYS IS "DOES NOT THROW", AND NOTHING ELSE — corrected in
+ * Task 13 after measuring it. Rejecting a value does NOT remove it: a route's
+ * search is its ancestors' search with its own validated result merged over it,
+ * and nothing between `/` and here declares `validateSearch`, so the ancestors
+ * contribute the whole raw object. MEASURED on the sibling list route
+ * (`runs.index.tsx`, which records the transcript): `validateSearch` returned
+ * `{}` and both `loaderDeps` and `useSearch()` still received the number. So
+ * `openPhase` below really can hold a non-string, and `phase?: string` is a
+ * type the runtime is free to violate. It lands on the timeline anyway — every
+ * comparison against a node id is false — which is the same place a param
+ * naming a node this run does not have lands. A future reader adding a
+ * `phase.startsWith(...)` or handing it to a template is the one this warns.
  */
 const searchSchema = z.object({ phase: z.string().optional() })
 

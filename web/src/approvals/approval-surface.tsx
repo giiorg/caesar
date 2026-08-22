@@ -1,7 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
-import { ApiError } from '../api/errors'
-import { ApiErrorPanel } from '../errors/api-error-panel'
+import { QueryFailure } from '../errors/query-failure'
 import type { GateEvidence } from '../gates/decide-gate'
 import { GateControls } from '../gates/gate-controls'
 import { type DiffFile, decodePatch, type ParsedPatch } from '../patch/decode-patch'
@@ -88,17 +87,6 @@ export function ApprovalSurface(props: {
 }
 
 const isPlan = (evidence: GateEvidence) => evidence.examined_artifact_type === 'plan'
-
-/** What a query that finished badly should say, correlation id included. */
-function QueryFailure(props: { error: unknown; fallback: string }) {
-  // ApiErrorPanel rethrows anything that is not ours, and `error` here is not
-  // always an ApiError: openapi-fetch propagates fetch's own TypeError from a
-  // request that never reached the server. Narrowing is what keeps a dropped
-  // connection from becoming a render-time throw in whichever route is hosting
-  // this surface.
-  if (props.error instanceof ApiError) return <ApiErrorPanel error={props.error} />
-  return <p className="text-text-muted text-sm">{props.fallback}</p>
-}
 
 /**
  * 1. THE AGENT SUMMARY, and the block that is absent rather than empty.

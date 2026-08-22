@@ -6,7 +6,7 @@ import type { GateEvidence } from '../../gates/decide-gate'
 import { expectDecisionRules } from '../../gates/decision-rules.testkit'
 import { onTheWire } from '../../runs/on-the-wire.testkit'
 import type { Run } from '../../runs/run-query'
-import { renderApp } from '../../test/render-app'
+import { renderApp, scriptedStream } from '../../test/render-app'
 
 type Phase = NonNullable<Run['phases']>[number]
 type Publication = NonNullable<Run['publications']>[number]
@@ -177,53 +177,6 @@ const events = (rows: unknown[] | (() => unknown[])) =>
   http.get('/api/v1/runs/:id/events', () =>
     HttpResponse.json({ events: typeof rows === 'function' ? rows() : rows }),
   )
-
-/**
- * The attention stream, under the test's control rather than the clock's.
- *
- * `render-app.tsx` already offers `silentStream` (opens, says nothing) and
- * `pendingStream` (never answers); this is the third shape and the only one a
- * live-update test can use — a handler that hands its controller back so a
- * frame can be written at a chosen moment, AFTER the screen under test has
- * rendered. It stays in this file because it has exactly one consumer.
- *
- * `emit` awaits the open, so a frame written before the transport's fetch has
- * been dispatched is queued rather than dropped on the floor. Without that the
- * test races the layout's effect and fails intermittently for a reason that has
- * nothing to do with its subject.
- */
-function scriptedStream() {
-  const enc = new TextEncoder()
-  let open!: (c: ReadableStreamDefaultController<Uint8Array>) => void
-  const opened = new Promise<ReadableStreamDefaultController<Uint8Array>>((res) => {
-    open = res
-  })
-  let seq = 0
-  return {
-    handler: http.get(
-      '/api/v1/stream',
-      () =>
-        new HttpResponse(
-          new ReadableStream({
-            start: (c) => open(c),
-          }),
-          { headers: { 'content-type': 'text/event-stream' } },
-        ),
-    ),
-    async emit(f: { kind: string; run_id: string }): Promise<void> {
-      const c = await opened
-      seq += 1
-      const data = JSON.stringify({
-        id: seq,
-        run_id: f.run_id,
-        kind: f.kind,
-        payload: {},
-        occurred_at: AT,
-      })
-      c.enqueue(enc.encode(`id: ${seq}\nevent: ${f.kind}\ndata: ${data}\n\n`))
-    },
-  }
-}
 
 describe('run detail', () => {
   it('reads top to bottom as the phase graph', async () => {

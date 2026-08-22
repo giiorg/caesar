@@ -1,5 +1,6 @@
 import { Link } from '@tanstack/react-router'
 import type { components } from '../api/schema'
+import { InboxEmpty } from './inbox-empty'
 
 type Approval = components['schemas']['ApiApprovalResponse']
 
@@ -13,20 +14,13 @@ type Approval = components['schemas']['ApiApprovalResponse']
  * exactly the thing they will want to forward — neither of which survives an
  * open state that lives only in React.
  *
- * THE TWO EMPTY STATES ARE DIFFERENT ANSWERS AND MUST STAY DIFFERENT.
- * "Nothing is waiting on you" is a statement about the inbox; "no projects are
- * shared with you yet" is a statement about grants. Collapsing them tells a
- * user with no access that they are all caught up, which is the one reading
- * that makes the screen useless to the person it is happening to.
+ * The two empty states live in `InboxEmpty` because Home's "Needs you" section
+ * is the same inbox and must give the same pair of answers; that module carries
+ * the rule and the reason.
  */
 export function ApprovalList(props: { approvals: Approval[]; scopeEmpty: boolean }) {
-  if (props.approvals.length === 0) {
-    return (
-      <p className="text-text-muted text-sm">
-        {props.scopeEmpty ? 'No projects are shared with you yet.' : 'Nothing is waiting on you.'}
-      </p>
-    )
-  }
+  if (props.approvals.length === 0) return <InboxEmpty scopeEmpty={props.scopeEmpty} />
+
   return (
     <ul className="flex flex-col gap-2">
       {props.approvals.map((a) => (

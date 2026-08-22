@@ -58,6 +58,54 @@ export const pendingStream = () =>
   })
 
 /**
+ * A stream the TEST writes frames on — the third shape, beside `silentStream`
+ * (opens, says nothing) and `pendingStream` (never answers).
+ *
+ * This is the only one a live-update test can use: it hands its controller back
+ * so a frame can be written at a chosen moment, AFTER the screen under test has
+ * rendered. Everything downstream of it is production code — the transport, the
+ * cache bridge's debounce window and react-query's refetch — so a test built on
+ * it asserts on the rendered DOM rather than on a request count.
+ *
+ * `emit` awaits the open, so a frame written before the transport's fetch has
+ * been dispatched is queued rather than dropped on the floor. Without that a
+ * test races the layout's effect and fails intermittently for a reason that has
+ * nothing to do with its subject.
+ */
+export function scriptedStream() {
+  const enc = new TextEncoder()
+  let open!: (c: ReadableStreamDefaultController<Uint8Array>) => void
+  const opened = new Promise<ReadableStreamDefaultController<Uint8Array>>((res) => {
+    open = res
+  })
+  let seq = 0
+  return {
+    handler: http.get(
+      '/api/v1/stream',
+      () =>
+        new HttpResponse(
+          new ReadableStream({
+            start: (c) => open(c),
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        ),
+    ),
+    async emit(f: { kind: string; run_id: string }): Promise<void> {
+      const c = await opened
+      seq += 1
+      const data = JSON.stringify({
+        id: seq,
+        run_id: f.run_id,
+        kind: f.kind,
+        payload: {},
+        occurred_at: '2026-08-20T00:00:00Z',
+      })
+      c.enqueue(enc.encode(`id: ${seq}\nevent: ${f.kind}\ndata: ${data}\n\n`))
+    },
+  }
+}
+
+/**
  * Mount the real router at a path, with the real query client, against MSW.
  *
  * HANDLER ORDER IS MEASURED, NOT ASSUMED. Within a single `server.use(...)`
@@ -77,12 +125,15 @@ export function renderApp(path: string, handlers: RequestHandler[] = []) {
     // `runs: null`, not `[]`. A Go nil slice marshals to null and the contract
     // permits it, so this is a body the server may really send — the handler
     // happens to build `make(...)` today
-    // (backend/internal/runs/api/dto.go:487), which is why the empty case is
-    // the one nothing would otherwise ever exercise. Picking the permitted
-    // shape costs nothing now (no route fetches /api/v1/runs yet) and puts
-    // `runsQueryOptions`'s `?? []` on the path of the first screen that
-    // mounts a list, instead of leaving that branch unreachable from every
-    // test in the tree.
+    // (backend/internal/runs/api/dto.go:525), which is why the empty case is
+    // the one nothing would otherwise ever exercise. It puts
+    // `runsQueryOptions`'s `?? []` on the path of the first screen that mounts
+    // a list, instead of leaving that branch unreachable from every test in the
+    // tree. Task 13 mounted that screen — Home and `/runs` both read this
+    // endpoint now — and the bet paid: with the `?? []` deleted, SEVEN tests
+    // across `_app.test.tsx` and `approvals.test.tsx` die on `null.filter`,
+    // every one of them a test that renders `/` and cares about something
+    // else entirely.
     http.get('/api/v1/runs', () => HttpResponse.json({ runs: null, next_cursor: null })),
     // `events: null`, for the same reason `runs: null` is null above: the
     // contract marks it required AND nullable (a Go nil slice marshals to

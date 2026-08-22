@@ -296,8 +296,16 @@ describe('/approvals', () => {
     // The global redirect interceptor is NOT what does this: it is armed in
     // `router.ts`, which only `main.tsx` imports, so under this harness
     // `redirectToLogin` is still its no-op default.
+    //
+    // AND THE ROUND TRIP HAS TO TERMINATE, which is why this test also pins
+    // Home's degradation. `/api/v1/approvals` is 401 for the whole test, and
+    // Home reads that endpoint too — so a Home that suspended on it would
+    // bounce straight back into this same boundary and go round forever.
+    // MEASURED while Task 13 was being built: 44 seconds and
+    // `Ineffective mark-compacts near heap limit`. Home renders its inbox
+    // section as unread instead, which is what makes `/` a resting place.
     const router = renderApp('/approvals', [http.get('/api/v1/approvals', noSession)])
-    expect(await screen.findByText(/not built yet/i)).toBeInTheDocument()
+    expect(await screen.findByTestId('status-line')).toBeInTheDocument()
     expect(router.state.location.pathname).toBe('/')
   })
 
