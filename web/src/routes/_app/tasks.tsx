@@ -12,9 +12,11 @@ import { type Task, tasksQueryOptions } from '../../tasks/tasks-query'
 /**
  * This route HAD no loader, deliberately, and `_app.test.tsx` navigated here
  * because of it: a route that issues no request is the case a redirect-on-401
- * design cannot catch. Plan 12a gives it one, and the guard test is rehomed
- * onto this route in the next commit rather than being allowed to quietly
- * assert less. See `_app.test.tsx`'s first case.
+ * design cannot catch. Plan 12a gives it one, so that case moved to /more,
+ * which asks the server for nothing, and the test that stayed here asserts
+ * what only a loader-bearing route can show instead — that the child loader
+ * really does run and really is rejected on the same load the layout redirects.
+ * See `_app.test.tsx`'s first two cases.
  */
 export const Route = createFileRoute('/_app/tasks')({
   loader: ({ context }) =>

@@ -16,24 +16,77 @@ import {
 // caller would fail the first test in this file rather than pass it quietly.
 
 describe('the protected layout', () => {
-  it('sends a direct unauthenticated visit to a STUB route to /login', async () => {
-    // The whole reason this layout exists: a stub makes no request to be
-    // rejected, so without a loader it would render the full shell to anyone.
-    const router = renderApp('/tasks', [http.get('/api/v1/auth/me', noSession)])
+  it('sends an unauthenticated visit to a loader-bearing route to /login, exactly once', async () => {
+    // THIS TEST CHANGED ITS MEANING IN PLAN 12a AND THE CHANGE IS THE POINT.
+    //
+    // It used to navigate to /tasks BECAUSE that route issued no request of its
+    // own, and it carried two properties at once on the strength of that. Task
+    // 14 gave /tasks a loader, so they are two tests now: this one on a route
+    // that fetches, the next one on a route that does not.
+    //
+    // The fix that was rejected: invent a loader-free route to keep the old
+    // property on /tasks. That is a seam with no production caller — a mistake
+    // this project has already paid for, where a test-only affordance made all
+    // five of its own tests vacuous. The next test uses /more instead, which is
+    // a real page reached from a real tab.
+    let taskRequests = 0
+    const router = renderApp('/tasks', [
+      http.get('/api/v1/auth/me', noSession),
+      http.get('/api/v1/tasks', () => {
+        taskRequests += 1
+        return noSession()
+      }),
+    ])
     expect(await screen.findByRole('button', { name: /sign in/i })).toBeInTheDocument()
 
-    // AND IT MUST BE THE LOADER THAT DID IT. Without this line the test is
-    // VACUOUS — MEASURED: neuter the loader's ensureQueryData and all three
-    // tests still pass, because AppLayout's useSuspenseQuery then throws the
-    // same 401 and AppErrorBoundary navigates to the same place. The visible
-    // outcome is identical; the history is not.
+    // THE ROUTE REALLY IS LOADER-BEARING, and that is this test's premise
+    // rather than a detail. MEASURED: the router runs the layout loader and the
+    // child loader on the same load, so /api/v1/tasks IS requested and IS
+    // rejected even though the layout's redirect wins. Delete /tasks' loader
+    // and this line goes to 0 — which is exactly how this test would decay back
+    // into the no-request case it no longer claims to cover.
+    expect(taskRequests).toBe(1)
+
+    // ONE ENTRY. A loader `throw redirect()` during the initial load REPLACES
+    // it; a navigate() from a rendered error boundary PUSHES one, leaving
+    // /tasks behind /login in the back stack — so Back returns the visitor to a
+    // route they cannot see and re-runs the whole failed load.
     //
-    // A loader `throw redirect()` during the initial load REPLACES the entry
-    // (length 1). A navigate() from a rendered error boundary PUSHES one
-    // (length 2), leaving /tasks behind /login in the back stack — so Back
-    // returns the visitor to a route they cannot see and re-runs the whole
-    // failed load. Resolving the session before anything renders is the
-    // property this route exists for, and this is what makes it falsifiable.
+    // Without this line the test is VACUOUS — MEASURED: neuter _app's
+    // ensureQueryData and it still passes, because AppLayout's
+    // useSuspenseQuery then throws the same 401 with no data to fall back on
+    // and AppErrorBoundary navigates to the same place. The visible outcome is
+    // identical (the sign-in assertion above stays green under that mutant);
+    // the history is not.
+    //
+    // WHAT THIS LINE DOES NOT SAY, so that nobody adds the claim back: it is
+    // not a redirect COUNT. MEASURED — a redirect thrown from a loader can
+    // never add an entry, because the router spreads the redirect's options and
+    // then hard-sets `replace: true` over them (router-core load-client.js,
+    // `followRedirect`). Making /tasks' loader throw a second /login redirect
+    // of its own leaves this at 1. Loader-versus-rendered-tree is the only
+    // distinction it draws, and that is the one worth drawing.
+    expect(router.history.length).toBe(1)
+    expect(router.state.location.pathname).toBe('/login')
+  })
+
+  it('sends an unauthenticated visit to a route with NO REQUEST OF ITS OWN to /login', async () => {
+    // THE CASE A REDIRECT-ON-401 DESIGN CANNOT CATCH, kept rather than given
+    // up. The brief for this rewrite dropped it on the premise that after Plan
+    // 12a no loader-free route remains; MEASURED FALSE — /more has no loader
+    // (routes/_app/more.tsx:13), it renders SECONDARY and asks the server for
+    // nothing, and /admin, /repos and /workflows are loader-free too.
+    //
+    // What it buys over the test above, MEASURED: move the session check out of
+    // the layout loader and into each data route's loader, and the test above
+    // still passes — /tasks would guard itself on the way to its own data.
+    // This one goes to 2, because this route asks the server for nothing, so a
+    // per-fetch guard has nothing to run on and the visitor is turned away only
+    // after the shell has tried to render, from the error boundary, onto a
+    // pushed entry. Guarding the LAYOUT rather than the fetches is the
+    // property, and this is the only test in the suite that can see it.
+    const router = renderApp('/more', [http.get('/api/v1/auth/me', noSession)])
+    expect(await screen.findByRole('button', { name: /sign in/i })).toBeInTheDocument()
     expect(router.history.length).toBe(1)
   })
 
