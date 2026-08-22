@@ -4196,12 +4196,31 @@ export const Route = createFileRoute('/_app/')({
 })
 ```
 
+> **(corrected in execution — see ledger.) THIS LOADER IS NOT WHAT SHIPPED, AND
+> THE SHAPE ABOVE HANGS THE APP.** `Promise.all` + `useSuspenseQuery` makes Home
+> suspend and throw, and `/` is where `/login`'s guard sends every authenticated
+> visitor: an endpoint answering 401 while `/auth/me` stays healthy sends this
+> loader into `_app`'s error boundary, the boundary navigates to `/login`, the
+> guard proves the session and sends the visitor back to `/`, and the cycle never
+> ends. MEASURED — the vitest worker ran 44 seconds and died with `Ineffective
+> mark-compacts near heap limit`; M18 in Task 13's report reproduces it, and the
+> reviewer verified the mechanism independently.
+>
+> What shipped is `Promise.allSettled` with each section reading its own
+> `useQuery` and rendering what it could not read, with the correlation id. **The
+> deviation was routed to sofo and RATIFIED on 2026-08-22.** It is also the better
+> screen: a failing inbox endpoint has no business hiding the run list, and
+> `_app.tsx` already reasons that way about the nav badge. The loader is kept —
+> what it buys is a router-level head start that `defaultPreload: 'intent'` can
+> begin on hover — but a rejection is not a reason to take the screen down.
+> `web/src/routes/_app/index.tsx`'s header carries the whole argument.
+
 Sections:
 
 - **Status line** — `<p data-testid="status-line">` with `{running} running · {waiting} waiting on you`, both counted from the two lists already in hand. When both are zero it says so plainly rather than rendering an empty bar.
 - **Needs you** — the approvals list as gate cards. Each card: task title (a link to the run), the node and what kind of artifact it examines, waiting-since, and `<GateControls>` with `evidence` straight off the row.
 - **Running** — runs whose status is `running`, `pending` or `waiting`, as `RunCard`s.
-- **Recent** — the rest of the list, capped at ten, newest first. **`log()` nothing and hide nothing**: if the cap drops rows, the section says "showing the 10 most recent" — a silent truncation reads as "this is everything".
+- **Recent** — the rest of the list, capped at ten, newest first. **`log()` nothing and hide nothing**: if the cap drops rows, the section says "showing the 10 most recent" — a silent truncation reads as "this is everything". **(corrected in execution — see ledger.)** "Newest first" is not the order the page arrives in: the server sorts by `created_at`, the cursor's own sort key, i.e. when a run was *requested* — so a run started yesterday and finished a minute ago would sit at the bottom of a section captioned "Recent". The shipped section re-sorts ONE PAGE by `runCardTime` (the timestamp the card itself shows), which is why the cap states how many of how many.
 
 - [ ] **Step 5: Run them and confirm they pass**
 
@@ -4513,6 +4532,16 @@ git commit -m "feat(web): Tasks — four attention groups over seven run statuse
 
 `_app.test.tsx` navigates to `/tasks` **because that route issues no request** — it proves the 401 redirect fires in the case no server rejection can produce. Task 14 gave Tasks a loader and destroyed that property. After 12a, plausibly no loader-free route remains.
 
+> **(corrected in execution — see ledger.) FOUR LOADER-FREE ROUTES REMAIN AFTER
+> 12a**, so the no-request case was never lost and did not have to be given up:
+> `/more`, `/admin`, `/repos` and `/workflows` all declare no loader. The
+> implementer measured this, kept the case, and retargeted it at `/more`. **The
+> deviation was routed to sofo and RATIFIED on 2026-08-22: both guard tests
+> stay.** The rejected-fix rationale in the next paragraph does not reach `/more`
+> — it is `PHONE_TABS`' fifth entry and a real page a person visits, not a seam
+> invented for a test. The two tests were proved non-redundant in **both**
+> directions: each has a mutant that kills it alone.
+
 **Inventing a route to keep the test green would be a seam with no production caller** — a mistake this project has already paid for once, where a test-only affordance made all five of its own tests vacuous.
 
 **But "assert the guard directly" is not the fix either.** `_app` authenticates in its **`loader`**, not in `beforeLoad` (`_app.tsx:25`), and a direct callback assertion would drop the router-and-history behaviour the current test actually proves: that exactly one redirect fires and `/login` **replaces** the entry rather than stacking on it.
@@ -4529,13 +4558,25 @@ So the rehoming keeps a **router-level** unauthorized-navigation test, retargete
 - [ ] **Step 1: Rewrite the first test**
 
 ```tsx
-it('sends an unauthenticated visit to a loader-bearing route to /login, exactly once', async () => {
+// (corrected in execution — see ledger.) THREE THINGS IN THIS DICTATED BLOCK ARE
+// WRONG AND WERE CORRECTED BEFORE IT SHIPPED. (1) The title's "exactly once" is
+// a redirect COUNT claim that no assertion below separates from "lands on /login
+// on one replaced entry" — a loader redirect can never add an entry, because the
+// router spreads the redirect's options and then hard-sets `replace: true` over
+// them, so a second /login redirect thrown from /tasks' loader still leaves
+// history at 1. Shipped as "…to /login, on a REPLACED entry", by SOFO'S RULING
+// on 2026-08-22. (2) "plausibly no loader-free route remains" is false — see the
+// corrective note above this step. (3) `toBeLessThanOrEqual(1)` is a dead bound:
+// the child loader really does run on this load, MEASURED at exactly 1, so the
+// shipped assertion is `toBe(1)` and deleting /tasks' loader now reddens it.
+it('sends an unauthenticated visit to a loader-bearing route to /login, on a REPLACED entry', async () => {
   // THIS TEST CHANGED ITS MEANING IN PLAN 12a AND THE CHANGE IS THE POINT.
   //
   // It used to navigate to /tasks BECAUSE that route issued no request: a stub
   // makes nothing for the server to reject, which is the one case a
-  // redirect-on-401 design cannot catch. Task 14 gave /tasks a loader, and
-  // after 12a plausibly no loader-free route remains.
+  // redirect-on-401 design cannot catch. Task 14 gave /tasks a loader, so that
+  // case moved to /more — which is loader-free, and is a real page reached from
+  // a real tab.
   //
   // The two fixes that were rejected, and why:
   //
@@ -4548,8 +4589,8 @@ it('sends an unauthenticated visit to a loader-bearing route to /login, exactly 
   //   behaviour this test actually proves.
   //
   // What is preserved is the guard's OBSERVABLE BEHAVIOUR UNDER THE ROUTER:
-  // exactly one redirect, and /login REPLACES the entry rather than stacking
-  // on it. What is given up is the no-request case, knowingly.
+  // /login REPLACES the entry rather than stacking on it. The no-request case
+  // is NOT given up — it moved to /more, in the test after this one.
   let taskRequests = 0
   const router = renderApp('/tasks', [
     http.get('/api/v1/auth/me', noSession),
@@ -4565,22 +4606,40 @@ it('sends an unauthenticated visit to a loader-bearing route to /login, exactly 
   // behind /login in the back stack — so Back returns the visitor to a route
   // they cannot see and re-runs the whole failed load.
   //
-  // Without this line the test is VACUOUS: neuter _app's ensureQueryData and it
-  // still passes, because Tasks' own loader now 401s into AppErrorBoundary,
-  // which navigates to the same place. The visible outcome is identical; the
-  // history is not.
+  // Without this line the test is VACUOUS — MEASURED: neuter _app's
+  // ensureQueryData and it still passes, and (corrected in execution — see
+  // ledger) NOT for the reason written here originally. The mutant's stderr
+  // blames AppLayout's useSuspenseQuery, which throws the same 401 with no data
+  // to fall back on, and AppErrorBoundary navigates to the same place — not
+  // Tasks' own loader. Decisively: the same mutant also kills the /more test
+  // below, which has no child loader at all. The visible outcome is identical
+  // either way; the history is not.
   expect(router.history.length).toBe(1)
 
-  // AND THE CHILD LOADER'S OWN FAILURE ADDS NO SECOND REDIRECT. This is the
-  // assertion the rehoming buys and the old test could not make, because the
-  // old target had no loader to fail. Two redirects would be invisible to a
-  // person and would double every unauthenticated load in the product.
+  // THE ROUTE REALLY IS LOADER-BEARING, and that is this test's premise rather
+  // than a detail. MEASURED: the router runs the layout loader and the child
+  // loader on the same load, so /api/v1/tasks IS requested and IS rejected even
+  // though the layout's redirect wins. Delete /tasks' loader and this goes to 0,
+  // which is exactly how this test would decay back into the no-request case it
+  // no longer claims to cover.
   expect(router.state.location.pathname).toBe('/login')
-  expect(taskRequests).toBeLessThanOrEqual(1)
+  expect(taskRequests).toBe(1)
 })
 ```
 
-Update the file's leading comment, which currently explains the old target's significance.
+Then a SECOND test keeps the no-request case, on `/more`:
+
+```tsx
+it('sends an unauthenticated visit to a route with NO REQUEST OF ITS OWN to /login', async () => {
+  const router = renderApp('/more', [http.get('/api/v1/auth/me', noSession)])
+  expect(await screen.findByRole('button', { name: /sign in/i })).toBeInTheDocument()
+  expect(router.history.length).toBe(1)
+})
+```
+
+What it buys over the first is measured, not assumed: move the session check out of the layout loader and into each data route's loader, and the first test still passes — `/tasks` would guard itself on the way to its own data. This one goes to 2, because a route that asks the server for nothing gives a per-fetch guard nothing to run on, so the visitor is turned away only after the shell has tried to render, from the error boundary, onto a pushed entry. **Guarding the layout rather than the fetches is the property, and this is the only test in the suite that can see it.**
+
+Update the file's leading comment, which currently explains the old target's significance. **(corrected in execution — see ledger.)** The *leading* comment (`_app.test.tsx:13-16`) is about handler ordering and stays true; the old target's significance lives inside the first test and is replaced wholesale by the rewrite above.
 
 - [ ] **Step 2: Run it and confirm it passes**
 
@@ -4600,9 +4659,16 @@ cd web
 #    Expect: FAIL on the same line.
 # 3. Add a second redirect from the error boundary on the same load.
 #    Expect: FAIL on the pathname/one-request assertion.
+#    (corrected in execution — see ledger.) PROOF 3 IS UNSATISFIABLE IN EVERY
+#    FORM, including the controller's restatement of it, and the reviewer
+#    confirmed it at the router's own source. The boundary never renders on this
+#    load, and `followRedirect` spreads a redirect's options and then hard-sets
+#    `replace: true` over them — so a loader redirect can never add a history
+#    entry no matter how many are thrown. Proofs 1, 2, 4 and 5 carry the task
+#    instead; the shipped record has five.
 ```
 
-Record all three. Proof 1 is the one that was measured to be missing before `router.history.length` was added, and the rehoming is what puts it at risk again.
+Record them. Proof 1 is the one that was measured to be missing before `router.history.length` was added, and the rehoming is what puts it at risk again. **(corrected in execution.)** Proof 1's stderr does *not* blame `/tasks`' loader — it blames `AppLayout`'s `useSuspenseQuery`, which throws the same 401 with no data to fall back on. The decisive evidence is that the same mutant also kills the `/more` test, which has no child loader at all.
 
 - [ ] **Step 4: Gate and commit**
 
@@ -4631,8 +4697,20 @@ Cancel and retry are §10.3 and 12a ships neither. Live agent output is §10.4: 
 - Rename: `web/src/routes/_app/runs.tsx` → `web/src/routes/_app/runs.index.tsx` (and give it the real list)
 - Create: `web/src/runs/run-events-query.ts`, `web/src/runs/publication-panel.tsx`
 
+> **(corrected in execution — see ledger.) TWO SCOPE CHANGES LANDED HERE.**
+> **(a)** The sofo-ruled reorder put Task 16 ahead of Task 13, and `RunCard` is
+> Task 13's product — so this task did the rename alone (mechanically required
+> for `/runs/$runId` to be a SIBLING rather than a child of the list) and kept
+> stub content. **The real runs list moved to Task 13**, where its dependency
+> lives. **(b)** decisions §7 locks "desktop = timeline left rail + detail
+> right", which appears nowhere in this task's text and, unlike cancel, retry and
+> live output, had no deliberate-cut rationale. The implementer flagged it and
+> **sofo ruled BUILD NOW** on 2026-08-22, as a scope addition before review; it
+> shipped in `d74dc32`, needing zero edits to the 21 tests already written.
+> Design §10.9 defers two desktop behaviours, and only ⌘K is still deferred.
+
 **Interfaces:**
-- Consumes: `runQueryOptions` (Task 9), `ApprovalSurface` (Task 12), `PhaseDots` / `RunCard` (Task 13), `expectDecisionRules` (Task 11).
+- Consumes: `runQueryOptions` (Task 9), `ApprovalSurface` (Task 12), `PhaseDots` / `RunCard` (Task 13), `expectDecisionRules` (Task 11). **(corrected in execution — see ledger.)** `runs.$runId.tsx` consumes **neither** `PhaseDots` nor `RunCard`: the timeline is a row per node with its status as visible text, not a dot row, and `PhaseDots`' only importers in the tree are `run-card.tsx` and `tasks.tsx`. This line is the origin of the false `PhaseDots` framing that reached Task 17's spec comment.
 - Produces: the `/runs/$runId` route string; nothing later consumes it.
 
 - [ ] **Step 1: Write the failing tests**
@@ -4832,7 +4910,15 @@ git commit -m "feat(web): run detail — the timeline spine, the gate surface in
 
 ### Task 17: Playwright — the three mobile-critical paths
 
-Playwright extends Plan 11's existing rig: Postgres up, migrations applied, admin bootstrapped, the Vite build embedded into a `-tags embedui` binary, specs run against it, `runs.Executor` faked and **nothing else**. Plan 11 built that lane precisely so 12a could add specs to something that already works.
+Playwright extends Plan 11's existing rig: Postgres up, migrations applied, admin bootstrapped, the Vite build embedded into a `-tags embedui` binary, specs run against it, `runs.Executor` faked and **nothing else**.
+
+> **(corrected in execution — see ledger.)** "Nothing else" was already imprecise
+> at Plan 11 — a forge stub answers the one outbound call `resolveIntake` makes —
+> and 12a added a second thing this sentence has to name: **the fake executor is
+> pointed at a REAL BARE REPOSITORY** (`fake.InitBareRepo` + `executor.Remote`),
+> which makes `git` on `PATH` a dependency of this lane. Why, in Step 1 below.
+
+Plan 11 built that lane precisely so 12a could add specs to something that already works.
 
 **Paths 1 and 3 are the operator interface for row 08's smoke — not a substitute for it.** The checklist in `backend/README.md` is forge-side and Playwright can observe none of it: a throwaway repo on **each** forge (GitHub *and* GitLab, because the two adapters' response shapes and error mappings are invented until a live call proves them); a branch named `caesar/<approved-artifact-id>` whose head is the reported `head_sha`; the commit's author being the requester and its committer being `caesar <caesar@invalid>`; all four `caesar-*` trailers and **no** `Co-authored-by`; a PR whose base is the default branch and whose number and URL match the publication projection; and the two broken-credential cases at the publish step, in the stated order. **Row 08 closes when every checklist item is recorded against both forges**, which stays an operator event. What 12a changes is that the checklist's operator half — reach the gate, one revision round, approve — is walked on a phone instead of with `curl`.
 
@@ -4851,6 +4937,34 @@ Playwright extends Plan 11's existing rig: Postgres up, migrations applied, admi
 
 - `GET /fixture/seed` → the project, repo and workflow ids the create-task form needs, so the spec can assert on names rather than hunting for them.
 - `GET /fixture/run/{id}` → the run's phases and generation as JSON, read through `runs.Service`. **This is the ORACLE for path 3**: "a new generation opened" is a backend fact, and asserting it only from the DOM would let a screen that re-rendered the same generation pass.
+
+> **(corrected in execution — see ledger.) THIS STEP AS WRITTEN LEAVES BEAT 4
+> UNWALKABLE, and two more things had to be built.**
+>
+> **(a) The fixture must register a real bare repository with the fake.** With no
+> remote, `fake.NewExecutor()` takes its *synthetic* implement branch, whose
+> `diff` is raw diff text — while the wire form is base64 (`fake/git.go`,
+> `collect.go`), because a patch is arbitrary bytes and JSON string encoding
+> would mangle a file in a legacy encoding silently. `decode-patch.ts`'s `atob`
+> throws on `-`, `@` and `.`, returns EMPTY, and MEASURED: the approval surface
+> rendered `0 files · +0 · −0` with no file rows for a patch that adds a line.
+> **A fake that differs from the real thing in the field under test is not a
+> fake, it is a different subject.** `fake.InitBareRepo` plus `executor.Remote`
+> takes the publishable branch — canonical base64, a real `git write-tree` id,
+> and one added file named `CAESAR-<node_id>.md` per node — which is what makes
+> Step 2's `/CAESAR-impl\.md/` locator correct. New lane dependency: `git` on
+> `PATH`. Sofo ratified the harness change on 2026-08-22.
+>
+> **(b) `POST /fixture/quiesce`, and `workers: 1`.** This step assumed isolation
+> the lane did not have. One server and one database serve every spec file, and
+> `playwright.config.ts` set no `workers`, so files ran in parallel workers by
+> default while `approvals.spec.ts` left its gate undecided forever and path 2's
+> run also ends `waiting_decision`. Every absolute badge assertion is a claim
+> about the whole world, and Step 2's `toHaveCount(0)` / `toHaveText('1')` are
+> unsatisfiable even fully serial. `quiesce` decides leftover gates through
+> `runs.Service.DecideGate` — **the SQL ban covers the reset as much as the
+> setup** — and `open-gate` now answers with its run id so a card can be scoped
+> to one run. Both halves are mutation-proved.
 
 - [ ] **Step 2: Path 1 — the gate, end to end on a phone**
 
@@ -4884,6 +4998,10 @@ test('a gate opened by the backend reaches Home, opens to its evidence, and appr
   await card.getByRole('link').first().click()
   await expect(page.getByTestId('hard-facts')).toBeVisible()
   await page.getByRole('button', { name: /CAESAR-impl\.md/ }).click()
+  // (corrected in execution — see ledger.) `getByText(/^\+/).first()` is VACUOUS
+  // and was replaced: the COLLAPSED FileRow header already renders "+1" before
+  // the click, so the assertion passes whether or not the diff body opened.
+  // Assert the added line's own deterministic text instead.
   await expect(page.getByText(/^\+/).first()).toBeVisible()
 
   // BEAT 5: approve, and the badge clears with no user action.
@@ -4914,9 +5032,21 @@ test('creating a task produces a run whose timeline advances live', async ({ pag
   // next assertion about a LIVE timeline rather than about a fresh page load.
   await expect(page.getByTestId('phase-timeline')).toBeVisible()
 
-  // ADVANCES WITHOUT A RELOAD. The dot the assertion watches starts not-started
-  // and must reach succeeded on this same DOM — asserted on the state
-  // attribute, because the whole content of a dot is colour.
+  // ADVANCES WITHOUT A RELOAD: both rows reach these states on the same DOM the
+  // create-task navigation landed on. The gate row is not even in the DOM when
+  // this starts — the timeline maps the phases the run HAS, and the gate phase
+  // materializes only once impl finishes.
+  //
+  // (corrected in execution — see ledger.) The original comment here said the
+  // watched dot "starts not-started" and that "the whole content of a dot is
+  // colour". Both are false on this path, and the second dissent of Task 17 is
+  // what showed it: `phase-<node_id>` is the TIMELINE ROW rendered by
+  // `runs.$runId.tsx`, not a `PhaseDots` dot — `PhaseDots`' only importers are
+  // `run-card.tsx` and `tasks.tsx`. So `data-state` here is
+  // `ApiPhaseResponse.status`, which is non-nullable, and the `?? 'not-started'`
+  // arm belongs to a different DTO on a different screen; a row absent from the
+  // DOM is the real starting state. The row also renders `{phase.status}` as
+  // visible text, so colour is not the whole content of anything on this path.
   await expect(page.getByTestId('phase-impl')).toHaveAttribute('data-state', 'succeeded', {
     timeout: 60_000,
   })
@@ -4981,8 +5111,13 @@ Each of the three, individually — a Playwright spec is the easiest kind of tes
 ```bash
 # Path 1: make the bridge ignore gate.waiting.
 #   Expect: the badge never reaches '1' and the spec times out at beat 3.
-# Path 2: make PhaseDots render every dot as not-started.
-#   Expect: the data-state assertion times out.
+# Path 2: pin the TIMELINE ROW's data-state to a constant in runs.$runId.tsx.
+#   Expect: both data-state assertions fail.
+#   (corrected in execution — see ledger.) This bullet said "make PhaseDots
+#   render every dot as not-started". That mutant SURVIVES: PhaseDots is not on
+#   the run-detail path at all — its only importers are run-card.tsx and
+#   tasks.tsx — so it changes nothing this spec can see. The row the spec reads
+#   is what has to be broken.
 # Path 3: make request_changes post without the note.
 #   Expect: the 400 surfaces and generation stays 1 — the backend oracle is
 #   what catches it, and that is why it is there.
