@@ -15,10 +15,11 @@ import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppAdminRouteImport } from './routes/_app/admin'
 import { Route as AppMoreRouteImport } from './routes/_app/more'
 import { Route as AppReposRouteImport } from './routes/_app/repos'
-import { Route as AppRunsRouteImport } from './routes/_app/runs'
 import { Route as AppTasksRouteImport } from './routes/_app/tasks'
 import { Route as AppWorkflowsRouteImport } from './routes/_app/workflows'
 import { Route as AppApprovalsIndexRouteImport } from './routes/_app/approvals.index'
+import { Route as AppRunsIndexRouteImport } from './routes/_app/runs.index'
+import { Route as AppRunsRunIdRouteImport } from './routes/_app/runs.$runId'
 import { Route as AppApprovalsRunIdNodeIdRouteImport } from './routes/_app/approvals.$runId.$nodeId'
 
 const AppRoute = AppRouteImport.update({
@@ -50,11 +51,6 @@ const AppReposRoute = AppReposRouteImport.update({
   path: '/repos',
   getParentRoute: () => AppRoute,
 } as any)
-const AppRunsRoute = AppRunsRouteImport.update({
-  id: '/runs',
-  path: '/runs',
-  getParentRoute: () => AppRoute,
-} as any)
 const AppTasksRoute = AppTasksRouteImport.update({
   id: '/tasks',
   path: '/tasks',
@@ -70,6 +66,16 @@ const AppApprovalsIndexRoute = AppApprovalsIndexRouteImport.update({
   path: '/approvals/',
   getParentRoute: () => AppRoute,
 } as any)
+const AppRunsIndexRoute = AppRunsIndexRouteImport.update({
+  id: '/runs/',
+  path: '/runs/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppRunsRunIdRoute = AppRunsRunIdRouteImport.update({
+  id: '/runs/$runId',
+  path: '/runs/$runId',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppApprovalsRunIdNodeIdRoute = AppApprovalsRunIdNodeIdRouteImport.update({
   id: '/approvals/$runId/$nodeId',
   path: '/approvals/$runId/$nodeId',
@@ -82,10 +88,11 @@ export interface FileRoutesByFullPath {
   '/admin': typeof AppAdminRoute
   '/more': typeof AppMoreRoute
   '/repos': typeof AppReposRoute
-  '/runs': typeof AppRunsRoute
   '/tasks': typeof AppTasksRoute
   '/workflows': typeof AppWorkflowsRoute
+  '/runs/$runId': typeof AppRunsRunIdRoute
   '/approvals/': typeof AppApprovalsIndexRoute
+  '/runs/': typeof AppRunsIndexRoute
   '/approvals/$runId/$nodeId': typeof AppApprovalsRunIdNodeIdRoute
 }
 export interface FileRoutesByTo {
@@ -93,11 +100,12 @@ export interface FileRoutesByTo {
   '/admin': typeof AppAdminRoute
   '/more': typeof AppMoreRoute
   '/repos': typeof AppReposRoute
-  '/runs': typeof AppRunsRoute
   '/tasks': typeof AppTasksRoute
   '/workflows': typeof AppWorkflowsRoute
   '/': typeof AppIndexRoute
+  '/runs/$runId': typeof AppRunsRunIdRoute
   '/approvals': typeof AppApprovalsIndexRoute
+  '/runs': typeof AppRunsIndexRoute
   '/approvals/$runId/$nodeId': typeof AppApprovalsRunIdNodeIdRoute
 }
 export interface FileRoutesById {
@@ -107,11 +115,12 @@ export interface FileRoutesById {
   '/_app/admin': typeof AppAdminRoute
   '/_app/more': typeof AppMoreRoute
   '/_app/repos': typeof AppReposRoute
-  '/_app/runs': typeof AppRunsRoute
   '/_app/tasks': typeof AppTasksRoute
   '/_app/workflows': typeof AppWorkflowsRoute
   '/_app/': typeof AppIndexRoute
+  '/_app/runs/$runId': typeof AppRunsRunIdRoute
   '/_app/approvals/': typeof AppApprovalsIndexRoute
+  '/_app/runs/': typeof AppRunsIndexRoute
   '/_app/approvals/$runId/$nodeId': typeof AppApprovalsRunIdNodeIdRoute
 }
 export interface FileRouteTypes {
@@ -122,10 +131,11 @@ export interface FileRouteTypes {
     | '/admin'
     | '/more'
     | '/repos'
-    | '/runs'
     | '/tasks'
     | '/workflows'
+    | '/runs/$runId'
     | '/approvals/'
+    | '/runs/'
     | '/approvals/$runId/$nodeId'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -133,11 +143,12 @@ export interface FileRouteTypes {
     | '/admin'
     | '/more'
     | '/repos'
-    | '/runs'
     | '/tasks'
     | '/workflows'
     | '/'
+    | '/runs/$runId'
     | '/approvals'
+    | '/runs'
     | '/approvals/$runId/$nodeId'
   id:
     | '__root__'
@@ -146,11 +157,12 @@ export interface FileRouteTypes {
     | '/_app/admin'
     | '/_app/more'
     | '/_app/repos'
-    | '/_app/runs'
     | '/_app/tasks'
     | '/_app/workflows'
     | '/_app/'
+    | '/_app/runs/$runId'
     | '/_app/approvals/'
+    | '/_app/runs/'
     | '/_app/approvals/$runId/$nodeId'
   fileRoutesById: FileRoutesById
 }
@@ -203,13 +215,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppReposRouteImport
       parentRoute: typeof AppRoute
     }
-    '/_app/runs': {
-      id: '/_app/runs'
-      path: '/runs'
-      fullPath: '/runs'
-      preLoaderRoute: typeof AppRunsRouteImport
-      parentRoute: typeof AppRoute
-    }
     '/_app/tasks': {
       id: '/_app/tasks'
       path: '/tasks'
@@ -231,6 +236,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppApprovalsIndexRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/runs/': {
+      id: '/_app/runs/'
+      path: '/runs'
+      fullPath: '/runs/'
+      preLoaderRoute: typeof AppRunsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/runs/$runId': {
+      id: '/_app/runs/$runId'
+      path: '/runs/$runId'
+      fullPath: '/runs/$runId'
+      preLoaderRoute: typeof AppRunsRunIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/approvals/$runId/$nodeId': {
       id: '/_app/approvals/$runId/$nodeId'
       path: '/approvals/$runId/$nodeId'
@@ -245,11 +264,12 @@ interface AppRouteChildren {
   AppAdminRoute: typeof AppAdminRoute
   AppMoreRoute: typeof AppMoreRoute
   AppReposRoute: typeof AppReposRoute
-  AppRunsRoute: typeof AppRunsRoute
   AppTasksRoute: typeof AppTasksRoute
   AppWorkflowsRoute: typeof AppWorkflowsRoute
   AppIndexRoute: typeof AppIndexRoute
+  AppRunsRunIdRoute: typeof AppRunsRunIdRoute
   AppApprovalsIndexRoute: typeof AppApprovalsIndexRoute
+  AppRunsIndexRoute: typeof AppRunsIndexRoute
   AppApprovalsRunIdNodeIdRoute: typeof AppApprovalsRunIdNodeIdRoute
 }
 
@@ -257,11 +277,12 @@ const AppRouteChildren: AppRouteChildren = {
   AppAdminRoute: AppAdminRoute,
   AppMoreRoute: AppMoreRoute,
   AppReposRoute: AppReposRoute,
-  AppRunsRoute: AppRunsRoute,
   AppTasksRoute: AppTasksRoute,
   AppWorkflowsRoute: AppWorkflowsRoute,
   AppIndexRoute: AppIndexRoute,
+  AppRunsRunIdRoute: AppRunsRunIdRoute,
   AppApprovalsIndexRoute: AppApprovalsIndexRoute,
+  AppRunsIndexRoute: AppRunsIndexRoute,
   AppApprovalsRunIdNodeIdRoute: AppApprovalsRunIdNodeIdRoute,
 }
 

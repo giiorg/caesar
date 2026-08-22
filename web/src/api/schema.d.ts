@@ -926,16 +926,16 @@ export interface components {
             updated_at?: string;
         };
         ApiPublicationResponse: {
-            base_sha?: string;
-            branch?: string;
+            base_sha: string;
+            branch: string;
             halt_reason?: string;
             head_sha?: string;
-            node_id?: string;
+            node_id: string;
             /** Format: int64 */
             pr_number?: number;
             pr_url?: string;
-            status?: string;
-            target_branch?: string;
+            status: string;
+            target_branch: string;
         };
         ApiRegisterHarnessRequest: {
             credential_id?: string;
@@ -976,16 +976,16 @@ export interface components {
         };
         ApiRunEventResponse: {
             /** Format: int64 */
-            id?: number;
-            kind?: string;
+            id: number;
+            kind: string;
             /** Format: date-time */
-            occurred_at?: string;
-            payload?: {
+            occurred_at: string;
+            payload: {
                 [key: string]: unknown;
             } | null;
         };
         ApiRunEventsResponse: {
-            events?: components["schemas"]["ApiRunEventResponse"][] | null;
+            events: components["schemas"]["ApiRunEventResponse"][] | null;
         };
         ApiRunListPageResponse: {
             next_cursor: null | string;

@@ -2894,6 +2894,13 @@
             "type": "string"
           }
         },
+        "required": [
+          "node_id",
+          "status",
+          "branch",
+          "target_branch",
+          "base_sha"
+        ],
         "type": "object"
       },
       "ApiRegisterHarnessRequest": {
@@ -3032,6 +3039,12 @@
             ]
           }
         },
+        "required": [
+          "id",
+          "kind",
+          "payload",
+          "occurred_at"
+        ],
         "type": "object"
       },
       "ApiRunEventsResponse": {
@@ -3046,6 +3059,9 @@
             ]
           }
         },
+        "required": [
+          "events"
+        ],
         "type": "object"
       },
       "ApiRunListPageResponse": {

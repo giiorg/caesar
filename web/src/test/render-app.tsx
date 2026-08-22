@@ -84,6 +84,14 @@ export function renderApp(path: string, handlers: RequestHandler[] = []) {
     // mounts a list, instead of leaving that branch unreachable from every
     // test in the tree.
     http.get('/api/v1/runs', () => HttpResponse.json({ runs: null, next_cursor: null })),
+    // `events: null`, for the same reason `runs: null` is null above: the
+    // contract marks it required AND nullable (a Go nil slice marshals to
+    // null), api.go:721 happens to build a non-nil slice today, and the null
+    // branch in `runEventsQueryOptions` would otherwise be unreachable from
+    // every test in the tree. Every protected screen that mounts a run detail
+    // fetches this, and `onUnhandledRequest: 'error'` turns a missing default
+    // into a failure far from the missing handler.
+    http.get('/api/v1/runs/:id/events', () => HttpResponse.json({ events: null })),
     http.get('/api/v1/stream', silentStream),
   )
   // BOTH router arguments are load-bearing and neither is optional.

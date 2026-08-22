@@ -110,6 +110,23 @@ func TestSliceEndpointsDocumentTheirRealAnswers(t *testing.T) {
 			"self_approval", "examined_artifact_id",
 		},
 		"ApiRunListResponse": {"runs"},
+		// The run-detail publication panel, and FIVE of its nine properties.
+		// head_sha, pr_number, pr_url and halt_reason each carry omitempty in
+		// dto.go, so the key really is absent on the wire for a publication
+		// that has not pushed, has opened no PR, or did not halt; optional is
+		// what the client should see for those four and their absence from
+		// this list is the decision, not an omission. Nothing in this file
+		// asserts that absence — it is recorded here, not pinned.
+		"ApiPublicationResponse": {"node_id", "status", "branch", "target_branch", "base_sha"},
+		// The run-detail event log. `events` is required AND nullable (a Go
+		// nil slice marshals to null), and all four fields of an event row are
+		// always-marshaled scalars or a map — no omitempty, no $ref — so each
+		// is a key the client reads without testing for it. `payload` keeps its
+		// null branch beside the required entry because a nil map marshals to
+		// null; it is a map, not a named component, so the generator really
+		// does render ["object","null"].
+		"ApiRunEventsResponse": {"events"},
+		"ApiRunEventResponse":  {"id", "kind", "payload", "occurred_at"},
 		// The artifact payload contract (document schema 2). These five reach
 		// the document through contracts' extraSchemas list rather than through
 		// an operation, so this is also the pin that fails if that mechanism

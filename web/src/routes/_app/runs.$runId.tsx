@@ -1,0 +1,295 @@
+import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
+import { createFileRoute } from '@tanstack/react-router'
+import { z } from 'zod'
+import { ApiError } from '../../api/errors'
+import { ApprovalSurface } from '../../approvals/approval-surface'
+import { ApiErrorPanel } from '../../errors/api-error-panel'
+import { GateDecision } from '../../gates/gate-decision'
+import { newestPhasePerNode, type Phase } from '../../runs/phase-spine'
+import { PublicationPanel } from '../../runs/publication-panel'
+import { type RunEvent, runEventsQueryOptions } from '../../runs/run-events-query'
+import { type Run, runQueryOptions } from '../../runs/run-query'
+
+/**
+ * WHICH PHASE IS OPEN IS URL STATE. Home's gate cards link here with `?phase=`
+ * already set (Task 13), so tapping a card body lands on the gate open rather
+ * than at the top of a timeline somebody has to scroll — and the state a person
+ * is looking at is the state they can send to somebody else. That is the
+ * constitution's URL-as-state rule and the reason this is not `useState`.
+ *
+ * `safeParse` rather than `parse`, and the failing case is not exotic.
+ * TanStack Router's default search parser runs `JSON.parse` over each value and
+ * keeps the raw string when that throws, so `?phase=gate` arrives as a string
+ * while `?phase=42` arrives as the NUMBER 42 — MEASURED, and pinned by
+ * "survives a phase param that is not even a string" in this route's suite.
+ * `parse` would throw on it and take the whole run screen down over a link
+ * somebody mistyped. An unparseable search reads as no phase named, which lands
+ * on the timeline: the same place a param naming a node this run does not have
+ * lands.
+ */
+const searchSchema = z.object({ phase: z.string().optional() })
+
+export const Route = createFileRoute('/_app/runs/$runId')({
+  validateSearch: (search: Record<string, unknown>) => {
+    const parsed = searchSchema.safeParse(search)
+    return parsed.success ? parsed.data : {}
+  },
+  loader: ({ context, params }) =>
+    context.queryClient.ensureQueryData(runQueryOptions(params.runId)),
+  component: RunDetail,
+})
+
+function RunDetail() {
+  const { runId } = Route.useParams()
+  const { phase: openPhase } = Route.useSearch()
+  const navigate = Route.useNavigate()
+  const { data: run } = useSuspenseQuery(runQueryOptions(runId))
+  const spine = newestPhasePerNode(run)
+
+  const toggle = (nodeId: string) => {
+    // The updater form returns the WHOLE next search object, so closing a phase
+    // drops the key rather than setting it to undefined — which
+    // `exactOptionalPropertyTypes` would refuse and which would leave a bare
+    // `?phase=` in the address bar.
+    void navigate({ search: (prev) => (prev.phase === nodeId ? {} : { phase: nodeId }) })
+  }
+
+  return (
+    <section className="flex flex-col gap-4">
+      <RunHeader run={run} />
+      <PhaseTimeline run={run} spine={spine} openPhase={openPhase} onToggle={toggle} />
+      <EventLog runId={runId} />
+    </section>
+  )
+}
+
+/**
+ * The sticky header: what this run is, and no controls at all.
+ *
+ * NO CANCEL AND NO RETRY, which is a decision about the API rather than about
+ * the layout. Cancel does not exist — `runs/tasks.go:394` refuses a rerun of a
+ * live run with "run is in flight; cancel arrives in Plan 09" — and whole-task
+ * retry (rerunTask) is deferred with it, so a button here would either lie or
+ * do something the reader did not ask for. decisions §7's locked mockup puts
+ * both in this header; they arrive when the endpoint does.
+ *
+ * ATTEMPT COMES OFF THE NEWEST PHASE AND GENERATION OFF THE RUN, and neither
+ * substitutes for the other. `attempt` is a PER-NODE execution ordinal — a
+ * rematerialized node continues it rather than restarting
+ * (`store/queries.sql:719-723`) — so the newest phase's attempt says which try
+ * that one node is on and nothing at all about how many revision rounds the run
+ * has been through. `run.generation` is that round (`dto.go:66-68`), bumped by
+ * `openRevision` (`runs/revisions.go:30`), and it is the only counter on this
+ * header that moves when a gate sends work back.
+ */
+function RunHeader(props: { run: Run }) {
+  const { run } = props
+  // The last of `run.phases` — the raw list, NOT the collapsed spine.
+  // `store/queries.sql:226` orders by `created_at, node_id, attempt`, so the
+  // last row is the phase row created most recently; the spine's last row is
+  // instead the node that first appeared last, which a retry of an earlier
+  // node does not move. The header wants the run's current attempt, so it
+  // wants the newer row.
+  const newest = (run.phases ?? []).at(-1)
+  return (
+    <header
+      data-testid="run-header"
+      className="bg-ground border-border sticky top-0 z-10 border-b py-3"
+    >
+      <h1 className="text-text font-medium">{run.task_title}</h1>
+      <p className="text-text-muted flex flex-wrap gap-2 font-mono text-xs">
+        <span>{run.workflow_name}</span>
+        <span>· {run.repo_slug}</span>
+        <span>· {run.status}</span>
+        {newest !== undefined && <span>· attempt {newest.attempt}</span>}
+        <span>· generation {run.generation}</span>
+      </p>
+    </header>
+  )
+}
+
+/**
+ * THE SPINE. One `<li>` per NODE — its newest attempt — in materialization
+ * order, each a disclosure that expands IN PLACE. The timeline is the screen,
+ * not an index into other screens, which is what locked run detail (A) decides.
+ *
+ * NO LIVE AGENT OUTPUT, anywhere in here. §10.4: no route serves an agent's
+ * log. What the run records instead is a `log_ref` artifact
+ * (`runs/compile.go:22`) pointing at bytes on the runner's disk, and serving
+ * those is a safety decision that deserves its own design pass. A terminal box
+ * that stayed empty would be the most convincing lie on this screen.
+ */
+function PhaseTimeline(props: {
+  run: Run
+  spine: Phase[]
+  openPhase: string | undefined
+  onToggle: (nodeId: string) => void
+}) {
+  if (props.spine.length === 0) {
+    return (
+      <p className="text-text-muted text-sm">
+        This run has no phases yet — nothing of its graph has been materialized.
+      </p>
+    )
+  }
+  return (
+    <ol data-testid="phase-timeline" className="border-border flex flex-col rounded-md border">
+      {props.spine.map((phase) => {
+        const open = props.openPhase === phase.node_id
+        return (
+          <li
+            key={phase.node_id}
+            data-testid={`phase-${phase.node_id}`}
+            data-node-id={phase.node_id}
+            data-state={phase.status}
+            className="border-border border-b last:border-b-0"
+          >
+            <button
+              type="button"
+              onClick={() => props.onToggle(phase.node_id)}
+              aria-expanded={open}
+              className="text-text flex w-full items-center gap-2 px-3 py-3 text-left text-sm"
+            >
+              <span className="font-mono">{phase.node_id}</span>
+              <span className="text-text-muted font-mono text-xs">{phase.status}</span>
+              <span className="text-text-muted font-mono text-xs">
+                attempt {phase.attempt}/{phase.max_attempts}
+              </span>
+            </button>
+            {open && (
+              <div className="border-border border-t px-3 py-3">
+                <PhaseBody run={props.run} phase={phase} />
+              </div>
+            )}
+          </li>
+        )
+      })}
+    </ol>
+  )
+}
+
+/**
+ * What a phase expands into, by what the phase IS rather than by a node_type —
+ * `ApiPhaseResponse` does not carry one.
+ *
+ * A PUBLISH NODE IS ONE THE RUN HAS A PUBLICATION FOR. `node_id` is the only
+ * thing tying `run.publications` to `run.phases` on the wire, and it is a real
+ * link rather than a guess: `runResponse` builds both lists from the same
+ * RunDetail in one pass (`dto.go:453-491`).
+ *
+ * A GATE IS ONE CARRYING EVIDENCE OR A DECISION, and evidence is read first
+ * because it is the half that can still be acted on. `attachGateEvidence`
+ * builds it only for a phase whose status is `waiting_decision`
+ * (`runs/tasks.go:714-715`), so a gate somebody has already decided arrives
+ * here with a decision and no evidence.
+ *
+ * `phase.evidence` is narrowed TRUTHY and never `!== undefined`: it is
+ * a nullable `$ref`, which this toolchain renders optional-and-non-nullable, so
+ * the runtime value can be `null` where the type says it cannot, and
+ * `exactOptionalPropertyTypes` (`tsconfig.json:14`) makes `!== undefined`
+ * narrow to the object while the value is null.
+ */
+function PhaseBody(props: { run: Run; phase: Phase }) {
+  const { run, phase } = props
+  const publication = (run.publications ?? []).find((p) => p.node_id === phase.node_id)
+  if (publication !== undefined) return <PublicationPanel publication={publication} />
+  if (phase.evidence) {
+    // THE SAME COMPONENT the deep approval route mounts, not a second gate
+    // renderer. §7 decides twice that a gate is decidable where its evidence is
+    // shown — here inline and there full-screen — and building it once is what
+    // stops the two decisions drifting.
+    return (
+      <ApprovalSurface
+        runId={run.id}
+        nodeId={phase.node_id}
+        evidence={phase.evidence}
+        executionUsedMs={run.execution_used_ms}
+      />
+    )
+  }
+  if (phase.decision) return <GateDecision decision={phase.decision} />
+  return <PhaseArtifacts run={run} phase={phase} />
+}
+
+/**
+ * A phase's artifacts, by type and id.
+ *
+ * SCOPED TO THIS ATTEMPT, not to the node. An artifact row carries its own
+ * `attempt` and `generation` (`dto.go:481-484`), and a retried or revised node
+ * keeps the rows its superseded attempts wrote — listing those beside the
+ * current ones would show a reader a plan the run has already thrown away.
+ *
+ * NOTHING HERE LINKS ANYWHERE. `GET /runs/{id}/artifacts/{artifact_id}` serves
+ * the payload, but 12a adds no route that renders one outside a gate's
+ * evidence — no task in this plan creates one — so a link would have no
+ * destination. The id is rendered because it is what a
+ * person quotes when asking about an artifact, not because it is clickable.
+ */
+function PhaseArtifacts(props: { run: Run; phase: Phase }) {
+  const { phase } = props
+  const rows = (props.run.artifacts ?? []).filter(
+    (a) =>
+      a.node_id === phase.node_id &&
+      a.attempt === phase.attempt &&
+      a.generation === phase.generation,
+  )
+  if (rows.length === 0) {
+    return <p className="text-text-muted text-sm">This attempt produced no artifacts.</p>
+  }
+  return (
+    <ul className="flex flex-col gap-1">
+      {rows.map((a) => (
+        <li key={a.id} className="flex gap-2">
+          <span className="text-text font-mono text-sm">{a.type}</span>
+          <span className="text-text-muted font-mono text-xs">{a.id}</span>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/**
+ * THE EVENT LOG IS FLAT AND CHRONOLOGICAL, and that is a contract fact rather
+ * than a layout preference. `ApiRunEventResponse` is `{id, kind, payload,
+ * occurred_at}` with NO node_id column — the node lives inside the untyped
+ * payload — so grouping events under their phase would depend on a field
+ * `contracts:check` cannot police, and would silently mis-place every event
+ * whose payload shape changed.
+ *
+ * A plain `useQuery`, not the route's `useSuspenseQuery`: the log is the least
+ * important thing on this screen and a failure reading it must not take the
+ * timeline down with it. The two empty states below are distinct for the same
+ * reason the inbox's are — "no events" is a statement about this run, and a
+ * failed read is a statement about the server.
+ */
+function EventLog(props: { runId: string }) {
+  const events = useQuery(runEventsQueryOptions(props.runId))
+  if (events.isLoading) return <p className="text-text-muted text-sm">Reading this run's log…</p>
+  if (events.isError) {
+    // ApiErrorPanel rethrows anything that is not ours, and this error is not
+    // always an ApiError: openapi-fetch propagates fetch's own TypeError from a
+    // request that never reached the server.
+    if (events.error instanceof ApiError) return <ApiErrorPanel error={events.error} />
+    return <p className="text-text-muted text-sm">This run's log could not be read.</p>
+  }
+  const rows = events.data ?? []
+  if (rows.length === 0) {
+    return <p className="text-text-muted text-sm">No events have been recorded for this run.</p>
+  }
+  return (
+    <ul data-testid="event-log" className="flex flex-col gap-1">
+      {rows.map((e) => (
+        <EventRow key={e.id} event={e} />
+      ))}
+    </ul>
+  )
+}
+
+function EventRow(props: { event: RunEvent }) {
+  return (
+    <li className="text-text-muted flex gap-2 font-mono text-xs">
+      <time dateTime={props.event.occurred_at}>{props.event.occurred_at}</time>
+      <span className="text-text">{props.event.kind}</span>
+    </li>
+  )
+}

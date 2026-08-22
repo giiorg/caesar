@@ -2,6 +2,7 @@ import { screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { HttpResponse, http } from 'msw'
 import { describe, expect, it } from 'vitest'
+import { onTheWire } from '../../runs/on-the-wire.testkit'
 import type { Run } from '../../runs/run-query'
 import { noSession, renderApp } from '../../test/render-app'
 
@@ -69,29 +70,6 @@ const waitingRun = (): Run => ({
 })
 
 const PATCH_B64 = btoa('--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old\n+new\n')
-
-/**
- * A run as the WIRE carries it, which is not what the generated type can say.
- *
- * `dto.go:182` and `:191` declare a phase's `decision` and `evidence` as
- * pointers with NO `omitempty`, so an absent one marshals to `null` and never
- * to a missing key — the DTO's own comment says the property "really is null on
- * every non-gate phase and on every decided one". The generated types render
- * both optional-and-NON-nullable (a `$ref` property carries no null branch in
- * this toolchain), so a `Run`-annotated fixture cannot write `null` at all.
- *
- * A fixture that leaves the key out instead is testing a body the server never
- * sends, and it makes `!phase.evidence` and `phase.evidence !== undefined`
- * indistinguishable — MEASURED: with the key merely absent, swapping the deep
- * route to `=== undefined` left the whole suite green. This puts the true shape
- * on the wire while the `Run` annotation above keeps every other field honest.
- */
-const onTheWire = (run: Run) => ({
-  ...run,
-  // Spread LAST, so a phase that really carries one keeps it and only the
-  // absent ones become null.
-  phases: (run.phases ?? []).map((phase) => ({ decision: null, evidence: null, ...phase })),
-})
 
 /**
  * Everything the deep link touches: the inbox row that renders the card, the

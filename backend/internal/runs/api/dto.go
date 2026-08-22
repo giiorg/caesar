@@ -350,27 +350,55 @@ type GateDecisionSummary struct {
 // deliberately absent: it is the settlement sweep's own bookkeeping, it moves
 // on every tick, and rendering it would invite a human to act on a probe that
 // is designed to be re-run.
+//
+// FIVE OF THE NINE ARE REQUIRED AND FOUR ARE NOT, and the `omitempty` tags
+// below are what decides which. The first five are always marshaled, so the
+// run-detail publication panel reads them without branching on an absence the
+// server cannot produce. The last four carry omitempty and are GENUINELY
+// conditional — a publication that has not pushed yet has no head SHA, one
+// that has not opened a PR has neither number nor URL, and one that did not
+// halt has no halt_reason — so the key really is missing on the wire for those
+// four and optional is the honest rendering rather than an oversight.
 type PublicationResponse struct {
-	NodeID       string `json:"node_id"`
-	Status       string `json:"status"` // pending | pushed | published | halted
-	Branch       string `json:"branch"`
-	TargetBranch string `json:"target_branch"`
-	BaseSHA      string `json:"base_sha"`
+	NodeID       string `json:"node_id" required:"true"`
+	Status       string `json:"status" required:"true"` // pending | pushed | published | halted
+	Branch       string `json:"branch" required:"true"`
+	TargetBranch string `json:"target_branch" required:"true"`
+	BaseSHA      string `json:"base_sha" required:"true"`
 	HeadSHA      string `json:"head_sha,omitempty"`
 	PRNumber     int64  `json:"pr_number,omitempty"`
 	PRURL        string `json:"pr_url,omitempty"`
 	HaltReason   string `json:"halt_reason,omitempty"`
 }
 
+// RunEventsResponse is the JSON half of GET /runs/{id}/events — the
+// poll-and-resume path, which is what the run-detail event log reads.
+//
+// Events is required AND nullable, and the two are independent: a Go nil slice
+// marshals to null, so the type stays ["array","null"] while the key is one the
+// client never has to test for. api.go:721 happens to build a non-nil
+// `make([]RunEventResponse, 0, len(events))` today, which is exactly why the
+// null shape is the one no test would otherwise exercise.
 type RunEventsResponse struct {
-	Events []RunEventResponse `json:"events"`
+	Events []RunEventResponse `json:"events" required:"true"`
 }
 
+// RunEventResponse is one row of a run's event log.
+//
+// All four are required because all four are always marshaled — none carries
+// omitempty and none is a $ref, so `required` here is the plain claim that the
+// key is present. Payload keeps its null branch for the same reason Events
+// does: a nil map marshals to null, and an event with no payload is ordinary.
+//
+// THERE IS NO node_id COLUMN, deliberately and structurally: the node lives
+// inside the untyped payload (events.go:67), which is why the run-detail log is
+// flat and chronological rather than grouped under its phase. Grouping would
+// depend on a field the contract cannot police.
 type RunEventResponse struct {
-	ID         int64          `json:"id"`
-	Kind       string         `json:"kind"`
-	Payload    map[string]any `json:"payload"`
-	OccurredAt time.Time      `json:"occurred_at"`
+	ID         int64          `json:"id" required:"true"`
+	Kind       string         `json:"kind" required:"true"`
+	Payload    map[string]any `json:"payload" required:"true"`
+	OccurredAt time.Time      `json:"occurred_at" required:"true"`
 }
 
 func taskResponse(t runs.Task) TaskResponse {
