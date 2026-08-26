@@ -16,8 +16,8 @@ Code citations below are against `main` at `fdbc8de`; line numbers drift, functi
 
 **The milestone, verified by the closing operator walk: from a fresh browser session, with no
 curl and no psql — create a project, add a forge credential and a repo bound to it, add a
-harness credential and register a harness, define a linear workflow in the outline editor, run a task through it, request changes with a note the
-harness actually receives, approve, open the PR, and afterwards read the decision in Approvals
+harness credential and register a harness, define a linear workflow in the outline editor, run
+a task through it, request changes with a note the harness actually receives, approve, open the PR, and afterwards read the decision in Approvals
 history.** That single walk exercises every 12b screen plus the top product fix. The order is
 dependency-true, and it takes **two credentials**: a repo binds a `forge_token` at creation
 (`CreateRepoRequest.credential_id` is required; `assets/repos.go` enforces the kind) and a
@@ -225,8 +225,8 @@ Create/edit through Plan 11's shared typed form abstraction: project (name, desc
 (forge kind `github|gitlab` chosen at create and immutable after — `UpdateRepoRequest` carries
 only slug, default branch and credential (`assets/api/dto.go`), and 12b adds no write paths, so
 the edit form renders forge read-only; slug, default branch, credential picker filtered to
-`forge_token` kind). Deletes surface the API's RESTRICT refusals as readable errors ("this repo has runs")
-rather than raw problem+json. Card-first on the phone, table projection on desktop, per the
+`forge_token` kind). Deletes surface the API's RESTRICT refusals as readable errors ("this
+repo has runs") rather than raw problem+json. Card-first on the phone, table projection on desktop, per the
 locked mobile-first standard.
 
 ## 5. Admin
@@ -278,8 +278,9 @@ harness picker (from the registry) and an instructions textarea; gate cards get 
 loop (max rounds; targets are the preceding **plan/implement** cards only — review is agentic
 (`definition.go`, `Agentic()`) yet never a legal target in the conveyor, because the gate's
 patch edge bypasses the review, so review does not dominate the gate and the validator refuses
-it (`validate.go`, `validateRevisions`; `genConveyor`'s comment records the same exclusion)). Node IDs auto-derive
-(`plan-1`, `impl-1`), editable for taste. Drag to reorder by the grip, per the mockup. The read-only DAG preview renders above the
+it (`validate.go`, `validateRevisions`; `genConveyor`'s comment records the same exclusion)).
+Node IDs auto-derive (`plan-1`, `impl-1`), editable for taste. Drag to reorder by the grip, per
+the mockup. The read-only DAG preview renders above the
 outline **in the editor too**, updating live from the derived edges as cards change — locked
 variant B puts the live preview in the editor, not only on the version read view (§6.1); the
 derivation is a pure client function, so live costs nothing.
@@ -312,7 +313,8 @@ misplaced review/gate/publish card fails the validator's *mandatory* consumption
 (`validateConsumption`: review needs exactly one patch, a gate exactly one plan-or-patch,
 publish exactly one patch), so the grammar IS the client-side check, not a nicety on top. The
 acceptance bar is the property test: **random editor operation sequences — add, reorder,
-retarget, all within the grammar — derive documents that parse and validate server-side.** The client additionally mirrors the cheap field checks inline (missing instructions, gate
+retarget, all within the grammar — derive documents that parse and validate server-side.**
+The client additionally mirrors the cheap field checks inline (missing instructions, gate
 target ordering); the server's validator remains the single truth, and a save rejection maps
 field errors back onto the offending card.
 
@@ -347,12 +349,13 @@ screens instead of stubs.
   documents the server validator accepts, extending `genConveyor` — plus the §10.9 fixture
   drift gate, plus one Playwright e2e that authors and saves a workflow against the real
   backend — the Task 17 harness already runs one.
-- **The refetch fan**: request counts under an event burst through the bridge's injected timer.
-- **The milestone's automated shadow**: one Playwright spec walking project → repo → credential
-  → harness → workflow → task → gate → decision against the fake
-  harness — in the §1 dependency-true order (forge credential before repo, harness credential
-  before harness), so "UI is the only
-  door" is CI-checked continuously, not just walked once at the checkpoint.
+- **The refetch fan**: the §2.5 pair — real HTTP request counts under an event burst through
+  the bridge's injected timer plus a request-recording fetch layer, and the liveness bound (a
+  rendered list advances its phase dot within the throttle under a pure-`phase.*` burst).
+- **The milestone's automated shadow**: one Playwright spec walking project → forge credential
+  → repo → harness credential → harness → workflow → task → gate → decision against the fake
+  harness (the §1 dependency-true order), so "UI is the only door" is CI-checked continuously,
+  not just walked once at the checkpoint.
 - House rules apply throughout: mutation is the acceptance criterion for any test-shaped claim;
   verification is `task backend:ci` + `contracts:check` + `web:ci`, never a hand-picked lane
   list.
@@ -390,7 +393,7 @@ The mockups are authoritative and departures must be explicit (the 12a rule, kep
    rules name.
 5. **The task-lifecycle Kanban board stays absent** — `draft`/`ready`/`in review` still do not
    exist as data (12a §10.8, unchanged).
-6. **⌘K arrives; nothing of §10.9 remains deferred** — run detail's split view shipped in 12a
+6. **⌘K arrives; nothing of 12a §10.9 remains deferred** — run detail's split view shipped in 12a
    (Task 16), and this plan brings the palette.
 7. **Workflows' "Run history per definition" (locked page map, `01-app-skeleton`) is deferred.**
    `GET /runs` filters by `status`/`task_id` only — the surface needs a workflow filter on the
