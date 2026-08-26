@@ -132,7 +132,17 @@ client-visible or the artifact DTO gains one field.
   checkpoint ruling, verbatim "Retry on failed runs only").
 - **Event rows and phase cards that name a destination become links**: `publish.pr_opened` → the
   PR URL, `gate.decided` → the gate decision, phases with artifacts → the artifact view
-  (finding 13 / mockup-gap entry thirteen).
+  (finding 13 / mockup-gap entry thirteen). The `gate.decided` destination must be
+  **attempt-precise**: run detail's URL carries only `?phase=<node>` today and the spine
+  collapses each node to its newest (generation, attempt) (`runs.$runId.tsx`,
+  `runs/phase-spine.ts` — request-changes brings the same gate back under the same node id),
+  so the naive link opens the *newest* gate, not the decision the event records. The search
+  schema gains the selector the event payload already carries (`gates.go` stamps `attempt` +
+  `generation` on `gate.decided`): a targeted `?phase=<node>&generation=<g>&attempt=<a>`
+  renders that specific historical attempt, bypassing the newest-per-node collapse for the
+  targeted node. §3.2's history rows carry the same pair and link the same way. The test
+  decides a gate, requests changes, approves the next generation, and asserts both links
+  resolve to their own decisions.
 - The **wordmark links Home** (finding 15); the **FAB is restyled** (finding 16, taste verdict
   at the checkpoint).
 
@@ -162,16 +172,22 @@ refresh floor and focus refetches (`api/query-client.ts`). The fix, two parts:
    deferring phase frames to the 60s floor would be a locked-design regression dressed as
    tuning. The bound: status changes stay immediate, phase dots advance within the throttle,
    and the drumbeat collapses from several collection refetches per second to at most one
-   set per throttle interval (per-run `['run', id]` invalidation stays per-window, so run
-   detail keeps its current liveness).
+   set per throttle interval. The per-run invalidation splits the same way: the run DTO
+   query keeps refetching per window — but **exact**, no longer by prefix. The event log
+   deliberately keys as `['run', runId, 'events']` *so that* prefix invalidation refetches
+   it (`runs/run-events-query.ts`: "the prefix is the whole mechanism"), which is exactly
+   the measured `/runs/{id}/events` drumbeat — so the events key joins the throttled tier,
+   and any non-phase window flushes it immediately, keeping terminal events instant while
+   phase bursts cost at most one events refetch per throttle interval.
 2. **Find `me`'s initiator before touching it.** Nothing in the bridge fires it, and the only
    realtime `/auth/me` is the rare forbidden-stream probe (`sse-connection.ts`) — so the
    drumbeat's source (the 60s `refetchInterval` floor, `refetchOnWindowFocus`, or something
    else) is identified in the network panel at plan time; its fix is whatever the measurement
    names, not a guess.
 
-The acceptance test counts real HTTP requests under an event burst — including `/auth/me` —
-through the bridge's injected timer plus a request-recording fetch layer, and it asserts the
+The acceptance test counts real HTTP requests under an event burst — with per-endpoint
+ceilings, `/auth/me` and `/runs/{id}/events` included, not one lumped total — through the
+bridge's injected timer plus a request-recording fetch layer, and it asserts the
 liveness half too: under a pure-`phase.*` burst, a rendered runs/tasks list advances its phase
 dot within the throttle bound, and a `run.superseded` (or `run.created`) window refetches the
 collections immediately rather than on the throttle. Asserting on invalidation calls alone would pass against
@@ -216,8 +232,9 @@ not survive the contract pipeline — one operation carries one response schema,
 arm's `ApprovalListResponse` (`approvals: []ApprovalResponse`, `runs/api/dto.go`) has no seam
 for decision rows or a cursor. So the history is a sibling operation and the existing operation
 changes by zero bytes: `GET /api/v1/approvals/decisions`, cursor-paginated newest-first,
-returning cross-run decision rows — decision, note, actor, `acted_at`, and run/task/gate
-identifiers for linking — in its own envelope with a `next_cursor`. Same grant scoping as the
+returning cross-run decision rows — decision, note, actor, `acted_at`, run/task/gate
+identifiers, and the gate's generation + attempt (the §2.4 attempt-precise link contract) —
+in its own envelope with a `next_cursor`. Same grant scoping as the
 waiting arm. The cursor key is `(acted_at DESC, id DESC)`, and the same change adds the matching
 composite index — `gate_decisions`' only index today is `(run_id, node_id)` (`schema.sql`),
 which cannot serve a global newest-first read. Pagination tests include equal-`acted_at` rows
@@ -326,8 +343,7 @@ and anything else renders read-only (§6.1).
 
 The editor's V1 sequence grammar is exactly the proven conveyor family:
 `plan? · implement+ · review? · gate · git-publish`, optional revision loop on the gate — the
-same domain `genConveyor` draws from, so the property test extends the repo's own generator
-instead of inventing a second one. The grammar is enforced structurally: the add-step menu
+same domain `genConveyor` draws from. The grammar is enforced structurally: the add-step menu
 offers only types the position accepts, and a reorder that breaks the grammar is refused with
 the reason on the card. This is what makes the acceptance bar honest — a standalone or
 misplaced review/gate/publish card fails the validator's *mandatory* consumption rules
@@ -335,6 +351,13 @@ misplaced review/gate/publish card fails the validator's *mandatory* consumption
 publish exactly one patch), so the grammar IS the client-side check, not a nicety on top. The
 acceptance bar is the property test: **random editor operation sequences — add, reorder,
 retarget, all within the grammar — derive documents that parse and validate server-side.**
+Its subject is the TypeScript reducer and derivation code — a Go generator cannot exercise
+them — and its documents reach the real Go validator through a seeded, committed corpus: the
+web property test emits its derived documents deterministically, the corpus rides the same
+regen-diff gate as every generated artifact here, and a Go test runs `Validate` over every
+corpus file. Mutating any TS derivation rule then either diffs the corpus or reddens the Go
+validation — red either way. `genConveyor` stays what it is, the server-side generator for
+server-side properties; it is not the subject of this test.
 The client additionally mirrors the cheap field checks inline (missing instructions, gate
 target ordering); the server's validator remains the single truth, and a save rejection maps
 field errors back onto the offending card.
@@ -366,8 +389,8 @@ screens instead of stubs.
   `ExecutionRequest.Instructions` for a revision generation; red-then-revert is deleting the
   injection. The existing `gatenote_runner_test` staging assertions stay as the
   artifact-contract half.
-- **The editor**: the §6.3 property test — random in-grammar editor operation sequences derive
-  documents the server validator accepts, extending `genConveyor` — plus the §10.9 fixture
+- **The editor**: the §6.3 property test — its subject the TS reducer and derivation, its
+  verdict the real Go validator via the seeded committed corpus — plus the §10.9 descriptor
   drift gate, plus one Playwright e2e that authors and saves a workflow against the real
   backend — the Task 17 harness already runs one.
 - **The refetch fan**: the §2.5 pair — real HTTP request counts under an event burst through
@@ -433,11 +456,17 @@ The mockups are authoritative and departures must be explicit (the 12a rule, kep
    typed forms** (§6.2). The definition rides the transport as `json.RawMessage` by design, so
    there is no client-visible schema to generate from short of a new cross-language generation
    pipeline. The drift the locked wording guards against is closed by an exhaustive gate
-   instead: a Go test emits a committed fixture enumerating node types, per-type editable
-   fields, limits and requiredness from `definition.go`; a web unit test asserts the editor's
-   card registry covers the fixture exactly — a Go-side field addition breaks CI until the
-   editor learns it. §6.3's property test proves validity of what the editor produces; this
-   gate proves coverage of what the engine accepts.
+   instead — with an honest source: the fixture is a declarative descriptor maintained in Go
+   beside the engine. The node-type vocabulary IS emitted mechanically from `definition.go`;
+   per-type applicability, limits and requiredness are NOT mechanically derivable — they live
+   as constants and imperative branches in `validate.go`, and `definition.go`'s `Node` is one
+   superset struct — so every declared descriptor row is *proved* against the engine instead
+   of parsed from it: a Go test builds a document violating the row and asserts `Validate`
+   rejects it, and a conforming one passes. That is the mutation bar keeping the descriptor
+   honest. The web unit test asserts the editor's card registry covers the descriptor
+   exactly; a Go-side field or rule change breaks CI until the descriptor and the editor both
+   learn it. §6.3's property test proves validity of what the editor produces; this gate
+   proves coverage of what the engine accepts.
 10. **Run detail's live agent output stream stays deferred** — 12a §10.4 named it ("deferred,
     and needs its own design pass") and 12b keeps that deferral, now recorded here because 12b
     is the plan that closes row 12. Locked run-detail A streams live output into the active
@@ -447,6 +476,14 @@ The mockups are authoritative and departures must be explicit (the 12a rule, kep
     Delivering it needs transport, authorization, truncation and redaction decisions — a design
     pass of its own, which is why 12a deferred it. Owner: the roadmap backlog; slotting it into
     a row is sofo's call.
+11. **Run detail's "supersede" control (locked page map: "Retry / cancel / supersede") is not
+    built.** Cancel's row-09 deferral was named from the start (§1); supersede never was — and
+    unlike cancel it is buildable today: `rerunTask` on a *pending* run already supersedes it
+    before minting the next (`runs/tasks.go`, supersede-before-work; running/waiting refuse
+    with "cancel arrives in Plan 09"). The checkpoint ruling behind §2.4 ("Retry on failed
+    runs only") governs the header Retry, not a pending-run Replace, so this is a genuine open
+    control. Named here as a departure; pulling a "Replace" control into 12b or letting it
+    ride with row 09's cancel is sofo's call.
 
 ## 11. Residuals
 
