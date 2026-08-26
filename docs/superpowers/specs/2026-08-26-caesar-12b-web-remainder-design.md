@@ -132,7 +132,19 @@ client-visible or the artifact DTO gains one field.
   checkpoint ruling, verbatim "Retry on failed runs only").
 - **Event rows and phase cards that name a destination become links**: `publish.pr_opened` → the
   PR URL, `gate.decided` → the gate decision, phases with artifacts → the artifact view
-  (finding 13 / mockup-gap entry thirteen). The `gate.decided` destination must be
+  (finding 13 / mockup-gap entry thirteen). "The artifact view" is a route this plan must
+  BUILD, not one it links: the run screen's own comment records that
+  `GET /runs/{id}/artifacts/{artifact_id}` serves payloads but 12a added no route rendering
+  one, so artifact ids are deliberately inert text today (`runs.$runId.tsx`,
+  `PhaseArtifacts`: "NOTHING HERE LINKS ANYWHERE"). 12b adds `/runs/$runId/artifacts/
+  $artifactId`, linked per artifact **row** — a phase can hold several artifacts, so the
+  phase card is not the link — with a per-kind rendering contract rather than one generic
+  JSON dump (`runs/compile.go` names all seven kinds): `patch` → the diff renderer the
+  approval surface already has; `plan` / `review_verdict` / `gate_note` → their typed payload
+  views (the 12a §2.3 schemas); `publication` → the PR reference; `log_ref` /
+  `failure_snapshot` → metadata-only presentations (path, outcome summary — their payloads
+  are not displayable content and are not fetched as such). Route and renderer tests cover at
+  least `patch`, `plan`, and one metadata-only kind. The `gate.decided` destination must be
   **attempt-precise**: run detail's URL carries only `?phase=<node>` today and the spine
   collapses each node to its newest (generation, attempt) (`runs.$runId.tsx`,
   `runs/phase-spine.ts` — request-changes brings the same gate back under the same node id),
@@ -281,7 +293,11 @@ The `admin.tsx` stub becomes the screen, four sections:
   read-path contract addition: the column is stored at create but absent from the metadata
   queries, domain projection and `CredentialResponse` (`assets/store/queries.sql`,
   `assets/api/dto.go`), so the read path gains it with the usual required-markup + regen + pin
-  treatment. Create, rotate secret via the existing `PUT /credentials/{id}/secret`, delete.
+  treatment — and with its real shape: it is populated **only for `agent_auth_file`** (it
+  feeds a partial unique index; every other kind stores NULL — `assets/credentials.go`,
+  `credentialFingerprint`), so the DTO field is required-but-nullable, the UI renders an
+  explicit "n/a" for the other three kinds — most credentials in the milestone walk among
+  them — and the tests cover all four kinds. Create, rotate secret via the existing `PUT /credentials/{id}/secret`, delete.
 - **Audit** — the §3.1 endpoint, newest-first, load-more on the cursor.
 
 A visible placeholder card names what arrives with row 09 — policy baselines and the kill
@@ -291,7 +307,14 @@ switch — so the page's eventual shape is honest about what is missing rather t
 
 ### 6.1 The screen's spine: list → detail → version
 
-The list is workflow cards (name, description, latest version number). A workflow detail shows
+The list is workflow cards (name, description, latest version number), and it carries the
+**New workflow** action — the milestone's "define a workflow" begins here, and creation is two
+writes, not one: `POST /workflows` creates the metadata, then the editor opens on the new id
+for the initial version (`POST /workflows/{id}/versions` — the two operations the API keeps
+separate, `workflows/api/api.go`). A workflow whose initial version never landed is a legal
+row (`latest_version` is `COALESCE(MAX(version), 0)`, `store/queries.sql`), so the list shows
+it as unfinished setup — "no versions yet" — and opening it resumes the initial-version
+editor; a failed first save strands nothing and duplicates nothing. A workflow detail shows
 metadata (PATCH-editable name/description) and its immutable version history, newest first, each
 row carrying its content hash. Opening a version shows the two projections the locked design
 names:
@@ -397,7 +420,8 @@ screens instead of stubs.
   the bridge's injected timer plus a request-recording fetch layer, and the liveness bound (a
   rendered list advances its phase dot within the throttle under a pure-`phase.*` burst).
 - **The milestone's automated shadow**: one Playwright spec walking project → forge credential
-  → repo → harness credential → harness → workflow → task → gate → decision → **PR link →
+  → repo → harness credential → harness → workflow (the two-write create: metadata from the
+  list, then the initial version through the editor) → task → gate → decision → **PR link →
   Approvals History**, against the fake harness and fake forge (the §1 dependency-true order;
   the fake forge already answers `OpenPullRequest` with a real ref — `runs/fake/forge.go`).
   Stopping at the decision would leave the milestone's last two clauses — open the PR, read
