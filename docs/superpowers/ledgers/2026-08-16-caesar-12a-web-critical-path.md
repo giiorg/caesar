@@ -533,7 +533,7 @@ a keyboard and then at a phone, **after the branch merges**. A checkpoint conduc
 data cannot produce the taste feedback it exists for, and nothing an agent can run substitutes for
 it.
 
-### 1. The deployed digest — NOT RECORDED
+### 1. The deployed digest — RECORDED + DEPLOYED LOCALLY (deviation noted)
 
 Use the release path Plan 11 built and measured: build once, test **that** digest with
 `image-serves-ui`, promote **that** digest. Do not build a second image for the deploy.
@@ -546,24 +546,122 @@ gh run list --branch main --limit 5
 `gh api user/packages/...` needs a `read:packages` scope the local token lacks — read the publish
 job log rather than trying to list GHCR versions.
 
-> **Digest:** _not recorded._
-> **Deployed at:** _not recorded._
+> **Digest:** `sha256:849157fc7e02f3b1a1618dca129505493b1e597ad2f19c6892773535a7bd6731`
+> — main run `32605704934` (green, 2026-08-22): the digest `image-serves-ui` tested, promoted
+> to `ghcr.io/giiorg/caesar:main` and `:sha-5d8f25f642573479a971e6b51e6a493ed37e2254`.
+> **Deployed at:** 2026-08-23, locally (Docker on the operator's Mac, dev database) — **with a
+> forced deviation, see below.** The digest booted, served the UI, and ran the runner, but its
+> first publish exposed that it cannot complete one; the deploy was swapped to the gate-built
+> `caesar-git:dev` (commit `e8d94d0`, tree byte-identical to `main`'s `5d8f25f`) to continue.
 
-### 2. The seven-step phone walk — NOT WALKED
+#### Findings from the local deploy (2026-08-23, pre-phone-walk shakedown)
 
-Against real data, on the real device. In order, timing each step. The timings are the
-deliverable, not a formality: they are the only evidence about whether the flow is usable on a
-phone.
+1. **BLOCKING — the published image cannot publish.** `git-publish` shells out to `git` inside
+   the control-plane process (`clone for publish: gitops: git binary: exec: "git": executable
+   file not found in $PATH`), and the shipped runtime image is distroless — git lives only in
+   the Dockerfile's separate `git` stage, which the runner uses for staging. Dev always ran the
+   binary on a host with git; no CI lane executes a publish from inside the shipped image, so
+   image-serves-ui and four review rounds could not see it. Fix is real work (bake git into the
+   runtime image, or run publish through the git-stage container like staging does). The
+   resumable-retry design behaved exactly as intended around the failure: `publish_resumable`,
+   `chargeable_failures: 0`, growing backoff, and the publication resumed cleanly (attempt 9,
+   PR giiorg/caesar-smoke#1) the moment the environment gained a git.
+2. **UI — the phase card renders "attempt 4/3" with no explanation** while a resumable publish
+   retries past the chargeable cap. The engine is right; the display reads as a bug. 12b item.
+3. **Packaging — the published image is amd64-only**; an Apple-silicon operator machine runs it
+   under Rosetta. If the Mac stays the deploy target, the image job needs a multi-arch build.
+4. **Operational, recorded for honesty:** the row-07 smoke master key lived in `/tmp` and was
+   lost to tmp cleanup on 2026-08-20, exactly as the smoke notes warned; all six stored
+   credentials became undecryptable and were rotated in place (`PUT /credentials/{id}/secret`)
+   under a new key now kept at `~/Projects/caesar/deploy/master.key`. The in-place rotation
+   path worked first try and preserved every harness/repo/workflow binding.
+
+#### Findings from the request-changes round (2026-08-26, Chrome iPhone viewport — the round the 08-23 shakedown skipped)
+
+The round ran three times before it passed, and each failure was its own finding. Runs:
+`checkpoint request-changes round` (failed, auth), `take 2` (rejected — the revision ignored the
+note), `take 3` (succeeded → PR giiorg/caesar-smoke#2). With take 2's reject, all three gate
+decisions have now been exercised against the live conveyor.
+
+5. **BLOCKING (product) — a gate's request-changes note never reaches the harness.** The control
+   plane does its half perfectly: `openRevision` seeds the note as `.caesar/in/1-gate_note.json`
+   and carries the examined patch forward, and the runner applies that patch to the fresh
+   workspace. But the harness prompt is `claude -p "$(cat .caesar/in/instructions.md)"`
+   (`docker/harness/claude-code/entrypoint.sh`), instructions.md is `node.Instructions` verbatim
+   (`orchestrator.go` — `OutputShapeInstruction` is empty for implement nodes), and nothing tells
+   the model `.caesar/in/` exists. Generation 2 therefore found its own generation-1 ROME.md
+   already in the tree, had no reason to touch it, and the recomputed diff came back
+   **byte-identical** (artifact md5 `38e94134…`, both generations). `gatenote_runner_test.go`
+   proves the note is *staged*; nothing proves any harness *reads* it — the lane is wired, its
+   assertion was never live. Operator fix proven live: `walk` v2's instructions name the file
+   path, and take 3's generation 2 honored the note exactly (three sentences, Rubicon) and
+   published. Product fix for 12b: the runner should inject the note into the prompt — the seed
+   comment itself calls it "the only new information in the loop" — and the workflow author
+   should not need to know the staging layout for the revision loop to mean anything.
+6. **UI — an unchanged revision is invisible.** The generation-2 gate presented the identical
+   patch with no "unchanged from generation 1" signal, while the superseded gate renders the
+   note prominently — which reads as "the note was delivered". Detecting the identical-patch
+   case is one hash comparison; without it, request-changes can silently loop an operator into
+   approving work that ignored their review.
+7. **UI — `auth_expired` never surfaces.** The claude-sub subscription token (materialized
+   custody, rotated 08-23) had expired by 08-26; the engine did everything right (`auth_expired`,
+   class permanent, straight to dead, 0 chargeable failures, `last_auth_expired_at` stamped on
+   the credential) and the run screen showed none of it — just `impl dead attempt 1/3`, where
+   "1/3" on a permanent failure promises retries that will never come (same family as the
+   "attempt 4/3" finding). An operator cannot tell an expired token from a crashed harness
+   without psql. Operational corollary: subscription custody means the token dies on a
+   days-not-weeks clock; `rotate-creds.sh` pulling the fresh token from the macOS keychain is
+   the working refresh path (used today, `secret_version` 3, mid-flight — the next task picked
+   the new secret up with no restart).
+8. **En-route evidence for §3's questions.** Network panel, run in flight: a steady several-
+   per-second drumbeat of `events` / `approvals` / `runs` / `me` fetches alongside the live
+   stream (Q3 — "what you saw": chatty). Home's Needs-you card offers all three decisions with
+   the patch never on screen; today it was used, but only after reading the patch on the run
+   screen first (Q1 evidence, one data point). Reject accepted an empty note.
+
+9. **BLOCKING (deploy) — the phone cannot log in over plain LAN http, at all.** Two
+   independent guards, both behaving as designed: `server.app_origin` is a SINGLE exact-match
+   string defaulting to `http://localhost:8080` (config.go:189; the phone's Origin gets
+   "cross-origin request rejected" on the login POST), and the session cookie is
+   `Secure: true` unconditionally (identity/api/api.go:169) — so even with the origin fixed, a
+   browser on `http://192.168.100.171:8080` accepts the login 200 and then refuses to store
+   the cookie; localhost only works because browsers exempt it as a trustworthy origin. The
+   environment map's "LAN URL for the phone" was written on 08-23 and never validated — the
+   phone walk is the first thing that ever tried it. Consequence: a phone walk requires an
+   HTTPS origin (tunnel or local TLS) plus `app_origin` set to match. 12b item: the deploy
+   story needs a phone-reachable shape — TLS guidance in the deploy notes at minimum.
+
+10. **BLOCKING (UI, real device only) — the new-task bottom sheet self-destructs when a text
+    field is focused on iOS Safari.** Tapping Title or Instructions transforms the vaul drawer's
+    content out of view: the operator sees an empty sheet with a floating caret and cannot see
+    what they type. Cause: vaul 1.1.2's default `repositionInputs` keyboard handling against the
+    iOS visual viewport. Chrome's device-toolbar emulation cannot reproduce it — the same form
+    was used there all morning without a hint — which is the argument for the real-device walk
+    in one screenshot. The gate screen's note field is an inline `TextField` on the page (no
+    drawer) and is unaffected. Fix applied mid-checkpoint as a recorded deviation (08-23
+    precedent): `repositionInputs={false}` on the FAB's `Drawer.Root` (web/src/routes/_app/
+    tasks.tsx), image rebuilt and redeployed; the source edit is uncommitted and needs to land
+    as a real commit when the checkpoint closes. Walk timings therefore run against this
+    one-line-divergent tree.
+
+### 2. The seven-step phone walk — WALKED 2026-08-26, real iPhone (iOS Safari)
+
+Against real data (run `01a03e20-…`, task "Phone walk"), over an ngrok HTTPS tunnel (finding 9;
+torn down after). Walked AFTER the drawer fix (finding 10) — the first attempt died at step 1.
+Step times below are reconstructed from `run_events` and the HTTP log; the operator's verbatim
+verdict on speed, friction, and self-updating was "everything was fast and good", with no
+friction reported on any step. Full loop, task creation → PR open: **1m52s wall, ~62s of it
+operator deliberation.**
 
 | # | Step | Time | Notes |
 |---|---|---|---|
-| 1 | Create a task from the FAB | _not walked_ | |
-| 2 | Watch its run advance without touching the screen | _not walked_ | |
-| 3 | Open the waiting gate from Home | _not walked_ | |
-| 4 | Read the examined artifact | _not walked_ | |
-| 5 | Request changes with a note; confirm the new generation appears | _not walked_ | |
-| 6 | Approve the next gate | _not walked_ | |
-| 7 | Open the PR from the publish phase | _not walked_ | |
+| 1 | Create a task from the FAB | task created 12:51:58Z | Only works post-fix; before it, focusing Title destroyed the sheet (finding 10). |
+| 2 | Watch its run advance without touching the screen | impl gen 1: 21s | Screen advanced unaided; operator reported no urge to refresh. |
+| 3 | Open the waiting gate from Home | within the 41s of steps 3–5 | gate.waiting 12:52:19 → decision 12:53:00 covers open + read + type + submit. |
+| 4 | Read the examined artifact | (same window) | Readable on the phone per operator; gen-2 artifact fetched 12s before the approve. |
+| 5 | Request changes with a note; confirm the new generation appears | note POSTed 12:53:00; gen 2 waiting 22s later | Note honored exactly (ROME.md reopens with the Ides of March). |
+| 6 | Approve the next gate | 21s after gen-2 gate waited | Patch opened BEFORE deciding, both decisions — Home's inline buttons not used blind (Q1 data). |
+| 7 | Open the PR from the publish phase | publish 6.4s; PR #3 12:53:49Z | https://github.com/giiorg/caesar-smoke/pull/3 |
 
 ### 3. The checkpoint questions — UNANSWERED
 
@@ -573,19 +671,55 @@ here, in this file.
 - **Does Home's inline approve get used, or is the run opened first every time?** (§10.2, §11.) It
   ships because it is locked and because this is the right instrument for the question. If the
   answer is "always opened first", the card's buttons come off **with evidence behind the
-  removal**. — _unanswered._
+  removal**. — **Answered 2026-08-26.** Evidence: across the Chrome rounds and the phone walk the
+  operator opened the patch before every decision; the buttons were never used blind. Sofo,
+  verbatim: "keep it for now, we will remove it later if needed" — controller had recommended
+  removal (finding 6 makes sight-unseen approval the easiest dangerous path). KEPT.
 - **What should the sticky header offer?** (§10.3, §11.) `rerunTask` ships today, so whole-task
   retry is a call rather than a feature; it stayed out so the checkpoint could decide the header as
   a whole. If the answer is "obviously retry", the cost of adding it was never the reason to wait.
-  — _unanswered._
+  — **Answered 2026-08-26.** Evidence: the checkpoint itself produced two dead-end runs (the
+  auth_expired failure and the rejected take 2), and both times the only path forward was
+  re-creating the task from the FAB by hand. Sofo, verbatim: "Retry on failed runs only, as you
+  recommend." 12b builds: sticky-header Retry on failed runs, wired to the existing
+  `POST /api/v1/tasks/{id}/runs` (rerun keeps title/inputs/pinned version — right for transient
+  failures, and rejected runs end `failed` so one status rule covers both).
 - **Is `phase.` on the global stream too chatty in practice?** (§11.) **Watch the network panel
   during step 2 and write down what you saw, not what you expect.** A run in flight emits far more
   phase transitions than gate or publish events, and the bridge's 250ms debounce is what keeps that
-  from becoming a refetch storm. — _unmeasured._
+  from becoming a refetch storm. — **Measured 2026-08-26.** What was seen: a steady
+  several-per-second drumbeat of `events` / `approvals` / `runs` / `me` refetches while a run was
+  in flight, alongside the live stream — each streamed event fans out into collection refetches,
+  stacked on the 2s poll fallback; the 250ms debounce is not containing it. It cost nothing
+  visible on the phone (screens self-updated within a second or two). Sofo adopted the
+  controller's recommendation verbatim: chatty but not harmfully so at this scale — keep
+  `phase.` on the global stream; 12b gets a tuning item to collapse the per-event refetch fan.
+  Sofo's own added observation, same screen: "here most of the things not clickable, neither
+  those events, so it's not always informational" — event rows that name a destination
+  (`publish.pr_opened` knows the PR URL, `gate.decided` knows the decision, `phase.succeeded`
+  has artifacts) are inert text. Recorded as a 12b navigation item and as mockup-gap entry
+  thirteen: rows and phase cards that reference an artifact, gate, or URL become links.
 - **Do the empty states read as empty or as broken?** Particularly "Up next", which is empty most
-  of the time by construction on a single-operator system. — _unanswered._
+  of the time by construction on a single-operator system. — **Answered 2026-08-26.** Checked
+  live with genuinely nothing pending (all checkpoint gates decided): Home and Approvals both
+  show "Nothing is waiting on you". Sofo, verbatim: "both shows 'Nothing is waiting on you' -
+  it's ok for me". Reads as empty, not broken; no change.
 - **What is missing that the mockups promised?** §10's twelve entries are the known list. Anything
-  else found here is a thirteenth, and it belongs in 12b's spec. — _unanswered._
+  else found here is a thirteenth, and it belongs in 12b's spec. — **Answered 2026-08-26.**
+  Sofo's list, verbatim where quoted, now entries 13–17:
+  13. Event rows / phase cards that name a destination are inert (recorded under Q3 above).
+  14. **The phone tab bar is not fixed** — "When I am on Home and there are some runs, I can't
+      see bottom menu bar." Verified in code: `nav.tsx`'s phone-tabs div has no `fixed`/`sticky`,
+      so the bar sits at document end and scrolls away; the FAB's own `bottom-20` comment
+      ("clears the phone tab bar") was written assuming a fixed bar. Bug-shaped; 12b early.
+  15. The "caesar" wordmark (top left) is not a link Home.
+  16. The FAB: "New task button is not so beautiful and convenient tbh."
+  17. The general texture — "everything is too 'texty' and not so rich in terms of
+      information/hypertext/linking"; sofo's own framing: polish once the whole thing is built
+      and correctness/comprehensiveness is achieved. Same family as 13.
+  Also raised: no way to create projects / add repos / define workflows from the UI — that is
+  not a mockup gap but the unbuilt remainder of roadmap row 12 (Workflows editor, Repos,
+  Admin); the API is the only door today.
 
 ### 4. The roadmap row — NOT FLIPPED
 
