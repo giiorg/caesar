@@ -115,8 +115,17 @@ client-visible or the artifact DTO gains one field.
 
 ### 2.4 Shell and navigation
 
-- **The phone tab bar becomes actually fixed** (`nav.tsx`'s phone-tabs div has no
-  `fixed`/`sticky`; the FAB's `bottom-20` comment was written assuming a fixed bar — finding 14).
+- **The phone tab bar becomes actually fixed — and the shell reserves the space that steals.**
+  `nav.tsx`'s phone-tabs div has no `fixed`/`sticky` and the FAB's `bottom-20` comment was
+  written assuming a fixed bar (finding 14); but `app-shell.tsx`'s `<main>` carries only a
+  uniform `p-4` with the nav in normal flow after it, and the approval thumb-zone bar is its
+  own `sticky bottom-0` surface (`approvals/approval-surface.tsx`) — so pinning the tabs alone
+  overlays the last screenful of every page AND the gate decision controls, the walk's most
+  important buttons. The fix is a set, not a class: one shared tab-bar-height token (on top of
+  the safe-area inset `styles/app.css` already honors), phone `<main>` reserving that height as
+  bottom padding, every bottom-docked surface (gate controls, FAB) offset above the bar with an
+  explicit stacking order, and a phone Playwright assertion that decision buttons and
+  end-of-page content stay visible and clickable with the bar pinned.
 - **Sticky-header Retry on failed runs only**, wired to the existing `rerunTask`
   (`POST /api/v1/tasks/{id}/runs`). Rerun keeps title, inputs and pinned version — right for
   transient failures, and rejected runs end `failed`, so one status rule covers both (sofo's
@@ -138,9 +147,13 @@ window fires *unconditionally*: `['runs']` + `['tasks']` + one `['run', id]` per
 so a chatty phase stream refetches the collections up to every 250ms, stacked on the 60s
 refresh floor and focus refetches (`api/query-client.ts`). The fix, two parts:
 
-1. **Two-tier collection invalidation.** Windows containing a status-moving kind (the
-   existing `ATTENTION_KINDS` set, mirrored from `events.go` — checked, not remembered) keep
-   invalidating the collections immediately, as today. Phase-only windows stop firing the
+1. **Two-tier collection invalidation.** Immediate stays the default: a window containing any
+   non-`phase.*` kind invalidates the collections at once, as today. `ATTENTION_KINDS` is NOT
+   the right predicate for this — its own doc comment scopes it to the approvals inbox "and
+   nothing else", and it omits `run.created` and `run.superseded`, both real lifecycle
+   transitions (`events.go`; superseding a pending run emits one after moving run state,
+   `runs/tasks.go`) — so the collection-immediate predicate is simply "not a phase frame",
+   and `ATTENTION_KINDS` keeps governing inbox invalidation alone. Phase-only windows stop firing the
    collections every 250ms and instead schedule a trailing collection refresh on a slower
    throttle — single-digit seconds, exact value picked at plan time and asserted in the test.
    NOT an outright drop: the collections *render* phase progress — `RunCard` and the Tasks
@@ -160,7 +173,8 @@ refresh floor and focus refetches (`api/query-client.ts`). The fix, two parts:
 The acceptance test counts real HTTP requests under an event burst — including `/auth/me` —
 through the bridge's injected timer plus a request-recording fetch layer, and it asserts the
 liveness half too: under a pure-`phase.*` burst, a rendered runs/tasks list advances its phase
-dot within the throttle bound. Asserting on invalidation calls alone would pass against
+dot within the throttle bound, and a `run.superseded` (or `run.created`) window refetches the
+collections immediately rather than on the throttle. Asserting on invalidation calls alone would pass against
 today's bridge and prove nothing.
 
 ### 2.6 Packaging and CI
@@ -225,8 +239,15 @@ Create/edit through Plan 11's shared typed form abstraction: project (name, desc
 (forge kind `github|gitlab` chosen at create and immutable after — `UpdateRepoRequest` carries
 only slug, default branch and credential (`assets/api/dto.go`), and 12b adds no write paths, so
 the edit form renders forge read-only; slug, default branch, credential picker filtered to
-`forge_token` kind). Deletes surface the API's RESTRICT refusals as readable errors ("this
-repo has runs") rather than raw problem+json. Card-first on the phone, table projection on desktop, per the
+`forge_token` kind). Deletes surface RESTRICT refusals as readable errors — which takes one
+backend classification first: `DeleteRepo` is the one delete in `assets` that wraps the
+constraint error without consulting the `fkViolation` helper its siblings all use
+(`repos.go` vs `projects.go`/`harnesses.go`/`credentials.go`), so deleting an in-use repo
+today surfaces as an unclassified error the generic handler hides behind a 500
+(`httpx/problem.go`). The fix maps it to `ClassConflict` with an accurate detail — the
+constraint is from **tasks** (`tasks.repo_id ON DELETE RESTRICT`, plus the publish tables),
+so "this repository is used by existing tasks", not "has runs" — with service and handler
+tests, and the UI renders the conflict distinctly from an outage. Card-first on the phone, table projection on desktop, per the
 locked mobile-first standard.
 
 ## 5. Admin
@@ -353,8 +374,14 @@ screens instead of stubs.
   the bridge's injected timer plus a request-recording fetch layer, and the liveness bound (a
   rendered list advances its phase dot within the throttle under a pure-`phase.*` burst).
 - **The milestone's automated shadow**: one Playwright spec walking project → forge credential
-  → repo → harness credential → harness → workflow → task → gate → decision against the fake
-  harness (the §1 dependency-true order), so "UI is the only door" is CI-checked continuously,
+  → repo → harness credential → harness → workflow → task → gate → decision → **PR link →
+  Approvals History**, against the fake harness and fake forge (the §1 dependency-true order;
+  the fake forge already answers `OpenPullRequest` with a real ref — `runs/fake/forge.go`).
+  Stopping at the decision would leave the milestone's last two clauses — open the PR, read
+  the decision in History — unshadowed, which is exactly where the existing closest e2e stops
+  (`gate-decision.spec.ts` ends at badge clearance): the spec asserts the `publish.pr_opened`
+  link renders, then opens the History tab and finds the just-made decision with its note,
+  actor and run linkage. "UI is the only door" is then CI-checked end-to-end continuously,
   not just walked once at the checkpoint.
 - House rules apply throughout: mutation is the acceptance criterion for any test-shaped claim;
   verification is `task backend:ci` + `contracts:check` + `web:ci`, never a hand-picked lane
@@ -411,6 +438,15 @@ The mockups are authoritative and departures must be explicit (the 12a rule, kep
    card registry covers the fixture exactly — a Go-side field addition breaks CI until the
    editor learns it. §6.3's property test proves validity of what the editor produces; this
    gate proves coverage of what the engine accepts.
+10. **Run detail's live agent output stream stays deferred** — 12a §10.4 named it ("deferred,
+    and needs its own design pass") and 12b keeps that deferral, now recorded here because 12b
+    is the plan that closes row 12. Locked run-detail A streams live output into the active
+    phase; but no log-serving route exists — agent logs land on the runner's disk
+    (`runs/runner/logs.go`), reachable only as a `log_ref` path artifact, the event vocabulary
+    is lifecycle-only, and the run screen renders event kinds (`routes/_app/runs.$runId.tsx`).
+    Delivering it needs transport, authorization, truncation and redaction decisions — a design
+    pass of its own, which is why 12a deferred it. Owner: the roadmap backlog; slotting it into
+    a row is sofo's call.
 
 ## 11. Residuals
 
