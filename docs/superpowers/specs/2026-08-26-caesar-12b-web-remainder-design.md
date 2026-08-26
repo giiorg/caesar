@@ -15,10 +15,14 @@ Code citations below are against `main` at `fdbc8de`; line numbers drift, functi
 ## 1. Scope — what "done" means
 
 **The milestone, verified by the closing operator walk: from a fresh browser session, with no
-curl and no psql — create a project, add a repo and a credential, register a harness, define a
-linear workflow in the outline editor, run a task through it, request changes with a note the
+curl and no psql — create a project, add a forge credential and a repo bound to it, add a
+harness credential and register a harness, define a linear workflow in the outline editor, run a task through it, request changes with a note the
 harness actually receives, approve, open the PR, and afterwards read the decision in Approvals
-history.** That single walk exercises every 12b screen plus the top product fix.
+history.** That single walk exercises every 12b screen plus the top product fix. The order is
+dependency-true, and it takes **two credentials**: a repo binds a `forge_token` at creation
+(`CreateRepoRequest.credential_id` is required; `assets/repos.go` enforces the kind) and a
+harness binds a model/subscription/auth-file credential (`assets/harnesses.go`,
+`harnessCredentialKinds`) — disjoint kinds, so one credential can never serve both.
 
 Fix-first ordering, decided against the alternatives (screens-first; a two-plan split) because
 the backlog items are the ones that bit the operator during the 12a checkpoint, and fixing them
@@ -29,7 +33,7 @@ deploy before the screens finish, merging early from the branch at the wave boun
 | Wave | Contents |
 |---|---|
 | **0 — conveyor truth** | The checkpoint backlog, backend and web: gate-note injection into the harness prompt; honest failure display (`auth_expired`, attempt counters); identical-revision warning; fixed phone tab bar; sticky-header Retry; linkified event rows and phase cards; refetch-fan tuning; wordmark→Home; FAB restyle; git in the runtime image + in-image publish assertion; runs-list index migration; deadline expiry in `cannot_decide_reason`; go-mod-tidy CI lane. |
-| **1 — Repos + Admin** | The two screens, the two read endpoints (`GET /api/v1/audit`; the decided arm of `GET /api/v1/approvals`), and the History tab the decided arm exists for on the 12a Approvals screen. |
+| **1 — Repos + Admin** | The two screens, the two read endpoints (`GET /api/v1/audit`; `GET /api/v1/approvals/decisions`), and the History tab the decision history exists for on the 12a Approvals screen. |
 | **2 — Workflows** | List, version history, version read view with DAG preview for any document; linear-first outline authoring. |
 | **3 — desktop** | ⌘K command palette; the desktop Playwright project with the parked geometry, split-view and ⌘K assertions. |
 | **checkpoint** | The operator walk above, on a real deploy, phone + desktop; taste verdicts recorded in the ledger. Row 12b flips only on that record. |
@@ -126,12 +130,28 @@ client-visible or the artifact DTO gains one field.
 ### 2.5 The refetch fan collapses
 
 Measured at the checkpoint: a steady several-per-second drumbeat of `events` / `approvals` /
-`runs` / `me` refetches while a run is in flight — each streamed event fans into collection
-refetches through the cache bridge, stacked on the poll fallback; the 250ms debounce
-(`realtime/cache-bridge.ts`) is not containing it. The fix: invalidations batch per debounce
-window into one targeted set scoped by event kind, and `me` leaves the fan entirely. Observable
-screen behavior stays identical — this is a network-panel fix, and its test asserts request
-counts under an event burst through the bridge's injected timer, not UI state.
+`runs` / `me` refetches while a run is in flight. The bridge's existing machinery is NOT the
+gap — `realtime/cache-bridge.ts` already pools frames per 250ms window, dedups run ids, scopes
+`['approvals']` by `ATTENTION_KINDS`, and never invalidates `me` — so "batch and scope the
+invalidations" would restate the status quo and change nothing. The real fan is what every
+window fires *unconditionally*: `['runs']` + `['tasks']` + one `['run', id]` per dirty run,
+so a chatty phase stream refetches the collections up to every 250ms, stacked on the 60s
+refresh floor and focus refetches (`api/query-client.ts`). The fix, two parts:
+
+1. **Kind-scope the collection invalidations.** Only status-moving kinds (the existing
+   `ATTENTION_KINDS` set, mirrored from `events.go` — checked, not remembered) invalidate the
+   `runs`/`tasks` lists; a `phase.*` frame touches only its own `['run', id]`. Status-shaped
+   screen behavior stays identical; non-status detail on a list row may go at most one
+   refresh-floor interval stale, which is the floor's existing, documented guarantee.
+2. **Find `me`'s initiator before touching it.** Nothing in the bridge fires it, and the only
+   realtime `/auth/me` is the rare forbidden-stream probe (`sse-connection.ts`) — so the
+   drumbeat's source (the 60s `refetchInterval` floor, `refetchOnWindowFocus`, or something
+   else) is identified in the network panel at plan time; its fix is whatever the measurement
+   names, not a guess.
+
+The acceptance test counts real HTTP requests under an event burst — including `/auth/me` —
+through the bridge's injected timer plus a request-recording fetch layer. Asserting on
+invalidation calls would pass against today's bridge and prove nothing.
 
 ### 2.6 Packaging and CI
 
@@ -160,12 +180,19 @@ Admin-only, newest-first, **cursor-paginated from day one** — `audit_entries` 
 bound, and this table is the one place where "unpaginated is fine at month-one volume" is
 already false. Minimal V1 surface: cursor + limit, no filters until a use appears.
 
-### 3.2 The decided arm of `GET /api/v1/approvals`
+### 3.2 Decision history: `GET /api/v1/approvals/decisions`
 
-The existing endpoint gains a `state=waiting|decided` parameter defaulting to `waiting`, so
-current behavior — waiting-gates-only, by design, unpaginated — is untouched. The decided arm is
-cursor-paginated and returns cross-run decision rows: decision, note, actor, `acted_at`, and
-run/task/gate identifiers for linking. Same grant scoping as the waiting arm.
+An earlier draft put this on the existing operation as `state=waiting|decided`; that shape does
+not survive the contract pipeline — one operation carries one response schema, and the waiting
+arm's `ApprovalListResponse` (`approvals: []ApprovalResponse`, `runs/api/dto.go`) has no seam
+for decision rows or a cursor. So the history is a sibling operation and the existing operation
+changes by zero bytes: `GET /api/v1/approvals/decisions`, cursor-paginated newest-first,
+returning cross-run decision rows — decision, note, actor, `acted_at`, and run/task/gate
+identifiers for linking — in its own envelope with a `next_cursor`. Same grant scoping as the
+waiting arm. The cursor key is `(acted_at DESC, id DESC)`, and the same change adds the matching
+composite index — `gate_decisions`' only index today is `(run_id, node_id)` (`schema.sql`),
+which cannot serve a global newest-first read. Pagination tests include equal-`acted_at` rows
+straddling a page boundary.
 
 The UI half lands in the same wave: the Approvals screen grows a **History tab** beneath the
 waiting list, newest-first, load-more on the cursor, each row linking into its run. This closes
@@ -195,7 +222,11 @@ The `admin.tsx` stub becomes the screen, four sections:
   credential binding, defaults JSON.
 - **Credentials** — list showing kind, fingerprint, `secret_version`, `last_used_at`, and
   **`last_auth_expired_at`** — the column that made the expired-token finding invisible gets a
-  face. Create, rotate secret via the existing `PUT /credentials/{id}/secret`, delete.
+  face (it is already in `CredentialResponse`; only the UI ever hid it). Fingerprint is a small
+  read-path contract addition: the column is stored at create but absent from the metadata
+  queries, domain projection and `CredentialResponse` (`assets/store/queries.sql`,
+  `assets/api/dto.go`), so the read path gains it with the usual required-markup + regen + pin
+  treatment. Create, rotate secret via the existing `PUT /credentials/{id}/secret`, delete.
 - **Audit** — the §3.1 endpoint, newest-first, load-more on the cursor.
 
 A visible placeholder card names what arrives with row 09 — policy baselines and the kill
@@ -221,17 +252,33 @@ names:
 The document model is immutable content-hashed versions and the editor honors it: a new version
 starts from scratch or prefilled from an existing chain-shaped version. Editor state is an
 ordered list of typed cards: add step → pick type (plan / implement / review / gate /
-git-publish) → fill the type's fields, generated from the engine's schema — agentic cards get a
+git-publish) → fill the type's fields. The card forms are hand-authored typed forms mirroring
+`workflows/definition.go`'s node types — there is no client-visible schema to generate from,
+because the definition document rides the transport as `json.RawMessage` by design
+(`workflows/api/dto.go`: schema enforced by the write door, not the contract), and §6.3's
+property test is the drift guard against the Go model. Agentic cards get a
 harness picker (from the registry) and an instructions textarea; gate cards get the revision
 loop (target restricted to preceding agentic nodes, max rounds). Node IDs auto-derive
 (`plan-1`, `impl-1`), editable for taste. Drag to reorder by the grip, per the mockup.
 
 ### 6.3 Edges are derived, not drawn
 
-For a linear chain the typed artifact bindings follow mechanically from node-type adjacency —
-and the derivation rules are written against Plan 04's validator invariants
-(gate-dominates-exact-patch included), with a property test as the acceptance bar: **any chain
-the editor can produce parses and validates server-side.** The client mirrors only the cheap
+Derivation works from the whole card sequence, not from adjacency — adjacency is provably
+wrong for the ordinary conveyor: in `implement → review → gate → git-publish`, the validator's
+consumption table (`workflows/validate.go`, `validateConsumption`) makes the review consume the
+implement's patch, the gate examine that *same* patch — a bypass edge past the review — while
+also consuming the review's verdict, and publish take the gate's pass-through patch. The repo's
+own conveyor generator builds exactly those edges (`workflows/property_test.go`, `genConveyor`).
+So the rules are per-type consumption rules over the ordered cards: a plan feeds the first
+agentic card; each implement takes the previous implement's patch; a review takes the nearest
+preceding patch; a gate examines the nearest preceding plan-or-patch producer and consumes an
+immediately preceding review's verdict; git-publish takes the gate's patch — all written against
+Plan 04's validator invariants (gate-dominates-exact-patch included). One consequence is
+load-bearing: an editor-produced document is **not edge-linear** (the implement above has two
+outgoing edges), so "chain-shaped" is defined by **round-trip**, not graph shape — a version
+opens editable iff deriving edges from its node sequence reproduces the stored edge set exactly,
+and anything else renders read-only (§6.1). The acceptance bar is the property test: **any card
+sequence the editor can produce derives a document that parses and validates server-side.** The client mirrors only the cheap
 checks inline (missing instructions, gate target ordering); the server's validator remains the
 single truth, and a save rejection maps field errors back onto the offending card.
 
@@ -246,9 +293,13 @@ typing); the backend never sees an invalid document as a row.
 **⌘K** lands scoped to what a single operator actually jumps to: the seven pages, "New task",
 and recent tasks/runs pulled from the query cache — client-side matching only, no new endpoint.
 
-**The desktop Playwright project** 12a parked arrives: the same critical-path specs at a desktop
-viewport, plus the three waiting geometry assertions and the split-view and ⌘K checks. The
-sidebar already exists from Plan 11 and simply gets the two real screens instead of stubs.
+**The desktop Playwright project** 12a parked arrives: the same critical-path *behavior* at a
+desktop viewport, plus the three waiting geometry assertions and the split-view and ⌘K checks.
+"Same specs" cannot mean unchanged files — the existing specs assert phone shell geometry
+(`e2e/approvals.spec.ts` expects `desktop-rail` hidden), which must fail at a desktop viewport —
+so shell/geometry assertions become per-project (viewport-aware) while the shared critical path
+stays one set of specs. The sidebar already exists from Plan 11 and simply gets the two real
+screens instead of stubs.
 
 ## 8. Testing
 
@@ -263,7 +314,9 @@ sidebar already exists from Plan 11 and simply gets the two real screens instead
   backend — the Task 17 harness already runs one.
 - **The refetch fan**: request counts under an event burst through the bridge's injected timer.
 - **The milestone's automated shadow**: one Playwright spec walking project → repo → credential
-  → harness → workflow → task → gate → decision against the fake harness, so "UI is the only
+  → harness → workflow → task → gate → decision against the fake
+  harness — in the §1 dependency-true order (forge credential before repo, harness credential
+  before harness), so "UI is the only
   door" is CI-checked continuously, not just walked once at the checkpoint.
 - House rules apply throughout: mutation is the acceptance criterion for any test-shaped claim;
   verification is `task backend:ci` + `contracts:check` + `web:ci`, never a hand-picked lane
@@ -294,17 +347,28 @@ The mockups are authoritative and departures must be explicit (the 12a rule, kep
    promises it in every variant; every assistant surface is row 13's.
 3. **Admin ships without policy baselines and the kill switch** (row 09), behind a visible
    placeholder rather than silence.
-4. **Cost and `tests` hard-facts fields stay absent** — no data source exists (12a §10.1,
-   unchanged).
+4. **The cost hard-fact stays absent** — no usage accounting exists anywhere in the API or
+   schema (12a §10.1). `tests` is NOT absent and never was after 12a: 12a opened the
+   `review_verdict` schema and shipped the field (`runs/api/payload_dto.go`, rendered by
+   `approvals/approval-surface.tsx`); 12b keeps it. The earlier draft of this entry repeated
+   12a's pre-build wording as if still true — the exact stale-rationale mistake the house
+   rules name.
 5. **The task-lifecycle Kanban board stays absent** — `draft`/`ready`/`in review` still do not
    exist as data (12a §10.8, unchanged).
 6. **⌘K arrives; nothing of §10.9 remains deferred** — run detail's split view shipped in 12a
    (Task 16), and this plan brings the palette.
+7. **Workflows' "Run history per definition" (locked page map, `01-app-skeleton`) is deferred.**
+   `GET /runs` filters by `status`/`task_id` only — the surface needs a workflow filter on the
+   runs list. Read-only and small, but the milestone walk doesn't need it; named here rather
+   than dropped silently, and pulling it into 12b is a plan-time call sofo can make.
+8. **Repos' "Per-repo policy + allowed workflows" (locked page map) → row 09** with the rest of
+   the policy surface. **"Recent activity per repo" is deferred** on the same missing runs-list
+   filter as departure 7.
 
 ## 11. Residuals
 
 - **`GET /tasks` and the waiting arm of `GET /approvals` remain unpaginated** — still correct at
-  this volume, still a cliff later; the decided arm and audit paginate from birth (§3).
+  this volume, still a cliff later; the decision history and audit paginate from birth (§3).
 - **Row 08's both-forges live smoke is untouched by this plan** and stays an operator event; the
   Approvals history gives it one more surface to be walked on, not a closure.
 - **Multi-arch and the TLS/phone-reachable deploy shape are row 14's**, moved there by this
