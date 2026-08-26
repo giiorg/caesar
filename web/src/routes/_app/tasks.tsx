@@ -174,8 +174,13 @@ function TaskRow(props: { task: Task; run: RunSummary | undefined }) {
 function NewTaskFab() {
   const [open, setOpen] = useState(false)
   const navigate = useNavigate()
+  // repositionInputs OFF: vaul's default keyboard handling transforms the
+  // sheet against the visual viewport, and on iOS Safari that moved the whole
+  // form out of view the moment a field was focused (operator checkpoint,
+  // 2026-08-26, real iPhone — invisible in desktop emulation). With it off the
+  // sheet stays put and scrolls under the keyboard.
   return (
-    <Drawer.Root open={open} onOpenChange={setOpen}>
+    <Drawer.Root open={open} onOpenChange={setOpen} repositionInputs={false}>
       <Drawer.Trigger className="bg-accent text-accent-contrast fixed right-4 bottom-20 flex size-14 items-center justify-center rounded-full text-sm font-medium md:bottom-6">
         New task
       </Drawer.Trigger>
