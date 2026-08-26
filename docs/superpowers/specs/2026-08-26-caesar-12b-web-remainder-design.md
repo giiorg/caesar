@@ -138,11 +138,19 @@ window fires *unconditionally*: `['runs']` + `['tasks']` + one `['run', id]` per
 so a chatty phase stream refetches the collections up to every 250ms, stacked on the 60s
 refresh floor and focus refetches (`api/query-client.ts`). The fix, two parts:
 
-1. **Kind-scope the collection invalidations.** Only status-moving kinds (the existing
-   `ATTENTION_KINDS` set, mirrored from `events.go` — checked, not remembered) invalidate the
-   `runs`/`tasks` lists; a `phase.*` frame touches only its own `['run', id]`. Status-shaped
-   screen behavior stays identical; non-status detail on a list row may go at most one
-   refresh-floor interval stale, which is the floor's existing, documented guarantee.
+1. **Two-tier collection invalidation.** Windows containing a status-moving kind (the
+   existing `ATTENTION_KINDS` set, mirrored from `events.go` — checked, not remembered) keep
+   invalidating the collections immediately, as today. Phase-only windows stop firing the
+   collections every 250ms and instead schedule a trailing collection refresh on a slower
+   throttle — single-digit seconds, exact value picked at plan time and asserted in the test.
+   NOT an outright drop: the collections *render* phase progress — `RunCard` and the Tasks
+   rows draw `PhaseDots` from `run.phase_summary` (`runs/run-card.tsx`,
+   `routes/_app/tasks.tsx`), and Home's "live phase dots" are locked (decisions §7) — so
+   deferring phase frames to the 60s floor would be a locked-design regression dressed as
+   tuning. The bound: status changes stay immediate, phase dots advance within the throttle,
+   and the drumbeat collapses from several collection refetches per second to at most one
+   set per throttle interval (per-run `['run', id]` invalidation stays per-window, so run
+   detail keeps its current liveness).
 2. **Find `me`'s initiator before touching it.** Nothing in the bridge fires it, and the only
    realtime `/auth/me` is the rare forbidden-stream probe (`sse-connection.ts`) — so the
    drumbeat's source (the 60s `refetchInterval` floor, `refetchOnWindowFocus`, or something
@@ -150,8 +158,10 @@ refresh floor and focus refetches (`api/query-client.ts`). The fix, two parts:
    names, not a guess.
 
 The acceptance test counts real HTTP requests under an event burst — including `/auth/me` —
-through the bridge's injected timer plus a request-recording fetch layer. Asserting on
-invalidation calls would pass against today's bridge and prove nothing.
+through the bridge's injected timer plus a request-recording fetch layer, and it asserts the
+liveness half too: under a pure-`phase.*` burst, a rendered runs/tasks list advances its phase
+dot within the throttle bound. Asserting on invalidation calls alone would pass against
+today's bridge and prove nothing.
 
 ### 2.6 Packaging and CI
 
@@ -178,7 +188,12 @@ paths anywhere in 12b's backend.
 
 Admin-only, newest-first, **cursor-paginated from day one** — `audit_entries` grows without
 bound, and this table is the one place where "unpaginated is fine at month-one volume" is
-already false. Minimal V1 surface: cursor + limit, no filters until a use appears.
+already false. Minimal V1 surface: cursor + limit, no filters until a use appears. The cursor
+key is `(occurred_at DESC, id DESC)` — `occurred_at` is not unique (writers stamp it from the
+injected clock, and one transaction can emit several entries, e.g. the login sweep in
+`identity/login.go`), and the table's only index is `audit_entries_occurred_idx (occurred_at)`
+(`schema.sql`), so the same change adds the matching composite index. Equal-timestamp rows
+straddling a page boundary are in the pagination tests, same as §3.2's.
 
 ### 3.2 Decision history: `GET /api/v1/approvals/decisions`
 
@@ -207,8 +222,10 @@ here rather than in Admin because the API is project-nested (`/projects/{id}/gra
 grant is a property of a project.
 
 Create/edit through Plan 11's shared typed form abstraction: project (name, description), repo
-(forge kind `github|gitlab`, slug, default branch, credential picker filtered to `forge_token`
-kind). Deletes surface the API's RESTRICT refusals as readable errors ("this repo has runs")
+(forge kind `github|gitlab` chosen at create and immutable after — `UpdateRepoRequest` carries
+only slug, default branch and credential (`assets/api/dto.go`), and 12b adds no write paths, so
+the edit form renders forge read-only; slug, default branch, credential picker filtered to
+`forge_token` kind). Deletes surface the API's RESTRICT refusals as readable errors ("this repo has runs")
 rather than raw problem+json. Card-first on the phone, table projection on desktop, per the
 locked mobile-first standard.
 
@@ -255,11 +272,17 @@ ordered list of typed cards: add step → pick type (plan / implement / review /
 git-publish) → fill the type's fields. The card forms are hand-authored typed forms mirroring
 `workflows/definition.go`'s node types — there is no client-visible schema to generate from,
 because the definition document rides the transport as `json.RawMessage` by design
-(`workflows/api/dto.go`: schema enforced by the write door, not the contract), and §6.3's
-property test is the drift guard against the Go model. Agentic cards get a
+(`workflows/api/dto.go`: schema enforced by the write door, not the contract); §10 departure 9
+records this and names the drift gate that replaces generation. Agentic cards get a
 harness picker (from the registry) and an instructions textarea; gate cards get the revision
-loop (target restricted to preceding agentic nodes, max rounds). Node IDs auto-derive
-(`plan-1`, `impl-1`), editable for taste. Drag to reorder by the grip, per the mockup.
+loop (max rounds; targets are the preceding **plan/implement** cards only — review is agentic
+(`definition.go`, `Agentic()`) yet never a legal target in the conveyor, because the gate's
+patch edge bypasses the review, so review does not dominate the gate and the validator refuses
+it (`validate.go`, `validateRevisions`; `genConveyor`'s comment records the same exclusion)). Node IDs auto-derive
+(`plan-1`, `impl-1`), editable for taste. Drag to reorder by the grip, per the mockup. The read-only DAG preview renders above the
+outline **in the editor too**, updating live from the derived edges as cards change — locked
+variant B puts the live preview in the editor, not only on the version read view (§6.1); the
+derivation is a pure client function, so live costs nothing.
 
 ### 6.3 Edges are derived, not drawn
 
@@ -277,10 +300,21 @@ Plan 04's validator invariants (gate-dominates-exact-patch included). One conseq
 load-bearing: an editor-produced document is **not edge-linear** (the implement above has two
 outgoing edges), so "chain-shaped" is defined by **round-trip**, not graph shape — a version
 opens editable iff deriving edges from its node sequence reproduces the stored edge set exactly,
-and anything else renders read-only (§6.1). The acceptance bar is the property test: **any card
-sequence the editor can produce derives a document that parses and validates server-side.** The client mirrors only the cheap
-checks inline (missing instructions, gate target ordering); the server's validator remains the
-single truth, and a save rejection maps field errors back onto the offending card.
+and anything else renders read-only (§6.1).
+
+The editor's V1 sequence grammar is exactly the proven conveyor family:
+`plan? · implement+ · review? · gate · git-publish`, optional revision loop on the gate — the
+same domain `genConveyor` draws from, so the property test extends the repo's own generator
+instead of inventing a second one. The grammar is enforced structurally: the add-step menu
+offers only types the position accepts, and a reorder that breaks the grammar is refused with
+the reason on the card. This is what makes the acceptance bar honest — a standalone or
+misplaced review/gate/publish card fails the validator's *mandatory* consumption rules
+(`validateConsumption`: review needs exactly one patch, a gate exactly one plan-or-patch,
+publish exactly one patch), so the grammar IS the client-side check, not a nicety on top. The
+acceptance bar is the property test: **random editor operation sequences — add, reorder,
+retarget, all within the grammar — derive documents that parse and validate server-side.** The client additionally mirrors the cheap field checks inline (missing instructions, gate
+target ordering); the server's validator remains the single truth, and a save rejection maps
+field errors back onto the offending card.
 
 ### 6.4 Save and drafts
 
@@ -309,8 +343,9 @@ screens instead of stubs.
   `ExecutionRequest.Instructions` for a revision generation; red-then-revert is deleting the
   injection. The existing `gatenote_runner_test` staging assertions stay as the
   artifact-contract half.
-- **The editor**: a property test over the derivation rules (any editor-produced chain validates
-  server-side), plus one Playwright e2e that authors and saves a workflow against the real
+- **The editor**: the §6.3 property test — random in-grammar editor operation sequences derive
+  documents the server validator accepts, extending `genConveyor` — plus the §10.9 fixture
+  drift gate, plus one Playwright e2e that authors and saves a workflow against the real
   backend — the Task 17 harness already runs one.
 - **The refetch fan**: request counts under an event burst through the bridge's injected timer.
 - **The milestone's automated shadow**: one Playwright spec walking project → repo → credential
@@ -364,6 +399,15 @@ The mockups are authoritative and departures must be explicit (the 12a rule, kep
 8. **Repos' "Per-repo policy + allowed workflows" (locked page map) → row 09** with the rest of
    the policy surface. **"Recent activity per repo" is deferred** on the same missing runs-list
    filter as departure 7.
+9. **Locked outline B's "fields generated from the engine's schema" ships as hand-authored
+   typed forms** (§6.2). The definition rides the transport as `json.RawMessage` by design, so
+   there is no client-visible schema to generate from short of a new cross-language generation
+   pipeline. The drift the locked wording guards against is closed by an exhaustive gate
+   instead: a Go test emits a committed fixture enumerating node types, per-type editable
+   fields, limits and requiredness from `definition.go`; a web unit test asserts the editor's
+   card registry covers the fixture exactly — a Go-side field addition breaks CI until the
+   editor learns it. §6.3's property test proves validity of what the editor produces; this
+   gate proves coverage of what the engine accepts.
 
 ## 11. Residuals
 
