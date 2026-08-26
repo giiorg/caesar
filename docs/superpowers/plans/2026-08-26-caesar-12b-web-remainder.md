@@ -20,6 +20,7 @@
 
 Project-wide. They apply to **every** task below and are not re-litigated inside one.
 
+- **Every task's `git add` must cover every file its own prose touches.** Check the last line of a task against its first before running the gate. This is not bookkeeping: `scripts/gate:99` refuses a dirty tree outright, so one unstaged helper edit ends the task at its final step — and three separate tasks in this plan shipped that defect through two review rounds (see Round 3), because a file named in "Files:" and absent from the commit reads as complete to everyone who is not the shell.
 - **Every task ends with `scripts/gate <abs-worktree-path> <sha> <branch>` green, on a clean tree.** A reviewer must not edit the worktree while a gate runs; use an overlay or a second checkout. The gate asserts each lane's RESOLVED command character for character — **any Taskfile.yml change in this plan needs a matching `scripts/gate` edit in the same commit** (Tasks 3, 4, and 29 change lanes).
 - **Mutation is the acceptance criterion.** Every new guard gets a red-then-revert proof, on the new test as well as on production code. Where a step says "prove it", the proof is a recorded command and its output.
 - **Verification is the full gate, never a hand-picked lane list.** `task backend:ci` + `task contracts:check` + `task web:ci` at minimum; the gate script runs more.
@@ -220,7 +221,7 @@ The 12a checkpoint's best finding (ledger finding 5, proven live with a byte-ide
 
 **Files:**
 - Modify: `backend/internal/runs/orchestrator.go` (buildRequest, ~line 931)
-- Test: `backend/internal/runs/buildrequest_test.go` (exists — extend)
+- Test: `backend/internal/runs/revisions_integration_test.go` (exists — extend). **NOT `buildrequest_test.go`.** That file holds harness-binding cases and the pure `TestCollapsePatchInputs`, and it has no pool or seed fixture because it cannot have one: `buildRequest` builds `store.New(o.svc.pool)` and reads the seeds it must inject through `ListSeedArtifacts` against real Postgres (`orchestrator.go:948-971`). A unit test there does not compile, let alone fail for the right reason. The revisions suite already owns exactly the seam this needs — `bindingRecorder` wrapping the executor and `waitForRequest(t, rec, runID, nodeID, attempt)` returning the real `runs.ExecutionRequest` (`revisions_integration_test.go:321-330`) — which is the assembled-`Instructions` assertion §2.1 asks for, made against the request a harness would actually receive.
 
 **Interfaces:**
 - Consumes: the seed loop already in `buildRequest` (`ListSeedArtifacts`, attempt-0 rows); the `gate_note` payload shape `{note, decision, gate_node_id, examined_artifact_id, acted_by, acted_at, generation}` (`revisions.go:262-270`); `maxGateNoteLen` = 8 KiB (`gates.go:40`) bounds growth upstream.
@@ -228,41 +229,54 @@ The 12a checkpoint's best finding (ledger finding 5, proven live with a byte-ide
 
 - [ ] **Step 1: Write the failing test**
 
-In `buildrequest_test.go`, alongside the existing cases (reuse their fixture helpers for plan/pool setup — the file already builds requests against seeded artifact rows):
+In `revisions_integration_test.go`, following the file's own fixture shape — `gatedRunWithExecutor(t, gatedConveyorDoc(), rec)` mints the run, `DecideGate` with `DecisionRequestChanges` writes the note, `waitForRun(t, svc, run.ID, runs.RunWaiting)` settles the generation, and `waitForRequest` returns the request the successor attempt was built with. `TestRequestChanges_ASecondRoundSeesOnlyItsOwnNote` (`:611-640`) is the closest existing case; read it before writing:
 
 ```go
-func TestBuildRequestInjectsGateNote(t *testing.T) {
-	// Fixture: a revision-target node whose seeds include a gate_note artifact
-	// (attempt 0, payload {"note": "Use three sentences, mention the Rubicon."}).
-	// Follow the existing seed-fixture pattern in this file.
-	req := buildRequestForNodeWithGateNoteSeed(t, "Use three sentences, mention the Rubicon.")
+// §2.1's acceptance: the note reaches the PROMPT, not only the staging dir.
+// Asserted on the assembled Instructions of the request a harness actually
+// receives — the artifact-contract half (the .caesar/in file) has its own
+// tests in gatenote_runner_test and is untouched here.
+func TestRequestChanges_TheNoteReachesTheAssembledInstructions(t *testing.T) {
+	rec := &bindingRecorder{inner: fake.NewExecutor()}
+	f, svc, run := gatedRunWithExecutor(t, gatedConveyorDoc(), rec)
 
-	// The node's own instructions still open the prompt, unchanged.
-	if !strings.HasPrefix(req.Instructions, "Implement the plan.") {
+	const note = "Use three sentences, mention the Rubicon."
+	if _, err := svc.DecideGate(context.Background(), principal(f), runs.GateDecisionInput{
+		RunID: run.ID, NodeID: "gate", Decision: runs.DecisionRequestChanges, Note: note,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForRun(t, svc, run.ID, runs.RunWaiting)
+
+	// Attempt 1 is generation 1's; the revision's target runs as attempt 2.
+	first := waitForRequest(t, rec, run.ID, "impl", 1)
+	if strings.Contains(first.Instructions, "Requested changes") {
+		t.Fatalf("generation 1 grew a requested-changes section:\n%s", first.Instructions)
+	}
+
+	req := waitForRequest(t, rec, run.ID, "impl", 2)
+	// The node's own instructions still OPEN the prompt — appended, never
+	// substituted. Compare against the document's own text rather than a
+	// literal: gatedConveyorDoc() owns it, and a hard-coded prefix here goes
+	// stale the first time that fixture is edited.
+	if !strings.HasPrefix(req.Instructions, implInstructionsOf(gatedConveyorDoc())) {
 		t.Fatalf("instructions no longer open with the node's own text:\n%s", req.Instructions)
 	}
-	// The note is APPENDED in a clearly marked section, verbatim.
-	want := "\n\n## Requested changes (a reviewer rejected the previous attempt)\n\n" +
-		"Use three sentences, mention the Rubicon.\n"
+	want := "\n\n## Requested changes (a reviewer rejected the previous attempt)\n\n" + note + "\n"
 	if !strings.Contains(req.Instructions, want) {
 		t.Fatalf("assembled instructions missing the requested-changes section:\n%s", req.Instructions)
 	}
 }
-
-func TestBuildRequestWithoutGateNoteAppendsNothing(t *testing.T) {
-	req := buildRequestForNodeWithoutSeeds(t)
-	if strings.Contains(req.Instructions, "Requested changes") {
-		t.Fatalf("a generation-1 attempt grew a requested-changes section:\n%s", req.Instructions)
-	}
-}
 ```
+
+The attempt-1 assertion is the negative control and it is free here — the same recorder already holds it, so no second fixture is needed to prove a generation-1 attempt grows nothing. Add the small `implInstructionsOf` helper beside the file's other fixture readers if one does not exist.
 
 Two constraints on the marker text, stated here because the test pins them: it must contain **no line beginning `caesar-fake:`** (`fake.parseDirective` scans instructions line-by-line for that prefix — 12a pre-flight 16), and the note is inserted VERBATIM (no escaping) because it is length-bounded and operator-authored.
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd backend && go test ./internal/runs/ -run TestBuildRequestInjectsGateNote -v`
-Expected: FAIL — no requested-changes section in the assembled instructions.
+Run: `cd backend && go test -tags integration ./internal/runs/ -run TestRequestChanges_TheNoteReachesTheAssembledInstructions -count=1 -v`
+Expected: FAIL on the generation-2 assertion — the section is absent — while the attempt-1 negative control passes. (Integration tags and a testcontainer Postgres: this suite is not the unit lane, and `buildRequest` reads its seeds from the database.)
 
 - [ ] **Step 3: Implement the injection**
 
@@ -290,8 +304,8 @@ In `buildRequest`, inside the existing seed loop (or immediately after it), extr
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cd backend && go test ./internal/runs/ -run TestBuildRequest -v`
-Expected: PASS, including every pre-existing buildRequest case.
+Run: `cd backend && go test -tags integration ./internal/runs/ -run TestRequestChanges -count=1 -v`
+Expected: PASS, including every pre-existing revisions case — `ASecondRoundSeesOnlyItsOwnNote` in particular, which now also proves the injected text is the CURRENT round's note and not a concatenation of both.
 
 - [ ] **Step 5: Red-then-revert proof**
 
@@ -300,7 +314,7 @@ Delete the four injection lines (the `if row.Type == ArtifactKindGateNote` block
 - [ ] **Step 6: Commit**
 
 ```bash
-git add backend/internal/runs/orchestrator.go backend/internal/runs/buildrequest_test.go
+git add backend/internal/runs/orchestrator.go backend/internal/runs/revisions_integration_test.go
 git commit -m "runs: append a seeded gate note to the harness prompt in buildRequest"
 ```
 
@@ -1046,18 +1060,31 @@ it('keeps one navigation landmark', () => {
      not against body's padding box — so the bar would sit under the iPhone
      home indicator no matter what body does. An earlier draft of this plan
      asserted the opposite as fact; it is wrong, and reasoning is not how this
-     gets settled (see "emulation is not the device"). The inset therefore goes
-     on the BAR: h-tab-bar for the content row plus its own
-     pb-[env(safe-area-inset-bottom)] equivalent — expressed as a named
-     utility, since arbitrary values fail web:arch — and the same inset is
-     added to <main>'s reservation, the FAB offset and the sticky decision
-     bar's offset, or each of them under-clears by exactly the indicator. */
-  --spacing-tab-bar: 4rem;
+     gets settled (see "emulation is not the device").
+
+     THE TOKEN IS THE TOTAL, and the 4rem is what survives INSIDE it. Preflight
+     makes everything border-box, so the bar's own bottom padding eats its
+     height rather than adding to it: a 4rem token plus a 34px inset would
+     leave a 30px tab, under the 44px floor — and the floor rule in app.css
+     does not cover these anchors, nor would any CI viewport reveal it.
+     Every consumer — main's clearance, the FAB, the decision bar — offsets by
+     this same total, or each under-clears by exactly the indicator. */
+  --spacing-tab-bar: calc(4rem + env(safe-area-inset-bottom));
 ```
 
-**The safe-area spelling is a task-time decision with a hard constraint**: `web:arch` rejects arbitrary-value utilities (`pb-(--x)`, `pb-[env(...)]`), so the inset cannot be written inline. Two legal shapes — pick one at Step 3 and record which: (a) a second `@theme` entry whose value is `calc(4rem + env(safe-area-inset-bottom))`, consumed as one named `tab-bar` utility that already includes the inset (simplest: every consumer stays a single named class); or (b) a plain CSS rule on the bar's own class in `app.css` carrying the `padding-bottom: env(safe-area-inset-bottom)`, with `--spacing-tab-bar` covering only the content row. **Verify the chosen spelling compiles to a real value under Tailwind 4 before building on it** — `env()` inside a `@theme` token is exactly the kind of pinned-surface claim this repo has lost four times by reasoning; run `task web:build` and grep the emitted CSS.
+**The safe-area spelling has one legal shape, not a choice.** `web:arch` rejects arbitrary-value utilities (`pb-(--x)`, `pb-[env(...)]`), so the inset cannot be written inline; and the token's value must be the TOTAL:
 
-`nav.tsx` — the phone-tabs div gains `fixed inset-x-0 bottom-0 z-20 h-tab-bar` (keeping `border-border bg-surface flex border-t md:hidden`) **plus the safe-area inset decided above** — the body padding does NOT reach a fixed element, so without it the bar sits under the home indicator. Confirm on a real device at Step 6; emulation will not show it. `app-shell.tsx` — `<main className="flex-1 p-4 pb-tab-bar md:pb-4">`; the wordmark `<span>` becomes `<Link to="/" className="font-mono text-sm">caesar</Link>` (inside the header, NOT a second nav). `tasks.tsx` — the FAB's `bottom-20` becomes `bottom-tab-bar` plus a small gap: `className="… fixed right-4 bottom-tab-bar mb-4 … md:bottom-6 md:mb-0"`, and the restyle (finding 16's taste verdict): drop the full-round `size-14 rounded-full` pill for `rounded-xl px-5 py-3` keeping `bg-accent text-accent-contrast` — final taste call is recorded at the checkpoint (Task 34). `approval-surface.tsx` — the decision bar becomes `sticky bottom-tab-bar z-10 md:bottom-0` (it must clear the fixed bar on phone; on desktop the bar is hidden). Stacking order: tab bar `z-20`, decision bar `z-10`, FAB `z-10` — the walk's most important buttons are never under chrome.
+```css
+  --spacing-tab-bar: calc(4rem + env(safe-area-inset-bottom));
+```
+
+The bar takes `h-tab-bar` **plus** an internal `padding-bottom` of the inset, so its content row keeps the full 4rem while the element occupies the total; `<main>`, the FAB and the decision bar all offset by the same total token.
+
+An earlier draft also offered a second shape — keep `--spacing-tab-bar` at `4rem` and add the inset as padding on the bar — **and that one is broken.** Tailwind's preflight sets `box-sizing: border-box` globally (`tailwindcss/preflight.css:12`), so padding lands INSIDE the 4rem rather than adding to it: on a 34px iPhone inset the tab content gets 30px, under the locked 44px minimum. Nor does the global floor catch it — `app.css:21-26` matches `button`, `a[role="button"]` and `[role="tab"]`, while the tabs are plain `<Link>` anchors with none of those (`nav.tsx:77-88`). And the Playwright projects run at zero inset, so nothing in CI would ever show it; the first report would be a thumb missing a tab on a real phone.
+
+**Verify the token compiles to a real value before building on it** — `env()` inside a `@theme` entry is exactly the kind of pinned-surface claim this repo has lost four times by reasoning. Run `task web:build`, grep the emitted CSS for the `h-tab-bar`/`pb-tab-bar` rules, and confirm the `calc()` survived rather than being dropped or resolved to `4rem`. If Tailwind refuses `env()` in a theme value, fall back to a plain `app.css` rule that sets BOTH the height and the padding on the bar's own class, keeping the content row at 4rem — and record which shape shipped.
+
+`nav.tsx` — the phone-tabs div gains `fixed inset-x-0 bottom-0 z-20 h-tab-bar` (keeping `border-border bg-surface flex border-t md:hidden`) **plus its own `padding-bottom` of the inset** — `h-tab-bar` is the TOTAL (content row + indicator), and under border-box the padding carves the indicator strip out of that total, leaving the tabs their full 4rem. Without the padding the tabs paint under the home indicator; without the inset in the token they lose 34px of touch target. Confirm on a real device at Step 6 — emulation runs at a zero inset and will show neither. `app-shell.tsx` — `<main className="flex-1 p-4 pb-tab-bar md:pb-4">`; the wordmark `<span>` becomes `<Link to="/" className="font-mono text-sm">caesar</Link>` (inside the header, NOT a second nav). `tasks.tsx` — the FAB's `bottom-20` becomes `bottom-tab-bar` plus a small gap: `className="… fixed right-4 bottom-tab-bar mb-4 … md:bottom-6 md:mb-0"`, and the restyle (finding 16's taste verdict): drop the full-round `size-14 rounded-full` pill for `rounded-xl px-5 py-3` keeping `bg-accent text-accent-contrast` — final taste call is recorded at the checkpoint (Task 34). `approval-surface.tsx` — the decision bar becomes `sticky bottom-tab-bar z-10 md:bottom-0` (it must clear the fixed bar on phone; on desktop the bar is hidden). Stacking order: tab bar `z-20`, decision bar `z-10`, FAB `z-10` — the walk's most important buttons are never under chrome.
 
 - [ ] **Step 4: Run the unit suites** — `vitest run src/shell src/routes src/approvals`; jsdom asserts structure only.
 
@@ -1153,6 +1180,7 @@ The bridge's existing pooling is NOT the gap (spec §2.5): the fan is what every
 - Modify: `web/src/realtime/cache-bridge.ts` (rewrite), `web/src/realtime/cache-bridge.test.ts`
 - Modify: `web/src/gates/decide-gate.ts`, `web/src/runs/run-events-query.ts` (comment)
 - Create: `web/src/realtime/refetch-fan.test.tsx` (the HTTP-counting acceptance)
+- **Modify: `web/src/test/render-app.tsx`** — the observer seam the acceptance test needs (see Step 4). It does not exist today: `renderApp(path, handlers)` renders `RouterProvider` and nothing else (`render-app.tsx:119, 165-170`), so there is no way to mount a `['tasks']` observer alongside a route that does not read it. Listed here rather than discovered mid-task, because the gate refuses a dirty tree and an unstaged helper edit is how this task fails at its last step.
 
 **Interfaces:**
 - Consumes: `EventFrame` (kind + run_id); `setTimeoutImpl` — the throttle tier gets its OWN injected timer through the same option (one seam, two uses), NOT a test-only flush (the recorded historical failure).
@@ -1270,7 +1298,7 @@ export function createCacheBridge(
 
 - [ ] **Step 4: The HTTP-counting acceptance test** (`refetch-fan.test.tsx`) — the spec's shape: real HTTP requests counted through MSW under an event burst, with per-endpoint ceilings, driven through the injected timers (`scriptedStream` + the bridge's `setTimeoutImpl`):
 
-**EVERY MEASURED ENDPOINT NEEDS A MOUNTED OBSERVER, or the ceiling is vacuous.** This is round 1's third blocker and it kills the obvious shape: `renderApp('/')` mounts `['approvals']` and `['runs']` and NOTHING ELSE — Home's loader and component read exactly those two (`routes/_app/index.tsx:52-55, 70-71`). Invalidating a query with no observers refetches nothing, so `GET /tasks` and `GET /runs/r1/events` would sit at **0** under any bridge, upper bounds would pass, and mutation (i) below could not fire. The route under test is therefore **`renderApp('/runs/r1')`** — run detail observes the run DTO and the events log — with the Tasks and Home collections mounted alongside by pre-warming their queries through a `useQuery` harness component rendered in the same tree (the render-app helper already accepts children for this; if it does not, add the seam here rather than moving the assertions to a route that cannot see them).
+**EVERY MEASURED ENDPOINT NEEDS A MOUNTED OBSERVER, or the ceiling is vacuous.** This is round 1's third blocker and it kills the obvious shape: `renderApp('/')` mounts `['approvals']` and `['runs']` and NOTHING ELSE — Home's loader and component read exactly those two (`routes/_app/index.tsx:52-55, 70-71`). Invalidating a query with no observers refetches nothing, so `GET /tasks` and `GET /runs/r1/events` would sit at **0** under any bridge, upper bounds would pass, and mutation (i) below could not fire. The route under test is therefore **`renderApp('/runs/r1')`** — run detail observes the run DTO and the events log — with the Tasks and Home collections mounted alongside by pre-warming their queries through a `useQuery` harness component rendered in the same tree (**the helper does NOT accept children today and this task adds the seam**: `renderApp` takes `(path, handlers)` and renders `RouterProvider` alone (`render-app.tsx:119, 165-170`). Give it an optional third argument — `renderApp(path, handlers, { observe: [tasksQueryOptions(), runsQueryOptions()] })` — that mounts a tiny component calling `useQuery` on each option INSIDE the same `QueryClientProvider`, so the observers are real ones the cache serves, not a hand-rolled subscription that behaves differently. Do not move the assertions to a route that cannot see them, and do not fake an observer: an invalidation reaches a query only if something is watching it, which is the whole property under test.)
 
 **TWO scenarios, because absorption and accumulation give different counts and one scenario cannot assert both.** Both share the same setup: `renderApp('/runs/r1')` with observers mounted for `['runs']`, `['tasks']`, `['approvals']` and `['run','r1','events']`; let every initial fetch settle; THEN zero the MSW counters — the baseline loads are not what is being measured. Counts are EXACT, never ceilings: an upper bound alone is satisfied by zero, which is the failure mode these scenarios exist to catch.
 
@@ -1308,7 +1336,7 @@ Asserting on invalidation calls alone would pass against today's bridge and prov
 - [ ] **Step 5: Suites + gate + commit**
 
 ```bash
-git add web/src/realtime/ web/src/gates/decide-gate.ts web/src/runs/run-events-query.ts web/src/approvals/approvals.test.tsx
+git add web/src/realtime/ web/src/gates/decide-gate.ts web/src/runs/run-events-query.ts web/src/approvals/approvals.test.tsx web/src/test/render-app.tsx
 git commit -m "web: two-tier cache bridge — phase bursts cost one trailing refresh per 5s, lifecycle stays instant, the twins move with it"
 ```
 
@@ -1542,16 +1570,18 @@ git commit -m "assets: DeleteRepo classifies RESTRICT refusals — a used repo a
 
 ### Task 17: The credential fingerprint gets a face, and wave 1's DTOs get their marks
 
-Three-layer read-path change (pre-flight 9) plus the `required:"true"` sweep for every DTO wave-1 screens read (pre-flight 10): `Credential*`, `Harness*`, `UserListResponse`, `ProjectGrantResponse`, `GrantListResponse`. Fingerprint's real shape: populated ONLY for `agent_auth_file` — the DTO field is `*string` + `required:"true"` (required-but-nullable), the UI renders an explicit "n/a" for the other three kinds, and the tests cover all four.
+**Four**-layer read-path change (pre-flight 9 undercounted it by one — see the files list) plus the `required:"true"` sweep for every DTO wave-1 screens read (pre-flight 10): `Credential*`, `Harness*`, `UserListResponse`, `ProjectGrantResponse`, `GrantListResponse`. Fingerprint's real shape: populated ONLY for `agent_auth_file` — the DTO field is `*string` + `required:"true"` (required-but-nullable), the UI renders an explicit "n/a" for the other three kinds, and the tests cover all four.
 
 **Files:**
-- Modify: `backend/internal/assets/store/queries.sql` (four column lists), `assets.go` (domain struct), `api/dto.go`
+- Modify: `backend/internal/assets/store/queries.sql` (four column lists), `assets.go` (domain struct), **`credentials.go`**, `api/dto.go`
 - Modify: `backend/internal/identity/api/dto.go`
 - Modify: `backend/internal/assets/api/api_integration_test.go`
 
-- [ ] **Step 1: Failing integration test** — create one credential per kind (`forge_token`, `subscription_token`, `model_key` — and `agent_auth_file` with a valid auth-file secret; steal the fixture from `credentials_test.go`'s fingerprint cases); `GET /credentials` asserts: the auth-file row's `fingerprint` is a 64-hex string, the other three are JSON `null` (present, null — not absent).
+**`credentials.go` is the layer the first draft missed, and missing it is silent.** sqlc emits a distinct row type per query, so the package hand-rolls one intermediate — `credentialRow` — and `newCredential` maps it to `assets.Credential` (`credentials.go:32-48`). All four read paths build that intermediate (`:175, :195, :212, :277`). Add the column to the queries and the field to the domain struct only, and the value is read from Postgres, dropped on the floor at `newCredential`, and every API fingerprint is `null` — **including `agent_auth_file`'s**, so this task's own integration test fails and the obvious diagnosis (the SQL, the DTO) is the wrong one twice before anyone looks at the mapper.
 
-- [ ] **Step 2: The three layers** — add `fingerprint` to the four queries' column lists (`CreateCredential RETURNING`, `ListCredentials`, `GetCredential`, `UpdateCredentialSecret RETURNING`); `task db:sqlc`; `assets.Credential` gains `Fingerprint *string`; `CredentialResponse` gains
+- [ ] **Step 1: Failing integration test** — create one credential per kind (`forge_token`, `subscription_token`, `model_key` — and `agent_auth_file` with a valid auth-file secret; steal the fixture from `credentials_test.go`'s fingerprint cases); `GET /credentials` asserts: the auth-file row's `fingerprint` is a 64-hex string, the other three are JSON `null` (present, null — not absent). **Assert it on all four read paths, not just the list** — create's response, get, list, and the rotate response each build their own `credentialRow`, so a mapper updated in three places out of four passes the list test and lies on one screen.
+
+- [ ] **Step 2: The four layers** — add `fingerprint` to the four queries' column lists (`CreateCredential RETURNING`, `ListCredentials`, `GetCredential`, `UpdateCredentialSecret RETURNING`); `task db:sqlc`; `assets.Credential` gains `Fingerprint *string`; **`credentialRow` gains `fingerprint *string`, `newCredential` assigns it, and all four `credentialRow{…}` literals pass it through** — the step the value is otherwise dropped at; `CredentialResponse` gains
 
 ```go
 	// Fingerprint is populated ONLY for agent_auth_file (it feeds the partial
@@ -2239,7 +2269,8 @@ Every generation/status claim goes through `runState` (the backend oracle), not 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add web/e2e/ backend/internal/app/webe2e_test.go
+# serve.go too — Step 1 extends serveOptions, and the gate refuses a dirty tree.
+git add web/e2e/ backend/internal/app/
 git commit -m "e2e: the milestone walk, shadowed — two credentials, the editor, the PR link, and History, continuously"
 ```
 
@@ -2328,6 +2359,16 @@ Eight findings, all validated, none rejected — and **three of the four blocker
 8. **Task 7 would have accused every plan revision of changing nothing.** Gates may examine plans (pre-flight 13, proven against the real validator); plan payloads have no `diff`; `undefined === undefined` is true. The banner would have fired on every plan-gate revision — telling an operator their reviewed changes were ignored when they were not, which is worse than the silence the task set out to fix.
 
 Also: `Doc.edges` was declared required while `toDocument` omits the key when empty (the emit would not type-check), and Task 20 asked `RunCard` for Task 6's status line using a list DTO that carries neither `max_attempts` nor `outcome`.
+
+### Round 3 (codex artifact review, 2026-08-26)
+
+Five findings, all validated, none rejected. The round turned up a **recurring class rather than five unrelated bugs**: a task names a file it must change and then does not stage it, so it cannot reach the clean-tree gate its own Global Constraints demand. Round 2 caught one instance (Task 31); round 3 caught three more, two of them in round 2's own fixes. The lesson is mechanical and worth stating as a rule for execution: **the last line of every task must be checked against the first — every file the task's prose touches appears in its `git add`.**
+
+1. **Task 1's test could not compile.** The plan said `buildrequest_test.go` "exists — extend", and it does exist, but it holds harness-binding cases and the pure `TestCollapsePatchInputs` — no pool, no seed fixture, and no way to acquire one: `buildRequest` builds `store.New(o.svc.pool)` and reads seeds through `ListSeedArtifacts` against real Postgres (`orchestrator.go:948-971`). The named helpers were invented. The acceptance moves to `revisions_integration_test.go`, whose `bindingRecorder` + `waitForRequest` seam returns the real `ExecutionRequest` — which is what §2.1 actually asks to assert on. This is the plan's **first** task and its top product fix.
+2. **Task 12 needed a `render-app` seam it neither described nor staged.** `renderApp(path, handlers)` renders `RouterProvider` alone (`render-app.tsx:119, 165-170`); there is no children slot, so the `['tasks']` observer round 1 relied on cannot exist. The task now defines the `observe` option and stages the helper.
+3. **Task 33 listed `serve.go` and staged only `web/e2e/` and `webe2e_test.go`** — round 2's own fix, one line short.
+4. **Task 17 was a four-layer change described as three.** sqlc emits a distinct row type per query, so the package hand-rolls a `credentialRow` intermediate that `newCredential` maps (`credentials.go:32-48`), built at all four read sites. Add the column and the domain field without it and the value is read from Postgres and dropped at the mapper — every fingerprint null, `agent_auth_file` included, and the task's own test red for a reason two layers away from where anyone would look.
+5. **Task 10's safe-area fix offered a broken option.** Round 2 left two spellings open; one keeps the token at `4rem` and adds the inset as bar padding, which under preflight's global `box-sizing: border-box` carves the inset OUT of the 4rem — a 30px tab on a 34px-inset phone, beneath the locked 44px floor. The floor rule does not cover these anchors (`app.css:21-26` matches `button`/`a[role="button"]`/`[role="tab"]`; the tabs are plain `<Link>`s), and every CI viewport runs at a zero inset, so nothing automated would ever have shown it. The token is now the total and the choice is gone.
 
 ### Risks carried knowingly
 
