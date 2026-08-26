@@ -656,6 +656,28 @@ describe('phaseStatusLine', () => {
     expect(line).not.toContain('4/3')
   })
 
+  // The two statuses a three-branch function silently mishandles. A gate has
+  // no retry clock at all (status.go:55-60) and a succeeded phase has no
+  // outcome (orchestrator.go:1099) — both fall through to "attempt 1/3"
+  // unless the switch is exhaustive.
+  it('a gate awaiting a human says so, never a counter', () => {
+    expect(phaseStatusLine({ ...base, status: 'waiting_decision', attempt: 1 }, null)).toBe('awaiting a decision')
+  })
+
+  it('a succeeded phase says succeeded, not a counter', () => {
+    // No outcome at all on this path — the success writer passes nil.
+    expect(phaseStatusLine({ ...base, status: 'succeeded', attempt: 1, outcome: undefined }, null)).toBe('succeeded')
+  })
+
+  it('every status in the generated vocabulary produces a line', () => {
+    // Exhaustiveness, asserted rather than assumed: a status added to the Go
+    // side and not to the switch must fail here, not render a wrong counter.
+    for (const status of ['pending', 'running', 'waiting_decision', 'reconciling',
+                          'succeeded', 'failed', 'dead', 'superseded']) {
+      expect(phaseStatusLine({ ...base, status }, null)).toBeTruthy()
+    }
+  })
+
   it('policy_violation renders its code like permanent (final is final)', () => {
     const p = { ...base, status: 'dead', outcome: { class: 'policy_violation', code: 'secret_in_artifact', message: 'x' } }
     expect(phaseStatusLine(p, null)).toContain('secret_in_artifact')
@@ -689,16 +711,35 @@ import type { Phase } from './run-query'
  *    (the run merely goes `failed`), so this reads the phase's outcome, never
  *    the run's.
  */
-const TERMINAL: ReadonlySet<string> = new Set(['dead', 'superseded'])
-
 export function phaseStatusLine(phase: Phase, priorAttempt: Phase | null): string {
   const out = phase.outcome
-  if (TERMINAL.has(phase.status)) {
-    // Over. Report the cause and never a counter: there is no next attempt to
-    // count toward. `attempts_exhausted` is a RUN outcome and deliberately not
-    // reachable here — the phase carries the outcome that actually ended it.
-    if (out) return out.class === 'transient' ? `${out.code} — no attempts remain` : out.code
-    return phase.status === 'superseded' ? 'superseded by a newer generation' : 'ended without an outcome'
+  // EXHAUSTIVE over all eight statuses (status.go:52-66). A default arm that
+  // falls through to the counter is how the counter reappears where it lies:
+  // a gate awaiting a human has no worker, no lease and no retry clock
+  // (status.go:55-60 says so), and a succeeded phase has no outcome at all
+  // (the success path writes finishPhase(…, PhaseSucceeded, …, nil) —
+  // orchestrator.go:1099), so both would render "attempt 1/3" under a
+  // three-branch function. Every arm below is pinned by its own test.
+  switch (phase.status) {
+    case 'succeeded':
+      return 'succeeded'
+    case 'waiting_decision':
+      // The only status whose next event is a PERSON. Never a counter.
+      return 'awaiting a decision'
+    case 'superseded':
+      return 'superseded by a newer generation'
+    case 'dead':
+      // Over. Report the cause and never a counter: there is no next attempt
+      // to count toward. `attempts_exhausted` is a RUN outcome and
+      // deliberately not reachable here — the phase carries the outcome that
+      // actually ended it.
+      if (!out) return 'ended without an outcome'
+      return out.class === 'transient' ? `${out.code} — no attempts remain` : out.code
+    case 'pending':
+    case 'running':
+    case 'reconciling':
+    case 'failed':
+      break // a row that can still advance — the counter is honest here
   }
   if (out && out.class !== 'transient') {
     // Permanent or policy_violation on a live row: the code IS the status.
@@ -714,7 +755,7 @@ export function phaseStatusLine(phase: Phase, priorAttempt: Phase | null): strin
 
 - [ ] **Step 4: Wire it into `PhaseSummary`** — replace the literal `attempt {phase.attempt}/{phase.max_attempts}` span with `{phaseStatusLine(phase, priorAttemptOf(run, phase))}` where `priorAttemptOf` scans `run.phases` for the same `node_id` with `attempt === phase.attempt - 1` (add it beside `newestPhaseOf` in `phase-spine.ts`). The route test gets one assertion per branch (permanent code shown; no counter on permanent; resumable line) using the existing fixture pattern.
 
-- [ ] **Step 5: Run the suites, prove the mutants** — `vitest run src/runs src/routes`. THREE mutations, each recorded, each must redden a DIFFERENT test: (i) change `out.class !== 'transient'` to `=== 'permanent'` — the policy_violation case fails; (ii) delete the `TERMINAL` branch entirely — the two dead-row cases fail (this is the round-1 blocker's guard; if they stay green the branch is not load-bearing and the fixtures are wrong); (iii) widen `TERMINAL` to include `'failed'` — the "failed row still reads as a retry in progress" case fails. Restore after each.
+- [ ] **Step 5: Run the suites, prove the mutants** — `vitest run src/runs src/routes`. FIVE mutations, each recorded, each must redden a DIFFERENT test: (i) change `out.class !== 'transient'` to `=== 'permanent'` — the policy_violation case fails; (ii) delete the `case 'dead'` arm — the two dead-row cases fail (if they stay green the arm is not load-bearing and the fixtures are wrong); (iii) move `'failed'` into the `dead` arm — the "failed row still reads as a retry in progress" case fails; (iv) delete the `waiting_decision` arm — the gate case fails; (v) delete the `succeeded` arm — the succeeded case fails. Restore after each.
 
 - [ ] **Step 6: Commit**
 
@@ -737,6 +778,8 @@ Finding 6: request-changes can silently loop an operator into approving work tha
 - Consumes: run detail's `artifacts` array (`ArtifactResponse[]`: `id`, `node_id`, `type`, `attempt`, `generation`); the immutable `artifactQueryOptions(runId, artifactId)`; the current evidence's `examined_artifact_id`.
 - Produces: `previousExaminedArtifactId(artifacts, examined): string | null` (pure — the newest `patch` artifact of the SAME node with `generation === examined.generation - 1`); a banner in the approval surface when the two payloads' `diff` strings are equal.
 
+**PATCH GATES ONLY, and the guard is not defensive.** A gate may examine a PLAN — the validator accepts `plan→gate (plan)` and pre-flight 13 confirms it by running the real `Validate`. A plan payload has no `diff` field, so a comparison written as `current.payload.diff === prior.payload.diff` reads `undefined === undefined` and is **true for every plan revision ever**, banner and all, telling the operator their reviewed changes were ignored when they were not. So: `previousExaminedArtifactId` requires `examined.type === 'patch'` and returns null otherwise, and the surface compares only when both `diff` values are strings. Byte-equality of plan CONTENT is a different feature with a different payload shape; it is not in this task and the code says so.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
@@ -758,10 +801,19 @@ describe('previousExaminedArtifactId', () => {
     const arts = [art('x', 1, 1, 'plan'), art('y', 1, 1, 'patch', 'other'), art('c', 2, 2)]
     expect(previousExaminedArtifactId(arts, art('c', 2, 2))).toBeNull()
   })
+
+  // A gate CAN examine a plan (validate.go accepts plan→gate; pre-flight 13
+  // proved it against the real validator). Plan payloads carry no `diff`, so
+  // without this guard the surface compares undefined to undefined, finds them
+  // equal, and accuses the operator's revision of changing nothing.
+  it('refuses to answer for a plan-examining gate', () => {
+    const arts = [art('p1', 1, 1, 'plan'), art('p2', 2, 1, 'plan')]
+    expect(previousExaminedArtifactId(arts, art('p2', 2, 1, 'plan'))).toBeNull()
+  })
 })
 ```
 
-And a surface test in the approvals suite: render the surface with MSW handlers where BOTH artifact payloads carry the same base64 `diff`; assert the banner (`getByText(/byte-identical/i)`) appears — and a second case with differing diffs asserting it does not.
+And three surface tests in the approvals suite: render with MSW handlers where BOTH artifact payloads carry the same base64 `diff` and assert the banner (`getByText(/byte-identical/i)`) appears; a second case with differing diffs asserting it does not; and **a plan-examining gate at generation 2** whose two plan payloads have no `diff` field at all — the banner must NOT appear, which is the case a naive equality passes and a person acts on.
 
 - [ ] **Step 2: Run, watch fail.**
 
@@ -771,6 +823,9 @@ And a surface test in the approvals suite: render the surface with MSW handlers 
 type Artifact = { id: string; node_id: string; type: string; generation: number; attempt: number }
 
 export function previousExaminedArtifactId(artifacts: readonly Artifact[], examined: Artifact): string | null {
+  // Patch gates only. A plan-examining gate's payloads have no `diff`, and a
+  // caller comparing two undefineds would find every plan revision identical.
+  if (examined.type !== 'patch') return null
   if (examined.generation <= 1) return null
   let best: Artifact | null = null
   for (const a of artifacts) {
@@ -782,7 +837,7 @@ export function previousExaminedArtifactId(artifacts: readonly Artifact[], exami
 }
 ```
 
-- [ ] **Step 4: The surface half** — in `approval-surface.tsx`, where the examined artifact is already fetched: compute the prior id from the run's artifacts (the route already ensures `runQueryOptions`); when non-null, mount a second `useQuery(artifactQueryOptions(runId, priorId))` (immutable, `staleTime: Infinity` — cost is one fetch, only on revision gates); when both payloads are present and `current.payload.diff === prior.payload.diff` (compare the base64 strings — decode nothing), render prominently ABOVE the accordion:
+- [ ] **Step 4: The surface half** — in `approval-surface.tsx`, where the examined artifact is already fetched: compute the prior id from the run's artifacts (the route already ensures `runQueryOptions`); when non-null, mount a second `useQuery(artifactQueryOptions(runId, priorId))` (immutable, `staleTime: Infinity` — cost is one fetch, only on revision gates); when both payloads are present and **both `diff` values are strings** and `current.payload.diff === prior.payload.diff` (compare the base64 strings — decode nothing; the `typeof` guard is what stops two absent fields from comparing equal), render prominently ABOVE the accordion:
 
 ```tsx
 <div role="status" className="border-warning text-text bg-surface mb-3 border px-3 py-2 text-sm">
@@ -791,7 +846,7 @@ export function previousExaminedArtifactId(artifacts: readonly Artifact[], exami
 </div>
 ```
 
-- [ ] **Step 5: Suites + mutant** — `vitest run src/gates src/approvals`. Mutation: compare `diff.length` instead of `diff` — the differing-diff case must still pass and the identical case must too, so ALSO add a same-length-different-bytes fixture that catches it; prove, restore.
+- [ ] **Step 5: Suites + mutants** — `vitest run src/gates src/approvals`. Two mutations: (i) compare `diff.length` instead of `diff` — the differing-diff case must still pass and the identical case must too, so ALSO add a same-length-different-bytes fixture that catches it; (ii) drop the `examined.type !== 'patch'` guard AND the `typeof` string check — the plan-gate case must go red. Prove both, restore.
 
 - [ ] **Step 6: Commit**
 
@@ -1217,29 +1272,38 @@ export function createCacheBridge(
 
 **EVERY MEASURED ENDPOINT NEEDS A MOUNTED OBSERVER, or the ceiling is vacuous.** This is round 1's third blocker and it kills the obvious shape: `renderApp('/')` mounts `['approvals']` and `['runs']` and NOTHING ELSE — Home's loader and component read exactly those two (`routes/_app/index.tsx:52-55, 70-71`). Invalidating a query with no observers refetches nothing, so `GET /tasks` and `GET /runs/r1/events` would sit at **0** under any bridge, upper bounds would pass, and mutation (i) below could not fire. The route under test is therefore **`renderApp('/runs/r1')`** — run detail observes the run DTO and the events log — with the Tasks and Home collections mounted alongside by pre-warming their queries through a `useQuery` harness component rendered in the same tree (the render-app helper already accepts children for this; if it does not, add the seam here rather than moving the assertions to a route that cannot see them).
 
+**TWO scenarios, because absorption and accumulation give different counts and one scenario cannot assert both.** Both share the same setup: `renderApp('/runs/r1')` with observers mounted for `['runs']`, `['tasks']`, `['approvals']` and `['run','r1','events']`; let every initial fetch settle; THEN zero the MSW counters — the baseline loads are not what is being measured. Counts are EXACT, never ceilings: an upper bound alone is satisfied by zero, which is the failure mode these scenarios exist to catch.
+
 ```
-Scenario: renderApp('/runs/r1') with observers mounted for ['runs'], ['tasks'],
-['approvals'] and ['run','r1','events']. Let every initial fetch settle, THEN
-zero the MSW counters — the baseline loads are not what is being measured.
-Stream then delivers 40 phase.* frames for r1 across 10 windows inside one
-throttle interval, then one run.succeeded window.
-Asserted as EXACT counts, not ceilings (an upper bound alone is satisfied by
-zero — the failure mode this scenario exists to catch):
-  GET /api/v1/runs           == 2   (one trailing throttle refresh + one lifecycle)
+Scenario A — the drumbeat collapses (throttle fires with work held).
+40 phase.* frames for r1 across 10 windows inside one throttle interval; run
+the throttle timer; THEN one run.succeeded window and its debounce.
+  GET /api/v1/runs           == 2   (the trailing throttle refresh, then the lifecycle)
   GET /api/v1/tasks          == 2
   GET /api/v1/approvals      == 1   (the lifecycle window only — run.succeeded is an attention kind)
   GET /api/v1/runs/r1/events == 2   (throttle + lifecycle; the old prefix behaviour measured ~10)
   GET /api/v1/runs/r1        == 11  (one exact per window — the per-window run DTO tier)
   GET /api/v1/auth/me        == 0   (pre-flight 1: bursts add zero me traffic)
-ORDERING half: the run.succeeded window's collection refetch fires BEFORE any
-throttle timer is run (the immediate tier is immediate), asserted by advancing
-the debounce timer only and reading the counters before the throttle timer.
-LIVENESS half: after the phase windows and the throttle timer, the runs-list
-query was REFETCHED (its phase_summary would advance a dot) — the == 2 above
-carries this, which is why it is an equality and not a ≤.
+This is the LIVENESS half too: the runs-list was genuinely refetched inside the
+throttle (its phase_summary would advance a dot), which is why the 2 is an
+equality and not a ≤.
+
+Scenario B — absorption (lifecycle arrives BEFORE the throttle fires).
+The same 10 phase windows, then one run.succeeded window and its debounce, and
+only THEN the still-pending throttle timer.
+  GET /api/v1/runs           == 1   (the lifecycle only — it drained the held set)
+  GET /api/v1/tasks          == 1
+  GET /api/v1/runs/r1/events == 1
+  GET /api/v1/runs/r1        == 11
+Then fire the orphaned throttle timer and assert EVERY counter is unchanged.
+That last step is the whole point: the timer cannot be cancelled through the
+setTimeoutImpl seam, so the empty-hold return is the only thing standing between
+a lifecycle event and a spurious collection refetch five seconds later.
 ```
 
-Asserting on invalidation calls alone would pass against today's bridge and prove nothing — the counters are HTTP-level (MSW resolver call counts). Mutation proofs, each recorded, and **each must fail this test on its own** (run them one at a time; a mutation that leaves the suite green means its endpoint has no observer and the fixture, not the bridge, is wrong): (i) revert the events key to prefix-riding (drop it from both tiers, rely on `['run', id]` non-exact) → the events count moves; (ii) route phase frames to the immediate tier → the runs/tasks counts blow past 2; (iii) drop the throttle's trailing refresh → runs/tasks/events fall to 1 and the liveness half fails; (iv) drop `exact: true` from the run-DTO invalidation → the events count rises (the prefix starts carrying it again).
+The ordering half rides Scenario B: the lifecycle window's collection refetch has already landed at a point where no throttle timer has run.
+
+Asserting on invalidation calls alone would pass against today's bridge and prove nothing — the counters are HTTP-level (MSW resolver call counts). Mutation proofs, each recorded, and **each must fail on its own** (run them one at a time; a mutation that leaves both scenarios green means its endpoint has no observer and the fixture, not the bridge, is wrong): (i) revert the events key to prefix-riding (drop it from both tiers, rely on `['run', id]` non-exact) → A's events count moves; (ii) route phase frames to the immediate tier → A's runs/tasks counts blow past 2; (iii) drop the throttle's trailing refresh → A falls to 1 across the board and its liveness half fails; (iv) drop `exact: true` from the run-DTO invalidation → A's events count rises (the prefix starts carrying it again); (v) **delete the `held.length === 0` return** → B's final step fails and A stays green, which is the asymmetry that proves the guard is load-bearing rather than decorative.
 
 - [ ] **Step 5: Suites + gate + commit**
 
@@ -1579,7 +1643,9 @@ Grants live on the project detail (the API is project-nested; a grant is a prope
 **Interfaces:**
 - Consumes: `listGrants`/`setGrant`/`deleteGrant` (`GET|PUT /projects/{id}/grants`, `DELETE /projects/{id}/grants/{user_id}`); `listUsers` (ADMIN-ONLY — the grant form's user picker; on 403 the picker degrades to a uuid text input with help text, honest not silent); `runsQueryOptions({ repo_id })` from Task 15.
 
-- [ ] **Step 1: Failing tests** — (a) grants section lists `{email, level}` rows with a remove control and a set-grant form (user picker + level select `view|run|approve|manage`; READ the grant level vocabulary from the generated `SetGrantRequest`/`GrantResponse` types and use ITS values, not this plan's guess — correct in place if they differ); (b) setting a grant PUTs and invalidates the grants query; removing DELETEs; (c) per-repo activity: each repo row (or its expansion) renders the last few runs via `['runs', { repo_id }]` — assert the filter param reached MSW and rows render with `PhaseDots` + Task 6's status line; empty state "No runs have touched this repo."
+- [ ] **Step 1: Failing tests** — (a) grants section lists `{email, level}` rows with a remove control and a set-grant form (user picker + level select `view|run|approve|manage`; READ the grant level vocabulary from the generated `SetGrantRequest`/`GrantResponse` types and use ITS values, not this plan's guess — correct in place if they differ); (b) setting a grant PUTs and invalidates the grants query; removing DELETEs; (c) per-repo activity: each repo row (or its expansion) renders the last few runs via `['runs', { repo_id }]` — assert the filter param reached MSW and rows render as **`RunCard`s exactly as they are today** (phase dots + the run's status); empty state "No runs have touched this repo."
+
+**NOT Task 6's status line — the list contract cannot carry it.** `PhaseSummaryResponse` is one dot: `node_id`, `node_type`, `status`, `attempt`, `generation` (`runs/api/dto.go:142-155`). It has no `max_attempts` and no `outcome`, both of which `phaseStatusLine` requires, so the formatter cannot run on a runs-list row at all. Task 6's line lives on run DETAIL, where `PhaseResponse` carries the outcome. Widening the list DTO to feed it would put an outcome object on every dot of every row of every list — a contract change with a real payload cost, for a surface nobody asked for. If a later row wants it, that is a DTO task with its own `contracts:gen`; it is not a parenthetical in a UI task.
 - [ ] **Step 2: Implement** — `grantsQueryOptions(projectId)` keyed `['grants', projectId]` + AUTH_SCOPED; activity reuses `RunCard` (it is THE card, per its own comment).
 - [ ] **Step 3: Suites + commit**
 
@@ -1705,7 +1771,11 @@ export type Card = {
   instructions?: string // agentic cards only
   revision?: { target: string; maxRounds: number } // gate cards only, target = a preceding plan/implement id
 }
-export type Doc = { schema: 2; nodes: DocNode[]; edges: DocEdge[] }  // the wire shapes, exactly definition.go's
+// The wire shapes, exactly definition.go's. `edges` is OPTIONAL because
+// toDocument omits the key entirely when the set is empty (the canonical
+// absent form — Document.Edges carries `omitempty`); declaring it required
+// makes that emit fail to type-check.
+export type Doc = { schema: 2; nodes: DocNode[]; edges?: DocEdge[] }
 export function deriveEdges(cards: readonly Card[]): DocEdge[]
 export function toDocument(cards: readonly Card[]): Doc
 export function isChainShaped(doc: { nodes: DocNode[]; edges?: DocEdge[] }): boolean  // round-trip equality
@@ -1793,7 +1863,7 @@ Ordered typed cards: add step → pick type (grammar-filtered menu) → fill the
 
 **Interfaces:**
 - Consumes: Task 25's whole surface; `harnessesQueryOptions` (Task 22); `workflowVersionQueryOptions` for prefill.
-- Produces: `editorReducer(state, action)` with actions `add(type, at)`, `remove(id)`, `move(from, to)`, `retarget(gateId, target)`, `setField(id, field, value)`, `rename(id, newId)` — every transition either applies or returns the SAME state plus a refusal string bound to the offending card (the grammar is enforced structurally: `add` consults `legalTypesAt`, `move` re-checks `grammarViolation`); `CARD_REGISTRY: Record<CardType, CardSpec>` — the per-type field spec Task 29's coverage test walks.
+- Produces: `editorReducer(state, action)` with actions `add(type, at)`, `remove(id)`, `move(from, to)`, `retarget(gateId, target)`, `setField(id, field, value)`, `rename(id, newId)` — every transition either applies or returns the SAME state plus a refusal string bound to the offending card. **Every transition is judged by `prefixViolation`, `move` included** — `add` consults `legalTypesAt` (its positional form of the same question) and `move` re-checks `prefixViolation` on the reordered sequence. Never `grammarViolation`: an editor mid-construction has no complete document, so judging a reorder by complete-document legality refuses ordinary reorders on an incomplete outline — the exact failure the prefix/complete split exists to remove, and one that survived the split's first draft inside this very sentence. `grammarViolation` appears in ONE place in the whole editor: Save. `CARD_REGISTRY: Record<CardType, CardSpec>` — the per-type field spec Task 29's coverage test walks.
 
 - [ ] **Step 1: Failing reducer tests** — add offers/accepts only legal types per position (a review before any implement is refused with its reason); move that would put publish before the gate is refused, state unchanged, reason present; retarget to a non-preceding node refused; rename validates the charset + uniqueness (the validator's exact pattern and its 64-byte cap); remove of the implement a gate's revision targets clears/retargets the revision with a visible note (decide: clear + note — never silently keep a dangling target); **every applied transition leaves a legal PREFIX** — `prefixViolation(state.cards) === null` after every accepted op, including the empty start and every partial sequence on the way up (an invariant test iterating a scripted sequence). It is deliberately NOT `grammarViolation`: an editor is incomplete for its whole authoring session, and holding the reducer to complete-document legality would refuse the first card ever added. `grammarViolation` is checked in ONE place — save (Task 28), which is where incompleteness actually matters — and the editor surfaces it as a disabled Save with the reason, not as a refused keystroke.
 - [ ] **Step 2: Failing component tests** — (a) the add-step menu at each position lists `legalTypesAt`'s answer exactly; (b) a gate card's target select lists preceding plan/implement ids only (fixture with review present — review absent from the options); (c) instructions over 8192 bytes shows the inline byte-count error BEFORE save (the validator's wording: bytes, not characters); (d) the preview region re-renders on card edits (add an implement → a new pill appears — live derivation is pure, no network); (e) drafts: edits persist to `localStorage` key `caesar.workflow-draft.<workflowId>` (the theme key's naming convention) debounced; reload (remount) restores; a successful save CLEARS the draft; (f) prefill: opening `/edit?from=<version>` with a chain-shaped fixture populates cards; with a NON-chain fixture the editor refuses into read-only mode showing "authored outside the editor" and the DAG preview (assert no card controls render); (g) drag reorder by the grip: fire pointer/drag events on the grip to move card 2 above card 1 and assert the order changed — hand-rolled HTML5 drag (draggable on the grip only) or pointer-based reorder; NO new dependency; keyboard fallback buttons (↑/↓ on each card) exist and are the thing the unit test drives if jsdom's drag events prove unfaithful — the e2e (Task 28's spec) drives the real drag.
@@ -1837,8 +1907,9 @@ Two halves. (1) Save: POST through `createWorkflowVersion`; 201 AND the undeclar
 **Files:**
 - Modify: `web/src/routes/_app/workflows.$workflowId.edit.tsx` (save), `web/src/workflows/editor-state.ts` (error binding)
 - Create: `web/src/workflows/editor-property.test.ts`, `web/src/workflows/op-generator.ts`
-- Create: `web/tools/gen-editor-corpus.mts`
-- Create: `backend/internal/workflows/editorcorpus_test.go`; generated `backend/internal/workflows/testdata/editor_corpus/*.json`
+- Create: `web/tools/gen-editor-corpus.mts` (imports `op-generator`, **`editor-state`** and `derive` — the reducer is in the pipeline, not beside it)
+- Modify: `backend/internal/workflows/definition.go` — add `NodeTypes() []NodeType` and make `Valid()` range over it, so the corpus's coverage assertion and Task 29's descriptor read ONE vocabulary
+- Create: `backend/internal/workflows/editorcorpus_test.go`; generated `backend/internal/workflows/testdata/editor_corpus/*.json` + `manifest.json`
 - Modify: `Taskfile.yml` (`contracts:gen` grows the corpus step; `contracts:check`'s diff paths grow the corpus dir) + `scripts/gate` (same commit)
 
 **Interfaces:**
@@ -1848,7 +1919,9 @@ Two halves. (1) Save: POST through `createWorkflowVersion`; 201 AND the undeclar
 - [ ] **Step 2: The property test** — `editor-property.test.ts`: for each of ~200 seeded runs (fast in CI — pure), `generateOps` drives the reducer from empty. **Invariant after every step: `prefixViolation(cards) === null`, or the op was refused-with-reason and the state is byte-identical to before.** (Not `grammarViolation` — the generator starts from `[]` and the first append can never produce a complete document, so a complete-legality invariant refuses the entire run. Round 1's blocker.) At sequence end, force-complete to a legal document (append the missing gate/publish through the reducer itself), assert `grammarViolation(cards) === null` — the completion actually completed — then assert `isChainShaped(toDocument(cards))` and local shape facts (exactly one gate, one publish, every edge's artifact matches the producer table). Deterministic: same seeds, same documents, no `Date.now`, no `Math.random` — mulberry32 only. One further invariant worth its line: a refused op must leave the state untouched, which is what makes "refused-with-reason" an escape hatch rather than a hole.
 - [ ] **Step 3: The corpus — an EXACT output set, not an accumulating directory**
 
-`gen-editor-corpus.mts` (run via `scripts/with-node node --experimental-strip-types`, the web:arch precedent) imports `op-generator` + `derive`, emits `SEEDS.length` documents as canonical JSON to `backend/internal/workflows/testdata/editor_corpus/seed-<n>.json`, byte-stable (stable key order comes free — `toDocument` builds objects in wire order; `JSON.stringify` with no spacing).
+`gen-editor-corpus.mts` (run via `scripts/with-node node --experimental-strip-types`, the web:arch precedent) emits `SEEDS.length` documents as canonical JSON to `backend/internal/workflows/testdata/editor_corpus/seed-<n>.json`, byte-stable (stable key order comes free — `toDocument` builds objects in wire order; `JSON.stringify` with no spacing).
+
+**It must REPLAY through the production `editorReducer`, not just call `derive`.** This task's own header names the subject as "the TS reducer + derivation", and the acceptance bar is that what the EDITOR produces validates server-side — but a generator importing only `op-generator` and `derive` never executes a line of the reducer, so a reducer mutation leaves every corpus document byte-identical and the Go lane green while the editor ships something else. The pipeline is therefore: `generateOps(seed, n)` → fold through `editorReducer` from the empty state (refusals are skipped, exactly as the UI would) → force-complete → `toDocument(state.cards)`. `derive` is then reached the way production reaches it, through the state the reducer actually built.
 
 **The generator RECONCILES the directory**: before writing, it reads the existing `*.json` entries and deletes any that are not in this run's output set. Without that, dropping a seed from `SEEDS` leaves its stale-but-still-valid file behind forever — generation never touches it, the tree stays clean, `contracts:check` is green, and the Go judge happily validates a document no current rule produces (round 1's second blocker). It also emits `manifest.json` — the sorted filename list plus each file's sha256 — which is what makes the exact set assertable from the Go side without re-running Node.
 
@@ -1903,9 +1976,16 @@ func TestEditorCorpusValidates(t *testing.T) {
 	if len(shapes) < 8 {
 		t.Errorf("corpus collapsed to %d distinct documents across %d seeds", len(shapes), len(files))
 	}
-	// ...plus: assert each NodeType from definition.go's vocabulary appears in
-	// at least one corpus document (walk the parsed docs; iterate the same
-	// constant list Descriptor() emits, so a new node type reddens here too).
+	// ...plus: assert each NodeType appears in at least one corpus document,
+	// iterating definition.go's OWN vocabulary. There is no slice today — the
+	// five types are loose constants (definition.go:46-50) and `Valid()` is a
+	// switch over them (:53) — so THIS task adds `func NodeTypes() []NodeType`
+	// beside them and rewrites `Valid()` to range over it, which is the only
+	// way "a new node type reddens the corpus" is true rather than hoped for.
+	// NOT Descriptor(): that lives in Task 29,
+	// which runs AFTER this one, and a Go test cannot reference a file the
+	// declared task order has not created yet. Task 29 then consumes the same
+	// vocabulary rather than minting a second copy.
 }
 ```
 
@@ -1920,6 +2000,8 @@ Two vacuousness guards, both load-bearing: the manifest count catches an orphan 
 (iii) **Hand-write an orphan** `seed-999.json` containing a valid document, do not regenerate, run `task backend:test` → the manifest count assertion is red. (Note what this replaces: the earlier draft prescribed "delete one corpus file without regenerating → `contracts:check` red", which is **backwards** — `contracts:check` runs `contracts:gen` FIRST (`Taskfile.yml:259-264`), so a deleted generated file is restored byte-for-byte and the check is GREEN. Direct deletion of a current artifact is self-healing by design and is not a mutation this gate can catch; the orphan is.)
 
 (iv) Weaken the grammar (allow two gates) → the property test's own invariant red.
+
+(v) **Mutate the REDUCER** — make `move` a no-op that returns state unchanged — and regenerate. The corpus must DIFF (`contracts:check` red). If it does not, the generator is not replaying through `editorReducer` and Step 3's whole claim is false; this is the proof that the reducer is genuinely the corpus's subject rather than a module the pipeline happens to sit beside.
 
 Restore all.
 - [ ] **Step 6: The editor e2e** — one Playwright spec (mobile project) against the real backend: from `/workflows`, New workflow → metadata → the editor → add implement/review/gate/publish, fill fields (harness from the seed via `seedLabels`), drag one reorder, save → land on v1's version view with the DAG rendered; assert via the API (`request.get('/api/v1/workflows/...')`) that `latest_version` is 1. This is the "authors and saves against the real backend" bar; the webe2e seed already registers a harness.
@@ -1974,6 +2056,8 @@ func Descriptor() []FieldRule
 ```
 
 Rows: harness+instructions required on plan/implement/review (max 100 / 8192 bytes), forbidden on gate/git-publish; on_request_changes optional on gate with `max_rounds` bounded 1–10, forbidden elsewhere. The JSON adds `{"node_types": [...], "agentic": [...], "node_fields": [...], "id_pattern": "^[a-z][a-z0-9_-]{0,63}$", "rules": [...]}`.
+
+The node-type vocabulary comes from `NodeTypes()`, which **Task 28 adds** to `definition.go` — this task consumes it rather than minting a second list, so the corpus's coverage assertion and the descriptor can never disagree about which types exist.
 
 **`node_fields` is what makes the gate detect an ADDED engine field.** Every assertion in the first draft iterated descriptor rows, so a new field or rule in `validate.go` with no descriptor row left every test green — the claim "a Go-side rule change breaks CI until descriptor AND editor both learn it" was not established by anything (round 1). The fix is a second, opposite-direction pass: `descriptorgen` reflects over `definition.Node`'s struct tags and emits the JSON field names (`id`, `type`, `harness`, `instructions`, `on_request_changes`), and `descriptor_test.go` asserts that **every** non-structural field (everything but `id` and `type`) has a `FieldRule` row for **every** `NodeType`. Add a field to `Node` and the descriptor is incomplete before anyone writes a rule for it.
 
@@ -2038,9 +2122,13 @@ Scoped to what a single operator actually jumps to: the seven pages, "New task",
 - [ ] **Step 3: Suites + commit**
 
 ```bash
-git add web/src/shell/
+# tasks.tsx and its tests MUST be in this commit — Step 2 moves the drawer to a
+# search param, and the gate refuses a dirty tree outright (scripts/gate:99).
+git add web/src/shell/ web/src/routes/_app/tasks.tsx web/src/routes/_app/tasks.test.tsx
 git commit -m "web: a hand-rolled command palette — pages, New task, and cache-fed recents"
 ```
+
+Also re-run `task web:e2e` before committing: any existing spec that opens the new-task drawer by clicking the FAB still passes (the trigger is unchanged), but a spec that asserted the URL does not change when it opens will now fail, and that failure is correct — fix the spec, not the feature.
 
 ---
 
@@ -2113,9 +2201,21 @@ One Playwright spec walking the §1 sentence end-to-end against the fake harness
 **Files:**
 - Create: `web/e2e/milestone-walk.spec.ts`
 - Modify: `web/e2e/harness.ts` (the stale "four control-server calls" comment → five; pre-flight 23)
-- Modify (if needed): `backend/internal/app/webe2e_test.go` — the shadow creates its OWN assets through the UI; verify the fake forge's `OpenPullRequest` answers a real ref for a UI-created repo (the fake already does — `runs/fake/forge.go` — but the EXECUTOR needs `executor.Remote(repoID, bare)` for the new repo id: add a control-server fixture `POST /fixture/register-remote {repo_id}` binding the bare repo, following `e2eFixtures`' style, raw-SQL-free)
+- **Modify: `backend/internal/app/webe2e_test.go` AND `backend/internal/app/serve.go`** — the shadow creates its OWN assets through the UI and is the first e2e spec to reach `git-publish`, which the harness cannot currently serve. See Step 1; this is the task's real cost and it is not optional.
 
-- [ ] **Step 1: The fixture gap first** — read `webe2e_test.go`'s `e2eFixtures`; add `register-remote` (202, body `{repo_id}`) calling `executor.Remote(id, bare)`. Without it the UI-created repo's implement falls back to the synthetic patch and the gate screen shows nothing — the recorded 12a lesson at the top of that file.
+- [ ] **Step 1: The harness gap — THREE registrations, not one, and a composition-root change**
+
+Read `webe2e_test.go`'s `e2eFixtures` and `serve.go`'s `serveOptions` before writing anything. The obvious plan — a `register-remote` fixture calling `executor.Remote(id, bare)` — is **necessary and nowhere near sufficient**, and the shortfall is silent: the spec would reach the gate, approve, and then fail at publish with an error about a URL nobody recognizes.
+
+What the tree actually holds:
+
+- `serveOptions` substitutes exactly two things, the executor and the listener (`serve.go:112-120`). Its own comment scopes the substitution deliberately: the agent CONTAINER is replaced, "everything below that substitution is production code."
+- So publication runs the PRODUCTION `newForgeAdapter` and `gitPublisher` (`serve.go:185-212`). The publisher clones from the forge endpoints — which, in this harness, point at a stub that answers `{"sha": …}` to **every** request whatever the path (`webe2e_test.go:131-134`). It is a `ResolveHead` stand-in and nothing more; there is no repository behind it to clone and no PR endpoint to open.
+- The doubles that would work exist and each needs its OWN registration: `fake.NewPublisher(remotes)` with `Publisher.Remote(repoID, bare)` (`fake/publisher.go:49-56`) and `fake.NewForge(heads)` with `Forge.Remote(repoID, bare)` (`fake/forge.go:90, 119`). Two maps, two registrations, plus the head SHA.
+
+So this step is: **extend `serveOptions` with `publisher` and `forge` slots** alongside `executor`, following the executor slot's existing shape and extending its doc comment to say why the substitution boundary moved (the same reasoning applies — a fake forge is the network stand-in, everything below it stays production). Wire the served service and the control-side service in `webe2e_test.go` to ONE shared fake forge and ONE shared fake publisher — the control side currently builds its own `gitPublisher` (`webe2e_test.go:528`) and two instances would register remotes into different maps, which fails exactly the way "the API host and the clone host drift apart" is described at `serve.go:180`. Then `POST /fixture/register-remote {repo_id}` registers the new repo with **all three** — executor, publisher, forge (with its head SHA) — in one call, following `e2eFixtures`' style, raw-SQL-free.
+
+Prove the wiring before writing the walk: assert the fake forge is the one serving by having the fixture return the registered head and checking a publish-shaped request reaches it. Without the executor registration the implement falls back to the synthetic patch and the gate screen shows nothing (the recorded 12a lesson at the top of that file); without the other two the walk dies at its last beat, which is the beat this whole spec exists to cover.
 - [ ] **Step 2: The spec** — mobile project (the conveyor is phone-first; the desktop pass is the human checkpoint's job), `beforeEach` quiesce, generous per-beat timeouts under the existing 120s budget:
 
 ```
@@ -2213,6 +2313,21 @@ Eleven findings, every one validated against the tree before acceptance; none re
 8. Two gaps: the version read view's outline placeholder was mounted by Task 24 and never replaced by anyone, and ⌘K's "New task" navigated without opening anything.
 
 Two findings were the author's own, from reading the Dockerfile against Task 4: the final-stage instruction was ambiguous in a way whose literal reading ships the **fake harness** as the runtime image, and the git stage's doc comment ("it is not the last stage") becomes false the moment the task lands.
+
+### Round 2 (codex artifact review, 2026-08-26)
+
+Eight findings, all validated, none rejected — and **three of the four blockers were defects round 1's own fixes introduced.** That is the round's real lesson and it is why the protocol treats a reviewer's fix as review input rather than as a closed question.
+
+1. **Round 1's absorption guard made round 1's own counts wrong.** Adding `if (held.length === 0) return` to the throttle is correct — and it means a lifecycle event arriving before the timer produces ONE collection refetch, not two. The scenario still asserted two, so the prescribed test could not pass against the prescribed bridge. Split into two scenarios: throttle-then-lifecycle (2) and lifecycle-then-orphaned-timer (1, then zero more).
+2. **Round 1's `prefixViolation` split left `move` behind.** The invariant was rewritten; the sentence three lines down still told `move` to re-check `grammarViolation`, which refuses ordinary reorders on an incomplete outline — the exact failure the split was for, surviving inside the fix for it.
+3. **Round 1's node-type coverage assertion referenced `Descriptor()`, which Task 29 creates.** Task 28 runs first; a Go test cannot cite a file the declared order has not written. Now both read a `NodeTypes()` accessor that Task 28 adds to `definition.go`.
+4. **Task 31's commit command was never updated** when the drawer moved to a search param, leaving `tasks.tsx` dirty — and `scripts/gate:99` refuses a dirty tree outright, so the task could not reach its own gate.
+5. **Task 33 could not publish.** The plan proposed one `executor.Remote` registration; the harness needs three. `serveOptions` substitutes only the executor and the listener (`serve.go:112`), so publication runs the production forge adapter and git publisher against a stub that answers `{"sha": …}` to every request (`webe2e_test.go:131`). The fakes exist and each needs its own remote registered. This is a composition-root change, and the spec's last beat — the beat it exists for — is what would have failed.
+6. **Task 28's corpus never executed the reducer** it named as its subject: the generator imported `op-generator` and `derive` only, so a reducer mutation left every document byte-identical and the Go lane green. It now replays through `editorReducer`, with a reducer mutation as the proof.
+7. **Task 6 was still lying, just for different rows.** Round 1 fixed `dead`; `waiting_decision` and `succeeded` still fell through to the counter. A gate awaiting a human has no worker, no lease and no retry clock (`status.go:55-60`) and a succeeded phase has no outcome at all (`orchestrator.go:1099`). The function is now exhaustive over all eight statuses, with an exhaustiveness test.
+8. **Task 7 would have accused every plan revision of changing nothing.** Gates may examine plans (pre-flight 13, proven against the real validator); plan payloads have no `diff`; `undefined === undefined` is true. The banner would have fired on every plan-gate revision — telling an operator their reviewed changes were ignored when they were not, which is worse than the silence the task set out to fix.
+
+Also: `Doc.edges` was declared required while `toDocument` omits the key when empty (the emit would not type-check), and Task 20 asked `RunCard` for Task 6's status line using a list DTO that carries neither `max_attempts` nor `outcome`.
 
 ### Risks carried knowingly
 
