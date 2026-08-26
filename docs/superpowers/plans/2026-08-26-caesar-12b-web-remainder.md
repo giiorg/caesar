@@ -24,7 +24,10 @@ Project-wide. They apply to **every** task below and are not re-litigated inside
 - **Mutation is the acceptance criterion.** Every new guard gets a red-then-revert proof, on the new test as well as on production code. Where a step says "prove it", the proof is a recorded command and its output.
 - **Verification is the full gate, never a hand-picked lane list.** `task backend:ci` + `task contracts:check` + `task web:ci` at minimum; the gate script runs more.
 - **Each wave lands complete before the next begins**; wave 1's endpoints land with `task contracts:gen` run and `contracts:check` green before their screens are touched. Merging the branch early at a wave boundary stays open (one plan, one branch: `caesar-12b-web-remainder`).
-- **Bounded contexts never import each other**; contexts never import `internal/app`; `internal/platform` imports no business code; the runs context's SQL never names another context's tables **except the precedented `users` join** (`ListGateDecisionsForRun` already does it). `internal/arch` fails CI on a violation.
+- **Bounded contexts never import each other**; contexts never import `internal/app`; `internal/platform` imports no business code. `internal/arch` fails CI on a violation — but note what it checks: **Go imports**, not SQL. The SQL rule is a convention this plan states and this plan must therefore keep consistent: the runs context's SQL names another context's tables only where an entry below licenses it, and every such entry names its reason.
+  - `users`, for the actor's email — precedented by `ListGateDecisionsForRun` and reused by Task 14.
+  - `workflow_versions`, for Task 15's `workflow_id` filter. Licensed here, in the constraint, rather than argued inside the task: the alternative is a cross-context read port resolving a workflow id to its version ids before the runs query runs, which buys a second round-trip and a new seam to keep the SQL text clean while the two queries still race. sqlc generates against one schema, the join is read-only, and spec §10.7 names this filter as the whole cost of the deferred surface. **The seam that actually matters stays intact — no Go import crosses, so `internal/arch` still holds the real line.**
+  - Nothing else. A third exception is a decision, not a convenience: add it here with its reason or use a port.
 - **Go house rules**: no ORMs, no DI frameworks, `log/slog` only, stdlib `flag` only, stdlib asserts + go-cmp.
 - **`required:"true"` on every DTO field a 12b screen reads** — with the $ref exception: NEVER mark a pointer-to-named-struct required (a `$ref` property gets no null branch; required would claim non-nullability). Scalars, slices and maps are marked freely — required and nullable are independent. Pattern for every DTO change: Go field → `task contracts:gen` → commit `openapi.json` AND `schema.d.ts` in the same commit → `contracts:check` green.
 - **Any new `{id}`-bearing endpoint with a request body needs a `requestOverrides` wrapper in `internal/contracts/contracts.go` or the generator panics.** Any new API constructor argument touches `operationTables()`'s nil-dependency construction in the same file.
@@ -51,7 +54,11 @@ Verified against `main` at `83aadbc` by reading source, running the real validat
 
 1. **The `/auth/me` drumbeat's initiator is the 60s refresh floor — measured, not guessed** (spec §2.5's named verification). Method: the `TestWebE2E` world was held open (same boot, steps 1–6, testcontainer Postgres — the deploy untouched) and real Chromium driven against it, every `/api/*` request timestamped. Result: `/auth/me` fired at t=60.6s, 120.6s, 180.6s — exactly the `refetchInterval: 60_000` in `AUTH_SCOPED_QUERY_OPTIONS` (`query-client.ts:39-41`) — through 90s of idle AND 60s with a run in flight; stream bursts added ZERO `me` requests. Each full document load adds one (~700ms after load). Code corroborates: nothing invalidates `['auth','me']` but `login.tsx`; `useMe` has zero consumers; the bridge never touches it. The one initiator with a true drumbeat SHAPE is `sse-connection.ts`'s `probeMe` under reconnect backoff (500ms→30s) — it fires only when the stream flaps, which the healthy bench never did but the checkpoint's phone-over-tunnel deploy plausibly did. **The fix is therefore: touch nothing about `me`'s config** (the floor is the deliberate grant-narrowing cap, row 10a relaxes it); Task 12's test pins a per-endpoint ceiling of ZERO `me` requests under a phase burst; Task 34's checkpoint re-measures the interval SHAPE on the real deploy (flat 60s = floor; exponential-flattening-at-30s = a flapping stream, which is a deploy/tunnel finding, not a client bug).
 2. **The phase-tier throttle is 5 seconds** (spec §2.5's second named verification). Chosen to equal the client-wide `staleTime: 5_000` (`query-client.ts:9`): the throttled tier then never serves data older than the staleness the design already accepts, and 5s comfortably satisfies the locked "live phase dots" bound against the 60s floor. It is a named constant (`PHASE_TIER_THROTTLE_MS = 5_000`) and Task 12's test asserts the value.
-3. **§2.2 needs NO DTO change.** `PhaseResponse` already carries `Outcome *OutcomeResponse` (`class`, `code`, `message`, `retry_at`) plus `Attempt` and `MaxAttempts` (`runs/api/dto.go:174-200`). Two engine facts complete the derivation: (a) the attempt ordinal outruns `max_attempts` ON PURPOSE — the claim predicate bounds `chargeable_failures`, not the ordinal (`store/queries.sql:128-141`), and only uncharged waits (`rate_limited`, `credential_busy`, `publish_not_started`, `publish_resumable` — `outcome.go:88-97`) can push it past, so **`attempt > max_attempts` alone is an honest "resumable — not chargeable" signal**, with the reason and `retry_at` on the previous attempt's phase row (also in `run.phases`); (b) `auth_expired` is a PHASE outcome, class permanent — the phase goes `dead` and the RUN goes `failed`, never run-status `dead` (`dead` ⇔ `wall_deadline_exceeded`, its sole producer `sweepExpiredRuns`). The status line reads the phase's outcome, not the run's.
+3. **§2.2 needs NO DTO change — but PHASE STATUS is the primary discriminator, not the counter.** `PhaseResponse` already carries `Outcome *OutcomeResponse` (`class`, `code`, `message`, `retry_at`) plus `Status`, `Attempt` and `MaxAttempts` (`runs/api/dto.go:174-200`). Three engine facts complete the derivation, and the FIRST was missing from this plan's first draft (round 1's blocker):
+   - (a) **`failed` means a successor exists; `dead` means the node is over.** `evaluateFailure` terminalizes the attempt row to `PhaseFailed` on the retry branch and inserts attempt N+1 in the same transaction — its comment states the invariant outright, "failed rows always have successors (plan decision 3)" (`orchestrator.go:1573-1592`) — and to `PhaseDead` on the terminal branch, where nothing follows (`orchestrator.go:1616-1622`). So `status` alone answers "will another attempt come?", which is the only question a status line is asked.
+   - (b) **An exhausted phase keeps its TRANSIENT outcome.** `finishPhase(…, PhaseDead, …, rawOut)` writes the original outcome; only the RUN-level outcome is rewritten to `attempts_exhausted` (`orchestrator.go:1652-1656`). A derivation keyed on outcome class alone therefore renders `attempt 3/3` — the exact lying counter §2.2 exists to kill — on the single most common exhaustion path, and renders "resumable" for a dead attempt whose ordinal outran the cap through earlier uncharged waits. Both were live bugs in this plan's first-draft formatter.
+   - (c) The attempt ordinal outruns `max_attempts` ON PURPOSE — the claim predicate bounds `chargeable_failures`, not the ordinal (`store/queries.sql:128-141`), and only uncharged waits (`rate_limited`, `credential_busy`, `publish_not_started`, `publish_resumable` — `outcome.go:88-97`) can push it past. So `attempt > max_attempts` is an honest "resumable — not chargeable" signal **only on a non-terminal row**, with the reason and `retry_at` on the previous attempt's phase row (also in `run.phases`).
+   - And: `auth_expired` is a PHASE outcome, class permanent — the phase goes `dead` and the RUN goes `failed`, never run-status `dead` (`dead` ⇔ `wall_deadline_exceeded`, its sole producer `sweepExpiredRuns`). The status line reads the phase's outcome, not the run's.
 4. **§2.3 needs NO contract change either.** No artifact hash exists anywhere (the `artifacts` table stores raw `payload jsonb`; `ListArtifactsForRun` is deliberately metadata-only, and computing a digest there would read every payload per run-detail request). Instead: the gate screen already fetches the examined patch payload through the immutable `['artifact', runId, id]` query (`staleTime: Infinity`); the previous generation's examined artifact is findable in run detail's `artifacts` array (same `node_id`, type `patch`, `generation N-1`, newest attempt), one more immutable fetch — and byte-equality of the two payloads' `diff` strings IS the "one hash comparison". Zero backend change; the extra fetch happens only when a previous generation exists.
 5. **§2.6's deadline machinery, verified**: `runs.wall_deadline` is written once at insert and never updated; `DecideGate` refuses on it with the DB clock (`q.DBNow`, `gates.go:171-181`) — grant first (handler), then gate liveness, then **deadline**, then self-approval, then examined artifact. So `deadline_expired` slots **SECOND** in `decidability()`'s deliberate order, between `not_approver` and `self_approval_forbidden`. `WallDeadline` already rides the evidence projection (`gateevidence.go:41-45` — put there in 12a precisely so a card could display expiry before it bites); the only missing ingredient is a `now`, which must come from the DB alongside the read (an app-clock comparison against a DB-stamped deadline is forbidden by `DBNow`'s own contract). One caveat Task 5 must check in-flight: whether the waiting-gates queries exclude expired runs — if they do, the reason is computable but only ever visible on run detail's gate phase (whose evidence rides `PhaseResponse.Evidence`), and the task's tests must cover that path rather than the inbox.
 6. **`gate_decisions` carries `generation` but NOT `attempt`** (`schema.sql:340-364`). Attempt-precise links (§2.4/§3.2) need a join through `phase_run_id` to `phase_runs`; the existing `ListGateDecisionsForRun` does not do it. The table's only useful index is `(run_id, node_id)`; a global newest-first read needs the new `(acted_at DESC, id DESC)` composite (Task 14 adds both query and index in one migration).
@@ -405,7 +412,13 @@ ENTRYPOINT ["/usr/local/bin/caesar"]
 CMD ["serve", "-config", "/etc/caesar/config.json"]
 ```
 
-Keep (or alias) the `git` build target so `image:build`'s `--target git` still resolves — simplest is `FROM alpine:3.22 AS git` on this same stage and dropping the old separate stage; verify `task image:build` still produces all three tags.
+**POSITION MATTERS AND IS THE TRAP HERE.** Docker's implicit final stage is the LAST one in the file, and today's order is `build` → `git` (:74) → `fakecli` (:85) → `distroless` (:91). "Drop the old separate stage and label this one `AS git`" is ambiguous, and the literal reading — delete :91 and leave the git stage where it is — makes **`fakecli` the final stage**, so a bare `docker build .` ships the scripted fake harness as the control plane. The instruction is therefore precise: **delete the distroless stage and move the git stage to the END of the file**, keeping its `AS git` label so `image:build --target git` still resolves. `fakecli` stays where it is, before it.
+
+Two more edits that must ride this commit:
+- **The git stage's own doc comment becomes FALSE** (`Dockerfile:71-73`: "It is not the last stage, so a bare `docker build .` still produces the control-plane runtime image"). Rewrite it to say what is now true — this IS the runtime image, and why (git-publish shells out in-process; distroless has no git and no `sh`). The plan rewrites two other comments the moment their mechanism changes (Tasks 8, 12); this is the third and it is the same rule.
+- `CMD ["serve", "-config", "/etc/caesar/config.json"]` moves onto it — the current git stage has an ENTRYPOINT but no CMD, because it was never the thing that boots.
+
+Verify `task image:build` still produces all three tags, and that `docker build .` with no `--target` produces an image whose `git version` answers.
 
 - [ ] **Step 2: Extend image-serves-ui with the in-image assertions**
 
@@ -413,21 +426,32 @@ In the job, after the four existing assertions (the container is already running
 
 ```bash
 # 5) The image can run git at all — the runtime regression this plan fixes.
-docker exec candidate git version || { echo "no git in the runtime image"; exit 1; }
-# 6) A publish-shaped git flow works INSIDE the image: clone a bare repo,
-#    commit, push. This is the minimal end of the spec's "better" option and
-#    runs entirely inside the candidate container.
+docker exec candidate git version || fail "no git in the runtime image"
+
+# 6) A publish-shaped git flow works INSIDE the image: init a bare repo, clone,
+#    commit, push. UNDER CAESAR'S OWN GIT ENVIRONMENT, not a convenient one —
+#    gitops.go:84-91 constructs every git invocation with HOME set to the work
+#    dir, GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1,
+#    GIT_TERMINAL_PROMPT=0 and the author/committer identity in the env. An
+#    assertion using `git -c user.email=…` instead would prove a shape caesar
+#    never executes, and the interesting failures here (no passwd entry for uid
+#    65532, no HOME, a config git refuses to read) live precisely in that env.
 docker exec candidate sh -c '
   set -e
+  export HOME=/tmp/pub-home
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+  export GIT_AUTHOR_NAME=caesar GIT_AUTHOR_EMAIL=caesar@invalid
+  export GIT_COMMITTER_NAME=caesar GIT_COMMITTER_EMAIL=caesar@invalid
+  mkdir -p "$HOME"
   git init --bare /tmp/pub-remote.git
   git clone /tmp/pub-remote.git /tmp/pub-work
   cd /tmp/pub-work
-  git -c user.email=ci@caesar -c user.name=ci commit --allow-empty -m probe
+  git commit --allow-empty -m probe
   git push origin HEAD:refs/heads/probe
-' || { echo "in-image git publish flow failed"; exit 1; }
+' || fail "in-image git publish flow failed under caesar's git env"
 ```
 
-(alpine has `sh`; distroless did not — this assertion is only writable because of Step 1.)
+Two things about this snippet, both learned the hard way in this very job (its own comments record the lessons): it routes through the existing **`fail()` helper** rather than `echo; exit 1`, so a red run carries the container logs with it like every other assertion here; and it runs under the step's existing `set -euo pipefail`, where `cmd || fail …` is the shape that actually fails the job — a bare failing command inside a pipeline, or one negated with `!`, does not. `alpine` has `sh`; distroless did not — this assertion is only writable because of Step 1.
 
 - [ ] **Step 3: Prove the assertions fire**
 
@@ -541,14 +565,16 @@ git commit -m "runs: cannot_decide_reason names an expired wall deadline, second
 
 ### Task 6: Honest failure display
 
-One rule fixes three findings: **a phase card's status line derives from the outcome class, not a bare counter** (spec §2.2). No DTO change (pre-flight 3). The derivation is a pure function; `runs.$runId.tsx`'s `PhaseSummary` (one component, used by rail and timeline — keep it one) renders its result.
+One rule fixes three findings: **a phase card's status line derives from the phase's STATUS first and its outcome class second — never from a bare counter** (spec §2.2). No DTO change (pre-flight 3). The derivation is a pure function; `runs.$runId.tsx`'s `PhaseSummary` (one component, used by rail and timeline — keep it one) renders its result.
+
+**The ordering matters and is the whole task.** `dead` is terminal — nothing follows that row — while `failed` always has a successor attempt (pre-flight 3a). A formatter that consults only the outcome class renders `attempt 3/3` for an exhausted node (whose phase outcome stays *transient*; only the run's is rewritten to `attempts_exhausted`) and "resumable" for a dead row whose ordinal outran the cap. Status is therefore checked BEFORE the counter, and the counter is reachable only from a row that can still advance.
 
 **Files:**
 - Create: `web/src/runs/phase-status.ts`, `web/src/runs/phase-status.test.ts`
 - Modify: `web/src/routes/_app/runs.$runId.tsx` (`PhaseSummary`, ~line 165)
 
 **Interfaces:**
-- Consumes: `Phase` (the generated `ApiPhaseResponse`): `status`, `attempt`, `max_attempts`, `outcome?: {class, code, message, retry_at?}`.
+- Consumes: `Phase` (the generated `ApiPhaseResponse`): `status`, `attempt`, `max_attempts`, `outcome?: {class, code, message, retry_at?}`. Read the status vocabulary from the generated type, not from this plan — `PhaseStatus`'s eight constants live in `runs/status.go:52-66` (`pending`, `running`, `waiting_decision`, `reconciling`, `succeeded`, `failed`, `dead`, `superseded`).
 - Produces: `phaseStatusLine(phase: Phase, priorAttempt: Phase | null): string` — `priorAttempt` is the same node's previous attempt row (for the resumable reason), findable in `run.phases`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -564,6 +590,45 @@ describe('phaseStatusLine', () => {
     expect(phaseStatusLine({ ...base, attempt: 2 }, null)).toBe('attempt 2/3')
   })
 
+  // THE ROUND-1 BLOCKER, pinned. An exhausted node's phase row keeps its
+  // TRANSIENT outcome (only the RUN's becomes attempts_exhausted —
+  // orchestrator.go:1652), and its status is `dead` because nothing follows it
+  // (`failed` rows always have successors — orchestrator.go:1573). A formatter
+  // that reads the outcome class first prints "attempt 3/3" here, which is
+  // exactly the lying counter this task exists to remove.
+  it('never prints a counter on a dead row, even with a transient outcome at the cap', () => {
+    const p = {
+      ...base, status: 'dead', attempt: 3,
+      outcome: { class: 'transient', code: 'harness_error', message: 'exit 1' },
+    }
+    const line = phaseStatusLine(p, null)
+    expect(line).not.toMatch(/attempt \d/)
+    expect(line).not.toContain('resumable')
+    expect(line).toContain('harness_error')  // the cause survives; the promise of a retry does not
+  })
+
+  // Same row shape, ordinal PAST the cap (earlier uncharged waits pushed it
+  // there). "resumable" is a promise of a successor; a dead row has none.
+  it('never says resumable on a dead row whose ordinal outran the cap', () => {
+    const p = {
+      ...base, status: 'dead', attempt: 5,
+      outcome: { class: 'transient', code: 'rate_limited', message: 'cap window' },
+    }
+    const line = phaseStatusLine(p, null)
+    expect(line).not.toContain('resumable')
+    expect(line).not.toContain('5/3')
+  })
+
+  // `failed` is the mirror case and proves the discriminator is STATUS, not
+  // just "is there an outcome": same class, same code, opposite reading.
+  it('a failed row with the same outcome still reads as a retry in progress', () => {
+    const p = {
+      ...base, status: 'failed', attempt: 2,
+      outcome: { class: 'transient', code: 'harness_error', message: 'exit 1' },
+    }
+    expect(phaseStatusLine(p, null)).toBe('attempt 2/3')
+  })
+
   it('names the terminal code on a permanent outcome, never a counter', () => {
     const p = {
       ...base,
@@ -576,8 +641,11 @@ describe('phaseStatusLine', () => {
   })
 
   it('says resumable — not chargeable past the cap, with the wait reason from the prior attempt', () => {
+    // The prior row is `failed`, not `dead`: it HAS a successor (this is the
+    // retry branch's invariant, orchestrator.go:1573). A `dead` prior would
+    // mean the node ended and there is no attempt 4 to describe.
     const prior = {
-      ...base, attempt: 3, status: 'dead',
+      ...base, attempt: 3, status: 'failed',
       outcome: { class: 'transient', code: 'rate_limited', message: 'cap window', retry_at: '2026-08-26T12:00:00Z' },
     }
     const p = { ...base, attempt: 4, status: 'pending' }
@@ -603,17 +671,37 @@ describe('phaseStatusLine', () => {
 import type { Phase } from './run-query'
 
 /**
- * §2.2's one rule: the status line derives from the OUTCOME CLASS, not a bare
- * counter. The engine facts this encodes (verified, plan pre-flight 3):
- * attempt outruns max_attempts ONLY via uncharged waits, so `attempt >
- * max_attempts` alone means "resumable — not chargeable"; auth_expired and
- * every other permanent code lives on the PHASE outcome (the run merely goes
- * `failed`), so this reads the phase's outcome, never the run's.
+ * §2.2's one rule: the status line derives from what will HAPPEN NEXT, not
+ * from a bare counter. The engine facts this encodes (verified, pre-flight 3):
+ *
+ *  - STATUS FIRST. `dead` means nothing follows this row; `failed` means a
+ *    successor attempt was inserted in the same transaction
+ *    (orchestrator.go:1573 — "failed rows always have successors"). Only a row
+ *    that can still advance may show a counter or the word "resumable", both
+ *    of which are promises about a next attempt.
+ *  - An exhausted node keeps its TRANSIENT phase outcome; only the RUN's is
+ *    rewritten to attempts_exhausted (orchestrator.go:1652). So class alone
+ *    cannot tell exhausted from mid-retry, and a class-first formatter printed
+ *    "attempt 3/3" on the commonest failure there is.
+ *  - attempt outruns max_attempts ONLY via uncharged waits, so on a LIVE row
+ *    `attempt > max_attempts` means "resumable — not chargeable".
+ *  - auth_expired and every other permanent code lives on the PHASE outcome
+ *    (the run merely goes `failed`), so this reads the phase's outcome, never
+ *    the run's.
  */
+const TERMINAL: ReadonlySet<string> = new Set(['dead', 'superseded'])
+
 export function phaseStatusLine(phase: Phase, priorAttempt: Phase | null): string {
   const out = phase.outcome
+  if (TERMINAL.has(phase.status)) {
+    // Over. Report the cause and never a counter: there is no next attempt to
+    // count toward. `attempts_exhausted` is a RUN outcome and deliberately not
+    // reachable here — the phase carries the outcome that actually ended it.
+    if (out) return out.class === 'transient' ? `${out.code} — no attempts remain` : out.code
+    return phase.status === 'superseded' ? 'superseded by a newer generation' : 'ended without an outcome'
+  }
   if (out && out.class !== 'transient') {
-    // Permanent or policy_violation: the code IS the status. Never a counter.
+    // Permanent or policy_violation on a live row: the code IS the status.
     return out.code
   }
   if (phase.attempt > phase.max_attempts) {
@@ -626,7 +714,7 @@ export function phaseStatusLine(phase: Phase, priorAttempt: Phase | null): strin
 
 - [ ] **Step 4: Wire it into `PhaseSummary`** — replace the literal `attempt {phase.attempt}/{phase.max_attempts}` span with `{phaseStatusLine(phase, priorAttemptOf(run, phase))}` where `priorAttemptOf` scans `run.phases` for the same `node_id` with `attempt === phase.attempt - 1` (add it beside `newestPhaseOf` in `phase-spine.ts`). The route test gets one assertion per branch (permanent code shown; no counter on permanent; resumable line) using the existing fixture pattern.
 
-- [ ] **Step 5: Run the suites, prove the mutant** — `vitest run src/runs src/routes`. Mutation: change `out.class !== 'transient'` to `=== 'permanent'` only — the policy_violation test must fail; restore.
+- [ ] **Step 5: Run the suites, prove the mutants** — `vitest run src/runs src/routes`. THREE mutations, each recorded, each must redden a DIFFERENT test: (i) change `out.class !== 'transient'` to `=== 'permanent'` — the policy_violation case fails; (ii) delete the `TERMINAL` branch entirely — the two dead-row cases fail (this is the round-1 blocker's guard; if they stay green the branch is not load-bearing and the fixtures are wrong); (iii) widen `TERMINAL` to include `'failed'` — the "failed row still reads as a retry in progress" case fails. Restore after each.
 
 - [ ] **Step 6: Commit**
 
@@ -895,12 +983,26 @@ it('keeps one navigation landmark', () => {
 ```css
   /* The phone tab bar's reserved height. A SPACING token so Tailwind derives
      h-tab-bar / pb-tab-bar / bottom-tab-bar as named utilities — web:arch
-     rejects arbitrary-value spellings. The safe-area inset stacks on top via
-     app.css's body padding, which already honours env(safe-area-inset-bottom). */
+     rejects arbitrary-value spellings.
+
+     THE BODY PADDING DOES NOT COVER A FIXED BAR. app.css:12-18 puts
+     env(safe-area-inset-*) on `body`, but a `position: fixed; bottom: 0`
+     element is laid out against the VIEWPORT (the initial containing block),
+     not against body's padding box — so the bar would sit under the iPhone
+     home indicator no matter what body does. An earlier draft of this plan
+     asserted the opposite as fact; it is wrong, and reasoning is not how this
+     gets settled (see "emulation is not the device"). The inset therefore goes
+     on the BAR: h-tab-bar for the content row plus its own
+     pb-[env(safe-area-inset-bottom)] equivalent — expressed as a named
+     utility, since arbitrary values fail web:arch — and the same inset is
+     added to <main>'s reservation, the FAB offset and the sticky decision
+     bar's offset, or each of them under-clears by exactly the indicator. */
   --spacing-tab-bar: 4rem;
 ```
 
-`nav.tsx` — the phone-tabs div gains `fixed inset-x-0 bottom-0 z-20 h-tab-bar` (keeping `border-border bg-surface flex border-t md:hidden`); the safe-area bottom inset already lives on `body`, so the bar sits above it — VERIFY on a real device in Step 6, not by reasoning. `app-shell.tsx` — `<main className="flex-1 p-4 pb-tab-bar md:pb-4">`; the wordmark `<span>` becomes `<Link to="/" className="font-mono text-sm">caesar</Link>` (inside the header, NOT a second nav). `tasks.tsx` — the FAB's `bottom-20` becomes `bottom-tab-bar` plus a small gap: `className="… fixed right-4 bottom-tab-bar mb-4 … md:bottom-6 md:mb-0"`, and the restyle (finding 16's taste verdict): drop the full-round `size-14 rounded-full` pill for `rounded-xl px-5 py-3` keeping `bg-accent text-accent-contrast` — final taste call is recorded at the checkpoint (Task 34). `approval-surface.tsx` — the decision bar becomes `sticky bottom-tab-bar z-10 md:bottom-0` (it must clear the fixed bar on phone; on desktop the bar is hidden). Stacking order: tab bar `z-20`, decision bar `z-10`, FAB `z-10` — the walk's most important buttons are never under chrome.
+**The safe-area spelling is a task-time decision with a hard constraint**: `web:arch` rejects arbitrary-value utilities (`pb-(--x)`, `pb-[env(...)]`), so the inset cannot be written inline. Two legal shapes — pick one at Step 3 and record which: (a) a second `@theme` entry whose value is `calc(4rem + env(safe-area-inset-bottom))`, consumed as one named `tab-bar` utility that already includes the inset (simplest: every consumer stays a single named class); or (b) a plain CSS rule on the bar's own class in `app.css` carrying the `padding-bottom: env(safe-area-inset-bottom)`, with `--spacing-tab-bar` covering only the content row. **Verify the chosen spelling compiles to a real value under Tailwind 4 before building on it** — `env()` inside a `@theme` token is exactly the kind of pinned-surface claim this repo has lost four times by reasoning; run `task web:build` and grep the emitted CSS.
+
+`nav.tsx` — the phone-tabs div gains `fixed inset-x-0 bottom-0 z-20 h-tab-bar` (keeping `border-border bg-surface flex border-t md:hidden`) **plus the safe-area inset decided above** — the body padding does NOT reach a fixed element, so without it the bar sits under the home indicator. Confirm on a real device at Step 6; emulation will not show it. `app-shell.tsx` — `<main className="flex-1 p-4 pb-tab-bar md:pb-4">`; the wordmark `<span>` becomes `<Link to="/" className="font-mono text-sm">caesar</Link>` (inside the header, NOT a second nav). `tasks.tsx` — the FAB's `bottom-20` becomes `bottom-tab-bar` plus a small gap: `className="… fixed right-4 bottom-tab-bar mb-4 … md:bottom-6 md:mb-0"`, and the restyle (finding 16's taste verdict): drop the full-round `size-14 rounded-full` pill for `rounded-xl px-5 py-3` keeping `bg-accent text-accent-contrast` — final taste call is recorded at the checkpoint (Task 34). `approval-surface.tsx` — the decision bar becomes `sticky bottom-tab-bar z-10 md:bottom-0` (it must clear the fixed bar on phone; on desktop the bar is hidden). Stacking order: tab bar `z-20`, decision bar `z-10`, FAB `z-10` — the walk's most important buttons are never under chrome.
 
 - [ ] **Step 4: Run the unit suites** — `vitest run src/shell src/routes src/approvals`; jsdom asserts structure only.
 
@@ -920,13 +1022,22 @@ test('the pinned bar never covers the decision controls or the end of a page', a
   const [barBox, btnBox] = [await bar.boundingBox(), await approve.boundingBox()]
   // The decision controls sit fully ABOVE the pinned bar — overlap is the bug class.
   expect(btnBox!.y + btnBox!.height).toBeLessThanOrEqual(barBox!.y + 1)
-  // End-of-page content is reachable: scroll to bottom, the last element clears the bar.
+
+  // THE MAIN-PADDING HALF NEEDS ITS OWN SUBJECT. The Approve button lives in a
+  // `sticky bottom-…` bar inside the approval surface (approval-surface.tsx:82)
+  // with its OWN offset — it clears the tab bar whether or not <main> reserves
+  // anything, so measuring it proves nothing about `pb-tab-bar` (round 1's
+  // blocker: the prescribed mutation below stayed green). The subject is an
+  // ordinary, non-sticky, LAST element of the scrolled document.
   await page.keyboard.press('End')
+  const tail = page.getByTestId('page-end')   // add this testid to the last block of the gate screen
+  const tailBox = await tail.boundingBox()
+  expect(tailBox!.y + tailBox!.height).toBeLessThanOrEqual(barBox!.y + 1)
   await approve.click() // clickable proves not covered — Playwright refuses covered targets
 })
 ```
 
-Run `task web:e2e`. Mutation proof: remove `pb-tab-bar` from `<main>` alone, re-run, the end-of-page/click half must fail; restore. Remove the decision bar's `bottom-tab-bar` alone; the overlap half must fail; restore.
+Run `task web:e2e`. **Three independent mutation proofs, each recorded:** (i) remove `pb-tab-bar` from `<main>` alone → the `page-end` assertion fails and the Approve assertion stays green (that asymmetry IS the point — if `page-end` also stays green the sentinel is not at the end of the scroll and the fixture is wrong); (ii) remove the decision bar's `bottom-tab-bar` alone → the Approve overlap half fails; (iii) remove `fixed` from the bar → both halves pass vacuously, so also assert the bar's `y` is unchanged after `End` (a pinned bar does not scroll away). Restore after each.
 
 - [ ] **Step 6: Commit**
 
@@ -993,6 +1104,8 @@ The bridge's existing pooling is NOT the gap (spec §2.5): the fan is what every
 - Produces: same export `createCacheBridge(qc, opts)`; new exported const `PHASE_TIER_THROTTLE_MS = 5_000`.
 
 - [ ] **Step 1: Rewrite the bridge**
+
+The snippet below shows the new INTERNALS only. `createCacheBridge`'s existing doc comment (`cache-bridge.ts:37-57`) carries two recorded lessons that survive this rewrite unchanged and must not be dropped with the code they sit above: why there is no test-only `flush()` (the plan-11 failure where deleting the scheduling arm left all five tests green and the shipped bridge inert), and why there is no `close()`. KEEP both paragraphs; extend the comment with the tier split. A rewrite that silently sheds them is the recorded "comments are written from intent" failure — and the next reader re-invents `flush()`.
 
 ```ts
 /** How long frames are pooled before one invalidation goes out. */
@@ -1063,6 +1176,16 @@ export function createCacheBridge(
       throttlePending = false // BEFORE the invalidations — same deafness guard
       const held = [...throttledRuns]
       throttledRuns.clear()
+      // ABSORBED: a lifecycle window that fired while this timer was in flight
+      // already refetched the collections and drained throttledRuns, and the
+      // timer cannot be cancelled through the setTimeoutImpl seam. Returning on
+      // an empty hold is what makes absorption total — without it the orphaned
+      // timer lands a second, pointless ['runs'] + ['tasks'] refetch a few
+      // seconds after the lifecycle event, which is precisely the drumbeat this
+      // task exists to remove (round 1's blocker). The guard is on the HELD SET
+      // rather than on a cancellation flag because the set is the honest
+      // question: "is there anything left to refresh?"
+      if (held.length === 0) return
       void qc.invalidateQueries({ queryKey: ['runs'] })
       void qc.invalidateQueries({ queryKey: ['tasks'] })
       for (const runId of held) void qc.invalidateQueries({ queryKey: ['run', runId, 'events'] })
@@ -1086,30 +1209,37 @@ export function createCacheBridge(
 
 (Keep `ATTENTION_KINDS` exactly as-is — it still governs the inbox alone; update its doc comment's last paragraph to name the new tier split. Delete the unused `fireCollections` stub above — it is shown here only to flag that `approvals` stays inbox-guarded.)
 
-- [ ] **Step 2: Rewrite the bridge tests** — the existing 12 adapt (the full-fan exact `toEqual` becomes the LIFECYCLE window's expectation, with `{exact: true}` visible on the run key — assert via the spy's second argument, not just the key); new cases: (a) a pure-`phase.*` window invalidates ONLY `['run', id]` exact, and after firing the throttle timer, `['runs']` + `['tasks']` + `['run', id, 'events']`; (b) two phase windows inside one throttle hold produce ONE trailing refresh (the drumbeat collapse, asserted by count); (c) a `run.superseded` window refetches collections immediately, never on the throttle; (d) a lifecycle window during a throttle hold absorbs it (no double events refetch); (e) the throttle timer's ms is `PHASE_TIER_THROTTLE_MS` and equals 5000; (f) BOTH deafness guards: after a fired window AND after a fired throttle, the next frame arms a new one (the recorded failure mode, now with two flags).
+- [ ] **Step 2: Rewrite the bridge tests** — the existing 12 adapt (the full-fan exact `toEqual` becomes the LIFECYCLE window's expectation, with `{exact: true}` visible on the run key — assert via the spy's second argument, not just the key); new cases: (a) a pure-`phase.*` window invalidates ONLY `['run', id]` exact, and after firing the throttle timer, `['runs']` + `['tasks']` + `['run', id, 'events']`; (b) two phase windows inside one throttle hold produce ONE trailing refresh (the drumbeat collapse, asserted by count); (c) a `run.superseded` window refetches collections immediately, never on the throttle; (d) **total absorption**: a lifecycle window arrives during a throttle hold, then the ORIGINAL throttle timer is fired manually — it must produce ZERO further invalidations of `['runs']`, `['tasks']` or the events key (the timer cannot be cancelled through the `setTimeoutImpl` seam, so the empty-hold return is the only thing standing between a lifecycle event and a spurious collection refetch five seconds later; assert on the spy's total call count before and after firing it, not merely on the events key); (d2) **absorption does not go deaf**: a NEW phase frame arriving after that lifecycle window, but before the orphaned timer fires, still gets its own trailing refresh (the orphan timer drains the newly-held run — or a fresh one is armed — either way the run's events refetch exactly once); (e) the throttle timer's ms is `PHASE_TIER_THROTTLE_MS` and equals 5000; (f) BOTH deafness guards: after a fired window AND after a fired throttle, the next frame arms a new one (the recorded failure mode, now with two flags).
 
 - [ ] **Step 3: The twins** — `decide-gate.ts`'s `onSettled` gains `exact: true` on `['run', runId]` and adds `['run', runId, 'events']` explicitly (a decision must refresh the log it just changed — the prefix no longer does it); `run-events-query.ts`'s doc comment is REWRITTEN: the key's mechanism is now explicit tier membership in the bridge and the decide mutation, and the stale `:92` citation goes. `approvals.test.tsx` still holds the key spellings together — extend it to the events key spelling if it does not already.
 
 - [ ] **Step 4: The HTTP-counting acceptance test** (`refetch-fan.test.tsx`) — the spec's shape: real HTTP requests counted through MSW under an event burst, with per-endpoint ceilings, driven through the injected timers (`scriptedStream` + the bridge's `setTimeoutImpl`):
 
+**EVERY MEASURED ENDPOINT NEEDS A MOUNTED OBSERVER, or the ceiling is vacuous.** This is round 1's third blocker and it kills the obvious shape: `renderApp('/')` mounts `['approvals']` and `['runs']` and NOTHING ELSE — Home's loader and component read exactly those two (`routes/_app/index.tsx:52-55, 70-71`). Invalidating a query with no observers refetches nothing, so `GET /tasks` and `GET /runs/r1/events` would sit at **0** under any bridge, upper bounds would pass, and mutation (i) below could not fire. The route under test is therefore **`renderApp('/runs/r1')`** — run detail observes the run DTO and the events log — with the Tasks and Home collections mounted alongside by pre-warming their queries through a `useQuery` harness component rendered in the same tree (the render-app helper already accepts children for this; if it does not, add the seam here rather than moving the assertions to a route that cannot see them).
+
 ```
-Scenario: a rendered runs list (renderApp('/')), stream delivers 40 phase.*
-frames for run r1 across 10 windows inside one throttle interval, then one
-run.succeeded window.
-Ceilings asserted (MSW handler counters):
-  GET /api/v1/runs          ≤ 2   (one trailing throttle refresh + one lifecycle)
-  GET /api/v1/tasks         ≤ 2
-  GET /api/v1/approvals     ≤ 1   (the lifecycle window only — run.succeeded is an attention kind)
-  GET /api/v1/runs/r1/events ≤ 2  (throttle + lifecycle; the old prefix behaviour measured ~10)
-  GET /api/v1/auth/me        = 0  (pre-flight 1: bursts add zero me traffic)
-LIVENESS half: after the phase windows fire and the throttle timer runs, the
-runs-list query was refetched (its phase_summary would advance a dot) — assert
-the refetch HAPPENED within the throttle, not merely that staleness was marked;
-and the run.succeeded window's collection refetch fired BEFORE any throttle
-timer (immediate tier).
+Scenario: renderApp('/runs/r1') with observers mounted for ['runs'], ['tasks'],
+['approvals'] and ['run','r1','events']. Let every initial fetch settle, THEN
+zero the MSW counters — the baseline loads are not what is being measured.
+Stream then delivers 40 phase.* frames for r1 across 10 windows inside one
+throttle interval, then one run.succeeded window.
+Asserted as EXACT counts, not ceilings (an upper bound alone is satisfied by
+zero — the failure mode this scenario exists to catch):
+  GET /api/v1/runs           == 2   (one trailing throttle refresh + one lifecycle)
+  GET /api/v1/tasks          == 2
+  GET /api/v1/approvals      == 1   (the lifecycle window only — run.succeeded is an attention kind)
+  GET /api/v1/runs/r1/events == 2   (throttle + lifecycle; the old prefix behaviour measured ~10)
+  GET /api/v1/runs/r1        == 11  (one exact per window — the per-window run DTO tier)
+  GET /api/v1/auth/me        == 0   (pre-flight 1: bursts add zero me traffic)
+ORDERING half: the run.succeeded window's collection refetch fires BEFORE any
+throttle timer is run (the immediate tier is immediate), asserted by advancing
+the debounce timer only and reading the counters before the throttle timer.
+LIVENESS half: after the phase windows and the throttle timer, the runs-list
+query was REFETCHED (its phase_summary would advance a dot) — the == 2 above
+carries this, which is why it is an equality and not a ≤.
 ```
 
-Asserting on invalidation calls alone would pass against today's bridge and prove nothing — the counters are HTTP-level (MSW resolver call counts). Mutation proofs, each recorded: (i) revert the events key to prefix-riding (drop it from both tiers, rely on `['run', id]` non-exact) → the events ceiling fails; (ii) route phase frames to the immediate tier → the runs/tasks ceilings fail; (iii) drop the throttle's trailing refresh → the liveness half fails.
+Asserting on invalidation calls alone would pass against today's bridge and prove nothing — the counters are HTTP-level (MSW resolver call counts). Mutation proofs, each recorded, and **each must fail this test on its own** (run them one at a time; a mutation that leaves the suite green means its endpoint has no observer and the fixture, not the bridge, is wrong): (i) revert the events key to prefix-riding (drop it from both tiers, rely on `['run', id]` non-exact) → the events count moves; (ii) route phase frames to the immediate tier → the runs/tasks counts blow past 2; (iii) drop the throttle's trailing refresh → runs/tasks/events fall to 1 and the liveness half fails; (iv) drop `exact: true` from the run-DTO invalidation → the events count rises (the prefix starts carrying it again).
 
 - [ ] **Step 5: Suites + gate + commit**
 
@@ -1269,7 +1399,7 @@ git commit -m "runs: GET /approvals/decisions — cross-run history with attempt
 
 ### Task 15: `workflow_id` and `repo_id` filters on `GET /runs`
 
-The pulled-in call. Repo: no new join (`tasks` is already joined). Workflow: one join to `workflow_versions` — legal for runs' SQL (sqlc shares the one schema; the bounded-context rule is about business imports, and the spec's §10.7 names this filter as the missing surface's whole cost).
+The pulled-in call. Repo: no new join (`tasks` is already joined). Workflow: one subquery against `workflow_versions` — **licensed by name in this plan's bounded-context constraint** (see Global Constraints; the licence lives there rather than here so a reader of the rule sees every exception it has, and so this task cannot be read as quietly overriding it).
 
 **Files:**
 - Modify: `backend/internal/runs/store/queries.sql` (`ListRunsPage`), `runlist.go`, `api/api.go` (`runListFilter`), `api/dto.go` (`ListRunsQuery`)
@@ -1534,7 +1664,9 @@ The locked design is variant B: a typed outline of step cards with a live read-o
 Creation is TWO writes: `POST /workflows` (metadata) then the editor on the new id for the initial version. A workflow with no versions is a legal row (`latest_version: 0`) — the list shows "no versions yet" and opening it resumes the initial-version editor; a failed first save strands nothing and duplicates nothing.
 
 **Files:**
-- Modify: `backend/internal/workflows/api/dto.go` — `required:"true"` on `WorkflowVersionResponse` (scalars; `Document` stays UNMARKED — `json.RawMessage` reflects as an untyped schema and the list projection omits it; required would claim presence the meta rows don't have… Document also carries `omitempty`. Mark `WorkflowID`, `Version`, `ContentHash`, `CreatedAt` and the Meta/List family; leave `Document` alone and say why in the field comment), then `contracts:gen`.
+- Modify: `backend/internal/workflows/api/dto.go` — `required:"true"` on **every** field of `WorkflowVersionResponse`, `Document` INCLUDED, plus the Meta/List family. The first draft exempted `Document` on the grounds that "the list projection omits it, so required would claim presence the meta rows don't have" — **that is false and the tree says so**: the list uses a SEPARATE type, `WorkflowVersionMetaResponse` (`dto.go:54-58`), which has no `Document` field at all, while `versionResponse` unconditionally assigns the document on the full type (`dto.go:70-76`). There is no shape in which a `WorkflowVersionResponse` lacks its document. So: drop `Document`'s `omitempty` (it contradicts required, the same pairing Task 17 fixes on `LastUsedAt`), mark it required, and leave the meta type document-free. Without this the editor and the version read view — Tasks 24, 26, 27, the whole of wave 2 — read the one field they exist to render through an optional type, which is exactly what the global `required:"true"` constraint is for.
+
+  Two things to CHECK at task time rather than assume, both cheap: (a) what schema swaggest emits for a `json.RawMessage` field — it is a `[]byte` and may reflect as a string or as an untyped object; run `task contracts:gen` and read the `openapi.json` diff before building the editor on the generated type, and if the emitted type is unusable, say so in the commit message and give the field an explicit schema rather than silently reverting the mark; (b) that `required` on it does not trip the `$ref` rule — it will not, since `json.RawMessage` is not a pointer-to-named-struct, but the rule is worth naming in the field comment so the next reader does not re-litigate it.
 - Create: `web/src/workflows/workflows-queries.ts` (list/detail/versions/version), `workflow-form.tsx` (+ tests)
 - Create: `web/src/routes/_app/workflows.index.tsx`, `workflows.$workflowId.tsx`, `workflows.$workflowId.versions.$version.tsx` (+ tests)
 - Delete: `web/src/routes/_app/workflows.tsx` (stub)
@@ -1577,7 +1709,18 @@ export type Doc = { schema: 2; nodes: DocNode[]; edges: DocEdge[] }  // the wire
 export function deriveEdges(cards: readonly Card[]): DocEdge[]
 export function toDocument(cards: readonly Card[]): Doc
 export function isChainShaped(doc: { nodes: DocNode[]; edges?: DocEdge[] }): boolean  // round-trip equality
-export function grammarViolation(cards: readonly Card[]): string | null  // null = legal V1 sequence
+/** COMPLETE-document legality: this sequence is saveable as-is. */
+export function grammarViolation(cards: readonly Card[]): string | null
+/**
+ * PREFIX legality: this sequence is a valid partial state on the way to some
+ * complete one. `[]`, `[implement]` and `[implement, review]` are all legal
+ * prefixes and NONE of them is a legal complete document — an editor lives in
+ * this state for its entire authoring session, so a reducer invariant written
+ * against grammarViolation would refuse every ordinary construction step
+ * (round 1's blocker). This is the reducer's invariant; grammarViolation is
+ * SAVE's precondition. `null` = completable.
+ */
+export function prefixViolation(cards: readonly Card[]): string | null
 export function legalTypesAt(cards: readonly Card[], index: number): CardType[]
 export function nextCardId(cards: readonly Card[], type: CardType): string  // plan-1, impl-1, …
 ```
@@ -1598,7 +1741,7 @@ it('derives the canonical conveyor edge set — bypass edge included', () => {
 })
 ```
 
-Further cases, each one derivation rule: plan feeds the FIRST agentic card (`plan→impl-1:plan`); each implement takes the previous implement's patch (`impl-1→impl-2:patch` on an implement+ chain); review takes the nearest preceding patch; a gate with no review consumes no verdict; git-publish takes the gate's pass-through patch (`g→pub:patch` — from the GATE, which is how the validator's pass-through works); `toDocument` emits `{schema: 2}` with nodes in card order and NO `edges` key when empty (the parse discipline hashes `[]` and absent identically, but emit the canonical absent form); round-trip: `isChainShaped(toDocument(cards))` is true for every grammar-legal sequence, false for the canonical conveyor with one edge REMOVED, one ADDED, or one artifact retyped (set equality on `(from,to,artifact)` triples — order-insensitive); grammar: `plan? · implement+ · review? · gate · git-publish` refusals — a leading review ("review needs a patch before it"), two gates, a missing publish, a missing implement — each `grammarViolation` returns a human sentence naming the card; `legalTypesAt` at each position of a partial sequence offers exactly the types that keep a legal completion reachable; `nextCardId` yields `impl-2` after `impl-1`, skips a user-renamed collision, and always matches the validator's charset.
+Further cases, each one derivation rule: plan feeds the FIRST agentic card (`plan→impl-1:plan`); each implement takes the previous implement's patch (`impl-1→impl-2:patch` on an implement+ chain); review takes the nearest preceding patch; a gate with no review consumes no verdict; git-publish takes the gate's pass-through patch (`g→pub:patch` — from the GATE, which is how the validator's pass-through works); `toDocument` emits `{schema: 2}` with nodes in card order and NO `edges` key when empty (the parse discipline hashes `[]` and absent identically, but emit the canonical absent form); round-trip: `isChainShaped(toDocument(cards))` is true for every grammar-legal sequence, false for the canonical conveyor with one edge REMOVED, one ADDED, or one artifact retyped (set equality on `(from,to,artifact)` triples — order-insensitive); grammar: `plan? · implement+ · review? · gate · git-publish` refusals — a leading review ("review needs a patch before it"), two gates, a missing publish, a missing implement — each `grammarViolation` returns a human sentence naming the card; **and the prefix/complete split gets its own table**: `prefixViolation([])`, `prefixViolation([implement])` and `prefixViolation([implement, review])` are all `null` while `grammarViolation` on each is non-null (nothing is saveable yet), whereas a leading review and a second gate are non-null under BOTH (no completion rescues them) — the pair of tables is what stops the two notions from silently collapsing back into one; `legalTypesAt` at each position of a partial sequence offers exactly the types that keep a legal completion reachable (its answer and `prefixViolation` are the same judgement asked two ways — assert they agree: appending any type `legalTypesAt` offers must leave `prefixViolation` null, and appending any type it withholds must not); `nextCardId` yields `impl-2` after `impl-1`, skips a user-renamed collision, and always matches the validator's charset.
 
 - [ ] **Step 2: Run, watch fail. Implement.** Derivation walks the sequence tracking `lastPatchProducer`, `pendingPlan`, `reviewOf(lastPatch)`; the rules are the spec §6.3 sentences transcribed — write each rule's sentence as the comment above its branch, citing `validate.go`'s consumption table as the thing each edge must satisfy. Grammar is a tiny state machine over positions; V1 pins EXACTLY ONE gate and ONE publish (the family `genConveyor` draws from), and `revision.target` legality = a PRECEDING plan/implement id (review is never offered — the bypass edge means it can never dominate the gate; cite `validate_test.go:249-255` in the comment).
 
@@ -1644,32 +1787,44 @@ Ordered typed cards: add step → pick type (grammar-filtered menu) → fill the
 **Files:**
 - Create: `web/src/workflows/editor-state.ts` (+ test) — the reducer (the property test's other subject)
 - Create: `web/src/workflows/editor-cards.tsx`, `card-registry.ts` (+ tests), `web/src/workflows/drafts.ts` (+ test)
+- Create: `web/src/workflows/outline-view.tsx` (+ test) — the READ-ONLY typed outline, shared by the editor's card list and the version read view
 - Create: `web/src/routes/_app/workflows.$workflowId.edit.tsx` (+ test)
+- **Modify: `web/src/routes/_app/workflows.$workflowId.versions.$version.tsx`** — Task 24 mounted TWO placeholder slots there (DAG and outline) and Task 26 replaced only the DAG. This task replaces the other one; without it the version read view ships a permanent placeholder and §6.1's read view is never finished. The read-only outline is the same renderer the editor uses with its controls off (one component, a `readOnly` prop — the 2+-importer clamp puts it at the group root), so a foreign document and a chain-shaped one both render, and the editor's "authored outside the editor" read-only mode gets its body from the same place rather than a second one.
 
 **Interfaces:**
 - Consumes: Task 25's whole surface; `harnessesQueryOptions` (Task 22); `workflowVersionQueryOptions` for prefill.
 - Produces: `editorReducer(state, action)` with actions `add(type, at)`, `remove(id)`, `move(from, to)`, `retarget(gateId, target)`, `setField(id, field, value)`, `rename(id, newId)` — every transition either applies or returns the SAME state plus a refusal string bound to the offending card (the grammar is enforced structurally: `add` consults `legalTypesAt`, `move` re-checks `grammarViolation`); `CARD_REGISTRY: Record<CardType, CardSpec>` — the per-type field spec Task 29's coverage test walks.
 
-- [ ] **Step 1: Failing reducer tests** — add offers/accepts only legal types per position (a review before any implement is refused with its reason); move that would put publish before the gate is refused, state unchanged, reason present; retarget to a non-preceding node refused; rename validates the charset + uniqueness (the validator's exact pattern and its 64-byte cap); remove of the implement a gate's revision targets clears/retargets the revision with a visible note (decide: clear + note — never silently keep a dangling target); every applied transition's `toDocument` stays grammar-legal (an invariant test iterating a scripted sequence).
+- [ ] **Step 1: Failing reducer tests** — add offers/accepts only legal types per position (a review before any implement is refused with its reason); move that would put publish before the gate is refused, state unchanged, reason present; retarget to a non-preceding node refused; rename validates the charset + uniqueness (the validator's exact pattern and its 64-byte cap); remove of the implement a gate's revision targets clears/retargets the revision with a visible note (decide: clear + note — never silently keep a dangling target); **every applied transition leaves a legal PREFIX** — `prefixViolation(state.cards) === null` after every accepted op, including the empty start and every partial sequence on the way up (an invariant test iterating a scripted sequence). It is deliberately NOT `grammarViolation`: an editor is incomplete for its whole authoring session, and holding the reducer to complete-document legality would refuse the first card ever added. `grammarViolation` is checked in ONE place — save (Task 28), which is where incompleteness actually matters — and the editor surfaces it as a disabled Save with the reason, not as a refused keystroke.
 - [ ] **Step 2: Failing component tests** — (a) the add-step menu at each position lists `legalTypesAt`'s answer exactly; (b) a gate card's target select lists preceding plan/implement ids only (fixture with review present — review absent from the options); (c) instructions over 8192 bytes shows the inline byte-count error BEFORE save (the validator's wording: bytes, not characters); (d) the preview region re-renders on card edits (add an implement → a new pill appears — live derivation is pure, no network); (e) drafts: edits persist to `localStorage` key `caesar.workflow-draft.<workflowId>` (the theme key's naming convention) debounced; reload (remount) restores; a successful save CLEARS the draft; (f) prefill: opening `/edit?from=<version>` with a chain-shaped fixture populates cards; with a NON-chain fixture the editor refuses into read-only mode showing "authored outside the editor" and the DAG preview (assert no card controls render); (g) drag reorder by the grip: fire pointer/drag events on the grip to move card 2 above card 1 and assert the order changed — hand-rolled HTML5 drag (draggable on the grip only) or pointer-based reorder; NO new dependency; keyboard fallback buttons (↑/↓ on each card) exist and are the thing the unit test drives if jsdom's drag events prove unfaithful — the e2e (Task 28's spec) drives the real drag.
 - [ ] **Step 3: Implement.** The registry drives card rendering:
 
 ```ts
+/**
+ * Every field carries its WIRE name — the JSON key on the engine's Node
+ * (definition.go:92-98) — because the editor's label and the engine's key
+ * differ for the gate: the card says "revision", the document says
+ * "on_request_changes". Task 29's coverage test joins on `wire`, so a registry
+ * that dropped it would fail on a naming difference and invite someone to
+ * rename one side, losing the mapping the save path needs.
+ */
 export const CARD_REGISTRY = {
-  plan:        { fields: ['harness', 'instructions'] },
-  implement:   { fields: ['harness', 'instructions'] },
-  review:      { fields: ['harness', 'instructions'] },
-  gate:        { fields: ['revision'] },          // optional; maxRounds 1-10
+  plan:      { fields: [{ name: 'harness', wire: 'harness' }, { name: 'instructions', wire: 'instructions' }] },
+  implement: { fields: [{ name: 'harness', wire: 'harness' }, { name: 'instructions', wire: 'instructions' }] },
+  review:    { fields: [{ name: 'harness', wire: 'harness' }, { name: 'instructions', wire: 'instructions' }] },
+  gate:      { fields: [{ name: 'revision', wire: 'on_request_changes' }] }, // optional; maxRounds 1-10
   'git-publish': { fields: [] },
-} as const satisfies Record<CardType, { fields: readonly string[] }>
+} as const satisfies Record<CardType, { fields: readonly { name: string; wire: string }[] }>
 ```
 
 (Task 29 proves this table against the ENGINE — do not decorate it beyond what the descriptor will carry.) Editor state lives in a `useReducer`; the route hosts `DagPreview(toDocument(cards))` above the card list. The forms are hand-authored typed inputs (spec §10.9's ruling) — reuse `field-frame.tsx`'s pieces, not `useAppForm` (this is not a flat form; RHF's `useFieldArray` has no precedent here and the reducer IS the state owner — say so in a comment).
 
-- [ ] **Step 4: Suites + commit**
+- [ ] **Step 4: Retire the version read view's outline placeholder** — mount `OutlineView` (readOnly) beneath the DAG preview in `workflows.$workflowId.versions.$version.tsx`, replacing Task 24's slot. Route tests: a chain-shaped fixture renders one row per node with its type badge and its typed fields; a BRANCHING fixture (two implements off one plan — API-authored, not editor-producible) still renders every node in document order rather than blanking, since this view renders any document the API will return. Assert no editable control is present in either.
+
+- [ ] **Step 5: Suites + commit**
 
 ```bash
-git add web/src/workflows/ web/src/routes/_app/workflows.\$workflowId.edit.tsx web/src/routeTree.gen.ts
+git add web/src/workflows/ web/src/routes/_app/workflows.\$workflowId.edit.tsx web/src/routes/_app/workflows.\$workflowId.versions.\$version.tsx web/src/routeTree.gen.ts
 git commit -m "web: the outline editor — grammar-structural cards, live preview, drafts, read-only for foreign documents"
 ```
 
@@ -1690,31 +1845,83 @@ Two halves. (1) Save: POST through `createWorkflowVersion`; 201 AND the undeclar
 - Produces: `generateOps(seed: number, count: number): Action[]` — a hand-rolled mulberry32 PRNG (NO fast-check; a new dependency needs its own install-and-verify cycle and pins — a 30-line generator over our own Action vocabulary does not); `SEEDS = [1, 2, …, 24] as const` — each seed emits one corpus document.
 
 - [ ] **Step 1: Save + error mapping, test-first** — (a) save POSTs `toDocument(cards)`; on 201 navigate to the new version's view and clear the draft; on **200** do the same (MSW case with a 200 body — the replay); (b) a 400 fixture with `errors: [{field: "nodes[1].instructions", message: "required on agentic nodes"}]` binds the message to card index 1 (assert the card shows it) — the mapper parses `nodes[<i>].<field>` with a regex and falls back to the banner for `document`-field and detail-only rejections (both asserted).
-- [ ] **Step 2: The property test** — `editor-property.test.ts`: for each of ~200 seeded runs (fast in CI — pure), `generateOps` drives the reducer from empty; invariants after every step: the state is grammar-legal or the op was refused-with-reason; at sequence end, force-complete to a legal document (append the missing gate/publish through the reducer itself), then assert `isChainShaped(toDocument(cards))` and local shape facts (exactly one gate, one publish, every edge's artifact matches the producer table). Deterministic: same seeds, same documents, no `Date.now`, no `Math.random` — mulberry32 only.
-- [ ] **Step 3: The corpus** — `gen-editor-corpus.mts` (run via `scripts/with-node node --experimental-strip-types`, the web:arch precedent) imports `op-generator` + `derive`, emits `SEEDS.length` documents as canonical JSON to `backend/internal/workflows/testdata/editor_corpus/seed-<n>.json`, byte-stable (stable key order comes free — `toDocument` builds objects in wire order; `JSON.stringify` with no spacing). Taskfile: a `contracts:editorcorpus` step inside `contracts:gen` (after `contracts:ts`), and the corpus dir added to `contracts:check`'s `git diff --exit-code` path list AND its porcelain assertion; `scripts/gate` updated in the same commit.
+- [ ] **Step 2: The property test** — `editor-property.test.ts`: for each of ~200 seeded runs (fast in CI — pure), `generateOps` drives the reducer from empty. **Invariant after every step: `prefixViolation(cards) === null`, or the op was refused-with-reason and the state is byte-identical to before.** (Not `grammarViolation` — the generator starts from `[]` and the first append can never produce a complete document, so a complete-legality invariant refuses the entire run. Round 1's blocker.) At sequence end, force-complete to a legal document (append the missing gate/publish through the reducer itself), assert `grammarViolation(cards) === null` — the completion actually completed — then assert `isChainShaped(toDocument(cards))` and local shape facts (exactly one gate, one publish, every edge's artifact matches the producer table). Deterministic: same seeds, same documents, no `Date.now`, no `Math.random` — mulberry32 only. One further invariant worth its line: a refused op must leave the state untouched, which is what makes "refused-with-reason" an escape hatch rather than a hole.
+- [ ] **Step 3: The corpus — an EXACT output set, not an accumulating directory**
+
+`gen-editor-corpus.mts` (run via `scripts/with-node node --experimental-strip-types`, the web:arch precedent) imports `op-generator` + `derive`, emits `SEEDS.length` documents as canonical JSON to `backend/internal/workflows/testdata/editor_corpus/seed-<n>.json`, byte-stable (stable key order comes free — `toDocument` builds objects in wire order; `JSON.stringify` with no spacing).
+
+**The generator RECONCILES the directory**: before writing, it reads the existing `*.json` entries and deletes any that are not in this run's output set. Without that, dropping a seed from `SEEDS` leaves its stale-but-still-valid file behind forever — generation never touches it, the tree stays clean, `contracts:check` is green, and the Go judge happily validates a document no current rule produces (round 1's second blocker). It also emits `manifest.json` — the sorted filename list plus each file's sha256 — which is what makes the exact set assertable from the Go side without re-running Node.
+
+Taskfile: a `contracts:editorcorpus` step inside `contracts:gen` (after `contracts:ts`), and the corpus dir added to `contracts:check`'s `git diff --exit-code` path list AND its porcelain assertion; `scripts/gate` updated in the same commit.
 - [ ] **Step 4: The Go judge** — `editorcorpus_test.go` (no build tag — it must run in plain `backend:test`):
 
 ```go
 func TestEditorCorpusValidates(t *testing.T) {
-	files, err := filepath.Glob("testdata/editor_corpus/*.json")
-	if err != nil || len(files) == 0 {
-		t.Fatalf("editor corpus missing: %v (%d files)", err, len(files))
+	// The manifest is the EXACT expected set. Globbing alone accepts an orphan
+	// file left behind by a removed seed — still valid JSON, validated
+	// forever, produced by no rule the editor still has.
+	var man struct {
+		Files map[string]string `json:"files"` // name -> sha256
 	}
+	raw, err := os.ReadFile("testdata/editor_corpus/manifest.json")
+	if err != nil {
+		t.Fatalf("editor corpus manifest missing: %v", err)
+	}
+	if err := json.Unmarshal(raw, &man); err != nil { t.Fatal(err) }
+	if len(man.Files) == 0 {
+		t.Fatal("editor corpus manifest is empty")
+	}
+
+	files, err := filepath.Glob("testdata/editor_corpus/seed-*.json")
+	if err != nil { t.Fatal(err) }
+	if len(files) != len(man.Files) {
+		t.Fatalf("corpus has %d files, manifest declares %d — an orphan or a missing document",
+			len(files), len(man.Files))
+	}
+
+	shapes := map[string]bool{}
 	for _, f := range files {
+		name := filepath.Base(f)
 		raw, err := os.ReadFile(f)
 		if err != nil { t.Fatal(err) }
-		doc, err := ParseDocument(raw)
-		if err != nil { t.Fatalf("%s: parse: %v", f, err) }
-		if v := Validate(doc); len(v) != 0 {
-			t.Errorf("%s: %d violations, first: %s %s", f, len(v), v[0].Path, v[0].Message)
+		if got := fmt.Sprintf("%x", sha256.Sum256(raw)); got != man.Files[name] {
+			t.Errorf("%s: sha256 %s, manifest says %s", name, got, man.Files[name])
+			continue
 		}
+		doc, err := ParseDocument(raw)
+		if err != nil { t.Fatalf("%s: parse: %v", name, err) }
+		if v := Validate(doc); len(v) != 0 {
+			t.Errorf("%s: %d violations, first: %s %s", name, len(v), v[0].Path, v[0].Message)
+		}
+		shapes[Hash(doc)] = true
 	}
+
+	// DIVERSITY. 24 seeds that all force-complete to the same minimal document
+	// satisfy every assertion above while exercising one code path. The bar is
+	// stated as a number so a generator that degenerates is RED, and every card
+	// type must appear somewhere in the corpus.
+	if len(shapes) < 8 {
+		t.Errorf("corpus collapsed to %d distinct documents across %d seeds", len(shapes), len(files))
+	}
+	// ...plus: assert each NodeType from definition.go's vocabulary appears in
+	// at least one corpus document (walk the parsed docs; iterate the same
+	// constant list Descriptor() emits, so a new node type reddens here too).
 }
 ```
 
-The zero-files fatal is the vacuousness guard: an empty corpus dir must be RED, not green.
+Two vacuousness guards, both load-bearing: the manifest count catches an orphan or a missing document, and the diversity floor catches a generator that degenerates to one shape.
 
-- [ ] **Step 5: The mutation proofs, all three recorded** — (i) flip a TS derivation rule (bypass edge drawn from review instead of implement): regen → either the corpus DIFFS (`contracts:check` red) or, committed, the Go test REDDENS ("a gate examines exactly one plan or patch") — record which; (ii) delete one corpus file without regenerating → `contracts:check`'s porcelain/diff assertion red; (iii) weaken the grammar (allow two gates) → the property test's own invariant red. Restore all.
+- [ ] **Step 5: The mutation proofs, all four recorded**
+
+(i) Flip a TS derivation rule (bypass edge drawn from review instead of implement): regen → either the corpus DIFFS (`contracts:check` red) or, committed, the Go test REDDENS ("a gate examines exactly one plan or patch") — record which.
+
+(ii) **Remove a seed from `SEEDS`** and regenerate. Expect: the reconciler deletes that seed's file and rewrites `manifest.json`, so `contracts:check`'s diff goes red on the deletion — and if the reconciler were absent, the orphan would survive with a clean tree and the Go test would still pass. Run it BOTH ways (with the reconciler, then with the reconciling lines commented out) and record the difference; that contrast is the proof the reconciler is load-bearing.
+
+(iii) **Hand-write an orphan** `seed-999.json` containing a valid document, do not regenerate, run `task backend:test` → the manifest count assertion is red. (Note what this replaces: the earlier draft prescribed "delete one corpus file without regenerating → `contracts:check` red", which is **backwards** — `contracts:check` runs `contracts:gen` FIRST (`Taskfile.yml:259-264`), so a deleted generated file is restored byte-for-byte and the check is GREEN. Direct deletion of a current artifact is self-healing by design and is not a mutation this gate can catch; the orphan is.)
+
+(iv) Weaken the grammar (allow two gates) → the property test's own invariant red.
+
+Restore all.
 - [ ] **Step 6: The editor e2e** — one Playwright spec (mobile project) against the real backend: from `/workflows`, New workflow → metadata → the editor → add implement/review/gate/publish, fill fields (harness from the seed via `seedLabels`), drag one reorder, save → land on v1's version view with the DAG rendered; assert via the API (`request.get('/api/v1/workflows/...')`) that `latest_version` is 1. This is the "authors and saves against the real backend" bar; the webe2e seed already registers a harness.
 - [ ] **Step 7: Full gate + commit**
 
@@ -1740,24 +1947,48 @@ Locked outline B's "fields generated from the engine's schema" ships as hand-aut
 
 ```go
 // FieldRule is one PROVEN statement about what Validate accepts. The vocabulary
-// (which types exist, which are agentic) is emitted from definition.go's
-// constants; the rules below are DECLARED — and descriptor_test.go convicts
-// every one against Validate, which is what keeps this file honest (§10.9).
+// (which types exist, which are agentic, WHICH FIELDS A NODE HAS) is emitted
+// from definition.go; the rules below are DECLARED — and descriptor_test.go
+// convicts every one against Validate, which is what keeps this file honest
+// (§10.9).
 type FieldRule struct {
 	NodeType    NodeType `json:"node_type"`
-	Field       string   `json:"field"`        // harness | instructions | on_request_changes
+	// WireField is the JSON name on definition.go's Node — harness,
+	// instructions, on_request_changes. It is the join key against the
+	// mechanically enumerated vocabulary, so it must be the WIRE name and never
+	// an editor-side label: the editor calls the gate's field "revision", and
+	// CardSpec carries that mapping (below) rather than the descriptor
+	// pretending the engine has a field by that name.
+	WireField   string   `json:"wire_field"`
 	Requirement string   `json:"requirement"`  // required | forbidden | optional
 	MaxBytes    int      `json:"max_bytes,omitempty"`
+	// Numeric bounds, for rules Validate expresses as an integer range rather
+	// than a byte cap — on_request_changes.max_rounds is 1..10
+	// (validate.go:18, :172-174). The first draft of this struct could not
+	// express that at all while the prose claimed it did (round 1).
+	MinInt      *int     `json:"min_int,omitempty"`
+	MaxInt      *int     `json:"max_int,omitempty"`
+	SubField    string   `json:"sub_field,omitempty"` // e.g. "max_rounds" under on_request_changes
 }
 func Descriptor() []FieldRule
 ```
 
-Rows: harness+instructions required on plan/implement/review (max 100 / 8192 bytes), forbidden on gate/git-publish; on_request_changes optional on gate (rounds 1–10), forbidden elsewhere. The JSON adds `{"node_types": [...], "agentic": [...], "id_pattern": "^[a-z][a-z0-9_-]{0,63}$", "rules": [...]}`.
+Rows: harness+instructions required on plan/implement/review (max 100 / 8192 bytes), forbidden on gate/git-publish; on_request_changes optional on gate with `max_rounds` bounded 1–10, forbidden elsewhere. The JSON adds `{"node_types": [...], "agentic": [...], "node_fields": [...], "id_pattern": "^[a-z][a-z0-9_-]{0,63}$", "rules": [...]}`.
 
-- [ ] **Step 1: The proof table, test-first** — `descriptor_test.go` iterates `Descriptor()`: for each `required` row, a minimal legal document MINUS that field must yield a violation whose Path names it and a conforming one zero violations on that path; for each `forbidden` row, a document WITH the field must be rejected; for each MaxBytes, the boundary (exactly max passes, max+1 fails — the validator counts BYTES; use a multibyte rune in one case). Build the minimal documents with a helper deriving from the canonical conveyor. RED first by declaring one deliberately wrong row (instructions optional on review), watching the test convict it, then fixing the row — the recorded proof that the harness can catch a lying descriptor.
+**`node_fields` is what makes the gate detect an ADDED engine field.** Every assertion in the first draft iterated descriptor rows, so a new field or rule in `validate.go` with no descriptor row left every test green — the claim "a Go-side rule change breaks CI until descriptor AND editor both learn it" was not established by anything (round 1). The fix is a second, opposite-direction pass: `descriptorgen` reflects over `definition.Node`'s struct tags and emits the JSON field names (`id`, `type`, `harness`, `instructions`, `on_request_changes`), and `descriptor_test.go` asserts that **every** non-structural field (everything but `id` and `type`) has a `FieldRule` row for **every** `NodeType`. Add a field to `Node` and the descriptor is incomplete before anyone writes a rule for it.
+
+- [ ] **Step 1: The proof table, test-first — in BOTH directions**
+
+*Rows → engine (soundness).* `descriptor_test.go` iterates `Descriptor()`: for each `required` row, a minimal legal document MINUS that field must yield a violation whose Path names it and a conforming one zero violations on that path; for each `forbidden` row, a document WITH the field must be rejected; for each MaxBytes, the boundary (exactly max passes, max+1 fails — the validator counts BYTES; use a multibyte rune in one case); **for each MinInt/MaxInt, the four boundary documents** (min−1 rejected, min accepted, max accepted, max+1 rejected) with the violation Path naming the sub-field (`nodes[i].on_request_changes.max_rounds`). Build the minimal documents with a helper deriving from the canonical conveyor.
+
+*Engine → rows (completeness).* A second test walks the emitted `node_fields` × `node_types` grid and fails on any cell with no `FieldRule`. This is the direction that catches an ADDED engine field, and it is the one the first draft lacked.
+
+RED first, twice: declare one deliberately wrong row (instructions optional on review) and watch the soundness test convict it; then delete one true row and watch the completeness test convict the hole. Fix both — the recorded proof that the harness catches a lying descriptor AND an incomplete one.
 - [ ] **Step 2: The generator** — `descriptorgen` marshals `Descriptor()` + the emitted vocabulary to `backend/api/workflow-descriptor.json` (stable field order, trailing newline); wire into `contracts:gen` + check paths + gate.
-- [ ] **Step 3: The web coverage test** — `descriptor-coverage.test.ts` imports the JSON (vitest resolves JSON imports) and `CARD_REGISTRY` + the grammar's type list: every descriptor node_type has a card spec; every `required` field row appears in that card's fields; every `forbidden` field is ABSENT; the id pattern string equals the one `derive.ts` validates with (export the regex SOURCE from derive.ts and compare strings). A Go-side rule change now breaks CI until descriptor AND editor both learn it.
-- [ ] **Step 4: Mutation** — add a fictitious `timeout` field row to `Descriptor()` → the Go proof test red (no violation to convict) AND the web coverage red (no card field); restore. Full gate + commit.
+- [ ] **Step 3: The web coverage test** — `descriptor-coverage.test.ts` imports the JSON (vitest resolves JSON imports) and `CARD_REGISTRY` + the grammar's type list: every descriptor node_type has a card spec; every `required` field row appears in that card's fields; every `forbidden` field is ABSENT; the id pattern string equals the one `derive.ts` validates with (export the regex SOURCE from derive.ts and compare strings); **and the `max_rounds` bounds the gate card's input enforces equal the descriptor's MinInt/MaxInt** (Task 27 hard-codes 1–10 — this is where that copy gets held to the engine).
+
+  The join is on the WIRE name, and `CardSpec` must carry it: the registry's gate field is called `revision` while the engine's is `on_request_changes`, so `CARD_REGISTRY` gains a per-field `wire` key and the test compares `wire` values, not labels. Without that the coverage test fails on a naming difference and an implementer "fixes" it by renaming one side — losing the mapping the editor actually needs.
+- [ ] **Step 4: Mutation, both directions** — (i) add a fictitious `timeout` field row to `Descriptor()` → the Go soundness test red (no violation to convict) AND the web coverage red (no card field); (ii) add a real field to `definition.Node` (`Timeout int` with `json:"timeout,omitempty"`) WITHOUT a descriptor row → the Go completeness test red. Restore both. (ii) is the one that proves the claimed direction "a Go-side change breaks CI"; without it that sentence is an assertion about a test nobody wrote. Full gate + commit.
 
 ```bash
 git add backend/ web/src/workflows/descriptor-coverage.test.ts Taskfile.yml scripts/gate backend/api/workflow-descriptor.json
@@ -1794,13 +2025,16 @@ Scoped to what a single operator actually jumps to: the seven pages, "New task",
 **Files:**
 - Create: `web/src/shell/command-palette.tsx`, `command-palette.test.tsx`, `palette-entries.ts` (+ test)
 - Modify: `web/src/shell/app-shell.tsx` (mount + the ⌘K listener)
+- Modify: `web/src/routes/_app/tasks.tsx` — the new-task drawer moves from local `useState` to the `?new=1` search param (see Step 2), plus `validateSearch` and its read-site re-narrowing
 
 **Interfaces:**
 - Consumes: `PHONE_TABS` + `SECONDARY` (nav.tsx's exported lists — the seven pages come from the SOURCE, not a copy); `queryClient.getQueryData(['tasks'])` and `getQueryData(['runs', {}])` — read-only cache peeks (never fetches: an empty cache lists no recents, honestly).
 - Produces: `paletteEntries(qc, query): Entry[]` (pure given the cache reads) — `Entry{label, kind: 'page'|'new-task'|'task'|'run', to, params?}`; the dialog opens on `metaKey+k` (and `ctrlKey+k`), arrows + Enter navigate, Escape closes, focus is trapped and restored.
 
 - [ ] **Step 1: Failing tests** — (a) `paletteEntries` with a warm cache: typing `app` matches "Approvals" (substring, case-insensitive); typing a task title substring surfaces that task; a cold cache yields pages + New task only; (b) the dialog: `cmd+k` opens (fire the keydown on window), input is focused; ArrowDown+Enter navigates to the highlighted entry (assert via the router's location in renderApp); Escape closes and focus returns to the previously-focused element; (c) `role="dialog"` with `aria-label`, entries in a `role="listbox"` — the accessibility contract the desktop e2e drives later.
-- [ ] **Step 2: Implement.** Overlay + panel styled with the semantic tokens; the listener lives in AppShell's effect (one listener, window-level, removed on unmount); "New task" navigates to `/tasks` and — since the FAB is Tasks-local — opens nothing else (honest: the drawer trigger lives there; note the seam for a later promotion).
+- [ ] **Step 2: Implement.** Overlay + panel styled with the semantic tokens; the listener lives in AppShell's effect (one listener, window-level, removed on unmount).
+
+**"New task" must actually create a task, not merely land near the button.** The spec names it as one of the palette's three entry classes (§7), and an entry that navigates to `/tasks` and stops is a command that does not perform its command. The drawer is currently local state (`useState` in `NewTaskFab`, `tasks.tsx:175`), so the palette cannot reach it — the fix is the plan's own URL-as-state constraint applied one more time: `/tasks` gains a `new` search param, `NewTaskFab` derives `open` from it and writes it on open/close, and the palette entry navigates to `/tasks?new=1`. That also makes the drawer linkable and survives a reload, which the local-state version does not. Re-narrow the param at the read site (pre-flight 20). Assert it: selecting "New task" from the palette closes the palette AND opens the drawer, from a route other than `/tasks`.
 - [ ] **Step 3: Suites + commit**
 
 ```bash
@@ -1948,7 +2182,7 @@ Run against the spec with fresh eyes after the plan was complete. Corrections we
 | §3.2 GET /approvals/decisions + History tab | Tasks 14, 18 |
 | §4 Repos: projects-as-unit, forms, RESTRICT classification, forge immutable | Tasks 16, 19, 20 |
 | §5 Admin: users/harnesses/credentials(+fingerprint)/audit + placeholder | Tasks 17, 21, 22, 23 |
-| §6.1 list/detail/version, DAG preview, two-write create, no-versions resume | Tasks 24, 26 |
+| §6.1 list/detail/version, DAG preview, two-write create, no-versions resume | Tasks 24, 26, 27 (the read view's outline) |
 | §6.2 new-version-never-edit, typed cards, pickers, ids, drag, live preview | Task 27 |
 | §6.3 derivation, round-trip chain-shape, grammar, property test via corpus | Tasks 25, 28 |
 | §6.4 save via the one door, client-only drafts | Tasks 28, 27 |
@@ -1965,10 +2199,25 @@ Run against the spec with fresh eyes after the plan was complete. Corrections we
 3. **Task 14's first draft keyed the attempt off `gate_decisions` directly** — the table doesn't store one (pre-flight 6); the `phase_runs` join was forced by the schema, and the equal-`acted_at` test had to move to the store layer because `DBNow` freezes per transaction, making equal stamps hard to mint through the full path honestly.
 4. **Task 27's first draft reached for `useFieldArray`** — no precedent in the tree, and the reducer owns ordering/refusal logic RHF cannot express; the hand-authored card forms follow §10.9's own ruling.
 
+### Round 1 (codex artifact review, 2026-08-26)
+
+Eleven findings, every one validated against the tree before acceptance; none rejected. Six were blockers and three of those were **tests that could not fail**, which is this repo's recurring failure mode rather than a coincidence. Recorded because the shape of each mistake is more useful than the fix:
+
+1. **Task 6 read the outcome class where it had to read the STATUS.** An exhausted phase keeps its *transient* outcome — only the RUN's is rewritten to `attempts_exhausted` (`orchestrator.go:1652`) — and its status is `dead`, while a retrying attempt is `failed` and always has a successor (`orchestrator.go:1573`, its own comment). So the first-draft formatter printed `attempt 3/3` on the commonest failure there is: the precise lying counter §2.2 exists to remove, reintroduced by the fix for it. The discriminator was sitting in the DTO the whole time.
+2. **Task 12's HTTP ceilings measured endpoints the test route never observes.** `renderApp('/')` mounts `['approvals']` and `['runs']` only, so `GET /tasks` and the events log would have counted **0** under any bridge — upper bounds all green, and the events-key mutation proof unable to fire. Ceilings are now exact counts on a route that observes every measured key. An upper bound is satisfied by zero; that is worth remembering the next time one is written.
+3. **Task 28's deletion mutation was backwards.** `contracts:check` runs `contracts:gen` FIRST, so a deleted generated file is restored byte-for-byte and the check goes **green** — the prescribed proof asserted the opposite. The real hole it was reaching for is the orphan: drop a seed and its stale-but-valid document survives forever, validated by the Go judge, invisible to the diff. Fixed with a reconciling generator, a manifest, and a diversity floor.
+4. **Task 12's throttle timer outlived its purpose.** A lifecycle window drained the held set without cancelling the timer, which then landed a second `['runs']`/`['tasks']` refetch seconds later — the drumbeat the task exists to remove, surviving inside its own fix.
+5. **Task 10's mutation proof was disconnected from its assertion.** The measured button lives in a `sticky` bar with its own offset, so removing `<main>`'s padding could not redden it. And the safe-area reasoning was simply wrong: `body` padding does not reach a `position: fixed` element, so the bar would have sat under the home indicator with the plan asserting it would not.
+6. **Task 28's reducer invariant made the editor unbuildable.** `grammarViolation` judges COMPLETE documents; the reducer was held to it from an empty start, so the first card ever added violated the invariant. Split into `prefixViolation` (the reducer's) and `grammarViolation` (save's).
+7. Three majors were false claims about the tree that a reader would have believed: `Document` was called optional because "the list omits it" (the list uses a different type entirely); Task 15's cross-context join contradicted this plan's own SQL rule; and Task 29's descriptor could not express the integer bound its prose claimed, nor detect an engine field added without a row — so "a Go-side rule change breaks CI" was not established by any test.
+8. Two gaps: the version read view's outline placeholder was mounted by Task 24 and never replaced by anyone, and ⌘K's "New task" navigated without opening anything.
+
+Two findings were the author's own, from reading the Dockerfile against Task 4: the final-stage instruction was ambiguous in a way whose literal reading ships the **fake harness** as the runtime image, and the git stage's doc comment ("it is not the last stage") becomes false the moment the task lands.
+
 ### Risks carried knowingly
 
 - **Task 12 rewrites the one module every screen leans on.** Mitigations: the tier predicate is a one-line boolean over the kind string; both deafness flags carry the recorded reset-before-invalidate ordering; the HTTP-ceiling test pins behaviour end-to-end; the twins (`decide-gate`, the events comment) move in the same commit.
-- **The corpus gate (Task 28) couples web tooling into backend testdata.** Accepted deliberately: the coupling IS the feature (a TS derivation change must redden a Go lane), and it rides the same regen-diff discipline as every generated artifact. The cost is a `contracts:gen` step that needs Node — which `contracts:ts` already imposed.
+- **The corpus gate (Task 28) couples web tooling into backend testdata.** Accepted deliberately: the coupling IS the feature (a TS derivation change must redden a Go lane), and it rides the same regen-diff discipline as every generated artifact. The cost is a `contracts:gen` step that needs Node — which `contracts:ts` already imposed. The residual risk after round 1 is narrower and named: the regen-diff discipline catches *changed* and *orphaned* documents (reconciler + manifest), but a corpus is only as good as its generator, so the diversity floor and the node-type coverage assertion are what stand between "24 documents" and "one document 24 times". Both are in the Go judge, where they redden the cheap lane.
 - **The runtime image loses distroless (Task 4).** The git stage's alpine shape is what the working deploy has run since 12a's checkpoint; the alternative (git into distroless) is a measured-libc-mismatch project this plan declines. Row 14 (deploy story) may revisit.
 - **Playwright's lane roughly doubles (Task 32)** — the recorded price 12a declined to pay and this plan owns, per the spec. `workers: 1` keeps the shared-inbox semantics.
 - **`GET /tasks` and the waiting arm stay unpaginated** — named residual, unchanged.
