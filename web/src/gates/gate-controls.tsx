@@ -35,7 +35,7 @@ const DEADLINE_PASSED =
  * two by nothing the reader can do at all.
  *
  * The four keys are exactly what `decidability()` returns
- * (`backend/internal/runs/api/api.go:526-542`), in that function's own order,
+ * (`backend/internal/runs/api/api.go:530-546`), in that function's own order,
  * which is decideGate's order — so the reason names the refusal the caller
  * would actually receive rather than some other true thing about the gate.
  */
@@ -183,7 +183,7 @@ export function GateControls(props: {
   // THIS CHECK AND `deadline_expired` ARE NOT REDUNDANT, and they are not the
   // same question. `can_decide` now folds the deadline in — measured against
   // the DATABASE clock, the clock the decision transaction reads
-  // (`api.go:532`) — but only AS OF THE INSTANT THE RESPONSE WAS COMPOSED. A
+  // (`api.go:536`) — but only AS OF THE INSTANT THE RESPONSE WAS COMPOSED. A
   // gate opened with eight minutes left and still on screen ten minutes later
   // is carrying a response that said `can_decide: true` and has since become
   // false, and only a check against the reader's own clock catches that. The

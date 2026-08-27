@@ -565,7 +565,7 @@ func decidability(canApprove bool, actorID, requesterID uuid.UUID, allowSelf, ha
 
 Update `dto.go`'s `CannotDecideReason` doc comment to enumerate all four values in order. Both `decidability` call sites (`gateViewer` in dto.go and any run-detail path) receive the pair.
 
-- [ ] **Step 5: The web half** — `gate-controls.tsx` maps the new reason to copy: "This run's wall deadline has passed; it can no longer be decided." (mirroring the 409's text), rendered through the same all-or-nothing suppression the other reasons use. Add the case to the decision testkit. Run `cd web && ../scripts/with-node ./node_modules/.bin/vitest run src/gates`.
+- [ ] **Step 5: The web half** — `gate-controls.tsx` maps the new reason to copy: "This run's wall deadline has passed, so its gates can no longer be decided." — which is the sentence the file's existing client-clock check ALREADY renders, so the two paths share one `DEADLINE_PASSED` constant rather than carrying two near-identical wordings for one fact (corrected in place after execution: this step originally dictated a second, slightly different sentence, and the reviewer's consolidation was upheld by the owner). Rendered through the same all-or-nothing suppression the other reasons use. Add the case to the decision testkit. Run `cd web && ../scripts/with-node ./node_modules/.bin/vitest run src/gates`.
 
 - [ ] **Step 6: Full check + mutation proof + commit**
 

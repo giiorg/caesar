@@ -133,7 +133,7 @@ export async function expectDecisionRules(render: (evidence: GateEvidence) => vo
   //    own, in 2099 — so this host's client-side deadline check does NOT fire,
   //    and the only thing that can produce a refusal is the server's
   //    `deadline_expired`. That combination is not contrived: `can_decide`
-  //    is measured against the DATABASE clock (`api.go:532`), the clock that
+  //    is measured against the DATABASE clock (`api.go:536`), the clock that
   //    will judge the POST, and a browser running behind it sees exactly this.
   //    A host that suppressed on its own clock alone would offer three controls
   //    here, every one of them a certain 409.

@@ -164,29 +164,34 @@ describe('gate controls', () => {
   })
 
   it('enforces §5 — all three or none, with the reason named', async () => {
-    // The trio lives in decision-rules.testkit.ts because Tasks 12, 13 and 16
+    // The rule lives in decision-rules.testkit.ts because Tasks 12, 13 and 16
     // re-run it verbatim from their own surfaces. Consuming it here rather than
     // restating it is what proves the kit works before three hosts depend on
-    // it — including its `cleanup()` between cases. MEASURED with the three
+    // it — including its `cleanup()` between cases. MEASURED with those
     // `cleanup()` calls deleted: this test fails with `Found multiple elements
     // with the text: /approve grant/i`, the third case tripping over the first
-    // case's DOM.
+    // case's DOM. The count is left unstated on purpose — the kit gained a
+    // fourth case with `deadline_expired` and this sentence went stale once
+    // already.
     await expectDecisionRules((evidence) => {
       renderControls({ evidence })
     })
   })
 
-  it('names the third refusal too, and it is nobody-can-decide', async () => {
+  it('names the last refusal too, and it is nobody-can-decide', async () => {
     // evidence_missing is not a permission problem: the gate examines an
     // artifact the run never produced, decideGate answers 500 rather than a
-    // refusal, and no grant anywhere fixes it. A message about grants or about
-    // self-approval would send the reader after the wrong thing.
+    // refusal, and no grant anywhere fixes it. A message about grants, about
+    // self-approval or about a deadline would send the reader after the wrong
+    // thing — and `decidable`'s wall_deadline is in 2099, so the deadline
+    // sentence has no business on this screen at all.
     renderControls({
       evidence: { ...decidable, can_decide: false, cannot_decide_reason: 'evidence_missing' },
     })
     expect(await screen.findByText(/never produced/i)).toBeInTheDocument()
     expect(screen.queryByText(/approve grant/i)).toBeNull()
     expect(screen.queryByText(/your own gate/i)).toBeNull()
+    expect(screen.queryByText(/wall deadline/i)).toBeNull()
   })
 
   it('degrades to something true on a reason it has never heard of', async () => {
@@ -293,7 +298,7 @@ describe('gate controls', () => {
   it('says when the wall deadline has already passed, before anything is posted', async () => {
     // `can_decide` is TRUE here, which is what makes this an assertion about
     // the CLIENT's own clock and not about the flag. The server does fold the
-    // deadline into `can_decide` (api.go:532) — but only as of the instant it
+    // deadline into `can_decide` (api.go:536) — but only as of the instant it
     // composed the response, so a response held open past the deadline looks
     // exactly like this one, and this refusal exists only if the client renders
     // it. The other direction, where the server says expired and the client's
@@ -308,10 +313,29 @@ describe('gate controls', () => {
     // BOTH refusals are true here, which is the only fixture in which the order
     // is observable at all — with either condition alone the two checks are
     // interchangeable (MEASURED: the swap mutant survived until this test
-    // existed). The deadline wins because it is the terminal one: a grant can
-    // be raised and a policy changed, but a run past its wall deadline is
-    // finished for everybody, and `gates.go:181` refuses on it before the
-    // policy check at `:190` for the same reason.
+    // existed).
+    //
+    // THIS ORDER IS NOT decideGate's ORDER, and this exact state is where the
+    // two diverge. The server puts the GRANT first: handleDecideGate authorizes
+    // GrantApprove before DecideGate opens its transaction, so for a caller
+    // short of approve on an expired run it answers `not_approver` and the
+    // endpoint really returns 403 — `api.go:533` documents the choice and
+    // "not_approver still wins" in gateevidence_integration_test.go pins it
+    // against the live endpoint. This surface renders the deadline anyway.
+    //
+    // That is deliberate, and the reason is not "the deadline is more
+    // terminal". It is that this check is NOT a refusal-naming step at all: it
+    // is a staleness guard on the response in hand, the only check on this
+    // screen that can see time pass after the response was composed, and it
+    // stops being unconditional the moment anything is allowed to run ahead of
+    // it. Pre-empting `not_approver` is the price of that, and it is a cheap
+    // one — no control is offered under either branch, both sentences are true,
+    // and `cannot_decide_reason` names what a POST would receive, which is a
+    // fact about a request this surface is not going to make.
+    //
+    // The two orders agree everywhere else: against `self_approval_forbidden`
+    // and `evidence_missing` the deadline wins on the server too
+    // (`gates.go:176` refuses before the policy at `:189`).
     renderControls({
       evidence: {
         ...decidable,

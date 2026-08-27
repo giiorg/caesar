@@ -507,11 +507,15 @@ func (a *API) handleGetArtifact(w http.ResponseWriter, r *http.Request, sess aut
 // cannot_decide_reason name the refusal the caller would ACTUALLY get rather
 // than some other true thing about the gate.
 //
-// The first two are also ordered the way an operator can act on them: a caller
-// short of approve is told about the grant even on a run that has expired,
-// because the grant is theirs to raise and the expiry is a fact about a run
-// that is finished for everybody. Both are true; the message names the one
-// that is about this caller.
+// THE GRANT COMES FIRST BECAUSE THE ENDPOINT PUTS IT THERE, and for no other
+// reason. A caller short of approve on an expired run is told "not_approver"
+// not because raising a grant would help them — on a run that is finished for
+// everybody it would not — but because 403 is the answer they would receive:
+// the authorize call never reaches gates.go:176 at all. This field's whole
+// contract is to name the refusal that would actually arrive, so an ordering
+// argued from what a reader can DO would have to override that contract to
+// win, and it does not. Pinned by "not_approver still wins" in
+// gateevidence_integration_test.go.
 //
 // THE DEADLINE IS COMPARED DB-CLOCK TO DB-CLOCK. `now` is q.DBNow from the
 // same read that carried `wallDeadline`, never s.clock.Now(): both sides of a
