@@ -39,13 +39,13 @@ function retryable(out: PhaseOutcome): boolean {
  *
  *  - An exhausted node keeps its TRANSIENT phase outcome. The terminal writer
  *    passes the raw one through — `finishPhase(…, PhaseDead, workerID, rawOut)`
- *    (`orchestrator.go:1627`) — while `attempts_exhausted` is written to a
- *    separate `runOut` for the RUN (`orchestrator.go:1662-1666`). So class
+ *    (`orchestrator.go:1631`) — while `attempts_exhausted` is written to a
+ *    separate `runOut` for the RUN (`orchestrator.go:1666-1670`). So class
  *    alone cannot tell exhausted from mid-retry, and a class-first formatter
  *    printed "attempt 3/3" on the commonest failure there is.
  *  - `dead` is the status that means nothing follows this row, and it is the
  *    only one that means it reliably. "Failed rows always have successors" is
- *    the RETRY BRANCH's invariant (`orchestrator.go:1584-1586`), scoped to that
+ *    the RETRY BRANCH's invariant (`orchestrator.go:1585-1590`), scoped to that
  *    transaction — it is NOT a property of the status. A rejected gate is
  *    finished `PhaseFailed` with a permanent `gate_rejected` outcome and no
  *    successor at all (`gates.go:241-247`), which is why a live row's outcome

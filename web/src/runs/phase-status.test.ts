@@ -46,8 +46,8 @@ describe('phaseStatusLine', () => {
 
   // THE ROUND-1 BLOCKER, pinned. An exhausted node's phase row keeps its
   // TRANSIENT outcome — `finishPhase(…, PhaseDead, workerID, rawOut)`
-  // (orchestrator.go:1627) writes the raw one, while only the RUN's is
-  // rewritten to attempts_exhausted (orchestrator.go:1662-1666) — and its
+  // (orchestrator.go:1631) writes the raw one, while only the RUN's is
+  // rewritten to attempts_exhausted (orchestrator.go:1666-1670) — and its
   // status is `dead`. A formatter that reads the outcome class first prints
   // "attempt 3/3" here, which is exactly the lying counter this task exists to
   // remove.
@@ -117,7 +117,8 @@ describe('phaseStatusLine', () => {
   it('says resumable — not chargeable past the cap, with the wait reason from the prior attempt', () => {
     // The prior row is `failed`, not `dead`: the retry branch inserts the
     // successor in the same transaction as the failure
-    // (orchestrator.go:1584-1586). A `dead` prior would mean the node ended
+    // (orchestrator.go:1591 fails the row, :1609-1610 inserts the
+    // successor). A `dead` prior would mean the node ended
     // and there is no attempt 4 to describe.
     const prior: Phase = {
       ...base,

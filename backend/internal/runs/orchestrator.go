@@ -1583,7 +1583,11 @@ func (o *Orchestrator) evaluateFailure(ctx context.Context, tx pgx.Tx, workerID 
 	}
 	if retry {
 		// Retry: prior attempt -> failed, next attempt inserted, SAME tx
-		// (spec §2). failed rows always have successors (plan decision 3).
+		// (spec §2). On THIS branch, failed rows always have successors (plan
+		// decision 3). Not on every branch, and not as a property of the
+		// status: a rejected gate is written failed and TERMINAL by
+		// gates.go:245, permanent outcome and no successor at all. These two
+		// are the only writers of PhaseFailed.
 		n, err := o.svc.finishPhase(ctx, tx, c.PhaseID, fromStatus, PhaseFailed, workerID, rawOut)
 		if err != nil {
 			return false, err
