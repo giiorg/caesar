@@ -334,8 +334,9 @@ In `schema.sql`, with the other `runs` indexes (~line 233):
 
 ```sql
 -- Serves ListRunsPage's keyset scan: ORDER BY created_at DESC, id DESC with a
--- row-value cursor on the same pair. Filter predicates (status, task_id, and
--- Task 15's workflow/repo) ride the tasks join and do not belong in it.
+-- row-value cursor on the same pair. status and task_id are selective runs-side
+-- equality filters and workflow/repo ride the tasks join; none of them earn a
+-- slot in a keyset index.
 CREATE INDEX runs_created_id_idx ON runs (created_at DESC, id DESC);
 ```
 
