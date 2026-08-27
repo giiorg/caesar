@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { QueryFailure } from '../errors/query-failure'
 import type { GateEvidence } from '../gates/decide-gate'
 import { GateControls } from '../gates/gate-controls'
+import { type ArtifactMeta, previousExaminedArtifactId } from '../gates/identical-revision'
 import { type DiffFile, decodePatch, type ParsedPatch } from '../patch/decode-patch'
 import {
   artifactQueryOptions,
@@ -23,12 +24,20 @@ import {
  *
  * The host supplies position and nothing else: this component takes the
  * evidence it is given rather than looking it up, because the two hosts find it
- * in different places (an inbox row and a run's phase).
+ * in different places (an inbox row and a run's phase). `artifacts` arrives the
+ * same way and for the same reason — both hosts already hold the run at the
+ * mount site, and a `runQueryOptions` fetch started in here would put a run
+ * request inside every test that renders this component standalone.
  */
 export function ApprovalSurface(props: {
   runId: string
   nodeId: string
   evidence: GateEvidence
+  /**
+   * The run's artifact metadata — `run.artifacts ?? []`. Required and nullable
+   * on the wire (`api/schema.d.ts:998`), hence the coalesce at both hosts.
+   */
+  artifacts: readonly ArtifactMeta[]
   /** The run's `execution_used_ms`, for the duration cell. */
   executionUsedMs: number
 }) {
@@ -43,22 +52,43 @@ export function ApprovalSurface(props: {
   const examined = useQuery(
     artifactQueryOptions(props.runId, examinable ? evidence.examined_artifact_id : ''),
   )
+  // THE PATCH THIS ONE IS A REVISION OF, resolved from metadata the host already
+  // has, so this fetch starts beside the other two instead of behind them. It is
+  // null on a first round and on every plan gate, and `artifactQueryOptions` is
+  // disabled on the empty id, so an ordinary gate spends no request here.
+  const priorId = previousExaminedArtifactId(props.artifacts, evidence.examined_artifact_id)
+  const prior = useQuery(artifactQueryOptions(props.runId, priorId ?? ''))
 
-  // BOTH QUERIES, ONE GATE, and it is about ORDER rather than about coupling.
-  // The locked order is summary-then-facts-then-evidence, and a surface that
-  // revealed each block as its own query landed would put the facts row on
-  // screen first whenever the diff came back first. Failure stays independent:
-  // `isLoading` is `isPending && isFetching` (query-core
+  // ALL THREE QUERIES, ONE GATE, and it is about ORDER rather than about
+  // coupling. The locked order is summary-then-facts-then-evidence, and a
+  // surface that revealed each block as its own query landed would put the facts
+  // row on screen first whenever the diff came back first. Failure stays
+  // independent: `isLoading` is `isPending && isFetching` (query-core
   // `queryObserver.js:310`), so a query that has ERRORED is ready and a query
   // that is DISABLED — no artifact id, therefore pending forever and never
   // fetching — is ready too. Each block below then renders from its own
   // query's state, and a 404 on one leaves the other on screen.
-  if (summary.isLoading || examined.isLoading) {
+  //
+  // The prior patch is inside the gate for a second reason of its own: the
+  // banner it decides sits ABOVE everything, and a warning that arrives after a
+  // person has begun reading the diff both moves the page under them and misses
+  // the moment it exists for.
+  if (summary.isLoading || examined.isLoading || prior.isLoading) {
     return <p className="text-text-muted text-sm">Reading this gate's evidence…</p>
   }
 
   const verdict = readVerdict(summary.data)
   const patch = evidence.examined_artifact_type === 'patch' ? readPatchDiff(examined.data) : null
+  // TWO READABLE DIFFS, THEN EQUALITY — never equality alone. `readPatchDiff`
+  // answers null for a payload whose `diff` is missing, non-string or empty, so
+  // `readPatchDiff(a) === readPatchDiff(b)` is `null === null` for two payloads
+  // that carry no diff at all: TRUE, and a banner accusing an operator's
+  // revision of changing nothing on a gate that never had a diff to compare.
+  // That is the `undefined === undefined` this whole comparison exists to avoid,
+  // wearing the reader's clothes. The base64 is compared as it arrived — decode
+  // nothing; identical bytes have identical base64.
+  const priorPatch = readPatchDiff(prior.data)
+  const identical = patch !== null && priorPatch !== null && patch === priorPatch
   // DECODED EXACTLY ONCE, here, and never re-encoded: a patch is arbitrary
   // bytes and the base64 is the contract, not an encoding choice.
   const parsed = patch === null ? null : decodePatch(patch)
@@ -66,6 +96,15 @@ export function ApprovalSurface(props: {
 
   return (
     <div className="flex flex-col gap-4">
+      {identical && (
+        // ABOVE THE SUMMARY, not merely above the diff. Everything below this
+        // reads differently once it is true — the agent's fresh-sounding verdict
+        // included — so it is the first sentence on the screen or it is decoration.
+        <div role="status" className="border-warning text-text bg-surface border px-3 py-2 text-sm">
+          This revision is byte-identical to what was already reviewed — the previous
+          request-changes note was not acted on.
+        </div>
+      )}
       <SummaryBlock evidence={evidence} query={summary} verdict={verdict} />
       <HardFacts
         evidence={evidence}

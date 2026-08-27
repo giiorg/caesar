@@ -70,6 +70,7 @@ function GateBody(props: { run: Run; nodeId: string; phase: Phase | null }) {
       runId={props.run.id}
       nodeId={props.nodeId}
       evidence={phase.evidence}
+      artifacts={props.run.artifacts ?? []}
       executionUsedMs={props.run.execution_used_ms}
     />
   )

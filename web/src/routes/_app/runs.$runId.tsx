@@ -341,6 +341,7 @@ function PhaseBody(props: { run: Run; phase: Phase }) {
         runId={run.id}
         nodeId={phase.node_id}
         evidence={phase.evidence}
+        artifacts={run.artifacts ?? []}
         executionUsedMs={run.execution_used_ms}
       />
     )

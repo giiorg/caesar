@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 import { queryClient } from '../api/query-client'
 import type { GateEvidence } from '../gates/decide-gate'
 import { expectDecisionRules } from '../gates/decision-rules.testkit'
+import type { ArtifactMeta } from '../gates/identical-revision'
 import { server } from '../test/msw'
 import { ApprovalSurface } from './approval-surface'
 
@@ -49,6 +50,33 @@ const LATIN1_B64 = b64(
     ...new TextEncoder().encode('\n+cafe\n'),
   ]),
 )
+
+/**
+ * TWO PATCHES OF THE SAME BYTE LENGTH AND DIFFERENT BYTES — `one.txt` and
+ * `two.txt` are seven characters each, so base64 of the two is the same length
+ * too. This pair exists for one mutant: a comparison written on `diff.length`
+ * rather than on `diff` passes every other case in this file, including the
+ * differing-patch one below, because those patches also differ in size.
+ */
+const ONE_TXT = '--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old\n+new\n'
+const TWO_TXT = '--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-old\n+new\n'
+
+/**
+ * A node on its SECOND ROUND, as `run.artifacts` carries it: the reviewed patch
+ * at generation 1 and the revision at generation 2, under one node id. The array
+ * really does hold both — `ListArtifactsForRun` (`store/queries.sql:288-293`)
+ * has no generation filter, unlike the query above it.
+ */
+const REVISED: ArtifactMeta[] = [
+  { id: 'a0', node_id: 'impl', type: 'patch', generation: 1, attempt: 1 },
+  { id: 'a1', node_id: 'impl', type: 'patch', generation: 2, attempt: 2 },
+]
+
+/** The same second round, for a gate examining a PLAN. `validate.go:209` allows it. */
+const REVISED_PLAN: ArtifactMeta[] = [
+  { id: 'a0', node_id: 'impl', type: 'plan', generation: 1, attempt: 1 },
+  { id: 'a1', node_id: 'impl', type: 'plan', generation: 2, attempt: 2 },
+]
 
 /** A gate this caller may decide, examining a patch, with a verdict beside it. */
 const decidable: GateEvidence = {
@@ -102,6 +130,12 @@ type Opts = {
   plan?: unknown
   /** A raw `a1` payload, for the malformed cases. */
   examined?: unknown
+  /** The run's artifact metadata. Empty means a first round with no predecessor. */
+  artifacts?: readonly ArtifactMeta[]
+  /** The `a0` payload — the previous round's patch. */
+  priorPatch?: string
+  /** The `a0` payload when the previous round examined a plan. */
+  priorPlan?: unknown
   executionUsedMs?: number
 }
 
@@ -128,6 +162,11 @@ function renderSurface(opts: Opts) {
       if (params.artifactId === 's1') {
         return artifact('s1', 'review_verdict', opts.verdict ?? DEFAULT_VERDICT)
       }
+      if (params.artifactId === 'a0') {
+        if (opts.priorPlan !== undefined) return artifact('a0', 'plan', opts.priorPlan)
+        if (opts.priorPatch !== undefined) return artifact('a0', 'patch', { diff: opts.priorPatch })
+        return notFound()
+      }
       if (params.artifactId !== 'a1') return notFound()
       if (opts.examined !== undefined) return artifact('a1', 'patch', opts.examined)
       if (opts.plan !== undefined) return artifact('a1', 'plan', opts.plan)
@@ -141,6 +180,7 @@ function renderSurface(opts: Opts) {
         runId="r1"
         nodeId="gate"
         evidence={evidence}
+        artifacts={opts.artifacts ?? []}
         executionUsedMs={opts.executionUsedMs ?? 0}
       />
     </QueryClientProvider>,
@@ -316,6 +356,53 @@ describe('the approval surface', () => {
     // branch is what puts it on screen: `s1` answered 200 here. An error
     // surface that dropped it would leave a user with nothing to quote.
     expect(screen.getByText('cid-404')).toBeInTheDocument()
+  })
+
+  it('names a revision whose patch is byte-identical to the one already reviewed', async () => {
+    // Finding 6: request-changes can otherwise loop an operator into approving
+    // work that ignored their review. Nothing on this screen distinguishes the
+    // two patches — same file list, same counts, same everything — because they
+    // ARE the same bytes.
+    renderSurface({ artifacts: REVISED, patch: TWO_FILES_B64, priorPatch: TWO_FILES_B64 })
+    expect(await screen.findByText(/byte-identical/i)).toBeInTheDocument()
+  })
+
+  it('says nothing when the revision actually changed the patch', async () => {
+    renderSurface({ artifacts: REVISED, patch: TWO_FILES_B64, priorPatch: b64text(ONE_TXT) })
+    // The negative is asserted AFTER the surface is past its loading gate, and
+    // the prior query is inside that gate for exactly this reason: a `queryBy`
+    // fired while a third fetch is still in flight passes against any
+    // implementation at all.
+    await screen.findByTestId('hard-facts')
+    expect(screen.queryByText(/byte-identical/i)).toBeNull()
+  })
+
+  it('compares the diff BYTES and not their length', async () => {
+    renderSurface({ artifacts: REVISED, patch: b64text(ONE_TXT), priorPatch: b64text(TWO_TXT) })
+    await screen.findByTestId('hard-facts')
+    expect(screen.queryByText(/byte-identical/i)).toBeNull()
+  })
+
+  it('says nothing about a PLAN gate on its second round', async () => {
+    // THE CASE A NAIVE EQUALITY PASSES AND A PERSON ACTS ON. `validate.go:209`
+    // accepts `plan→gate`, and a plan payload has no `diff` at all — so a
+    // comparison that did not insist on two readable diffs would read
+    // `undefined === undefined`, call every plan revision identical, and tell
+    // this operator their review was ignored when it was not.
+    //
+    // `priorPlan` is served but never fetched by the shipped code: the pure half
+    // refuses to name a predecessor for a plan. It is here so the mutant that
+    // removes both guards gets the honest payload production would give it,
+    // rather than a 404 that happens to answer null for a different reason.
+    const plan = { summary: 'Adds revocation.', steps: [{ title: 'Add the table' }] }
+    renderSurface({
+      evidence: { ...decidable, examined_artifact_type: 'plan' },
+      artifacts: REVISED_PLAN,
+      plan,
+      priorPlan: plan,
+    })
+    await screen.findByText('Add the table')
+    expect(screen.queryByText(/byte-identical/i)).toBeNull()
   })
 
   it('carries the decision rules of every host', async () => {
