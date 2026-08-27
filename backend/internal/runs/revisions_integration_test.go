@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -88,6 +89,22 @@ func patchTargetDoc() runs.DefinitionDoc {
 			{From: "polish", To: "gate", Artifact: runs.ArtifactKindPatch},
 		},
 	}
+}
+
+// implInstructionsOf reads the impl node's own instructions out of a document.
+// An assertion about what OPENS a prompt then compares against the fixture
+// that owns the text instead of a literal that goes stale the first time that
+// fixture is edited. It takes t and fails loudly rather than returning "",
+// which any HasPrefix check would swallow as a pass.
+func implInstructionsOf(t *testing.T, doc runs.DefinitionDoc) string {
+	t.Helper()
+	for _, n := range doc.Nodes {
+		if n.ID == "impl" {
+			return n.Instructions
+		}
+	}
+	t.Fatal("document has no impl node")
+	return ""
 }
 
 // gatedRunWithExecutor is gatedRunAtItsGate with the executor under the test's
@@ -660,6 +677,41 @@ func hasPatchInput(req runs.ExecutionRequest, id uuid.UUID) bool {
 		}
 	}
 	return false
+}
+
+// §2.1's acceptance: the note reaches the PROMPT, not only the staging dir.
+// Asserted on the assembled Instructions of the request a harness actually
+// receives — the artifact-contract half (the .caesar/in file) has its own
+// tests in gatenote_runner_test and is untouched here.
+func TestRequestChanges_TheNoteReachesTheAssembledInstructions(t *testing.T) {
+	rec := &bindingRecorder{inner: fake.NewExecutor()}
+	f, svc, run := gatedRunWithExecutor(t, gatedConveyorDoc(), rec)
+
+	const note = "Use three sentences, mention the Rubicon."
+	if _, err := svc.DecideGate(context.Background(), principal(f), runs.GateDecisionInput{
+		RunID: run.ID, NodeID: "gate", Decision: runs.DecisionRequestChanges, Note: note,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForRun(t, svc, run.ID, runs.RunWaiting)
+
+	// Attempt 1 is generation 1's; the revision's target runs as attempt 2.
+	first := waitForRequest(t, rec, run.ID, "impl", 1)
+	if strings.Contains(first.Instructions, "Requested changes") {
+		t.Fatalf("generation 1 grew a requested-changes section:\n%s", first.Instructions)
+	}
+
+	req := waitForRequest(t, rec, run.ID, "impl", 2)
+	// The node's own instructions still OPEN the prompt — appended, never
+	// substituted. Compared against the document's own text rather than a
+	// literal, which gatedConveyorDoc() would silently outgrow.
+	if !strings.HasPrefix(req.Instructions, implInstructionsOf(t, gatedConveyorDoc())) {
+		t.Fatalf("instructions no longer open with the node's own text:\n%s", req.Instructions)
+	}
+	want := "\n\n## Requested changes (a reviewer rejected the previous attempt)\n\n" + note + "\n"
+	if !strings.Contains(req.Instructions, want) {
+		t.Fatalf("assembled instructions missing the requested-changes section:\n%s", req.Instructions)
+	}
 }
 
 // A revision must leave no spendable token behind: every LIVE authorization

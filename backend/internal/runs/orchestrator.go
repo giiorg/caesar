@@ -976,6 +976,16 @@ func (o *Orchestrator) buildRequest(ctx context.Context, cp cachedPlan, node Pla
 			return ExecutionRequest{}, err
 		}
 		req.Inputs = append(req.Inputs, ArtifactInput{ID: row.ID, Type: row.Type, Payload: payload})
+		// The revision loop's only new input reaches the PROMPT, not just the
+		// staging dir: the note is appended — never substituted, same rule as
+		// OutputShapeInstruction above — in a marked section, so the model
+		// reads its original task first and the reviewer's words after.
+		// The staged .caesar/in file stays; it is the artifact contract.
+		if row.Type == ArtifactKindGateNote {
+			if note, ok := payload["note"].(string); ok && note != "" {
+				req.Instructions += "\n\n## Requested changes (a reviewer rejected the previous attempt)\n\n" + note + "\n"
+			}
+		}
 	}
 
 	// One patch reaches a phase, ever (Plan 07's cumulative-patch contract):
