@@ -369,10 +369,12 @@ describe('the approval surface', () => {
 
   it('says nothing when the revision actually changed the patch', async () => {
     renderSurface({ artifacts: REVISED, patch: TWO_FILES_B64, priorPatch: b64text(ONE_TXT) })
-    // The negative is asserted AFTER the surface is past its loading gate, and
-    // the prior query is inside that gate for exactly this reason: a `queryBy`
-    // fired while a third fetch is still in flight passes against any
-    // implementation at all.
+    // The negative is asserted AFTER the surface is past its loading gate: a
+    // `queryBy` fired while a fetch is still in flight would pass against any
+    // implementation at all. Measured, not assumed — with the prior query taken
+    // OUT of the gate this case still dies to `patch === priorPatch`, so today
+    // it is the `findByTestId` that makes it discriminate and the gate is
+    // insurance against a future ordering, not what is holding it up.
     await screen.findByTestId('hard-facts')
     expect(screen.queryByText(/byte-identical/i)).toBeNull()
   })

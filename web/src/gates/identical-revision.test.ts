@@ -16,17 +16,21 @@ describe('previousExaminedArtifactId', () => {
   })
 
   it('returns null on generation 1 (nothing to compare)', () => {
-    // NOT the proof of an early-exit line — there is none, and the one the plan
-    // proposed survived its own deletion (task-7-preflight.md, MUT-B). What this
-    // pins is the LOOP's generation filter: drop `a.generation >= examined
-    // .generation` and this case returns 'a', which is the examined artifact
-    // reported as its own predecessor.
+    // NOT the proof of an early-exit line — there is none. The `generation <= 1`
+    // exit the plan proposed was measured surviving its own deletion, because
+    // `CHECK (generation >= 1)` on the artifacts table
+    // (`platform/pg/schema.sql:286`) already makes the search below it empty.
+    // What this pins is the LOOP's generation filter: drop `a.generation >=
+    // examined.generation` and this case returns 'a', which is the examined
+    // artifact reported as its own predecessor.
     expect(previousExaminedArtifactId([art('a', 1, 1)], 'a')).toBeNull()
   })
 
   it('reaches past a round in which this node wrote nothing', () => {
-    // A revision rewinds ONE gate's slice (`runs/revisions.go:47`), so a node
-    // outside that slice contributes no row for that generation. Under a strict
+    // A revision at ANOTHER gate. `generation` is run-level
+    // (`store/queries.sql:520-527`) and revision loops are pairwise disjoint
+    // (`workflows/validate.go:328-343`), so a request-changes on a parallel
+    // branch bumps the number while this node contributes no row. Under a strict
     // `generation - 1` this is where the banner silently stops appearing — on a
     // revision, which is the only time it was ever going to appear.
     const arts = [art('p1', 1, 1), art('c', 3, 2)]

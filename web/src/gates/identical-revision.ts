@@ -31,18 +31,25 @@ export type ArtifactMeta = {
  * stored that either has a `diff` or does not.
  *
  * STRICTLY EARLIER, not `generation - 1`, and the difference is a banner that
- * would otherwise go missing. A revision rewinds one gate's slice
- * (`runs/revisions.go:47`), so a node OUTSIDE that slice writes nothing for that
- * round and its patches skip a generation entirely; `generation - 1` then finds
- * no row and says nothing, on exactly the revision it exists to describe.
+ * would otherwise go missing. NOT because of this gate's own revision — its
+ * target must dominate it (`workflows/validate.go:317-319`), so the examined
+ * producer is always inside the slice that rewinds (`runs/compile.go:452-458`)
+ * and always writes the round before. It is a revision at ANOTHER gate:
+ * `generation` is run-level (`BumpRunGeneration`, `store/queries.sql:520-527`),
+ * and loops are pairwise disjoint (`workflows/validate.go:328-343`), so a
+ * request-changes on a parallel branch bumps the number for the whole run while
+ * this node writes nothing. Its patches then skip a generation, and
+ * `generation - 1` finds no row and says nothing on exactly the revision it
+ * exists to describe.
  *
- * NO `generation <= 1` EARLY EXIT, deliberately. Every artifact table declares
+ * NO `generation <= 1` EARLY EXIT, deliberately. The artifacts table declares
  * `generation integer NOT NULL DEFAULT 1 CHECK (generation >= 1)`
- * (`platform/pg/schema.sql:224,260,286,350,396`), so a first-round gate's search
+ * (`platform/pg/schema.sql:286`), so a first-round gate's search
  * for anything below its own generation is empty on its own and the extra line
  * could never change an answer — it was measured surviving its own deletion
  * before this was written. "Returns null on generation 1" in the suite is a test
- * of the comparison below, which is the live guard.
+ * of the comparison below, which is the live guard: deleting that comparison
+ * turns the case red.
  */
 export function previousExaminedArtifactId(
   artifacts: readonly ArtifactMeta[],
@@ -60,9 +67,9 @@ export function previousExaminedArtifactId(
 }
 
 /**
- * GENERATION FIRST, THEN ATTEMPT — the order `NewestArtifact` already uses
- * (`store/queries.sql:275`), and not a style match: attempt alone gets this
- * wrong on the one row a revision is guaranteed to write.
+ * GENERATION FIRST, THEN ATTEMPT — the order `GetNodeArtifact` already uses
+ * (`store/queries.sql:255,273-276`), and not a style match: attempt alone gets
+ * this wrong on the one row a revision is guaranteed to write.
  *
  * Opening a revision copies the examined artifact under the target node at the
  * NEW generation with `attempt = 0` (`runs/revisions.go:19,286-297` — zero is
