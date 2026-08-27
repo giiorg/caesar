@@ -2,9 +2,10 @@ import { useQuery } from '@tanstack/react-query'
 import { QueryFailure } from '../errors/query-failure'
 import type { GateEvidence } from '../gates/decide-gate'
 import { GateControls } from '../gates/gate-controls'
-import { type ArtifactMeta, previousExaminedArtifactId } from '../gates/identical-revision'
+import { priorRejectedArtifactId } from '../gates/prior-decision'
 import { decodePatch, type ParsedPatch } from '../patch/decode-patch'
 import { FileAccordion } from '../patch/file-accordion'
+import type { Phase } from '../runs/phase-spine'
 import {
   artifactQueryOptions,
   type PlanView,
@@ -25,7 +26,7 @@ import { PlanProse, VerdictProse } from './payload-prose'
  *
  * The host supplies position and nothing else: this component takes the
  * evidence it is given rather than looking it up, because the two hosts find it
- * in different places (an inbox row and a run's phase). `artifacts` arrives the
+ * in different places (an inbox row and a run's phase). `phases` arrives the
  * same way and for the same reason — both hosts already hold the run at the
  * mount site, and a `runQueryOptions` fetch started in here would put a run
  * request inside every test that renders this component standalone.
@@ -35,10 +36,15 @@ export function ApprovalSurface(props: {
   nodeId: string
   evidence: GateEvidence
   /**
-   * The run's artifact metadata — `run.artifacts ?? []`. Required and nullable
-   * on the wire (`api/schema.d.ts:998`), hence the coalesce at both hosts.
+   * The run's phases — `run.phases ?? []`. Required and nullable on the wire
+   * (`api/schema.d.ts:1011`, a Go nil slice marshals to `null`), which is why
+   * the coalesce is at both hosts rather than optional-chained in here.
+   *
+   * THE WHOLE RUN'S, not this gate's: the decided attempts this reads are
+   * superseded rows for the same node id, and `ListPhasesForRun` carries every
+   * one of them (`store/queries.sql:225-226`).
    */
-  artifacts: readonly ArtifactMeta[]
+  phases: readonly Phase[]
   /** The run's `execution_used_ms`, for the duration cell. */
   executionUsedMs: number
 }) {
@@ -53,11 +59,30 @@ export function ApprovalSurface(props: {
   const examined = useQuery(
     artifactQueryOptions(props.runId, examinable ? evidence.examined_artifact_id : ''),
   )
-  // THE PATCH THIS ONE IS A REVISION OF, resolved from metadata the host already
-  // has, so this fetch starts beside the other two instead of behind them. It is
-  // null on a first round and on every plan gate, and `artifactQueryOptions` is
+  // THE ARTIFACT THIS GATE ALREADY SENT BACK, resolved from the decision record
+  // the host already has, so this fetch starts beside the other two instead of
+  // behind them. It is null on a first round, and `artifactQueryOptions` is
   // disabled on the empty id, so an ordinary gate spends no request here.
-  const priorId = previousExaminedArtifactId(props.artifacts, evidence.examined_artifact_id)
+  //
+  // THE `patch` GUARD BUYS A REQUEST, NOT CORRECTNESS, and the distinction is
+  // the whole reason it is worth a comment. The rule this replaced needed its
+  // type guard to stay correct — it compared artifact rows, so without one a
+  // plan gate reached `undefined === undefined` and accused the operator. Here
+  // correctness is already held one layer down by `patch` and `identical`
+  // below: `patch` is null for any gate not examining a patch, and `identical`
+  // requires `patch !== null`. What this guard buys is keeping a plan gate from
+  // spending a request to learn the banner cannot fire.
+  //
+  // Nor is the artifact it names a `patch` row by construction any more — the
+  // id comes from a decision rather than from a type-filtered artifact list,
+  // and a gate may legally examine a plan (`workflows/validate.go:209`). What
+  // stops a plan payload reaching the comparison is `priorPatch` below, where
+  // `readPatchDiff` answers null for any payload carrying no `diff`, and the
+  // `priorPatch !== null` conjunct of `identical` beside it.
+  const priorId =
+    evidence.examined_artifact_type === 'patch'
+      ? priorRejectedArtifactId(props.phases, props.nodeId)
+      : null
   const prior = useQuery(artifactQueryOptions(props.runId, priorId ?? ''))
 
   // ALL THREE QUERIES, ONE GATE, and it is about ORDER rather than about

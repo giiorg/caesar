@@ -22,7 +22,7 @@ export type Phase = components['schemas']['ApiPhaseResponse']
  * is what keeps this right if that ever stops being true, and it is the reading
  * `attempt` cannot express: generation is the run's revision round.
  */
-function isNewer(a: Phase, b: Phase): boolean {
+export function isNewerAttempt(a: Phase, b: Phase): boolean {
   if (a.generation !== b.generation) return a.generation > b.generation
   return a.attempt > b.attempt
 }
@@ -44,7 +44,7 @@ export function newestPhasePerNode(run: Run): Phase[] {
   const newest = new Map<string, Phase>()
   for (const phase of run.phases ?? []) {
     const seen = newest.get(phase.node_id)
-    if (seen === undefined || isNewer(phase, seen)) newest.set(phase.node_id, phase)
+    if (seen === undefined || isNewerAttempt(phase, seen)) newest.set(phase.node_id, phase)
   }
   return [...newest.values()]
 }
@@ -56,7 +56,7 @@ export function newestPhasePerNode(run: Run): Phase[] {
  * that parked it — the `rate_limited` behind a "resumable" line — is on the
  * attempt before. `phaseStatusLine` is the caller.
  *
- * KEYED ON (node_id, attempt) AND NOT ON GENERATION, unlike `isNewer` above,
+ * KEYED ON (node_id, attempt) AND NOT ON GENERATION, unlike `isNewerAttempt` above,
  * because that pair already identifies one row: `phase_runs` carries
  * `UNIQUE (run_id, node_id, attempt)` (`schema.sql:267`) and a rematerialized
  * node CONTINUES the ordinal rather than restarting it
@@ -76,7 +76,7 @@ export function newestPhaseOf(run: Run, nodeId: string): Phase | null {
   let best: Phase | null = null
   for (const phase of run.phases ?? []) {
     if (phase.node_id !== nodeId) continue
-    if (best === null || isNewer(phase, best)) best = phase
+    if (best === null || isNewerAttempt(phase, best)) best = phase
   }
   return best
 }

@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest'
 import { queryClient } from '../api/query-client'
 import type { GateEvidence } from '../gates/decide-gate'
 import { expectDecisionRules } from '../gates/decision-rules.testkit'
-import type { ArtifactMeta } from '../gates/identical-revision'
+import type { Phase } from '../runs/phase-spine'
 import { server } from '../test/msw'
 import { ApprovalSurface } from './approval-surface'
 
@@ -62,20 +62,64 @@ const ONE_TXT = '--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old\n+new\n'
 const TWO_TXT = '--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-old\n+new\n'
 
 /**
- * A node on its SECOND ROUND, as `run.artifacts` carries it: the reviewed patch
- * at generation 1 and the revision at generation 2, under one node id. The array
- * really does hold both — `ListArtifactsForRun` (`store/queries.sql:288-293`)
- * has no generation filter, unlike the query above it.
+ * A decided attempt of THIS GATE, as `run.phases` carries it.
+ *
+ * THE NODE ID IS THE GATE'S, and that is the whole difference from the artifact
+ * fixtures these replaced. Those filtered by the PRODUCER (`impl`), because the
+ * old rule searched a producer's artifact rows for a predecessor. The rule now
+ * reads the gate's own decision record, this suite mounts the surface with
+ * `nodeId="gate"`, and a fixture still saying `impl` would match nothing and
+ * turn every banner case below silently bannerless.
+ *
+ * The array really does hold a superseded round beside the live one:
+ * `ListPhasesForRun` has no generation or attempt filter
+ * (`store/queries.sql:225-226`), and a decision is attached per ATTEMPT row
+ * (`runs/tasks.go:584-596`), so both of this gate's rounds arrive with their own.
  */
-const REVISED: ArtifactMeta[] = [
-  { id: 'a0', node_id: 'impl', type: 'patch', generation: 1, attempt: 1 },
-  { id: 'a1', node_id: 'impl', type: 'patch', generation: 2, attempt: 2 },
-]
+const decidedGate = (
+  generation: number,
+  attempt: number,
+  verb: string,
+  examinedArtifactId: string,
+): Phase => ({
+  node_id: 'gate',
+  attempt,
+  max_attempts: 3,
+  status: 'superseded',
+  generation,
+  created_at: '2026-01-01T00:00:00Z',
+  finished_at: '2026-01-01T00:01:00Z',
+  decision: {
+    decision: verb,
+    note: 'please add a test',
+    acted_by_id: 'u1',
+    acted_by_email: 'reviewer@example.com',
+    acted_at: '2026-01-01T00:01:00Z',
+    self_approval: false,
+    examined_artifact_id: examinedArtifactId,
+  },
+})
 
-/** The same second round, for a gate examining a PLAN. `validate.go:209` allows it. */
-const REVISED_PLAN: ArtifactMeta[] = [
-  { id: 'a0', node_id: 'impl', type: 'plan', generation: 1, attempt: 1 },
-  { id: 'a1', node_id: 'impl', type: 'plan', generation: 2, attempt: 2 },
+/** This gate on its SECOND ROUND: sent back at generation 1 over `a0`. */
+const REVISED: Phase[] = [decidedGate(1, 1, 'request_changes', 'a0')]
+
+/**
+ * The same gate, sent back and then APPROVED, and now waiting a third time.
+ *
+ * BOTH ROUNDS ARE REQUIRED FOR THIS TO DISCRIMINATE — MEASURED. A fixture
+ * carrying only the approval is answered `null` by "newest request_changes"
+ * too, for want of any request-changes row at all, so it cannot tell the two
+ * rules apart and the case proves nothing. With the earlier request-changes
+ * present, that rule reaches past the approval to `a0` and raises the banner.
+ *
+ * The approval examined `a1` — the artifact on screen — which the handler
+ * serves. So a mutant that takes the newest decision and skips the verb check
+ * entirely also lands on identical bytes and fires, rather than escaping
+ * through a 404 that answers null for an unrelated reason.
+ */
+const APPROVED_SINCE: Phase[] = [
+  decidedGate(1, 1, 'request_changes', 'a0'),
+  decidedGate(2, 2, 'approve', 'a1'),
 ]
 
 /** A gate this caller may decide, examining a patch, with a verdict beside it. */
@@ -130,8 +174,8 @@ type Opts = {
   plan?: unknown
   /** A raw `a1` payload, for the malformed cases. */
   examined?: unknown
-  /** The run's artifact metadata. Empty means a first round with no predecessor. */
-  artifacts?: readonly ArtifactMeta[]
+  /** The run's phases. Empty means a first round: no decided attempt, no predecessor. */
+  phases?: readonly Phase[]
   /** The `a0` payload — the previous round's patch. */
   priorPatch?: string
   /** The `a0` payload when the previous round examined a plan. */
@@ -180,7 +224,7 @@ function renderSurface(opts: Opts) {
         runId="r1"
         nodeId="gate"
         evidence={evidence}
-        artifacts={opts.artifacts ?? []}
+        phases={opts.phases ?? []}
         executionUsedMs={opts.executionUsedMs ?? 0}
       />
     </QueryClientProvider>,
@@ -363,12 +407,30 @@ describe('the approval surface', () => {
     // work that ignored their review. Nothing on this screen distinguishes the
     // two patches — same file list, same counts, same everything — because they
     // ARE the same bytes.
-    renderSurface({ artifacts: REVISED, patch: TWO_FILES_B64, priorPatch: TWO_FILES_B64 })
+    renderSurface({ phases: REVISED, patch: TWO_FILES_B64, priorPatch: TWO_FILES_B64 })
     expect(await screen.findByText(/byte-identical/i)).toBeInTheDocument()
   })
 
+  it('says NOTHING when the request-changes was already acted on and approved', async () => {
+    // The §2.1 correction, visible at the surface: the same identical bytes as
+    // the case above, with an approval recorded SINCE the request-changes. The
+    // banner's second clause — "the previous request-changes note was not acted
+    // on" — would be a false sentence here. It was acted on, at generation 2,
+    // and approved.
+    //
+    // DEFENSIVE RATHER THAN A LIVE SHAPE, and the fixture says so honestly: an
+    // approve finishes the gate `succeeded` (`runs/gates.go:254`) and a node
+    // whose newest row succeeded is never rematerialized
+    // (`runs/orchestrator.go:1236`), so a waiting gate cannot today look back
+    // on its own approval. What it pins is that the surface does not depend on
+    // that being true — see `gates/prior-decision.ts` for the full chain.
+    renderSurface({ phases: APPROVED_SINCE, patch: TWO_FILES_B64, priorPatch: TWO_FILES_B64 })
+    await screen.findByTestId('hard-facts')
+    expect(screen.queryByText(/byte-identical/i)).toBeNull()
+  })
+
   it('says nothing when the revision actually changed the patch', async () => {
-    renderSurface({ artifacts: REVISED, patch: TWO_FILES_B64, priorPatch: b64text(ONE_TXT) })
+    renderSurface({ phases: REVISED, patch: TWO_FILES_B64, priorPatch: b64text(ONE_TXT) })
     // The negative is asserted AFTER the surface is past its loading gate: a
     // `queryBy` fired while a fetch is still in flight would pass against any
     // implementation at all. Measured rather than assumed — with the prior query
@@ -378,13 +440,13 @@ describe('the approval surface', () => {
     // `patch === priorPatch` leaves this case green — its two diffs differ
     // either way — and kills the PLAN-gate negative instead. The gate holds the
     // third query for the product reason the component states
-    // (`approval-surface.tsx:72-75`), not for this one.
+    // (`approval-surface.tsx:98-101`), not for this one.
     await screen.findByTestId('hard-facts')
     expect(screen.queryByText(/byte-identical/i)).toBeNull()
   })
 
   it('compares the diff BYTES and not their length', async () => {
-    renderSurface({ artifacts: REVISED, patch: b64text(ONE_TXT), priorPatch: b64text(TWO_TXT) })
+    renderSurface({ phases: REVISED, patch: b64text(ONE_TXT), priorPatch: b64text(TWO_TXT) })
     await screen.findByTestId('hard-facts')
     expect(screen.queryByText(/byte-identical/i)).toBeNull()
   })
@@ -396,14 +458,21 @@ describe('the approval surface', () => {
     // `undefined === undefined`, call every plan revision identical, and tell
     // this operator their review was ignored when it was not.
     //
-    // `priorPlan` is served but never fetched by the shipped code: the pure half
-    // refuses to name a predecessor for a plan. It is here so the mutant that
-    // removes both guards gets the honest payload production would give it,
-    // rather than a 404 that happens to answer null for a different reason.
+    // `priorPlan` is served but never fetched by the shipped code: the call
+    // site refuses to look one up for a gate whose evidence declares a plan.
+    // It is here so the mutant that removes both guards gets the honest payload
+    // production would give it, rather than a 404 that happens to answer null
+    // for a different reason.
+    //
+    // THE PHASE FIXTURE IS THE PATCH ONE, and that is not an oversight: a phase
+    // carries no artifact type, so `REVISED` says only "this gate was sent back
+    // over `a0`" — which is exactly the state a plan gate on its second round
+    // is in. The type now lives solely in the evidence, which is where the
+    // surface reads it.
     const plan = { summary: 'Adds revocation.', steps: [{ title: 'Add the table' }] }
     renderSurface({
       evidence: { ...decidable, examined_artifact_type: 'plan' },
-      artifacts: REVISED_PLAN,
+      phases: REVISED,
       plan,
       priorPlan: plan,
     })

@@ -318,7 +318,7 @@ function PhaseTimeline(props: {
  * A GATE IS ONE CARRYING EVIDENCE OR A DECISION, and evidence is read first
  * because it is the half that can still be acted on. `attachGateEvidence`
  * builds it only for a phase whose status is `waiting_decision`
- * (`runs/tasks.go:714-715`), so a gate somebody has already decided arrives
+ * (`runs/tasks.go:717-719`), so a gate somebody has already decided arrives
  * here with a decision and no evidence.
  *
  * `phase.evidence` is narrowed TRUTHY and never `!== undefined`: it is
@@ -341,7 +341,7 @@ function PhaseBody(props: { run: Run; phase: Phase }) {
         runId={run.id}
         nodeId={phase.node_id}
         evidence={phase.evidence}
-        artifacts={run.artifacts ?? []}
+        phases={run.phases ?? []}
         executionUsedMs={run.execution_used_ms}
       />
     )
