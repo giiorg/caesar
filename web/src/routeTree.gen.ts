@@ -21,6 +21,7 @@ import { Route as AppApprovalsIndexRouteImport } from './routes/_app/approvals.i
 import { Route as AppRunsIndexRouteImport } from './routes/_app/runs.index'
 import { Route as AppRunsRunIdRouteImport } from './routes/_app/runs.$runId'
 import { Route as AppApprovalsRunIdNodeIdRouteImport } from './routes/_app/approvals.$runId.$nodeId'
+import { Route as AppRunsRunIdArtifactsArtifactIdRouteImport } from './routes/_app/runs.$runId_.artifacts.$artifactId'
 
 const AppRoute = AppRouteImport.update({
   id: '/_app',
@@ -81,6 +82,12 @@ const AppApprovalsRunIdNodeIdRoute = AppApprovalsRunIdNodeIdRouteImport.update({
   path: '/approvals/$runId/$nodeId',
   getParentRoute: () => AppRoute,
 } as any)
+const AppRunsRunIdArtifactsArtifactIdRoute =
+  AppRunsRunIdArtifactsArtifactIdRouteImport.update({
+    id: '/runs/$runId_/artifacts/$artifactId',
+    path: '/runs/$runId/artifacts/$artifactId',
+    getParentRoute: () => AppRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
@@ -94,6 +101,7 @@ export interface FileRoutesByFullPath {
   '/approvals/': typeof AppApprovalsIndexRoute
   '/runs/': typeof AppRunsIndexRoute
   '/approvals/$runId/$nodeId': typeof AppApprovalsRunIdNodeIdRoute
+  '/runs/$runId/artifacts/$artifactId': typeof AppRunsRunIdArtifactsArtifactIdRoute
 }
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
@@ -107,6 +115,7 @@ export interface FileRoutesByTo {
   '/approvals': typeof AppApprovalsIndexRoute
   '/runs': typeof AppRunsIndexRoute
   '/approvals/$runId/$nodeId': typeof AppApprovalsRunIdNodeIdRoute
+  '/runs/$runId/artifacts/$artifactId': typeof AppRunsRunIdArtifactsArtifactIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -122,6 +131,7 @@ export interface FileRoutesById {
   '/_app/approvals/': typeof AppApprovalsIndexRoute
   '/_app/runs/': typeof AppRunsIndexRoute
   '/_app/approvals/$runId/$nodeId': typeof AppApprovalsRunIdNodeIdRoute
+  '/_app/runs/$runId_/artifacts/$artifactId': typeof AppRunsRunIdArtifactsArtifactIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -137,6 +147,7 @@ export interface FileRouteTypes {
     | '/approvals/'
     | '/runs/'
     | '/approvals/$runId/$nodeId'
+    | '/runs/$runId/artifacts/$artifactId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/login'
@@ -150,6 +161,7 @@ export interface FileRouteTypes {
     | '/approvals'
     | '/runs'
     | '/approvals/$runId/$nodeId'
+    | '/runs/$runId/artifacts/$artifactId'
   id:
     | '__root__'
     | '/_app'
@@ -164,6 +176,7 @@ export interface FileRouteTypes {
     | '/_app/approvals/'
     | '/_app/runs/'
     | '/_app/approvals/$runId/$nodeId'
+    | '/_app/runs/$runId_/artifacts/$artifactId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -257,6 +270,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppApprovalsRunIdNodeIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/runs/$runId_/artifacts/$artifactId': {
+      id: '/_app/runs/$runId_/artifacts/$artifactId'
+      path: '/runs/$runId/artifacts/$artifactId'
+      fullPath: '/runs/$runId/artifacts/$artifactId'
+      preLoaderRoute: typeof AppRunsRunIdArtifactsArtifactIdRouteImport
+      parentRoute: typeof AppRoute
+    }
   }
 }
 
@@ -271,6 +291,7 @@ interface AppRouteChildren {
   AppApprovalsIndexRoute: typeof AppApprovalsIndexRoute
   AppRunsIndexRoute: typeof AppRunsIndexRoute
   AppApprovalsRunIdNodeIdRoute: typeof AppApprovalsRunIdNodeIdRoute
+  AppRunsRunIdArtifactsArtifactIdRoute: typeof AppRunsRunIdArtifactsArtifactIdRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
@@ -284,6 +305,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppApprovalsIndexRoute: AppApprovalsIndexRoute,
   AppRunsIndexRoute: AppRunsIndexRoute,
   AppApprovalsRunIdNodeIdRoute: AppApprovalsRunIdNodeIdRoute,
+  AppRunsRunIdArtifactsArtifactIdRoute: AppRunsRunIdArtifactsArtifactIdRoute,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)

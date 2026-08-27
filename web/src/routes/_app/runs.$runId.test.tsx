@@ -264,6 +264,50 @@ describe('run detail', () => {
     expect(screen.queryByText('superseded-1')).toBeNull()
   })
 
+  it('sends an artifact ROW to the artifact view', async () => {
+    // PER ROW, NOT PER PHASE, and the fixture is what makes that a claim rather
+    // than a coincidence: this attempt produced two artifacts, so a link on the
+    // phase card could only ever open one of them.
+    //
+    // THE ASSERTION IS THE RENDERED PATCH ON THE OTHER SIDE, never the href,
+    // and that is not fastidiousness. Named
+    // `runs.$runId.artifacts.$artifactId.tsx`, the destination route nests
+    // under THIS one, whose component renders no `<Outlet />` — MEASURED: the
+    // href was correct, the URL was correct, and run detail rendered again. An
+    // href-only check passes against that; only reading the artifact's own
+    // output catches it.
+    renderApp('/runs/run-1?phase=impl', [
+      run({
+        phases: [phase({ node_id: 'impl' })],
+        artifacts: [
+          artifactRow({ node_id: 'impl', type: 'plan', id: 'a0' }),
+          artifactRow({ node_id: 'impl', type: 'patch', id: 'a1' }),
+        ],
+      }),
+      // ANSWERS PER ID, and that is what makes the click's DESTINATION
+      // falsifiable rather than merely its route. With one payload served for
+      // every id, a row that linked to the phase's FIRST artifact instead of
+      // its own would land on `a0`, render the same patch, and pass — MEASURED
+      // as a surviving mutant before this handler was split in two.
+      http.get('/api/v1/runs/:id/artifacts/:artifactId', ({ params }) =>
+        HttpResponse.json({
+          id: params.artifactId,
+          run_id: 'run-1',
+          node_id: 'impl',
+          type: params.artifactId === 'a1' ? 'patch' : 'plan',
+          attempt: 1,
+          generation: 1,
+          parent_ids: [],
+          created_at: AT,
+          payload: params.artifactId === 'a1' ? patchPayload() : { summary: 'the superseded plan' },
+        }),
+      ),
+    ])
+    await userEvent.click(await screen.findByRole('link', { name: /a1/ }))
+    expect(await screen.findByText('one.txt')).toBeInTheDocument()
+    expect(screen.queryByText('the superseded plan')).toBeNull()
+  })
+
   it('says so when the wire carries a publication status this screen has never heard of', async () => {
     // The runtime half of the exhaustive switch, and the reason the switch runs
     // over a LOCAL union rather than over the wire type. `status` is a bare

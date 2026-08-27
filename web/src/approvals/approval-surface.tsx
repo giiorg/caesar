@@ -1,10 +1,10 @@
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
 import { QueryFailure } from '../errors/query-failure'
 import type { GateEvidence } from '../gates/decide-gate'
 import { GateControls } from '../gates/gate-controls'
 import { type ArtifactMeta, previousExaminedArtifactId } from '../gates/identical-revision'
-import { type DiffFile, decodePatch, type ParsedPatch } from '../patch/decode-patch'
+import { decodePatch, type ParsedPatch } from '../patch/decode-patch'
+import { FileAccordion } from '../patch/file-accordion'
 import {
   artifactQueryOptions,
   type PlanView,
@@ -13,6 +13,7 @@ import {
   readVerdict,
   type VerdictView,
 } from './artifact-query'
+import { PlanProse, VerdictProse } from './payload-prose'
 
 /**
  * ONE COMPONENT, TWO HOSTS. This task mounts it full-screen under
@@ -150,51 +151,15 @@ function SummaryBlock(props: {
   if (props.verdict === null) {
     return <p className="text-text-muted text-sm">The review summary could not be read.</p>
   }
+  // THE FRAME STAYS HERE, THE PROSE DOES NOT. `agent-summary` marks the block
+  // this gate consumes as its summary, which is a statement about the GATE —
+  // the artifact view renders the same verdict with no gate in sight and must
+  // not claim to be one.
   return (
     <section data-testid="agent-summary" className="border-border bg-surface rounded-md border p-3">
-      <p className="text-text font-medium">
-        {VERDICT_SENTENCE[props.verdict.verdict] ?? props.verdict.verdict}
-      </p>
-      {props.verdict.findings.length > 0 && (
-        <ul className="mt-2 flex flex-col gap-1">
-          {props.verdict.findings.map((f, i) => (
-            <li
-              // A finding carries no id on the wire (`ApiReviewFinding` is
-              // severity, message and an optional file/line), so nothing in it
-              // is guaranteed unique. The index is the only key available, and
-              // it is stable here: this list is one read of one immutable
-              // artifact and is never reordered or filtered.
-              // biome-ignore lint/suspicious/noArrayIndexKey: no identity on the wire
-              key={i}
-              className="text-text-muted text-sm"
-            >
-              <span className="text-text font-mono text-xs">{f.severity}</span> {f.message}
-              {f.file !== undefined && f.file !== '' && (
-                <span className="font-mono text-xs">
-                  {' '}
-                  {f.file}
-                  {f.line !== undefined && f.line > 0 ? `:${f.line}` : ''}
-                </span>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
+      <VerdictProse verdict={props.verdict} />
     </section>
   )
-}
-
-/**
- * The agent's verdict as a sentence, keyed by `string` and not by a union: the
- * wire type is `verdict: string`, so a verdict added server-side has to degrade
- * to the raw token rather than render `undefined`. The vocabulary is
- * deliberately the one a human gate decision uses (`payload_dto.go:27-29`), so
- * a reader is not learning two.
- */
-const VERDICT_SENTENCE: Record<string, string> = {
-  approve: 'The review agent approved this change.',
-  request_changes: 'The review agent requested changes.',
-  reject: 'The review agent rejected this change.',
 }
 
 /**
@@ -309,135 +274,3 @@ function ExaminedArtifact(props: {
   }
   return <FileAccordion parsed={props.parsed} />
 }
-
-function PlanProse(props: { plan: PlanView | null }) {
-  if (props.plan === null) {
-    return <p className="text-text-muted text-sm">The examined plan could not be read.</p>
-  }
-  return (
-    <section className="flex flex-col gap-2">
-      <p className="text-text">{props.plan.summary}</p>
-      <ol className="flex list-decimal flex-col gap-1 pl-5">
-        {props.plan.steps.map((step, i) => (
-          // A plan step is a title and an optional detail (`ApiPlanStep`) and
-          // nothing else — two steps may legitimately share a title, so the
-          // index is the only unique key. Stable for the same reason as the
-          // findings list above: one read of one immutable artifact.
-          // biome-ignore lint/suspicious/noArrayIndexKey: no identity on the wire
-          <li key={i}>
-            <p className="text-text text-sm">{step.title}</p>
-            {step.detail !== undefined && step.detail !== '' && (
-              <p className="text-text-muted text-sm">{step.detail}</p>
-            )}
-          </li>
-        ))}
-      </ol>
-    </section>
-  )
-}
-
-/**
- * FILES LISTED, DIFFS ON DEMAND. A gate's patch is routinely thousands of
- * lines, and the locked design opens on the file list so the first thing on
- * screen is what changed rather than how.
- */
-function FileAccordion(props: { parsed: ParsedPatch }) {
-  const [open, setOpen] = useState<string | null>(null)
-  return (
-    <div className="flex flex-col gap-2">
-      {props.parsed.lossy && (
-        // decodePatch decodes twice to learn this rather than hunting for
-        // U+FFFD in its own output, so this warning cannot be triggered by a
-        // patch that legitimately contains a replacement character.
-        <p className="text-warning text-sm">
-          Some of these patch bytes were not valid UTF-8, so the text below may not render exactly
-          as it was produced.
-        </p>
-      )}
-      <div data-testid="file-accordion" className="border-border rounded-md border">
-        {props.parsed.files.map((file, i) => {
-          // `path` ALONE IS NOT A KEY. decodePatch opens a file on a bare
-          // `--- ` header with no `diff --git` line before it, and such a file
-          // keeps `path: ''` until a `+++ ` header names it — so a patch
-          // carrying two of them yields two entries with the same empty path.
-          // The index disambiguates, and the list is never reordered or
-          // filtered: it is one decode of one immutable artifact.
-          //
-          // Naming it here also puts it out of `noArrayIndexKey`'s reach — the
-          // rule matches the index syntactically inside `key=` — so the
-          // paragraph above is the only thing guarding this, rather than a
-          // suppression a reader can find. It is written where the binding is
-          // for that reason.
-          const id = `${i}:${file.path}`
-          return (
-            <FileRow
-              key={id}
-              file={file}
-              open={open === id}
-              onToggle={() => setOpen(open === id ? null : id)}
-            />
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-function FileRow(props: { file: DiffFile; open: boolean; onToggle: () => void }) {
-  const { file } = props
-  return (
-    <div className="border-border border-b last:border-b-0">
-      <button
-        type="button"
-        onClick={props.onToggle}
-        aria-expanded={props.open}
-        className="text-text flex w-full items-center gap-2 px-3 py-2 text-left text-sm"
-      >
-        <span className="font-mono">{file.path}</span>
-        <span className="text-success text-xs">+{file.added}</span>
-        <span className="text-danger text-xs">−{file.removed}</span>
-      </button>
-      {props.open && (
-        <div className="border-border border-t px-3 py-2">
-          {file.binary && (
-            <p className="text-text-muted text-sm">
-              A binary file — there is no text diff to show.
-            </p>
-          )}
-          {file.hunks.map((hunk) => (
-            <div key={hunk.header} className="font-mono text-xs">
-              <p className="text-text-muted">{hunk.header}</p>
-              {hunk.lines.map((line, i) => (
-                <p
-                  // biome-ignore lint/suspicious/noArrayIndexKey: a hunk's lines have no identity and never reorder
-                  key={i}
-                  className={LINE_CLASS[line.kind]}
-                >
-                  {/* THE MARKER IS A SEPARATE SPAN AND NOT PART OF THE TEXT.
-                      decodePatch strips the leading +/-/space so that a
-                      renderer colouring by `kind` does not also print the
-                      character it coloured for, and the line's text is
-                      therefore exactly the file's. Rendering the marker beside
-                      it — not aria-hidden — is what keeps colour from being
-                      the only channel that says add or del, both for a reader
-                      who does not distinguish the two colours and for one
-                      hearing the line read out. */}
-                  <span>{MARKER[line.kind]}</span>
-                  <span>{line.text}</span>
-                </p>
-              ))}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-const LINE_CLASS = {
-  add: 'text-success',
-  del: 'text-danger',
-  context: 'text-text-muted',
-} as const
-
-const MARKER = { add: '+', del: '−', context: ' ' } as const

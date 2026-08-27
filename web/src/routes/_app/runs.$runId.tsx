@@ -354,15 +354,24 @@ function PhaseBody(props: { run: Run; phase: Phase }) {
  * A phase's artifacts, by type and id.
  *
  * SCOPED TO THIS ATTEMPT, not to the node. An artifact row carries its own
- * `attempt` and `generation` (`dto.go:481-484`), and a retried or revised node
+ * `attempt` and `generation` (`dto.go:499-502`), and a retried or revised node
  * keeps the rows its superseded attempts wrote — listing those beside the
  * current ones would show a reader a plan the run has already thrown away.
  *
- * NOTHING HERE LINKS ANYWHERE. `GET /runs/{id}/artifacts/{artifact_id}` serves
- * the payload, but 12a adds no route that renders one outside a gate's
- * evidence — no task in this plan creates one — so a link would have no
- * destination. The id is rendered because it is what a
- * person quotes when asking about an artifact, not because it is clickable.
+ * THE LINK IS PER ROW, AND THE PHASE CARD IS NOT THE LINK. A single attempt
+ * routinely writes several artifacts, and not as an edge case: the success path
+ * appends a `log_ref` beside the patch on EVERY attempt
+ * (`runner/collect.go:142,159`), and a failed one emits a `failure_snapshot`
+ * beside its own log_ref (`runner/execute.go:346-350`). So a destination hung
+ * off the phase could only ever be one of them, chosen here rather than by the
+ * reader. Each row therefore carries its own
+ * `/runs/$runId/artifacts/$artifactId`, which
+ * `routes/_app/runs.$runId_.artifacts.$artifactId.tsx` renders through the
+ * per-kind views.
+ *
+ * THE ROW STILL SHOWS THE ID, and not only because it is now an href: the id is
+ * what a person quotes when asking somebody else about an artifact, and it is
+ * the only thing distinguishing two rows of the same type.
  */
 function PhaseArtifacts(props: { run: Run; phase: Phase }) {
   const { phase } = props
@@ -378,9 +387,15 @@ function PhaseArtifacts(props: { run: Run; phase: Phase }) {
   return (
     <ul className="flex flex-col gap-1">
       {rows.map((a) => (
-        <li key={a.id} className="flex gap-2">
-          <span className="text-text font-mono text-sm">{a.type}</span>
-          <span className="text-text-muted font-mono text-xs">{a.id}</span>
+        <li key={a.id}>
+          <Link
+            to="/runs/$runId/artifacts/$artifactId"
+            params={{ runId: props.run.id, artifactId: a.id }}
+            className="flex gap-2"
+          >
+            <span className="text-accent font-mono text-sm underline">{a.type}</span>
+            <span className="text-text-muted font-mono text-xs">{a.id}</span>
+          </Link>
         </li>
       ))}
     </ul>
