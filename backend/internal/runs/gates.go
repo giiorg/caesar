@@ -539,6 +539,21 @@ func (s *Service) ListWaitingGates(ctx context.Context, projectIDs []uuid.UUID, 
 		}
 	}
 
+	if len(rows) == 0 {
+		// An empty inbox pays for neither the clock below nor a plan: there is
+		// no deadline to compare and no row to project.
+		return []WaitingGate{}, nil
+	}
+	// The deciding clock, read ONCE for the whole page and from the DATABASE.
+	// It is the other half of every row's wall_deadline comparison, and
+	// s.clock.Now() on that side would let app-clock skew move the boundary
+	// (queries.sql:114-119). Once per page rather than once per row so two rows
+	// of one response cannot disagree about what time it is.
+	asOf, err := q.DBNow(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("runs: read the deciding clock: %w", err)
+	}
+
 	plans := map[uuid.UUID]ExecPlan{}
 	compiled := func(versionID uuid.UUID) (ExecPlan, error) {
 		if p, ok := plans[versionID]; ok {
@@ -568,7 +583,7 @@ func (s *Service) ListWaitingGates(ctx context.Context, projectIDs []uuid.UUID, 
 		}
 		ev, err := gateEvidence(ctx, q, gateEvidenceInput{
 			plan: plan, runID: r.RunID, nodeID: r.NodeID, snapshot: snap,
-			requesterID: r.RequesterID, wallDeadline: r.WallDeadline,
+			requesterID: r.RequesterID, wallDeadline: r.WallDeadline, asOf: asOf,
 		})
 		if err != nil {
 			return nil, err

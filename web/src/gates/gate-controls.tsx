@@ -16,19 +16,33 @@ import {
 } from './decide-gate'
 
 /**
+ * The deadline sentence, ONE constant read from two places.
+ *
+ * Below it is rendered off this client's own clock, and in REASONS it is
+ * rendered off the server's `deadline_expired`. Those are two different
+ * questions about one fact (see the comment on the check itself), and one fact
+ * gets one wording: two near-identical sentences differing in punctuation would
+ * leave a reader unable to tell which of the two paths they had hit, and would
+ * drift the moment either was edited.
+ */
+const DEADLINE_PASSED =
+  "This run's wall deadline has passed, so its gates can no longer be decided."
+
+/**
  * Every refusal `cannot_decide_reason` can carry, and each says WHICH refusal
  * it is. Two refusals sharing one message is a message that tells nobody what
- * to do: the first is fixed by a grant, the second by a policy on a run already
- * created, and the third by nothing the reader can do at all.
+ * to do: one is fixed by a grant, one by a policy on a run already created, and
+ * two by nothing the reader can do at all.
  *
- * The three keys are exactly what `decidability()` returns
- * (`backend/internal/runs/api/api.go:516-527`), in that function's own order,
+ * The four keys are exactly what `decidability()` returns
+ * (`backend/internal/runs/api/api.go:526-542`), in that function's own order,
  * which is decideGate's order — so the reason names the refusal the caller
  * would actually receive rather than some other true thing about the gate.
  */
 const REASONS: Record<string, string> = {
   not_approver:
     'You can see this gate but not decide it — deciding needs the approve grant on this project.',
+  deadline_expired: DEADLINE_PASSED,
   self_approval_forbidden:
     'You requested this run, and its policy does not let you decide your own gate.',
   evidence_missing:
@@ -42,7 +56,7 @@ const REASONS: Record<string, string> = {
  * heard of. An exhaustive match would render nothing at all for it — a
  * suppressed control with no explanation, which is the one outcome §5 exists to
  * prevent. Degrading to something true is the requirement; naming one of the
- * three specific refusals instead would send the reader after a fix that does
+ * four specific refusals instead would send the reader after a fix that does
  * not apply.
  */
 const GENERIC_REFUSAL = 'You cannot decide this gate.'
@@ -166,15 +180,19 @@ export function GateControls(props: {
   // both apply — the only fixture that can see it, since with either condition
   // alone the two checks are interchangeable.
   //
-  // That this check exists at all is separate and load-bearing: `can_decide`
-  // deliberately ignores the wall clock (dto.go:309-315), so a gate can arrive
-  // decidable and expired, and nothing but this line would say so.
+  // THIS CHECK AND `deadline_expired` ARE NOT REDUNDANT, and they are not the
+  // same question. `can_decide` now folds the deadline in — measured against
+  // the DATABASE clock, the clock the decision transaction reads
+  // (`api.go:532`) — but only AS OF THE INSTANT THE RESPONSE WAS COMPOSED. A
+  // gate opened with eight minutes left and still on screen ten minutes later
+  // is carrying a response that said `can_decide: true` and has since become
+  // false, and only a check against the reader's own clock catches that. The
+  // server's answer is the authoritative one and it is checked too, one branch
+  // below: where the two disagree — a browser clock running behind the
+  // database's — the response wins, because it is the clock that will judge
+  // the POST.
   if (new Date(props.evidence.wall_deadline) <= new Date()) {
-    return (
-      <p className="text-text-muted text-sm">
-        This run's wall deadline has passed, so its gates can no longer be decided.
-      </p>
-    )
+    return <p className="text-text-muted text-sm">{DEADLINE_PASSED}</p>
   }
 
   if (!props.evidence.can_decide) {

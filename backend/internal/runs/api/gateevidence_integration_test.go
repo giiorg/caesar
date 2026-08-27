@@ -233,6 +233,106 @@ func TestWaitingGateCarriesItsEvidence(t *testing.T) {
 	})
 }
 
+// TestDecidabilityPastTheWallDeadline is §5's FOURTH refusal, and every case
+// here carries decideGate's own answer as its oracle. can_decide is only worth
+// rendering if it predicts the endpoint: a gate the inbox calls decidable and
+// the endpoint answers 409 ships a control guaranteed to fail, which is the one
+// outcome this field exists to prevent.
+func TestDecidabilityPastTheWallDeadline(t *testing.T) {
+	h := newHarness(t)
+
+	t.Run("an approver who could otherwise decide is told the deadline instead", func(t *testing.T) {
+		// Every OTHER refusal passes on this fixture: approver-tok holds
+		// approve, did not request the run, and the examined patch exists. So
+		// can_decide is TRUE here without the deadline arm, which makes this
+		// case the arm's own test rather than a restatement of one of the three.
+		run, node := h.stagePatchGateWithoutVerdict(t)
+		h.expireWallDeadline(t, run)
+
+		got := h.onlyApproval(t, "approver-tok", run)
+		if got.Evidence.CanDecide {
+			t.Error("can_decide is true on a run whose wall deadline has passed")
+		}
+		if got.Evidence.CannotDecideReason != "deadline_expired" {
+			t.Errorf("cannot_decide_reason = %q, want deadline_expired", got.Evidence.CannotDecideReason)
+		}
+		// The oracle. gates.go:176 refuses on the deadline with ClassConflict,
+		// which httpx answers 409 — so a caller who followed can_decide: true
+		// would have been sent to a certain failure.
+		if resp := h.do(t, http.MethodPost, decisionPath(run, node), "approver-tok",
+			runsapi.GateDecisionRequest{Decision: "approve"}); resp.StatusCode != http.StatusConflict {
+			t.Errorf("decideGate = %d, want 409", resp.StatusCode)
+		}
+	})
+
+	t.Run("the deadline beats self_approval_forbidden, in decideGate's own order", func(t *testing.T) {
+		// BOTH refusals are true, which is the only fixture in which the order
+		// between them is observable at all — with either condition alone the
+		// two arms are interchangeable. decideGate refuses on the deadline at
+		// gates.go:176 before the policy at :189, so the deadline is the
+		// refusal this caller would ACTUALLY receive.
+		run, node := h.stageGateNoSelfApproval(t, "approver-tok")
+		h.expireWallDeadline(t, run)
+
+		got := h.onlyApproval(t, "approver-tok", run)
+		if got.Evidence.CannotDecideReason != "deadline_expired" {
+			t.Errorf("order violated: cannot_decide_reason = %q, want deadline_expired before self_approval_forbidden",
+				got.Evidence.CannotDecideReason)
+		}
+		// And the endpoint really does answer the deadline's 409 rather than
+		// the policy's 403. Without this, the ordering claim above is a claim
+		// about this file rather than about the server.
+		if resp := h.do(t, http.MethodPost, decisionPath(run, node), "approver-tok",
+			runsapi.GateDecisionRequest{Decision: "approve"}); resp.StatusCode != http.StatusConflict {
+			t.Errorf("decideGate = %d, want 409 (the deadline), not 403 (the policy)", resp.StatusCode)
+		}
+	})
+
+	t.Run("not_approver still wins: the grant is checked before the deadline is read", func(t *testing.T) {
+		// The deadline arm is SECOND and not first, and this is what holds it
+		// there. handleDecideGate authorizes GrantApprove before DecideGate
+		// opens its transaction, so a viewer on an expired run gets 403 and
+		// never reaches gates.go:176 at all — naming the deadline would send
+		// them after a fact that is true and not theirs to fix.
+		run, node := h.stagePatchGateWithoutVerdict(t)
+		h.expireWallDeadline(t, run)
+
+		got := h.onlyApproval(t, "viewer-tok", run)
+		if got.Evidence.CannotDecideReason != "not_approver" {
+			t.Errorf("cannot_decide_reason = %q, want not_approver: the grant is checked first",
+				got.Evidence.CannotDecideReason)
+		}
+		if resp := h.do(t, http.MethodPost, decisionPath(run, node), "viewer-tok",
+			runsapi.GateDecisionRequest{Decision: "approve"}); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("decideGate = %d, want 403", resp.StatusCode)
+		}
+	})
+
+	t.Run("the run's own gate phase says it too", func(t *testing.T) {
+		// The SECOND read path, and it reads its own clock: run detail resolves
+		// evidence through attachGateEvidence rather than through
+		// ListWaitingGates. An arm threaded into the inbox alone would leave
+		// this surface offering three controls that 409, and §2.4 is one
+		// component with two hosts.
+		run, node := h.stagePatchGateWithoutVerdict(t)
+		h.expireWallDeadline(t, run)
+
+		var fromPhase *runsapi.GateEvidenceResponse
+		for _, p := range h.getRun(t, "approver-tok", run).Phases {
+			if p.NodeID == node && p.Evidence != nil {
+				fromPhase = p.Evidence
+			}
+		}
+		if fromPhase == nil {
+			t.Fatal("the run's waiting gate phase carries no evidence")
+		}
+		if fromPhase.CanDecide || fromPhase.CannotDecideReason != "deadline_expired" {
+			t.Errorf("phase evidence = (%v, %q), want (false, deadline_expired)",
+				fromPhase.CanDecide, fromPhase.CannotDecideReason)
+		}
+	})
+}
+
 // stagePlanGateWithLaterVerdict parks a run of planGateDoc at its gate: the
 // gate examines the PLAN, and the review node's verdict — produced afterwards —
 // is the newest artifact on the run.
@@ -333,6 +433,26 @@ func (h *harness) stageGateNoSelfApproval(t *testing.T, requester string) (uuid.
 		t.Fatal(err)
 	}
 	return runID, "gate"
+}
+
+// expireWallDeadline moves a staged run's deadline one minute into the past.
+//
+// It is written off the DATABASE clock — `now() - interval '1 minute'` — and
+// not off a Go time, for the same reason parkAtGate writes the FUTURE deadline
+// that way: every deciding predicate compares against now(), and this harness's
+// app clock is pinned to a fixed date in 2026. A deadline computed in Go would
+// land on whichever side of the database's clock the two machines happened to
+// put it, and every assertion below would be about the wrong refusal.
+//
+// wall_deadline is written once at insert and never updated by the system
+// (gates.go:382), so rewriting the run's own copy is how an expired run is
+// staged — the same technique stageGateNoSelfApproval uses on the snapshot.
+func (h *harness) expireWallDeadline(t *testing.T, runID uuid.UUID) {
+	t.Helper()
+	if _, err := h.pool.Exec(context.Background(),
+		`UPDATE runs SET wall_deadline = now() - interval '1 minute' WHERE id = $1`, runID); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // onlyApproval is the caller's inbox entry FOR THIS RUN, and fails unless there

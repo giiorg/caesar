@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -499,23 +500,37 @@ func (a *API) handleGetArtifact(w http.ResponseWriter, r *http.Request, sess aut
 // grant is not in the response at all.
 //
 // ORDER MATTERS AND IS DELIBERATE, and it is decideGate's own order. That
-// endpoint refuses on the grant first, then on the policy, and only then
-// resolves the examined artifact (gates.go), so checking in the same sequence
-// makes cannot_decide_reason name the refusal the caller would ACTUALLY get
-// rather than some other true thing about the gate.
+// endpoint refuses on the grant first (handleDecideGate authorizes
+// GrantApprove before DecideGate opens its transaction), then on the wall
+// deadline (gates.go:176), then on the policy (:189), and only then resolves
+// the examined artifact (:193) — so checking in the same sequence makes
+// cannot_decide_reason name the refusal the caller would ACTUALLY get rather
+// than some other true thing about the gate.
 //
-// The first two also happen to be ordered the way an operator can act on them:
-// a caller who is both the requester and short of approve gets "not_approver",
-// because a grant can be raised and self-approval is a property of a run
-// already created. Both are true; the message names the fixable one.
+// The first two are also ordered the way an operator can act on them: a caller
+// short of approve is told about the grant even on a run that has expired,
+// because the grant is theirs to raise and the expiry is a fact about a run
+// that is finished for everybody. Both are true; the message names the one
+// that is about this caller.
+//
+// THE DEADLINE IS COMPARED DB-CLOCK TO DB-CLOCK. `now` is q.DBNow from the
+// same read that carried `wallDeadline`, never s.clock.Now(): both sides of a
+// deadline comparison have to be database timestamps or app-clock skew moves
+// the boundary, and this projection would then disagree with the transaction
+// that actually refuses (DBNow's contract, store/queries.sql:114-119).
 //
 // haveExamined is last because it is not the caller's problem until the caller
 // is otherwise able. A gate whose examined artifact the run never produced is
 // undecidable BY ANYONE — decideGate answers 500, not a refusal — so the
 // surface has to say so rather than ship a control that provokes it.
-func decidability(canApprove bool, actorID, requesterID uuid.UUID, allowSelf, haveExamined bool) (bool, string) {
+func decidability(canApprove bool, actorID, requesterID uuid.UUID, allowSelf, haveExamined bool,
+	wallDeadline, now time.Time,
+) (bool, string) {
 	if !canApprove {
 		return false, "not_approver"
+	}
+	if !wallDeadline.After(now) {
+		return false, "deadline_expired"
 	}
 	if actorID == requesterID && !allowSelf {
 		return false, "self_approval_forbidden"

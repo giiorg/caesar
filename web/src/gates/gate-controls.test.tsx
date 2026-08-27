@@ -191,9 +191,9 @@ describe('gate controls', () => {
 
   it('degrades to something true on a reason it has never heard of', async () => {
     // cannot_decide_reason is a bare string on the wire, not an OpenAPI enum
-    // (schema.d.ts: `cannot_decide_reason: string`). A fourth reason added
+    // (schema.d.ts: `cannot_decide_reason: string`). A FIFTH reason added
     // server-side must reach the user as an honest generic refusal, not as an
-    // empty block — and never as one of the three specific messages, each of
+    // empty block — and never as one of the four specific messages, each of
     // which tells the reader to go and do something that would not help.
     renderControls({
       evidence: { ...decidable, can_decide: false, cannot_decide_reason: 'quota_exhausted' },
@@ -202,6 +202,11 @@ describe('gate controls', () => {
     expect(screen.queryByText(/approve grant/i)).toBeNull()
     expect(screen.queryByText(/your own gate/i)).toBeNull()
     expect(screen.queryByText(/never produced/i)).toBeNull()
+    // And not the deadline sentence either. `decidable`'s wall_deadline is in
+    // 2099, so this line is what catches REASONS keyed on the wrong token —
+    // a `deadline_expired` entry spelt as a catch-all would show a reader a
+    // deadline that has not passed.
+    expect(screen.queryByText(/wall deadline/i)).toBeNull()
   })
 
   it('approve posts the decision and nothing else', async () => {
@@ -287,10 +292,13 @@ describe('gate controls', () => {
 
   it('says when the wall deadline has already passed, before anything is posted', async () => {
     // `can_decide` is TRUE here, which is what makes this an assertion about
-    // the deadline and not about the flag: the server deliberately leaves the
-    // wall clock out of `can_decide` (dto.go:309-315), so this refusal exists
-    // only if the client renders it. Which refusal wins when both apply is the
-    // next test.
+    // the CLIENT's own clock and not about the flag. The server does fold the
+    // deadline into `can_decide` (api.go:532) — but only as of the instant it
+    // composed the response, so a response held open past the deadline looks
+    // exactly like this one, and this refusal exists only if the client renders
+    // it. The other direction, where the server says expired and the client's
+    // clock does not, is decision-rules.testkit.ts case 4. Which refusal wins
+    // when both apply is the next test.
     renderControls({ evidence: { ...decidable, wall_deadline: '2020-01-01T00:00:00Z' } })
     expect(await screen.findByText(/deadline/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /^approve$/i })).toBeNull()

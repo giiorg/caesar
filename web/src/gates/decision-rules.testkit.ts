@@ -26,7 +26,16 @@ import type { GateEvidence } from './decide-gate'
  * type at `:204`, so request_changes and reject are refused identically.
  */
 
-/** A gate nobody may decide, with the reason left for each case to name. */
+/**
+ * A gate nobody may decide, with the reason left for each case to name.
+ *
+ * `wall_deadline` IS LOAD-BEARING and it is deliberately far in the future: a
+ * host may suppress on its own clock as well as on `cannot_decide_reason`
+ * (gate-controls.tsx does), and a past deadline here would make every case pass
+ * through that check instead — the reasons would never be read at all and all
+ * four cases would be vacuous. 2099 keeps each case about the reason it names,
+ * and it is what makes case 4 an assertion about the SERVER's answer.
+ */
 const REFUSED: GateEvidence = {
   examined_artifact_id: 'a1',
   examined_artifact_type: 'patch',
@@ -49,7 +58,7 @@ function expectNoControls(): void {
 }
 
 /**
- * The three assertions every host re-runs verbatim.
+ * The four assertions every host re-runs verbatim.
  *
  * `render` mounts the host's own surface around the evidence it is given; the
  * kit knows nothing about how much of the app that is.
@@ -65,12 +74,12 @@ function expectNoControls(): void {
  * `cleanup()` between cases is likewise required rather than tidy.
  * `src/test/setup.ts:29` registers `afterEach(cleanup)` — between TESTS — and
  * all three hosts call this inside a single `it`, so without an explicit
- * unmount each case renders on top of the last. MEASURED with the three calls
+ * unmount each case renders on top of the last. MEASURED with the calls
  * deleted: `Found multiple elements with the text: /approve grant/i` at case 3,
  * which re-renders the message case 1 left on screen. It fails deterministically
  * and it would fail this way in every host.
  *
- * THE LAST `cleanup()` UNMOUNTS THE HOST'S WHOLE TREE, not just case 3's
+ * THE LAST `cleanup()` UNMOUNTS THE HOST'S WHOLE TREE, not just case 4's
  * render — `cleanup` unmounts every container in a module-level registry and
  * then clears it (`@testing-library/react/dist/pure.js:301-314`), so it knows
  * nothing about which render belongs to this kit. A host that renders
@@ -80,17 +89,20 @@ function expectNoControls(): void {
  * Every assertion below has been observed failing on its own, which is the
  * only reason three hosts may re-run them sight unseen: case 2's suppression
  * check dies at `expectNoControls` on a component that suppresses the other
- * two reasons and not this one, and case 2's message check dies when
- * `self_approval_forbidden` is dropped from gate-controls.tsx's REASONS.
+ * three reasons and not this one, case 2's message check dies when
+ * `self_approval_forbidden` is dropped from gate-controls.tsx's REASONS, and
+ * case 4's message check dies when `deadline_expired` is dropped from it — the
+ * generic fallback then renders instead, which case 4's `/wall deadline/i` does
+ * not match.
  *
- * Both were measured against gate-controls.test.tsx, and the two halves of
- * each run are not symmetric: case 1 had already PASSED, while case 3 was
- * never REACHED, because a failing assertion throws and the exception
- * propagates straight out of this function. That asymmetry is the evidence.
- * Case 1 passing on the same mutant is what shows the kill is scoped to the
- * reason the mutant names rather than to the kit as a whole; case 3 not
- * running is why neither mutant says anything about case 3, which M4 and M5
- * cover instead.
+ * All three were measured against gate-controls.test.tsx, and the two halves of
+ * each run are not symmetric: the earlier cases had already PASSED, while the
+ * later ones were never REACHED, because a failing assertion throws and the
+ * exception propagates straight out of this function. That asymmetry is the
+ * evidence. An earlier case passing on the same mutant is what shows the kill
+ * is scoped to the reason the mutant names rather than to the kit as a whole;
+ * a later case not running is why neither of the case-2 mutants says anything
+ * about case 3, which M4 and M5 cover instead.
  */
 export async function expectDecisionRules(render: (evidence: GateEvidence) => void): Promise<void> {
   // 1. Short of the approve grant. `GET /approvals` lists gates for any grant
@@ -115,5 +127,18 @@ export async function expectDecisionRules(render: (evidence: GateEvidence) => vo
   render({ ...REFUSED, cannot_decide_reason: 'not_approver' })
   expect(await screen.findByText(/approve grant/i)).toBeInTheDocument()
   expect(screen.queryByText(/your own gate/i)).toBeNull()
+  cleanup()
+
+  // 4. THE SERVER'S CLOCK BEATS THE READER'S. `wall_deadline` here is REFUSED's
+  //    own, in 2099 — so this host's client-side deadline check does NOT fire,
+  //    and the only thing that can produce a refusal is the server's
+  //    `deadline_expired`. That combination is not contrived: `can_decide`
+  //    is measured against the DATABASE clock (`api.go:532`), the clock that
+  //    will judge the POST, and a browser running behind it sees exactly this.
+  //    A host that suppressed on its own clock alone would offer three controls
+  //    here, every one of them a certain 409.
+  render({ ...REFUSED, cannot_decide_reason: 'deadline_expired' })
+  expect(await screen.findByText(/wall deadline/i)).toBeInTheDocument()
+  expectNoControls()
   cleanup()
 }

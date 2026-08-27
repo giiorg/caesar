@@ -705,10 +705,13 @@ func (s *Service) ArtifactPayload(ctx context.Context, runID, artifactID uuid.UU
 // It compiles the run's plan at most once — all phases of a run share one
 // definition — and does so ONLY when such a phase exists: a run with no waiting
 // gate must not pay for a task read and a definition read on every page load,
-// and most runs on most pages have none.
+// and most runs on most pages have none. The deciding clock is read in the same
+// lazy block for the same reason, and once rather than per phase, so two gates
+// of one run cannot disagree about which side of the run's deadline they are on.
 func (s *Service) attachGateEvidence(ctx context.Context, q *store.Queries, run Run, phases []Phase) error {
 	var plan ExecPlan
 	var requesterID uuid.UUID
+	var asOf time.Time
 	planLoaded := false
 	for i, p := range phases {
 		if p.Status != PhaseWaitingDecision {
@@ -726,12 +729,18 @@ func (s *Service) attachGateEvidence(ctx context.Context, q *store.Queries, run 
 			if plan, err = compilePinned(def); err != nil {
 				return err
 			}
+			// From the DATABASE, because it is the other half of every
+			// wall_deadline comparison below and s.clock.Now() on that side
+			// would let app-clock skew move the boundary (queries.sql:114-119).
+			if asOf, err = q.DBNow(ctx); err != nil {
+				return fmt.Errorf("runs: read the deciding clock: %w", err)
+			}
 			requesterID = task.RequesterID
 			planLoaded = true
 		}
 		ev, err := gateEvidence(ctx, q, gateEvidenceInput{
 			plan: plan, runID: run.ID, nodeID: p.NodeID, snapshot: run.Snapshot,
-			requesterID: requesterID, wallDeadline: run.WallDeadline,
+			requesterID: requesterID, wallDeadline: run.WallDeadline, asOf: asOf,
 		})
 		if err != nil {
 			return err

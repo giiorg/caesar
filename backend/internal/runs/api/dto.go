@@ -304,22 +304,31 @@ type GateEvidenceResponse struct {
 	SummaryArtifactID *string `json:"summary_artifact_id" required:"true"`
 	// CanDecide covers every way decideGate refuses before it reads the
 	// decision, and they are independent: this endpoint lists gates for any
-	// grant while decideGate needs approve, the run's policy may forbid the
-	// requester deciding their own gate, and a gate whose examined artifact the
-	// run never produced is decidable by nobody.
+	// grant while decideGate needs approve, the run may be past its wall
+	// deadline, the run's policy may forbid the requester deciding their own
+	// gate, and a gate whose examined artifact the run never produced is
+	// decidable by nobody.
 	// Where it is false the client suppresses ALL THREE controls — DecideGate
 	// refuses before it branches on decision type.
 	CanDecide bool `json:"can_decide" required:"true"`
-	// One of "", "not_approver", "self_approval_forbidden", "evidence_missing".
-	// Empty exactly when CanDecide is true. Computed server-side in decideGate's
-	// own order, so it names the refusal the caller would actually receive.
+	// One of "", "not_approver", "deadline_expired", "self_approval_forbidden",
+	// "evidence_missing". Empty exactly when CanDecide is true. Computed
+	// server-side in decideGate's own order, so it names the refusal the caller
+	// would actually receive.
 	CannotDecideReason string `json:"cannot_decide_reason" required:"true"`
-	// WallDeadline rides along because §5's third refusal is displayable BEFORE
-	// it bites: a run past its deadline can no longer be decided and the
+	// WallDeadline rides along because the deadline refusal is displayable
+	// BEFORE it bites: a run past its deadline can no longer be decided and the
 	// deadline is on the run, so a card can say "this expires in 20 minutes"
-	// instead of only reporting the 409 afterwards. It is NOT part of
-	// CanDecide — that would make the flag a function of the client's clock,
-	// and the database clock is the one that decides.
+	// instead of only reporting the 409 afterwards.
+	//
+	// It ALSO stays on the wire now that CanDecide accounts for it, and the two
+	// answer different questions. CanDecide is the deadline as of the DATABASE
+	// clock at the instant this response was composed — the same clock the
+	// decision transaction reads — while this field is what lets a client that
+	// has held the response open notice the deadline passing afterwards. A
+	// client that suppressed on its own clock ALONE would make the refusal a
+	// function of the reader's machine; one that trusted CanDecide alone would
+	// keep offering controls on a response that has since gone stale.
 	WallDeadline time.Time `json:"wall_deadline" required:"true"`
 }
 
@@ -438,7 +447,8 @@ func noGateViewer() gateViewer { return gateViewer{canApprove: false} }
 
 func gateEvidenceResponse(ev runs.GateEvidence, v gateViewer) GateEvidenceResponse {
 	haveExamined := ev.ExaminedArtifactID != uuid.Nil
-	canDecide, reason := decidability(v.canApprove, v.actorID, ev.RequesterID, ev.AllowSelfApproval, haveExamined)
+	canDecide, reason := decidability(v.canApprove, v.actorID, ev.RequesterID, ev.AllowSelfApproval,
+		haveExamined, ev.WallDeadline, ev.AsOf)
 	out := GateEvidenceResponse{
 		ExaminedArtifactType: ev.ExaminedArtifactType,
 		CanDecide:            canDecide,

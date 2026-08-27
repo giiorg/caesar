@@ -38,11 +38,27 @@ type GateEvidence struct {
 	// and this layer holds the run; can_decide is computed where both are.
 	AllowSelfApproval bool
 	RequesterID       uuid.UUID
-	// WallDeadline rides along because §5's third refusal is displayable BEFORE
-	// it bites: a run past its deadline can no longer be decided and the
+	// WallDeadline rides along because §5's deadline refusal is displayable
+	// BEFORE it bites: a run past its deadline can no longer be decided and the
 	// deadline is on the run, so a card can say "this expires in 20 minutes"
 	// instead of only reporting the 409 afterwards.
 	WallDeadline time.Time
+	// AsOf is the DATABASE clock at the moment this evidence was read, and it
+	// is the ONLY value WallDeadline may be compared against. Both sides of a
+	// deadline comparison have to be database timestamps or app-clock skew
+	// moves the boundary — DBNow's own contract (store/queries.sql:114-119),
+	// and the rule the decision path at gates.go:172-181 already follows.
+	//
+	// It rides HERE rather than beside the rows because the two halves of one
+	// comparison belong in one struct: a caller holding a WallDeadline can
+	// reach its clock without knowing which of the two read paths produced it.
+	//
+	// A zero value fails OPEN — an unset AsOf reads as "the deadline is still
+	// ahead" and the gate projects as decidable, which is the pre-deadline
+	// behaviour and not a lie the client acts on destructively. Both production
+	// call sites set it, and both are pinned by
+	// api/gateevidence_integration_test.go's TestDecidabilityPastTheWallDeadline.
+	AsOf time.Time
 }
 
 // gateEvidenceInput is what resolving one gate's evidence needs that is not a
@@ -58,6 +74,11 @@ type gateEvidenceInput struct {
 	snapshot     PolicySnapshot
 	requesterID  uuid.UUID
 	wallDeadline time.Time
+	// asOf is q.DBNow, read ONCE per request by the caller rather than once per
+	// gate: it is the clock the whole response is composed against, and a
+	// per-row read would let two rows of one page disagree about which side of
+	// their deadlines they are on.
+	asOf time.Time
 }
 
 // gateEvidence resolves one gate's evidence against an already-compiled plan.
@@ -66,6 +87,7 @@ func gateEvidence(ctx context.Context, q *store.Queries, in gateEvidenceInput) (
 		AllowSelfApproval: in.snapshot.AllowSelfApproval,
 		RequesterID:       in.requesterID,
 		WallDeadline:      in.wallDeadline,
+		AsOf:              in.asOf,
 	}
 
 	examined, ok := in.plan.ExaminedInput(in.nodeID)
