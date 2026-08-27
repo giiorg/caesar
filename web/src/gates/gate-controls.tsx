@@ -172,13 +172,17 @@ export function GateControls(props: {
     },
   })
 
-  // FIRST, and before can_decide, because the two can BOTH be true and only
-  // one of them is terminal: a grant can be raised and a policy changed, but a
-  // run past its wall deadline is finished for everybody. `gates.go:181`
-  // refuses on the deadline before the policy check at `:190` for the same
-  // reason, and gate-controls.test.tsx pins the order with the fixture in which
-  // both apply — the only fixture that can see it, since with either condition
-  // alone the two checks are interchangeable.
+  // FIRST, and ahead of every reason `cannot_decide_reason` can carry —
+  // `not_approver` included, which is NOT decideGate's order and is a departure
+  // from it rather than a mirror of it. This check is not a refusal-naming step
+  // at all: it is a STALENESS GUARD on the response in hand, the only check on
+  // this screen that can see time pass after the response was composed, and it
+  // stops being unconditional the moment anything is allowed to run ahead of
+  // it. Pre-empting `not_approver` is the price, and a viewer on an expired run
+  // really does get the deadline sentence here where the endpoint would answer
+  // 403. The full argument, and the fixture that is the only one able to
+  // observe the order at all, are on `gate-controls.test.tsx`'s "puts the
+  // deadline ahead of every other refusal".
   //
   // THIS CHECK AND `deadline_expired` ARE NOT REDUNDANT, and they are not the
   // same question. `can_decide` now folds the deadline in — measured against

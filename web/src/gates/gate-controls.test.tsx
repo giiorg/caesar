@@ -319,7 +319,7 @@ describe('gate controls', () => {
     // two diverge. The server puts the GRANT first: handleDecideGate authorizes
     // GrantApprove before DecideGate opens its transaction, so for a caller
     // short of approve on an expired run it answers `not_approver` and the
-    // endpoint really returns 403 — `api.go:533` documents the choice and
+    // endpoint really returns 403 — `api.go:510-518` documents the choice and
     // "not_approver still wins" in gateevidence_integration_test.go pins it
     // against the live endpoint. This surface renders the deadline anyway.
     //
