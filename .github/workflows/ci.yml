@@ -301,8 +301,13 @@ jobs:
           # /var/lib /tmp` → `drwxr-xr-x root root /var/lib`, `drwxrwxrwt root
           # root /tmp`. Same conclusion, different image.)
           #
-          # MEASURED 2026-08-16 on a real container with '{}' and a healthy
-          # postgres 18: `"msg":"migrations applied"` then
+          # MEASURED 2026-08-16 with '{}' and a healthy postgres 18 — on the
+          # PREVIOUS distroless container, and deliberately not re-run, unlike
+          # the permission facts above: the uid and the /var/lib mode are
+          # identical on both images (re-measured above), and the text below is
+          # os.MkdirAll's own error, which is image-independent Go output. So it
+          # stands as evidence for the alpine shape too. It said:
+          # `"msg":"migrations applied"` then
           #   "msg":"serve failed","error":"serve: publish work dir:
           #    mkdir /var/lib/caesar: permission denied"
           # and exit 1. Note the error names the PARENT, /var/lib/caesar, not
@@ -436,24 +441,51 @@ jobs:
 
           # 6. A publish-shaped git flow works INSIDE the image: init a bare repo, clone,
           #    commit, push. UNDER CAESAR'S OWN GIT ENVIRONMENT, not a convenient one —
-          #    gitops.go's baseEnv constructs every git invocation with HOME set to the
-          #    work dir, GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1,
+          #    gitops.go's baseEnv constructs every git invocation with PATH set to
+          #    dirname(git) and nothing else, HOME set to the work dir,
+          #    GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1,
           #    GIT_TERMINAL_PROMPT=0 and the author/committer identity in the env. An
           #    assertion using `git -c user.email=…` instead would prove a shape caesar
           #    never executes, and the interesting failures here (no passwd entry for uid
           #    65532 — alpine has none, MEASURED — no HOME, a config git refuses to
           #    read) live precisely in that env.
           #
+          #    PATH is the narrowest and most image-dependent of the set, and it
+          #    is the one an inherited env silently widens: docker exec hands the
+          #    container's full PATH (/usr/local/sbin:/usr/local/bin:/usr/sbin:
+          #    /usr/bin:/sbin:/bin, MEASURED), while caesar hands git
+          #    dirname(git) and NOTHING else. Deriving it here the way baseEnv
+          #    does — rather than hard-coding /usr/bin — is what keeps the two in
+          #    step if a future base image moves the binary. The remaining delta
+          #    from baseEnv is HOSTNAME, which docker exec sets and git does not
+          #    read; MEASURED, `docker exec` supplies exactly PATH, HOSTNAME and
+          #    HOME here, and the other two are overridden below.
+          #
+          #    ORDER IS LOAD-BEARING: the narrowing comes AFTER mkdir. busybox
+          #    mkdir is /bin/mkdir and drops off a PATH of /usr/bin — MEASURED,
+          #    narrowing first gives `mkdir: not found` and a probe that fails
+          #    for a reason having nothing to do with git.
+          #
           #    `sh` is only available here because the final stage is alpine:
           #    distroless/static had no shell, so this assertion was unwritable
           #    before the Dockerfile change that ships with it.
+          #
+          #    HONEST SCOPE: the push goes to a bare repo over a FILESYSTEM path,
+          #    so this exercises no network transport, no credential helper and
+          #    no TLS, and says nothing about reaching a real forge. What it does
+          #    prove is the layer that regressed: the binary is present, a shell
+          #    exists to invoke it, git's object plumbing works, and all of it
+          #    runs as uid 65532 with no /etc/passwd entry under the env caesar
+          #    actually constructs.
           docker exec candidate sh -c '
             set -e
             export HOME=/tmp/pub-home
+            mkdir -p "$HOME"
+            gitbin=$(command -v git)
+            export PATH=$(dirname "$gitbin")
             export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
             export GIT_AUTHOR_NAME=caesar GIT_AUTHOR_EMAIL=caesar@invalid
             export GIT_COMMITTER_NAME=caesar GIT_COMMITTER_EMAIL=caesar@invalid
-            mkdir -p "$HOME"
             git init --bare /tmp/pub-remote.git
             git clone /tmp/pub-remote.git /tmp/pub-work
             cd /tmp/pub-work
