@@ -456,10 +456,19 @@ jobs:
           #    /usr/bin:/sbin:/bin, MEASURED), while caesar hands git
           #    dirname(git) and NOTHING else. Deriving it here the way baseEnv
           #    does — rather than hard-coding /usr/bin — is what keeps the two in
-          #    step if a future base image moves the binary. The remaining delta
-          #    from baseEnv is HOSTNAME, which docker exec sets and git does not
-          #    read; MEASURED, `docker exec` supplies exactly PATH, HOSTNAME and
-          #    HOME here, and the other two are overridden below.
+          #    step if a future base image moves the binary. PATH and HOME are
+          #    both overridden below, so the residual delta from baseEnv is six
+          #    variables git does not read: DATABASE_URL and CAESAR_MASTER_KEY
+          #    (the container's config env — the `docker run -e` flags above,
+          #    which `docker exec` re-injects into every exec), HOSTNAME (the
+          #    daemon sets it, and under this step's --network host it is the
+          #    RUNNER's name, not the container id), and PWD, OLDPWD and SHLVL
+          #    (set by `sh` itself; git finds its cwd with getcwd(), not PWD).
+          #    MEASURED by dumping `env` at the end of this very body in a
+          #    container started with those same two -e flags — and measure it
+          #    THAT way: the first draft of this clause said `docker exec`
+          #    supplies "exactly PATH, HOSTNAME and HOME", which is true of the
+          #    bare container it was taken on and false of this candidate.
           #
           #    ORDER IS LOAD-BEARING: the narrowing comes AFTER mkdir. busybox
           #    mkdir is /bin/mkdir and drops off a PATH of /usr/bin — MEASURED,
