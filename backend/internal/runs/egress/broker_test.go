@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -78,6 +79,23 @@ func lastRecord(t *testing.T, buf *syncBuffer, msg string) map[string]any {
 		}
 	}
 	return found
+}
+
+// waitForRecord waits for a line with the given msg to appear. The handler
+// goroutine that logs a broken stream races the client's own read of it, so
+// there is nothing to synchronise on but the log itself.
+func waitForRecord(t *testing.T, buf *syncBuffer, msg string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if rec := lastRecord(t, buf, msg); rec != nil {
+			return rec
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no %s line after 5s:\n%s", msg, buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func newTestServer(t *testing.T, g *Gateway) *httptest.Server {
@@ -379,6 +397,312 @@ func TestBroker_StreamsResponseBodyWithoutBuffering(t *testing.T) {
 	if string(rest) != "data: two\n\n" {
 		t.Fatalf("rest = %q, want the second chunk", rest)
 	}
+}
+
+// TestBroker_TruncatedUpstreamStreamIsNotSilent is the production failure the
+// flake investigation found: the provider's connection dies after the gateway
+// has already written the response header and some bytes. The agent must not
+// be handed a short answer that reads as a complete one.
+func TestBroker_TruncatedUpstreamStreamIsNotSilent(t *testing.T) {
+	const chunk = "data: one\n\n"
+	f := brokerFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, chunk)
+		w.(http.Flusher).Flush()
+		// net/http drops the connection without writing the chunked
+		// terminator, which is what a provider hanging up mid-stream looks
+		// like on the wire.
+		panic(http.ErrAbortHandler)
+	})
+
+	resp := brokerRequest(t, f.proxy, http.MethodPost, "/v1/messages", map[string]string{"x-api-key": tok}, `{}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err == nil {
+		t.Fatalf("the agent read %q to a clean EOF; a broken stream must reach it as a transport error", got)
+	}
+	if string(got) != chunk {
+		t.Errorf("delivered bytes = %q, want the chunk that crossed before the break", got)
+	}
+
+	rec := waitForRecord(t, f.log, "egress.upstream_error")
+	if rec["stage"] != "stream" {
+		t.Errorf("stage = %v, want %q", rec["stage"], "stream")
+	}
+	if rec["bytes"] != float64(len(chunk)) {
+		t.Errorf("bytes = %v, want %d delivered before the break", rec["bytes"], len(chunk))
+	}
+	if got := f.gateway.meter.snapshot().ResponseBytes; got != int64(len(chunk)) {
+		t.Errorf("metered response bytes = %d, want the %d that crossed", got, len(chunk))
+	}
+}
+
+// TestBroker_ClientGoingAwayIsNotAnUpstreamFault pins the other side of the
+// classification: the agent hanging up mid-stream is not a provider failure
+// and must never be reported as one.
+func TestBroker_ClientGoingAwayIsNotAnUpstreamFault(t *testing.T) {
+	const chunk = "data: one\n\n"
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	defer releaseOnce()
+
+	f := brokerFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, chunk)
+		w.(http.Flusher).Flush()
+		<-release // the provider is mid-stream and perfectly healthy
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.proxy.URL+"/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-api-key", tok)
+	resp, err := f.proxy.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if _, err := io.ReadFull(resp.Body, make([]byte, len(chunk))); err != nil {
+		t.Fatalf("first chunk: %v", err)
+	}
+	cancel() // the agent goes away with the stream still open
+
+	rec := waitForRecord(t, f.log, "egress.client_gone")
+	if rec["stage"] != "stream" {
+		t.Errorf("stage = %v, want %q", rec["stage"], "stream")
+	}
+	if rec := lastRecord(t, f.log, "egress.upstream_error"); rec != nil {
+		t.Fatalf("the agent hanging up was logged as an upstream fault: %v", rec)
+	}
+}
+
+// heldBody wraps the *http.body that net/http hands a handler as r.Body. It
+// delegates every Read to that real body and adds exactly one power: the read
+// that goes past Content-Length — the transport's unconditional check for
+// extra bytes, transfer.go's doBodyCopy(io.Discard, body) — waits until the
+// response is already on its way back to the client. That is the ordering the
+// flake investigation measured happening by chance under CPU contention; the
+// hold makes it certain. Only the transport's writeLoop goroutine reads this
+// body: net/http's own drain reads the server's saved reference, not r.Body.
+type heldBody struct {
+	io.ReadCloser
+	remaining int64 // Content-Length not yet handed to the reader
+	hold      <-chan struct{}
+}
+
+func (b *heldBody) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		<-b.hold
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
+// TestBroker_InboundBodyIsNotReadAfterTheServerClosesIt drives the cause of
+// the truncation rather than its silence. An upstream that answers before
+// consuming the request body lets net/http's server reach its response-header
+// path — which drains and CLOSES r.Body — while the transport still owes that
+// body one read. Reading a closed server body kills the upstream connection
+// mid-response, so the stream the agent gets is cut short.
+func TestBroker_InboundBodyIsNotReadAfterTheServerClosesIt(t *testing.T) {
+	const chunk = "data: one\n\n"
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	defer releaseOnce()
+	hold := make(chan struct{})
+	holdOnce := sync.OnceFunc(func() { close(hold) })
+	defer holdOnce()
+
+	// This upstream answers on the headers alone, as a provider rejecting a
+	// request does.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, chunk)
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = io.WriteString(w, "data: two\n\n")
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(upstream.Close)
+
+	g, logBuf := testGateway(t, Config{
+		Attempt: "caesar-r-n-1", TokenSHA256: shaOf(tok),
+		Provider: Provider{
+			Endpoint: upstream.URL, Credential: "real-key", CredentialHeader: "x-api-key",
+			Ops: []Op{{Method: "POST", PathPrefix: "/v1/messages"}},
+		},
+	})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = &heldBody{ReadCloser: r.Body, remaining: r.ContentLength, hold: hold}
+		g.handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+
+	resp := brokerRequest(t, proxy, http.MethodPost, "/v1/messages", map[string]string{"x-api-key": tok}, `{}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if _, err := io.ReadFull(resp.Body, make([]byte, len(chunk))); err != nil {
+		t.Fatalf("first chunk: %v", err)
+	}
+	// The response header is written, so net/http has already drained and
+	// closed r.Body if it is going to. Now let the transport take its last
+	// read.
+	holdOnce()
+	releaseOnce()
+
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the rest of the stream: %v\n%s", err, logBuf.String())
+	}
+	if string(rest) != "data: two\n\n" {
+		t.Fatalf("rest = %q, want the second chunk\n%s", rest, logBuf.String())
+	}
+}
+
+// unwrappedWriter is the ResponseWriter a middleware adds when it forwards
+// every method but offers no Unwrap: ResponseController cannot reach
+// net/http's own writer through it. It is strictly less capable than the
+// *http.response production hands this handler — it flushes only because that
+// writer does.
+type unwrappedWriter struct {
+	http.ResponseWriter
+}
+
+func (u unwrappedWriter) Flush() {
+	if f, ok := u.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// TestBroker_AWriterWithoutFullDuplexIsSaidOutLoud covers the fallback: the
+// gateway keeps brokering, but the request-body ownership it cannot claim is
+// on the record instead of being assumed.
+func TestBroker_AWriterWithoutFullDuplexIsSaidOutLoud(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(upstream.Close)
+	g, logBuf := testGateway(t, Config{
+		Attempt: "caesar-r-n-1", TokenSHA256: shaOf(tok),
+		Provider: Provider{
+			Endpoint: upstream.URL, Credential: "real-key", CredentialHeader: "x-api-key",
+			Ops: []Op{{Method: "POST", PathPrefix: "/v1/messages"}},
+		},
+	})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.handler().ServeHTTP(unwrappedWriter{ResponseWriter: w}, r)
+	}))
+	t.Cleanup(proxy.Close)
+
+	resp := brokerRequest(t, proxy, http.MethodPost, "/v1/messages", map[string]string{"x-api-key": tok}, `{}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: the request is still brokered", resp.StatusCode)
+	}
+	rec := lastRecord(t, logBuf, "egress.full_duplex_unavailable")
+	if rec == nil {
+		t.Fatalf("no egress.full_duplex_unavailable line in %s", logBuf.String())
+	}
+	if rec["attempt"] != "caesar-r-n-1" {
+		t.Errorf("attempt = %v, want the gateway's", rec["attempt"])
+	}
+}
+
+// brokenPipeWriter stands in for the *http.response net/http hands this
+// handler (gateway.go's http.Server): it is a flusher, as that writer always
+// is, and its Write fails once the connection underneath has gone — the only
+// way an agent that hung up shows up inside the copy loop. It can do nothing
+// else that the real writer cannot.
+type brokenPipeWriter struct {
+	hdr       http.Header
+	body      bytes.Buffer
+	failAfter int // bytes accepted before writes start failing; -1 never fails
+	flushes   int
+}
+
+func (b *brokenPipeWriter) Header() http.Header {
+	if b.hdr == nil {
+		b.hdr = http.Header{}
+	}
+	return b.hdr
+}
+
+func (b *brokenPipeWriter) WriteHeader(int) {}
+
+func (b *brokenPipeWriter) Flush() { b.flushes++ }
+
+func (b *brokenPipeWriter) Write(p []byte) (int, error) {
+	if b.failAfter >= 0 && b.body.Len()+len(p) > b.failAfter {
+		n, _ := b.body.Write(p[:max(0, b.failAfter-b.body.Len())])
+		return n, errors.New("write tcp 127.0.0.1:1->127.0.0.1:2: broken pipe")
+	}
+	return b.body.Write(p)
+}
+
+// errorReader is the tail of a stream that failed: no bytes, one error.
+type errorReader struct{ err error }
+
+func (e errorReader) Read([]byte) (int, error) { return 0, e.err }
+
+// TestStreamBody_ReportsHowTheCopyEnded pins the classification at its source:
+// which of the two sides failed is what forward decides on, and a clean end of
+// stream must stay indistinguishable from today's success.
+func TestStreamBody_ReportsHowTheCopyEnded(t *testing.T) {
+	const payload = "data: one\n\n"
+	upstreamBroke := errors.New("read tcp 127.0.0.1:1->127.0.0.1:2: use of closed network connection")
+
+	t.Run("a clean end of stream is not an error", func(t *testing.T) {
+		w := &brokenPipeWriter{failAfter: -1}
+		total, readErr, writeErr := streamBody(w, strings.NewReader(payload))
+		if readErr != nil || writeErr != nil {
+			t.Fatalf("read err = %v, write err = %v, want both nil at io.EOF", readErr, writeErr)
+		}
+		if total != int64(len(payload)) || w.body.String() != payload {
+			t.Errorf("copied %d bytes %q, want all %d", total, w.body.String(), len(payload))
+		}
+		if w.flushes == 0 {
+			t.Error("nothing was flushed: the stream would reach the agent only at the end")
+		}
+	})
+
+	t.Run("an upstream failure is reported as one", func(t *testing.T) {
+		w := &brokenPipeWriter{failAfter: -1}
+		src := io.MultiReader(strings.NewReader(payload), errorReader{err: upstreamBroke})
+		total, readErr, writeErr := streamBody(w, src)
+		if !errors.Is(readErr, upstreamBroke) {
+			t.Fatalf("read err = %v, want the upstream error", readErr)
+		}
+		if writeErr != nil {
+			t.Errorf("write err = %v, want nil: the agent's side was fine", writeErr)
+		}
+		if total != int64(len(payload)) {
+			t.Errorf("copied %d bytes, want the %d that crossed before the break", total, len(payload))
+		}
+	})
+
+	t.Run("the agent's side failing is reported as the other thing", func(t *testing.T) {
+		w := &brokenPipeWriter{failAfter: 4}
+		rest := strings.NewReader("data: two\n\n")
+		total, readErr, writeErr := streamBody(w, io.MultiReader(strings.NewReader(payload), rest))
+		if writeErr == nil {
+			t.Fatal("write err = nil, want the broken pipe")
+		}
+		if readErr != nil {
+			t.Errorf("read err = %v, want nil: the provider never failed", readErr)
+		}
+		if total != 4 {
+			t.Errorf("copied %d bytes, want the 4 the agent took", total)
+		}
+		if rest.Len() != len("data: two\n\n") {
+			t.Errorf("%d bytes of the stream were still consumed after the agent went away", len("data: two\n\n")-rest.Len())
+		}
+	})
 }
 
 func TestBroker_UpstreamFailureIsBadGateway(t *testing.T) {
