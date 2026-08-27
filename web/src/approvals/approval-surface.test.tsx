@@ -371,10 +371,14 @@ describe('the approval surface', () => {
     renderSurface({ artifacts: REVISED, patch: TWO_FILES_B64, priorPatch: b64text(ONE_TXT) })
     // The negative is asserted AFTER the surface is past its loading gate: a
     // `queryBy` fired while a fetch is still in flight would pass against any
-    // implementation at all. Measured, not assumed — with the prior query taken
-    // OUT of the gate this case still dies to `patch === priorPatch`, so today
-    // it is the `findByTestId` that makes it discriminate and the gate is
-    // insurance against a future ordering, not what is holding it up.
+    // implementation at all. Measured rather than assumed — with the prior query
+    // taken OUT of the gate this case still dies to an `identical` that drops
+    // the equality (`patch !== null && priorPatch !== null`), so it is the
+    // `findByTestId` below that makes it discriminate today. Note which mutant:
+    // `patch === priorPatch` leaves this case green — its two diffs differ
+    // either way — and kills the PLAN-gate negative instead. The gate holds the
+    // third query for the product reason the component states
+    // (`approval-surface.tsx:72-75`), not for this one.
     await screen.findByTestId('hard-facts')
     expect(screen.queryByText(/byte-identical/i)).toBeNull()
   })
