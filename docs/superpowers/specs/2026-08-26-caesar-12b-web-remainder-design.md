@@ -107,11 +107,21 @@ gets in this repo).
 
 ### 2.3 An identical revision is visible
 
-One hash comparison between the examined patch artifact of generation N and N−1; if equal, the
-gate screen says prominently that the revision is byte-identical to what was already reviewed
-(finding 6 — without it, request-changes can silently loop an operator into approving work that
-ignored their review). Plan-time verification: whether an artifact content hash is already
-client-visible or the artifact DTO gains one field.
+One comparison between the examined patch artifact and the newest patch the same node wrote in a
+STRICTLY EARLIER generation; if equal, the gate screen says prominently that the revision is
+byte-identical to what was already reviewed (finding 6 — without it, request-changes can silently
+loop an operator into approving work that ignored their review). Plan-time verification: whether an
+artifact content hash is already client-visible or the artifact DTO gains one field.
+
+**Amended after Task 7 shipped, on measurement.** This said "generation N and N−1" until
+`606c0ee`. N−1 can legitimately hold no row for the node: `generation` is run-level
+(`BumpRunGeneration`, `runs/store/queries.sql:520-527`) and revision loops are pairwise disjoint
+(`workflows/validate.go:328-343`), so a request-changes at a gate on a PARALLEL branch bumps the
+number for the whole run while this node writes nothing. The literal N−1 rule then finds no row and
+the screen stays silent on exactly the revision the feature exists for. The gate's OWN revision
+never causes this — its target must dominate it, so the examined producer always rewinds with it.
+There is no artifact hash and none was added: byte-equality of the two payloads' `diff` strings is
+the comparison (Task 7, `web/src/gates/identical-revision.ts`).
 
 ### 2.4 Shell and navigation
 
