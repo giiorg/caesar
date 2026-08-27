@@ -265,7 +265,7 @@ describe('ArtifactKindView', () => {
   })
 
   it('renders a publication with no PR yet as a sentence, not a link to nowhere', () => {
-    // `"pr_url": derefText(intent.PrUrl)` (`runs/publish.go:1743`) — a
+    // `"pr_url": derefText(intent.PrUrl)` (`runs/publish.go:1746`) — a
     // publication artifact exists before a pull request does, and the empty
     // string is what that looks like on the wire. An <a href=""> takes the
     // reader to the page they are already on.

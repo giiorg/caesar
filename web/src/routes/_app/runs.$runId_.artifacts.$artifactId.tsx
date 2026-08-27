@@ -7,7 +7,7 @@ import { ArtifactKindView } from '../../runs/artifact-kind-views'
  * One artifact, full-screen. A URL, not a disclosure.
  *
  * IT HAS TO FETCH, and that is a contract fact rather than a design choice: the
- * rows on `run.artifacts` are `ApiArtifactResponse` — eight fields and NO
+ * rows on `run.artifacts` are `ApiArtifactResponse` — seven fields and NO
  * `payload` (`api/schema.d.ts:745-756`) — so a run-detail row physically cannot
  * render what the artifact says. `GET /runs/{id}/artifacts/{artifact_id}` is
  * the only thing that serves it, and `artifactQueryOptions` is the same query

@@ -205,7 +205,7 @@ function LogRefView(props: { payload: Record<string, unknown> | null }) {
  *            alone (`runner/execute.go:341-345`): no log was scanned, so none
  *            is claimed.
  *   empty  — `logTail` returns "" when the file cannot be read as an ordinary
- *            file or holds nothing (`snapshot.go:71-82`, `readTail` :85-95).
+ *            file or holds nothing (`snapshot.go:71-81`, `readTail` :85-105).
  *   text   — the tail itself.
  * An empty <pre> for either of the first two would read as an agent that ran
  * and said nothing, which is a claim this screen cannot support.
