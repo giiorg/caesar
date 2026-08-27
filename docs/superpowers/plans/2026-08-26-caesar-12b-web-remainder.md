@@ -582,7 +582,7 @@ git commit -m "runs: cannot_decide_reason names an expired wall deadline, second
 
 One rule fixes three findings: **a phase card's status line derives from the phase's STATUS first and its outcome class second — never from a bare counter** (spec §2.2). No DTO change (pre-flight 3). The derivation is a pure function; `runs.$runId.tsx`'s `PhaseSummary` (one component, used by rail and timeline — keep it one) renders its result.
 
-**The ordering matters and is the whole task.** `dead` is terminal — nothing follows that row — while `failed` always has a successor attempt (pre-flight 3a). A formatter that consults only the outcome class renders `attempt 3/3` for an exhausted node (whose phase outcome stays *transient*; only the run's is rewritten to `attempts_exhausted`) and "resumable" for a dead row whose ordinal outran the cap. Status is therefore checked BEFORE the counter, and the counter is reachable only from a row that can still advance.
+**The ordering matters and is the whole task.** `dead` is terminal — nothing follows that row — while a `failed` row written by the RETRY branch always has a successor attempt; a rejected gate is written `failed` and terminal too (pre-flight 3a). A formatter that consults only the outcome class renders `attempt 3/3` for an exhausted node (whose phase outcome stays *transient*; only the run's is rewritten to `attempts_exhausted`) and "resumable" for a dead row whose ordinal outran the cap. Status is therefore checked BEFORE the counter, a live row's outcome class before the counter too, and the counter is reachable only from a row that can still advance.
 
 **Files:**
 - Create: `web/src/runs/phase-status.ts`, `web/src/runs/phase-status.test.ts`
