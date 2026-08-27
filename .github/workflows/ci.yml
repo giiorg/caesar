@@ -291,11 +291,15 @@ jobs:
           # which is a `Handler:` field inside the http.Server literal and
           # binds nothing — the real call is ~100 lines further down, and the
           # two neighbouring citations being exact gave a reader no cue that
-          # only one had drifted. The final image is distroless:nonroot running
-          # as uid 65532, and /var/lib is
+          # only one had drifted. The final image is the Dockerfile's `git`
+          # stage — alpine:3.22 running as uid 65532 — and /var/lib is
           # root-owned 0755, so MkdirAll fails, nothing ever listens, and both
           # this check and its no-UI mutant die before reaching the thing they
-          # test. /tmp is 01777 in that image.
+          # test. /tmp is 01777 in that image. (It said "distroless:nonroot"
+          # until the runtime stage changed under it; the two permission facts
+          # were RE-MEASURED on the alpine image, not carried over — `ls -ld
+          # /var/lib /tmp` → `drwxr-xr-x root root /var/lib`, `drwxrwxrwt root
+          # root /tmp`. Same conclusion, different image.)
           #
           # MEASURED 2026-08-16 on a real container with '{}' and a healthy
           # postgres 18: `"msg":"migrations applied"` then
@@ -422,7 +426,42 @@ jobs:
             fail "served / carries the tagless twin's refusal — this image has no UI embedded"
           fi
 
-          echo "candidate digest serves $EXPECTED_SHA's UI"
+          # 5. The image can run git at all — the runtime regression this plan
+          #    fixes. MEASURED to fire on the PREVIOUS (distroless) final stage,
+          #    2026-08-27, against a container that was healthy and serving:
+          #      OCI runtime exec failed: exec failed: unable to start container
+          #      process: exec: "git": executable file not found in $PATH
+          #    so the red says "no git", not "the container never booted".
+          docker exec candidate git version || fail "no git in the runtime image"
+
+          # 6. A publish-shaped git flow works INSIDE the image: init a bare repo, clone,
+          #    commit, push. UNDER CAESAR'S OWN GIT ENVIRONMENT, not a convenient one —
+          #    gitops.go's baseEnv constructs every git invocation with HOME set to the
+          #    work dir, GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1,
+          #    GIT_TERMINAL_PROMPT=0 and the author/committer identity in the env. An
+          #    assertion using `git -c user.email=…` instead would prove a shape caesar
+          #    never executes, and the interesting failures here (no passwd entry for uid
+          #    65532 — alpine has none, MEASURED — no HOME, a config git refuses to
+          #    read) live precisely in that env.
+          #
+          #    `sh` is only available here because the final stage is alpine:
+          #    distroless/static had no shell, so this assertion was unwritable
+          #    before the Dockerfile change that ships with it.
+          docker exec candidate sh -c '
+            set -e
+            export HOME=/tmp/pub-home
+            export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+            export GIT_AUTHOR_NAME=caesar GIT_AUTHOR_EMAIL=caesar@invalid
+            export GIT_COMMITTER_NAME=caesar GIT_COMMITTER_EMAIL=caesar@invalid
+            mkdir -p "$HOME"
+            git init --bare /tmp/pub-remote.git
+            git clone /tmp/pub-remote.git /tmp/pub-work
+            cd /tmp/pub-work
+            git commit --allow-empty -m probe
+            git push origin HEAD:refs/heads/probe
+          ' || fail "in-image git publish flow failed under caesar's git env"
+
+          echo "candidate digest serves $EXPECTED_SHA's UI, and can publish from inside itself"
 
   publish:
     needs: [image, image-serves-ui]

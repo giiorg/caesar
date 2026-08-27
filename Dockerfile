@@ -68,27 +68,53 @@ RUN CGO_ENABLED=0 go build -trimpath -tags "${GOTAGS}" \
       -X github.com/giiorg/caesar/backend/internal/platform/buildinfo.Date=${DATE}" \
     -o /out/caesar ./cmd/caesar
 
-# The git stage is the runner's stage/extract image: caesar's own binary plus
-# a real git. It is not the last stage, so a bare `docker build .` still
-# produces the control-plane runtime image.
-FROM alpine:3.22 AS git
-RUN apk add --no-cache git
-COPY --from=build /out/caesar /usr/local/bin/caesar
-USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/caesar"]
-
 # The fakecli stage is CI's agent: a scripted stand-in for a real harness CLI,
 # speaking the same filesystem contract the operator-built images do
 # (docker/harness/). It lives in this Dockerfile rather than beside them so the
 # existing runner CI lane builds it with `task image:build` and no workflow
-# change — and, like the git stage, it is deliberately not the last stage.
+# change — and it is deliberately NOT the last stage, so no bare `docker build .`
+# can ever ship the scripted fake harness as the control plane. Nothing may be
+# added below it except the runtime stage.
 FROM alpine:3.22 AS fakecli
 RUN apk add --no-cache jq
 COPY docker/fakecli.sh /usr/local/bin/fakecli
 RUN chmod 0755 /usr/local/bin/fakecli
 ENTRYPOINT ["/usr/local/bin/fakecli"]
 
-FROM gcr.io/distroless/static-debian12:nonroot
+# THE RUNTIME IMAGE, and it is LAST ON PURPOSE: docker's implicit target is the
+# final stage in the file, so this is what a bare `docker build .` — and CI's
+# image job, which passes no --target — produces. Do not append a stage after
+# this one.
+#
+# alpine + a real git rather than distroless, because git-publish shells out to
+# `git` IN-PROCESS (internal/runs/runner/gitops), and gcr.io/distroless/static
+# carries neither a git binary nor a `sh`: the published image could not
+# publish, which was the deploy's first blocking finding at the 12a operator
+# checkpoint. MEASURED on the previous shape — `docker exec <candidate> git
+# version` → `exec: "git": executable file not found in $PATH`, on a container
+# that was otherwise healthy and serving.
+#
+# This is the shape the `git` target has always built, and the shape the only
+# working deploy (`caesar-local` = `caesar-git:dev`) already runs; it now also
+# boots. It keeps its `AS git` label so `docker build --target git` (Taskfile's
+# `image:build`, tag `caesar-git:dev` — the runner lane's stage/extract image)
+# still resolves to it. The CMD is new: this stage previously had an ENTRYPOINT
+# and no CMD, because it was never the thing that boots.
+#
+# uid 65532 has no /etc/passwd entry in alpine, unlike distroless:nonroot —
+# MEASURED, `getent passwd 65532` finds nothing in this image. That is survivable
+# only because gitops.go pins the identity in the env rather than letting git
+# derive one. MEASURED in this image, same env minus GIT_AUTHOR_*/GIT_COMMITTER_*:
+#   fatal: unable to auto-detect email address (got 'unknown@<host>.(none)')
+# and exit 128 — the `unknown` is the missing passwd entry showing through. So
+# `.github/workflows/ci.yml`'s image-serves-ui runs its init/clone/commit/push
+# under caesar's OWN env (HOME in the work dir, GIT_CONFIG_GLOBAL=/dev/null,
+# GIT_CONFIG_NOSYSTEM=1, identity from the environment); a probe that passed
+# `git -c user.email=…` would prove a shape caesar never executes and would
+# step around exactly this.
+FROM alpine:3.22 AS git
+RUN apk add --no-cache git
 COPY --from=build /out/caesar /usr/local/bin/caesar
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/caesar"]
 CMD ["serve", "-config", "/etc/caesar/config.json"]
