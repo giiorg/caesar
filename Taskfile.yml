@@ -48,6 +48,14 @@ tasks:
     cmds:
       - test -z "$(bin/gofumpt -l .)" || (bin/gofumpt -l . && exit 1)
 
+  backend:tidy:check:
+    desc: "Fail if go.mod/go.sum drift from go mod tidy"
+    dir: backend
+    cmds:
+      # -diff prints the diff and exits non-zero WITHOUT writing, so the lane
+      # never mutates the tree it is checking. Verified against go1.26.6.
+      - go mod tidy -diff
+
   backend:vet:
     dir: backend
     cmds:
@@ -396,6 +404,7 @@ tasks:
   backend:ci:
     cmds:
       - task: backend:fmt:check
+      - task: backend:tidy:check
       - task: backend:vet
       - task: backend:lint
       - task: backend:analyze

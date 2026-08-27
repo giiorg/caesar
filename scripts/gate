@@ -246,6 +246,7 @@ fail() { printf '  - %s\n' "$1" >&2; FAILED=1; }
 # shellcheck disable=SC2016  # these are literal command lines, not expressions
 LANE_CMDS=(
 	'task: [backend:fmt:check] test -z "$(bin/gofumpt -l .)" || (bin/gofumpt -l . && exit 1)'
+	'task: [backend:tidy:check] go mod tidy -diff'
 	'task: [backend:vet] go vet -tags integration,property,runnerintegration,webe2e ./...'
 	'task: [backend:lint] bin/golangci-lint run'
 	'task: [backend:analyze] go build -o bin/caesar-analyze ./internal/analyzers/cmd/analyze'
