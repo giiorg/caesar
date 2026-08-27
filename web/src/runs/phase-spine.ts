@@ -49,6 +49,28 @@ export function newestPhasePerNode(run: Run): Phase[] {
   return [...newest.values()]
 }
 
+/**
+ * The row one attempt BELOW `phase` for the same node, or null.
+ *
+ * WHY A CLIENT WANTS IT: a row that is waiting has no outcome yet, so the code
+ * that parked it — the `rate_limited` behind a "resumable" line — is on the
+ * attempt before. `phaseStatusLine` is the caller.
+ *
+ * KEYED ON (node_id, attempt) AND NOT ON GENERATION, unlike `isNewer` above,
+ * because that pair already identifies one row: `phase_runs` carries
+ * `UNIQUE (run_id, node_id, attempt)` (`schema.sql:267`) and a rematerialized
+ * node CONTINUES the ordinal rather than restarting it
+ * (`store/queries.sql:719-723`). Adding `generation` would not narrow the
+ * match, it would break it — the wait that pushed this attempt past its cap
+ * may well have been charged a revision round ago.
+ */
+export function priorAttemptOf(run: Run, phase: Phase): Phase | null {
+  const prior = (run.phases ?? []).find(
+    (p) => p.node_id === phase.node_id && p.attempt === phase.attempt - 1,
+  )
+  return prior ?? null
+}
+
 /** The newest attempt of ONE node, or null when the run has no such node. */
 export function newestPhaseOf(run: Run, nodeId: string): Phase | null {
   let best: Phase | null = null

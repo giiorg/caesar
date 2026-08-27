@@ -5,7 +5,8 @@ import { ApiError } from '../../api/errors'
 import { ApprovalSurface } from '../../approvals/approval-surface'
 import { ApiErrorPanel } from '../../errors/api-error-panel'
 import { GateDecision } from '../../gates/gate-decision'
-import { newestPhasePerNode, type Phase } from '../../runs/phase-spine'
+import { newestPhasePerNode, type Phase, priorAttemptOf } from '../../runs/phase-spine'
+import { phaseStatusLine } from '../../runs/phase-status'
 import { PublicationPanel } from '../../runs/publication-panel'
 import { type RunEvent, runEventsQueryOptions } from '../../runs/run-events-query'
 import { type Run, runQueryOptions } from '../../runs/run-query'
@@ -83,7 +84,7 @@ function RunDetail() {
           assertion in this route's suite for why that is a hard constraint and
           not a preference. */}
       <div className="md:flex md:items-start md:gap-4">
-        <PhaseRail runId={runId} spine={spine} openPhase={openPhase} />
+        <PhaseRail run={run} spine={spine} openPhase={openPhase} />
         <div data-testid="phase-detail" className="min-w-0 md:flex-1">
           <PhaseTimeline run={run} spine={spine} openPhase={openPhase} onToggle={toggle} />
           {spine.length > 0 && !spine.some((p) => p.node_id === openPhase) && (
@@ -130,7 +131,7 @@ function RunDetail() {
  * "drives both presentations from the one ?phase= param" is what pins the
  * default, and it fails loudly if a router upgrade ever stops including search.
  */
-function PhaseRail(props: { runId: string; spine: Phase[]; openPhase: string | undefined }) {
+function PhaseRail(props: { run: Run; spine: Phase[]; openPhase: string | undefined }) {
   if (props.spine.length === 0) return null
   return (
     <ol
@@ -144,11 +145,11 @@ function PhaseRail(props: { runId: string; spine: Phase[]; openPhase: string | u
           <li key={phase.node_id} className="border-border border-b last:border-b-0">
             <Link
               to="/runs/$runId"
-              params={{ runId: props.runId }}
+              params={{ runId: props.run.id }}
               search={{ phase: phase.node_id }}
               className={`flex flex-col gap-1 px-3 py-2 text-sm ${open ? 'bg-surface text-text' : 'text-text-muted'}`}
             >
-              <PhaseSummary phase={phase} />
+              <PhaseSummary run={props.run} phase={phase} />
             </Link>
           </li>
         )
@@ -161,15 +162,30 @@ function PhaseRail(props: { runId: string; spine: Phase[]; openPhase: string | u
  * One phase in one line, rendered by BOTH hosts. Two copies of these three
  * fields would drift the first time one gains a field, and the surface that
  * lost it would be whichever one the author was not looking at.
+ *
+ * THE THIRD FIELD IS NO LONGER A COUNTER. `attempt N/M` lies on every row that
+ * has ended — it promised retries under an exhausted node, under a permanently
+ * failed one, and under a gate somebody had just rejected. `phaseStatusLine`
+ * derives the line from the phase's status first and its outcome class second;
+ * what it may say, and why, is that function's business and is argued there.
+ *
+ * IT TAKES `run` RATHER THAN A RESOLVED PRIOR ATTEMPT, which is the reason
+ * `PhaseRail` now receives the run instead of a bare `runId`. The line needs
+ * the node's previous attempt for one case (the wait reason behind
+ * "resumable"), and a `priorAttempt` prop would put that lookup at BOTH call
+ * sites — where one host could pass it and the other forget, and the rail and
+ * the timeline would disagree about the same row. That is exactly the drift the
+ * paragraph above exists to prevent, so the lookup lives here and neither host
+ * decides anything.
  */
-function PhaseSummary(props: { phase: Phase }) {
-  const { phase } = props
+function PhaseSummary(props: { run: Run; phase: Phase }) {
+  const { run, phase } = props
   return (
     <>
       <span className="font-mono">{phase.node_id}</span>
       <span className="text-text-muted font-mono text-xs">{phase.status}</span>
       <span className="text-text-muted font-mono text-xs">
-        attempt {phase.attempt}/{phase.max_attempts}
+        {phaseStatusLine(phase, priorAttemptOf(run, phase))}
       </span>
     </>
   )
@@ -276,7 +292,7 @@ function PhaseTimeline(props: {
               aria-expanded={open}
               className="text-text flex w-full items-center gap-2 px-3 py-3 text-left text-sm md:hidden"
             >
-              <PhaseSummary phase={phase} />
+              <PhaseSummary run={props.run} phase={phase} />
             </button>
             {open && (
               <div className="border-border border-t px-3 py-3 md:rounded-md md:border">

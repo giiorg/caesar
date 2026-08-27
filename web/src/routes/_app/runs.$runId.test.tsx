@@ -339,6 +339,76 @@ describe('run detail', () => {
     expect(screen.getByTestId('phase-gate')).toHaveAttribute('data-state', 'running')
   })
 
+  // THE COUNTER IS GONE FROM THE SUMMARY, and these two cases are why. Both
+  // rows below rendered "attempt 1/3" and "attempt 4/3" before this — a promise
+  // of a further attempt under a gate a person had just rejected, and a
+  // nonsense fraction under one that is merely parked. What the line may say is
+  // `phaseStatusLine`'s business and is pinned exhaustively in
+  // `runs/phase-status.test.ts`; what these assert is that the ROUTE reaches
+  // it, on both of the surfaces that render a summary.
+  it('a rejected gate names the rejection rather than a counter, on both surfaces', async () => {
+    // A rejected gate is a `failed` row with a PERMANENT outcome and no
+    // successor — `gates.go:241-247` finishes it and fails the run in one
+    // transaction. Status alone cannot save this row; the outcome class does.
+    renderApp('/runs/run-1', [
+      run({
+        status: 'failed',
+        phases: [
+          phase({ node_id: 'impl' }),
+          phase({
+            node_id: 'gate',
+            status: 'failed',
+            outcome: {
+              class: 'permanent',
+              code: 'gate_rejected',
+              message: 'gate "gate" was rejected',
+            },
+          }),
+        ],
+      }),
+    ])
+    const row = within(await screen.findByTestId('phase-gate'))
+    expect(row.getByText('gate_rejected')).toBeInTheDocument()
+    expect(row.queryByText(/attempt \d/)).toBeNull()
+    // The rail restates the same summary, so it must say the same thing. This
+    // is the assertion that fails if a future edit gives one host a line the
+    // other does not have.
+    expect(within(screen.getByTestId('phase-rail')).getByText('gate_rejected')).toBeInTheDocument()
+  })
+
+  it('says resumable — with the reason from the attempt before — rather than 4/3', async () => {
+    // `attempt` outruns `max_attempts` only through UNCHARGED waits
+    // (`orchestrator.go:1532` spends the budget on chargeable failures while
+    // the ordinal counts every attempt), so 4/3 is not a bug and must not read
+    // as one. The waiting row has no outcome yet — the code that parked it is
+    // on attempt 3, which is what `priorAttemptOf` goes and gets.
+    renderApp('/runs/run-1', [
+      run({
+        phases: [
+          // `review` is also on attempt 3 and is here so that the lookup's NODE
+          // scoping is load-bearing: matching on the ordinal alone would reach
+          // this row first and report the wrong code below.
+          phase({
+            node_id: 'review',
+            attempt: 3,
+            status: 'failed',
+            outcome: { class: 'transient', code: 'harness_error', message: 'exit 1' },
+          }),
+          phase({
+            node_id: 'impl',
+            attempt: 3,
+            status: 'failed',
+            outcome: { class: 'transient', code: 'rate_limited', message: 'cap window' },
+          }),
+          phase({ node_id: 'impl', attempt: 4, status: 'pending', finished_at: null }),
+        ],
+      }),
+    ])
+    const row = within(await screen.findByTestId('phase-impl'))
+    expect(row.getByText('resumable — not chargeable (rate_limited)')).toBeInTheDocument()
+    expect(row.queryByText(/4\/3/)).toBeNull()
+  })
+
   it('opens at the phase the URL names', async () => {
     renderApp('/runs/run-1?phase=gate', [run(threePhases()), artifact(patchPayload())])
     expect(await screen.findByTestId('hard-facts')).toBeVisible()
