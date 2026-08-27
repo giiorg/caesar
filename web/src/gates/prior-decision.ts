@@ -32,17 +32,34 @@ import { isNewerAttempt, type Phase } from '../runs/phase-spine'
  * it WAS acted on, and approved. An approval is not an unacted-on note, so it
  * answers null and the banner stays off.
  *
- * THAT ORDERING IS A DEFENCE, NOT A LIVE CASE, and saying otherwise here would
- * be inventing a bug to justify a line. An approve finishes the gate's phase as
- * `succeeded` (`runs/gates.go:254`); a node whose newest attempt row succeeded
- * is `live` and is never rematerialized (`runs/orchestrator.go:1236`); and the
- * one statement that can move a row out of `succeeded` is scoped to the
- * revising gate's own slice (`store/queries.sql:739-741`), which invariant V1
- * keeps disjoint from every other gate's (`workflows/validate.go:328-343`). So
- * an approved gate does not run again and a WAITING gate never looks back on an
- * approval. The point of preferring this order is that none of that chain is
- * visible from `web/` — this file can check the decision it found instead of
- * trusting five backend files to stay as they are.
+ * THAT ORDERING IS A DEFENCE, NOT A LIVE CASE, and the reason is narrower than
+ * "an approved gate never runs again" — which is FALSE, so stating it that way
+ * would defend a true conclusion with an invariant the tree does not hold.
+ *
+ * An approve finishes the gate's phase as `succeeded` (`runs/gates.go:254`), a
+ * node whose newest attempt row succeeded is `live` and never rematerialized
+ * (`runs/orchestrator.go:1236`), and the only edge out of `succeeded` in the
+ * transition table is to `superseded` (`runs/status.go:78`) — which a revision
+ * applies to every node of its slice (`store/queries.sql:739-741`). A gate
+ * declaring no `on_request_changes` is skipped when loops are registered
+ * (`workflows/validate.go:308`), so it owns no slice and V1 never constrains
+ * it: it can sit INSIDE another gate's slice and be rewound after approving.
+ * `impl → gate1 → gate2` does exactly that, and it is legal — the shape
+ * `workflows/validate_test.go:323` calls out.
+ *
+ * What holds is about the gates this rule can reach past. Only a gate declaring
+ * a loop can issue `request_changes` at all (`runs/revisions.go:44-48`); such a
+ * gate is in its own slice (`workflows/validate.go:321`) and therefore in no
+ * other's, because V1 keeps loops pairwise disjoint
+ * (`workflows/validate.go:328-343`); and its own revision cannot open from
+ * `succeeded`, since `FinishGatePhase` fires only on `waiting_decision`
+ * (`store/queries.sql:435-436`). So a gate ONCE SENT BACK never looks back on
+ * an approval of its own. A re-run gate that only ever approved has no
+ * `request_changes` to reach past, so the ordering cannot matter there either.
+ *
+ * The point of preferring this order is that none of that chain is visible from
+ * `web/` — this file can check the decision it found instead of trusting six
+ * backend files to stay as they are.
  *
  * NO "STRICTLY EARLIER" COMPARISON, deliberately, and step 2 is what makes it
  * unnecessary. Evidence is built only for a phase whose status is

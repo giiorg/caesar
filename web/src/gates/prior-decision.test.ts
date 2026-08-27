@@ -90,15 +90,19 @@ describe('priorRejectedArtifactId', () => {
     // under that rule.
     //
     // DEFENSIVE, AND NOT A LIVE PRODUCTION SHAPE — the honest reading, because
-    // a comment claiming otherwise would invent a bug to justify a line. An
-    // approve finishes the gate as `succeeded` (`runs/gates.go:254`), a node
-    // whose newest row succeeded is never rematerialized
-    // (`runs/orchestrator.go:1236`), and the only statement that moves a row
-    // out of `succeeded` is scoped to the revising gate's own slice
-    // (`store/queries.sql:739-741`), which V1 keeps disjoint from every other
-    // gate's (`workflows/validate.go:328-343`). So a waiting gate cannot today
-    // look back on its own approval. What this pins is that the rule does not
-    // DEPEND on that five-file chain, none of which is visible from here.
+    // a comment claiming otherwise would invent a bug to justify a line. The
+    // reason is narrower than "an approved gate never runs again", which is
+    // false: a gate declaring no `on_request_changes` is skipped when loops are
+    // registered (`workflows/validate.go:308`), owns no slice, and can sit
+    // inside ANOTHER gate's slice to be rewound after approving.
+    //
+    // What holds is that a gate which has ever issued `request_changes`
+    // declares a loop (`runs/revisions.go:44-48`), is in its own slice
+    // (`workflows/validate.go:321`), and so is in no other's — V1 keeps loops
+    // pairwise disjoint (`workflows/validate.go:328-343`). A gate ONCE SENT
+    // BACK cannot look back on an approval of its own, and that is exactly this
+    // fixture. `prior-decision.ts` carries the full chain; what this case pins
+    // is that the rule does not DEPEND on it, none of it being visible here.
     const phases = [
       decided('gate', 1, 1, 'request_changes', 'old'),
       decided('gate', 2, 2, 'approve', 'approved'),

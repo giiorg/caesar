@@ -198,6 +198,12 @@ type Opts = {
 function renderSurface(opts: Opts) {
   const evidence = opts.evidence ?? decidable
   queryClient.clear()
+  // COUNTED, NOT MERELY SERVED. The `a0` branch below is the only thing in this
+  // file that can answer a prior-artifact fetch, so counting its hits is what
+  // makes the call site's `patch` type guard assertable AT ALL: that guard
+  // changes no rendered output — measured — only whether the request happens.
+  // Returned rather than kept module-level so each render owns its own count.
+  const hits = { a0: 0 }
   server.use(
     // Keyed on the two LITERAL ids the fixture uses, so a case that points
     // evidence at some other id gets a real 404 out of the same handler —
@@ -207,6 +213,7 @@ function renderSurface(opts: Opts) {
         return artifact('s1', 'review_verdict', opts.verdict ?? DEFAULT_VERDICT)
       }
       if (params.artifactId === 'a0') {
+        hits.a0 += 1
         if (opts.priorPlan !== undefined) return artifact('a0', 'plan', opts.priorPlan)
         if (opts.priorPatch !== undefined) return artifact('a0', 'patch', { diff: opts.priorPatch })
         return notFound()
@@ -229,6 +236,7 @@ function renderSurface(opts: Opts) {
       />
     </QueryClientProvider>,
   )
+  return hits
 }
 
 describe('the approval surface', () => {
@@ -418,12 +426,17 @@ describe('the approval surface', () => {
     // on" — would be a false sentence here. It was acted on, at generation 2,
     // and approved.
     //
-    // DEFENSIVE RATHER THAN A LIVE SHAPE, and the fixture says so honestly: an
-    // approve finishes the gate `succeeded` (`runs/gates.go:254`) and a node
-    // whose newest row succeeded is never rematerialized
-    // (`runs/orchestrator.go:1236`), so a waiting gate cannot today look back
-    // on its own approval. What it pins is that the surface does not depend on
-    // that being true — see `gates/prior-decision.ts` for the full chain.
+    // DEFENSIVE RATHER THAN A LIVE SHAPE, and the fixture says so honestly —
+    // though not because "an approved gate never runs again", which is false: a
+    // gate with no revision loop of its own owns no slice
+    // (`workflows/validate.go:308`) and can sit inside another gate's, to be
+    // rewound after approving. What holds is narrower. A gate that has ever
+    // issued `request_changes` declares a loop (`runs/revisions.go:44-48`) and
+    // is in its own slice, which V1 keeps disjoint from every other loop's
+    // (`workflows/validate.go:328-343`) — so a gate ONCE SENT BACK, which is
+    // this fixture, cannot look back on an approval of its own. What it pins is
+    // that the surface does not depend on that being true; see
+    // `gates/prior-decision.ts` for the full chain.
     renderSurface({ phases: APPROVED_SINCE, patch: TWO_FILES_B64, priorPatch: TWO_FILES_B64 })
     await screen.findByTestId('hard-facts')
     expect(screen.queryByText(/byte-identical/i)).toBeNull()
@@ -470,7 +483,7 @@ describe('the approval surface', () => {
     // is in. The type now lives solely in the evidence, which is where the
     // surface reads it.
     const plan = { summary: 'Adds revocation.', steps: [{ title: 'Add the table' }] }
-    renderSurface({
+    const hits = renderSurface({
       evidence: { ...decidable, examined_artifact_type: 'plan' },
       phases: REVISED,
       plan,
@@ -478,6 +491,15 @@ describe('the approval surface', () => {
     })
     await screen.findByText('Add the table')
     expect(screen.queryByText(/byte-identical/i)).toBeNull()
+    // THE CALL SITE'S `patch` GUARD, and the only assertion that can kill it.
+    // The guard is behaviour-neutral by construction — `identical` already
+    // requires a readable patch on BOTH sides, so a plan gate shows no banner
+    // either way — which means every assertion above stays green when it is
+    // deleted. MEASURED: dropping it leaves 28/28 passing. What it actually
+    // buys is the request, so the request is what gets asserted. `REVISED`
+    // names `a0`, so an unguarded call site resolves it, fetches it, and this
+    // goes to 1.
+    expect(hits.a0).toBe(0)
   })
 
   it('carries the decision rules of every host', async () => {
