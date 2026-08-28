@@ -14,10 +14,11 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppAdminRouteImport } from './routes/_app/admin'
 import { Route as AppMoreRouteImport } from './routes/_app/more'
-import { Route as AppReposRouteImport } from './routes/_app/repos'
 import { Route as AppTasksRouteImport } from './routes/_app/tasks'
 import { Route as AppWorkflowsRouteImport } from './routes/_app/workflows'
 import { Route as AppApprovalsIndexRouteImport } from './routes/_app/approvals.index'
+import { Route as AppReposIndexRouteImport } from './routes/_app/repos.index'
+import { Route as AppReposProjectIdRouteImport } from './routes/_app/repos.$projectId'
 import { Route as AppRunsIndexRouteImport } from './routes/_app/runs.index'
 import { Route as AppRunsRunIdRouteImport } from './routes/_app/runs.$runId'
 import { Route as AppApprovalsRunIdNodeIdRouteImport } from './routes/_app/approvals.$runId.$nodeId'
@@ -47,11 +48,6 @@ const AppMoreRoute = AppMoreRouteImport.update({
   path: '/more',
   getParentRoute: () => AppRoute,
 } as any)
-const AppReposRoute = AppReposRouteImport.update({
-  id: '/repos',
-  path: '/repos',
-  getParentRoute: () => AppRoute,
-} as any)
 const AppTasksRoute = AppTasksRouteImport.update({
   id: '/tasks',
   path: '/tasks',
@@ -65,6 +61,16 @@ const AppWorkflowsRoute = AppWorkflowsRouteImport.update({
 const AppApprovalsIndexRoute = AppApprovalsIndexRouteImport.update({
   id: '/approvals/',
   path: '/approvals/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppReposIndexRoute = AppReposIndexRouteImport.update({
+  id: '/repos/',
+  path: '/repos/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppReposProjectIdRoute = AppReposProjectIdRouteImport.update({
+  id: '/repos/$projectId',
+  path: '/repos/$projectId',
   getParentRoute: () => AppRoute,
 } as any)
 const AppRunsIndexRoute = AppRunsIndexRouteImport.update({
@@ -94,11 +100,12 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/admin': typeof AppAdminRoute
   '/more': typeof AppMoreRoute
-  '/repos': typeof AppReposRoute
   '/tasks': typeof AppTasksRoute
   '/workflows': typeof AppWorkflowsRoute
+  '/repos/$projectId': typeof AppReposProjectIdRoute
   '/runs/$runId': typeof AppRunsRunIdRoute
   '/approvals/': typeof AppApprovalsIndexRoute
+  '/repos/': typeof AppReposIndexRoute
   '/runs/': typeof AppRunsIndexRoute
   '/approvals/$runId/$nodeId': typeof AppApprovalsRunIdNodeIdRoute
   '/runs/$runId/artifacts/$artifactId': typeof AppRunsRunIdArtifactsArtifactIdRoute
@@ -107,12 +114,13 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/admin': typeof AppAdminRoute
   '/more': typeof AppMoreRoute
-  '/repos': typeof AppReposRoute
   '/tasks': typeof AppTasksRoute
   '/workflows': typeof AppWorkflowsRoute
   '/': typeof AppIndexRoute
+  '/repos/$projectId': typeof AppReposProjectIdRoute
   '/runs/$runId': typeof AppRunsRunIdRoute
   '/approvals': typeof AppApprovalsIndexRoute
+  '/repos': typeof AppReposIndexRoute
   '/runs': typeof AppRunsIndexRoute
   '/approvals/$runId/$nodeId': typeof AppApprovalsRunIdNodeIdRoute
   '/runs/$runId/artifacts/$artifactId': typeof AppRunsRunIdArtifactsArtifactIdRoute
@@ -123,12 +131,13 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/_app/admin': typeof AppAdminRoute
   '/_app/more': typeof AppMoreRoute
-  '/_app/repos': typeof AppReposRoute
   '/_app/tasks': typeof AppTasksRoute
   '/_app/workflows': typeof AppWorkflowsRoute
   '/_app/': typeof AppIndexRoute
+  '/_app/repos/$projectId': typeof AppReposProjectIdRoute
   '/_app/runs/$runId': typeof AppRunsRunIdRoute
   '/_app/approvals/': typeof AppApprovalsIndexRoute
+  '/_app/repos/': typeof AppReposIndexRoute
   '/_app/runs/': typeof AppRunsIndexRoute
   '/_app/approvals/$runId/$nodeId': typeof AppApprovalsRunIdNodeIdRoute
   '/_app/runs/$runId_/artifacts/$artifactId': typeof AppRunsRunIdArtifactsArtifactIdRoute
@@ -140,11 +149,12 @@ export interface FileRouteTypes {
     | '/login'
     | '/admin'
     | '/more'
-    | '/repos'
     | '/tasks'
     | '/workflows'
+    | '/repos/$projectId'
     | '/runs/$runId'
     | '/approvals/'
+    | '/repos/'
     | '/runs/'
     | '/approvals/$runId/$nodeId'
     | '/runs/$runId/artifacts/$artifactId'
@@ -153,12 +163,13 @@ export interface FileRouteTypes {
     | '/login'
     | '/admin'
     | '/more'
-    | '/repos'
     | '/tasks'
     | '/workflows'
     | '/'
+    | '/repos/$projectId'
     | '/runs/$runId'
     | '/approvals'
+    | '/repos'
     | '/runs'
     | '/approvals/$runId/$nodeId'
     | '/runs/$runId/artifacts/$artifactId'
@@ -168,12 +179,13 @@ export interface FileRouteTypes {
     | '/login'
     | '/_app/admin'
     | '/_app/more'
-    | '/_app/repos'
     | '/_app/tasks'
     | '/_app/workflows'
     | '/_app/'
+    | '/_app/repos/$projectId'
     | '/_app/runs/$runId'
     | '/_app/approvals/'
+    | '/_app/repos/'
     | '/_app/runs/'
     | '/_app/approvals/$runId/$nodeId'
     | '/_app/runs/$runId_/artifacts/$artifactId'
@@ -221,13 +233,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppMoreRouteImport
       parentRoute: typeof AppRoute
     }
-    '/_app/repos': {
-      id: '/_app/repos'
-      path: '/repos'
-      fullPath: '/repos'
-      preLoaderRoute: typeof AppReposRouteImport
-      parentRoute: typeof AppRoute
-    }
     '/_app/tasks': {
       id: '/_app/tasks'
       path: '/tasks'
@@ -247,6 +252,20 @@ declare module '@tanstack/react-router' {
       path: '/approvals'
       fullPath: '/approvals/'
       preLoaderRoute: typeof AppApprovalsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/repos/': {
+      id: '/_app/repos/'
+      path: '/repos'
+      fullPath: '/repos/'
+      preLoaderRoute: typeof AppReposIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/repos/$projectId': {
+      id: '/_app/repos/$projectId'
+      path: '/repos/$projectId'
+      fullPath: '/repos/$projectId'
+      preLoaderRoute: typeof AppReposProjectIdRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/runs/': {
@@ -283,12 +302,13 @@ declare module '@tanstack/react-router' {
 interface AppRouteChildren {
   AppAdminRoute: typeof AppAdminRoute
   AppMoreRoute: typeof AppMoreRoute
-  AppReposRoute: typeof AppReposRoute
   AppTasksRoute: typeof AppTasksRoute
   AppWorkflowsRoute: typeof AppWorkflowsRoute
   AppIndexRoute: typeof AppIndexRoute
+  AppReposProjectIdRoute: typeof AppReposProjectIdRoute
   AppRunsRunIdRoute: typeof AppRunsRunIdRoute
   AppApprovalsIndexRoute: typeof AppApprovalsIndexRoute
+  AppReposIndexRoute: typeof AppReposIndexRoute
   AppRunsIndexRoute: typeof AppRunsIndexRoute
   AppApprovalsRunIdNodeIdRoute: typeof AppApprovalsRunIdNodeIdRoute
   AppRunsRunIdArtifactsArtifactIdRoute: typeof AppRunsRunIdArtifactsArtifactIdRoute
@@ -297,12 +317,13 @@ interface AppRouteChildren {
 const AppRouteChildren: AppRouteChildren = {
   AppAdminRoute: AppAdminRoute,
   AppMoreRoute: AppMoreRoute,
-  AppReposRoute: AppReposRoute,
   AppTasksRoute: AppTasksRoute,
   AppWorkflowsRoute: AppWorkflowsRoute,
   AppIndexRoute: AppIndexRoute,
+  AppReposProjectIdRoute: AppReposProjectIdRoute,
   AppRunsRunIdRoute: AppRunsRunIdRoute,
   AppApprovalsIndexRoute: AppApprovalsIndexRoute,
+  AppReposIndexRoute: AppReposIndexRoute,
   AppRunsIndexRoute: AppRunsIndexRoute,
   AppApprovalsRunIdNodeIdRoute: AppApprovalsRunIdNodeIdRoute,
   AppRunsRunIdArtifactsArtifactIdRoute: AppRunsRunIdArtifactsArtifactIdRoute,

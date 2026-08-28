@@ -9,53 +9,14 @@ import { SelectField, type SelectOption } from '../forms/select-field'
 import { TextField } from '../forms/text-field'
 import { TextAreaField } from '../forms/textarea-field'
 import { useAppForm } from '../forms/use-app-form'
+import { projectReposQueryOptions, projectsQueryOptions } from '../projects/projects-query'
 import type { Task } from './tasks-query'
-
-/**
- * THE SHORT FORM IS THE LOCKED DESIGN'S OWN STATED ALTERNATIVE, not a
- * substitute invented here. Locked Tasks B pairs the list with an
- * assistant-drafted task — you describe what you want and something else fills
- * in the repo, the workflow and the inputs — and that is roadmap row 13
- * (§10.6), unbuilt. §10.6 names this short form as what ships until then.
- *
- * So: five controls, every one of which the server needs, and no field that
- * pretends to be understood. `instructions` is the only free text and it goes
- * into `inputs` verbatim; nothing here parses it, and nothing claims to.
- */
-const projectsQueryOptions = queryOptions({
-  queryKey: ['projects'],
-  queryFn: async () => (await unwrap(await api.GET('/api/v1/projects'))).projects ?? [],
-  ...AUTH_SCOPED_QUERY_OPTIONS,
-})
 
 const workflowsQueryOptions = queryOptions({
   queryKey: ['workflows'],
   queryFn: async () => (await unwrap(await api.GET('/api/v1/workflows'))).workflows ?? [],
   ...AUTH_SCOPED_QUERY_OPTIONS,
 })
-
-/**
- * The second half of the cascade. `enabled` on the empty id is what makes it a
- * cascade rather than two independent lists: the only way to LIST repos is
- * `GET /projects/{id}/repos` (assets/api/api.go:63), and assets exposes no repo
- * collection of its own — `GET /api/v1/repos/{id}` fetches one by id and there
- * is nothing at `GET /api/v1/repos`. So an unscoped request has nothing to send
- * and this query has nothing to do until a project is picked.
- */
-const reposQueryOptions = (projectId: string) =>
-  queryOptions({
-    queryKey: ['project-repos', projectId],
-    queryFn: async () =>
-      (
-        await unwrap(
-          await api.GET('/api/v1/projects/{id}/repos', {
-            params: { path: { id: projectId } },
-          }),
-        )
-      ).repos ?? [],
-    enabled: projectId !== '',
-    ...AUTH_SCOPED_QUERY_OPTIONS,
-  })
 
 /**
  * `project_id` IS NOT A `CreateTaskRequest` FIELD and is deliberately in the
@@ -73,6 +34,17 @@ const schema = z.object({
   instructions: z.string().min(1, 'say what needs doing'),
 })
 
+/**
+ * THE SHORT FORM IS THE LOCKED DESIGN'S OWN STATED ALTERNATIVE, not a
+ * substitute invented here. Locked Tasks B pairs the list with an
+ * assistant-drafted task — you describe what you want and something else fills
+ * in the repo, the workflow and the inputs — and that is roadmap row 13
+ * (§10.6), unbuilt. §10.6 names this short form as what ships until then.
+ *
+ * So: five controls, every one of which the server needs, and no field that
+ * pretends to be understood. `instructions` is the only free text and it goes
+ * into `inputs` verbatim; nothing here parses it, and nothing claims to.
+ */
 export function NewTaskForm(props: { onCreated: (task: Task) => void }) {
   const queryClient = useQueryClient()
   /**
@@ -132,7 +104,7 @@ export function NewTaskForm(props: { onCreated: (task: Task) => void }) {
 
   const projectId = form.watch('project_id')
   const projects = useQuery(projectsQueryOptions)
-  const repos = useQuery(reposQueryOptions(projectId))
+  const repos = useQuery(projectReposQueryOptions(projectId))
   const workflows = useQuery(workflowsQueryOptions)
 
   const workflowOptions = new Map((workflows.data ?? []).map((w) => [w.id, w.latest_version]))

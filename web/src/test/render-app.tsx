@@ -222,6 +222,25 @@ export function renderApp(
     http.get('/api/v1/approvals/decisions', () =>
       HttpResponse.json({ decisions: null, next_cursor: null }),
     ),
+    // `projects: null`, for the FIFTH time and the same reason: required AND
+    // nullable, because a Go nil slice marshals to null; `handleListProjects`
+    // happens to build a non-nil slice today
+    // (backend/internal/assets/api/api.go); and the null branch in
+    // `projectsQueryOptions` would otherwise be unreachable from every test in
+    // the tree. Two screens read it — the Repos list and the new-task form's
+    // project select — so this default is what the Repos empty state runs
+    // against rather than a stub nothing observes.
+    http.get('/api/v1/projects', () => HttpResponse.json({ projects: null })),
+    // `repos: null` and `credentials: null`, both `| null` in the contract for
+    // the same nil-slice reason.
+    //
+    // THERE IS DELIBERATELY NO DEFAULT FOR `GET /projects/{id}` beside these.
+    // A list has an honest empty answer; ONE project does not — a default would
+    // have to invent a name and a description, and every test that renders the
+    // detail screen supplies its own project anyway. `onUnhandledRequest:
+    // 'error'` is what makes that omission loud instead of silent.
+    http.get('/api/v1/projects/:id/repos', () => HttpResponse.json({ repos: null })),
+    http.get('/api/v1/credentials', () => HttpResponse.json({ credentials: null })),
     http.get('/api/v1/stream', silentStream),
   )
   // BOTH router arguments are load-bearing and neither is optional.
