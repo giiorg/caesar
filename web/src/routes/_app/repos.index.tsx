@@ -1,11 +1,11 @@
 import { useSuspenseQuery } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
 import { useState } from 'react'
+import { useMe } from '../../auth/me-query'
 import { ProjectCards } from '../../projects/project-cards'
 import { ProjectForm } from '../../projects/project-form'
 import { projectsQueryOptions } from '../../projects/projects-query'
 import { FormSheet } from '../../ui/form-sheet'
-import { useMe } from '../_app'
 
 /**
  * Repos, and the screen is a list of PROJECTS — which is the API's shape rather

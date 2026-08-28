@@ -145,7 +145,3 @@ function AppErrorBoundary({ error }: ErrorComponentProps) {
   // up as a server error.
   return <ApiErrorPanel error={error} />
 }
-
-export function useMe() {
-  return useSuspenseQuery(meQueryOptions).data
-}

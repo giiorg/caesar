@@ -2,7 +2,9 @@ import { useMutation, useQueryClient, useSuspenseQuery } from '@tanstack/react-q
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useState } from 'react'
 import { api, unwrap } from '../../api/client'
+import { useMe } from '../../auth/me-query'
 import { asApiError, ErrorSurface } from '../../errors/error-surface'
+import { canManageProject, GrantsSection } from '../../projects/grants-section'
 import { ProjectForm } from '../../projects/project-form'
 import {
   type Project,
@@ -10,6 +12,7 @@ import {
   projectReposQueryOptions,
   type Repo,
 } from '../../projects/projects-query'
+import { RepoActivity } from '../../projects/repo-activity'
 import { RepoForm } from '../../projects/repo-form'
 import { FormSheet } from '../../ui/form-sheet'
 
@@ -22,8 +25,11 @@ import { FormSheet } from '../../ui/form-sheet'
  * surface outside a form that renders `correlation_id` — and whose 403 branch
  * says what to ask for rather than inviting a retry that cannot succeed.
  *
- * Task 20 adds the grants section here; grants live on the project because the
- * API is project-nested and a grant is a property of a project.
+ * THE GRANTS SECTION IS HERE because the API is project-nested and a grant is a
+ * property of a project — and it is CONDITIONAL, because every one of its
+ * endpoints (the list included) enforces `manage`. `canManageProject` is asked
+ * once, here, so the decision is visible beside the screen rather than buried
+ * in the section's own render.
  */
 export const Route = createFileRoute('/_app/repos/$projectId')({
   loader: ({ context, params }) =>
@@ -38,11 +44,15 @@ function ProjectDetail() {
   const { projectId } = Route.useParams()
   const { data: project } = useSuspenseQuery(projectQueryOptions(projectId))
   const { data: repos } = useSuspenseQuery(projectReposQueryOptions(projectId))
+  // `useMe` suspends on a query `_app`'s loader has already awaited on every
+  // protected route, so it resolves from the cache and adds no request here.
+  const canManage = canManageProject(useMe(), projectId)
 
   return (
     <div className="flex flex-col gap-6">
       <ProjectHeader project={project} />
       <RepoSection projectId={projectId} repos={repos} />
+      {canManage && <GrantsSection projectId={projectId} />}
     </div>
   )
 }
@@ -126,23 +136,32 @@ function ProjectHeader(props: { project: Project }) {
  * desktop rail are both mounted, which is where the one-`<nav>`-landmark rule
  * comes from. Nothing here adds a landmark.
  *
- * THE DIALOGS AND THE ERROR LIVE HERE, NOT IN A ROW. Two copies of a row means
- * two copies of everything inside it, and a sheet rendered per row would put
- * two dialogs in the document for one repo. One `editing` value beside the list
- * — set by whichever copy of the button was pressed — keeps a single dialog and
- * a single error surface.
+ * THE DIALOGS, THE ERROR AND THE ACTIVITY PANEL LIVE HERE, NOT IN A ROW. Two
+ * copies of a row means two copies of everything inside it, and a sheet
+ * rendered per row would put two dialogs in the document for one repo. One
+ * `editing` value beside the list — set by whichever copy of the button was
+ * pressed — keeps a single dialog and a single error surface, and `expanded`
+ * does the same job for the one open repo's activity.
  *
- * NOT GATED ON A GRANT LEVEL, deliberately. Repo writes need `manage` on the
- * project, and deciding here who has it means hard-coding the grant ladder's
- * ORDER — which is Task 20's subject, and the one place this plan says to read
- * the vocabulary out of the generated types rather than guess it. A guess made
- * here would be invisible until it was wrong. A 403 from any of these buttons
- * reaches `ApiErrorPanel`'s grant branch, which already says what to ask for.
+ * ONE OPEN REPO AT A TIME, WHICH IS A FETCH DECISION AS MUCH AS A LAYOUT ONE.
+ * Activity is a runs query per repo (`['runs', {repoId}]`); rendering it inline
+ * under every row would fire one per repo on first paint. React-query folds the
+ * two projections onto one key, but not twenty repos onto one request.
+ *
+ * REPO WRITES STAY UNGATED, deliberately, even though the ladder is now spelled
+ * out in `grants-section.tsx` and could be consulted here. `manage` is what the
+ * server requires for them, and a client-side gate would only duplicate that
+ * check where it can drift; a 403 from any of these buttons reaches
+ * `ApiErrorPanel`'s grant branch, which already says what to ask for. The
+ * grants section is gated for a different reason — see the route component —
+ * and the difference is that its READ is forbidden too, so an ungated render
+ * there produces an error panel rather than a working screen.
  */
 function RepoSection(props: { projectId: string; repos: readonly Repo[] }) {
   const queryClient = useQueryClient()
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Repo | undefined>(undefined)
+  const [expanded, setExpanded] = useState<Repo | undefined>(undefined)
 
   const remove = useMutation({
     mutationFn: async (repo: Repo) =>
@@ -151,7 +170,15 @@ function RepoSection(props: { projectId: string; repos: readonly Repo[] }) {
       queryClient.invalidateQueries({ queryKey: ['project-repos', props.projectId] }),
   })
 
-  const rowProps = { onEdit: setEditing, onDelete: (repo: Repo) => remove.mutate(repo) }
+  const rowProps = {
+    onEdit: setEditing,
+    onDelete: (repo: Repo) => remove.mutate(repo),
+    // A SECOND PRESS ON THE OPEN ROW CLOSES IT. Compared by id rather than by
+    // identity: `repos` is a fresh array after any refetch, so the object the
+    // button hands back is not the one in state.
+    onToggleActivity: (repo: Repo) =>
+      setExpanded((open) => (open?.id === repo.id ? undefined : repo)),
+  }
 
   return (
     <section className="flex flex-col gap-3">
@@ -168,6 +195,11 @@ function RepoSection(props: { projectId: string; repos: readonly Repo[] }) {
           <RepoTable repos={props.repos} {...rowProps} />
         </>
       )}
+      {/* ONCE, BELOW BOTH PROJECTIONS — the `editing` sheet's argument applied
+          to a panel. Rendered inside the rows it would exist twice per repo in
+          jsdom, and on a real desktop it would have to be built twice: as a
+          nested list in the cards and as a full-width `<tr>` in the table. */}
+      {expanded !== undefined && <RepoActivity repo={expanded} />}
       {remove.isError && <ErrorSurface failure={asApiError(remove.error)} />}
       <button type="button" onClick={() => setCreating(true)} className={ACTION_CLASS}>
         New repo
@@ -204,7 +236,11 @@ function RepoSection(props: { projectId: string; repos: readonly Repo[] }) {
   )
 }
 
-type RowActions = { onEdit: (repo: Repo) => void; onDelete: (repo: Repo) => void }
+type RowActions = {
+  onEdit: (repo: Repo) => void
+  onDelete: (repo: Repo) => void
+  onToggleActivity: (repo: Repo) => void
+}
 
 /** The phone projection. Hidden from `md:` up, where the table takes over. */
 function RepoCards(props: { repos: readonly Repo[] } & RowActions) {
@@ -277,6 +313,13 @@ function RowButtons(props: { repo: Repo } & RowActions) {
       </button>
       <button type="button" onClick={() => props.onDelete(props.repo)} className={ACTION_CLASS}>
         Delete {props.repo.slug}
+      </button>
+      <button
+        type="button"
+        onClick={() => props.onToggleActivity(props.repo)}
+        className={ACTION_CLASS}
+      >
+        Activity for {props.repo.slug}
       </button>
     </div>
   )

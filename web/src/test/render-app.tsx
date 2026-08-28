@@ -240,6 +240,19 @@ export function renderApp(
     // detail screen supplies its own project anyway. `onUnhandledRequest:
     // 'error'` is what makes that omission loud instead of silent.
     http.get('/api/v1/projects/:id/repos', () => HttpResponse.json({ repos: null })),
+    // `grants: null`, for the SIXTH time and the same reason: required AND
+    // nullable, because a Go nil slice marshals to null.
+    //
+    // It is also the default every test renders the project detail against —
+    // `authenticatedMe` is an admin, so `canManageProject` is true and the
+    // grants section mounts on every one of them. `grants-section.test.tsx`'s
+    // empty-state test deliberately does NOT override it, so this default is
+    // observed rather than merely present: with `?? []` deleted from
+    // `grantsQueryOptions` that test dies on `null.length`. Task 19 added a
+    // default that every one of its own tests then overrode, and the coalesce
+    // it was supposed to exercise sat on no live path while a comment claimed
+    // otherwise.
+    http.get('/api/v1/projects/:id/grants', () => HttpResponse.json({ grants: null })),
     http.get('/api/v1/credentials', () => HttpResponse.json({ credentials: null })),
     http.get('/api/v1/stream', silentStream),
   )
