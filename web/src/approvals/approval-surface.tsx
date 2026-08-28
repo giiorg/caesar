@@ -143,8 +143,28 @@ export function ApprovalSurface(props: {
       {/* The thumb zone the locked design asks for. GateControls supplies the
           controls and this supplies the position — the split its own doc
           comment states. `bg-ground` rather than a transparent bar: the diff
-          scrolls underneath it. */}
-      <div className="bg-ground border-border sticky bottom-0 border-t py-3">
+          scrolls underneath it.
+
+          `bottom-tab-bar` and not `bottom-0`: on a phone the tab bar is fixed
+          over the bottom of the viewport, and a decision bar that stuck to 0
+          would sit under it — the three controls this whole screen exists for.
+          The same token the bar's own height comes from, so the two cannot
+          drift. `md:bottom-0` puts it back where the bar is display:none.
+          `z-10` matches the run-detail sticky header and stays under the
+          bar's z-20.
+
+          THIS OFFSET IS NOT CURRENTLY FALSIFIABLE, and the honest record of
+          that belongs here rather than in a report nobody reads next. MEASURED
+          on both hosts: swapping this back to `bottom-0` leaves every e2e
+          assertion green, because a bottom-sticky element only leaves its flow
+          position once its containing block is taller than the viewport, and
+          neither host's fixture gate is — forcing this element's `bottom` to
+          0px, 64px and 200px in the live page moved its box not at all. So the
+          class is written from the invariant it states, NOT from a lane that
+          holds it: the first real gate with a long diff is where it starts
+          mattering, and a shorter viewport would too. Recorded as a geometry
+          debt for Task 32, which owns exactly this class of hole. */}
+      <div className="bg-ground border-border sticky bottom-tab-bar z-10 border-t py-3 md:bottom-0">
         <GateControls runId={props.runId} nodeId={props.nodeId} evidence={evidence} />
       </div>
     </div>

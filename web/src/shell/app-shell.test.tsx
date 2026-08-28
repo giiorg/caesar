@@ -72,6 +72,16 @@ describe('the app shell', () => {
     renderShell()
     expect(screen.getByText('user@example.com')).toBeInTheDocument()
   })
+
+  it('the wordmark links Home', () => {
+    // The product name in the corner is the affordance every web surface has
+    // trained people to expect, and until now it was a <span>. Asserted here
+    // rather than in the tab-bar describe because it lives in the <header> and
+    // adds no landmark — 'keeps one navigation landmark' below is what holds
+    // that line.
+    renderShell()
+    expect(screen.getByRole('link', { name: 'caesar' })).toHaveAttribute('href', '/')
+  })
 })
 
 /**
@@ -120,6 +130,26 @@ describe('the phone tab bar', () => {
     for (const label of ['Workflows', 'Repos', 'Admin']) {
       expect(bar.queryByRole('link', { name: label })).toBeNull()
     }
+  })
+
+  it('pins the phone tab bar and reserves its height on main', () => {
+    // STRUCTURE ONLY — jsdom loads no Tailwind, so these are assertions about
+    // which class names were written, and the geometry they are meant to
+    // produce is falsifiable only in e2e/approvals.spec.ts's phone project.
+    //
+    // THE SUBJECT IS THE <nav>, not the phone-tabs div, and that is the fix
+    // rather than an accommodation: pinning the inner div leaves the landmark
+    // with an empty bounding box on a phone, which reddened all five e2e specs
+    // at signIn. `md:static` is asserted with it because without it the rail
+    // stays pinned to the bottom of a desktop viewport.
+    renderShell()
+    const nav = screen.getByRole('navigation')
+    expect(nav.className).toMatch(/\bfixed\b/)
+    expect(nav.className).toMatch(/\bbottom-0\b/)
+    expect(nav.className).toMatch(/\bmd:static\b/)
+    // The reservation is the other half of the fix: pinning alone overlays the
+    // last screenful of every page (finding 14's real shape).
+    expect(screen.getByRole('main').className).toMatch(/\bpb-tab-bar\b/)
   })
 
   it('keeps one navigation landmark', () => {

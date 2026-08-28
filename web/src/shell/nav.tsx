@@ -73,8 +73,35 @@ export function Nav(props: { approvalCount: number }) {
        Both presentations therefore render the badge: which one a person sees is
        a viewport's decision, and a badge in only one of them is a badge missing
        on one of the two surfaces. */
-    <nav aria-label="Sections" className="md:order-first">
-      <div data-testid="phone-tabs" className="border-border bg-surface flex border-t md:hidden">
+    <nav aria-label="Sections" className="fixed inset-x-0 bottom-0 z-20 md:static md:order-first">
+      {/* THE LANDMARK IS WHAT IS PINNED, not the div inside it — MEASURED, and
+          the other way round breaks five specs. Putting `fixed` on this inner
+          div takes the phone's only in-flow child out of the flow while the
+          rail beside it is `display:none` at 412px, so the <nav> itself is left
+          with an EMPTY BOUNDING BOX: `harness.ts`'s signIn asserts
+          `getByRole('navigation')` is visible and every e2e spec awaits it, so
+          all five went red at login on a class-only diff. Playwright's
+          visibility is a box, and a landmark whose whole content is out of flow
+          does not have one. `md:static` hands the position back where the rail
+          is a flow sidebar; inset and z-index do not apply to a static box, so
+          nothing else needs undoing.
+
+          `z-20` is the top of this screen's stack (decision bar and FAB are
+          z-10, so the walk's most important buttons are never under chrome),
+          and it is also what forces the New-task drawer to z-30 in tasks.tsx:
+          vaul sets no z-index at all, so its sheet would otherwise be painted
+          over by this bar exactly where it opens. */}
+      {/* The height is the token's TOTAL. `h-tab-bar` is the content row plus
+          the home-indicator strip; under the global border-box the
+          `pb-[env(safe-area-inset-bottom)]` carves that strip out rather than adding
+          to it, so the tabs keep their full 4rem and still clear the indicator.
+          Drop the padding and the tabs paint under it; drop the inset from the
+          token and they lose 34px of touch target. Neither is visible in CI —
+          the Playwright project and Chrome emulation both run at inset 0. */}
+      <div
+        data-testid="phone-tabs"
+        className="border-border bg-surface flex h-tab-bar border-t pb-[env(safe-area-inset-bottom)] md:hidden"
+      >
         {PHONE_TABS.map((item) => (
           <Link
             key={item.to}

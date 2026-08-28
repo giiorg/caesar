@@ -28,4 +28,29 @@
   --radius-sm: 0.125rem;
   --radius-md: 0.25rem;
   --radius-lg: 0.375rem;
+
+  /* The phone tab bar's reserved height. A SPACING token so Tailwind derives
+     h-tab-bar / pb-tab-bar / bottom-tab-bar as named utilities from one entry.
+
+     ONE TOKEN BECAUSE EVERY CONSUMER MUST OFFSET BY THE SAME TOTAL — main's
+     clearance, the FAB, the decision bar, and the bar's own height — and the
+     list is open (decisions §7 still owes Home an assistant ask-bar docked
+     above these tabs). Nothing in CI enforces the spelling: web:arch reads
+     class strings for COLOUR names only (tools/arch/tokens.ts), so an inline
+     inline arbitrary-value padding would pass every lane and then drift away
+     from these consumers on the first edit. The token
+     is the discipline, not the checker.
+
+     THE BODY PADDING DOES NOT COVER A FIXED BAR. app.css puts
+     env(safe-area-inset-*) on `body`, but a `position: fixed; bottom: 0`
+     element is laid out against the VIEWPORT (the initial containing block),
+     not against body's padding box — so the bar would sit under the iPhone
+     home indicator no matter what body does.
+
+     THE TOKEN IS THE TOTAL, and the 4rem is what survives INSIDE it. Preflight
+     makes everything border-box, so the bar's own bottom padding eats its
+     height rather than adding to it: a 4rem token plus a 34px inset would
+     leave a 30px tab, under the 44px target the visual style locks — and no
+     CI viewport would reveal it, because every one of them runs at inset 0. */
+  --spacing-tab-bar: calc(4rem + env(safe-area-inset-bottom));
 }

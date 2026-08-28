@@ -162,10 +162,20 @@ function TaskRow(props: { task: Task; run: RunSummary | undefined }) {
  *
  * A BOTTOM SHEET, because the locked mobile-first decision names bottom sheets
  * as the default modal, and `vaul` is the dependency this project took for
- * them. `fixed bottom-20` clears the phone tab bar; `md:bottom-6` drops it back
- * down on a viewport where the nav is a left rail and there is nothing to
- * clear. `size-14` is 56px — comfortably past the 44px minimum target, which
- * `min-h-11` alone would only just meet.
+ * them.
+ *
+ * `bottom-tab-bar mb-4` clears the phone tab bar, which is now genuinely fixed
+ * — the previous `bottom-20` was written against a bar that never was, so it
+ * cleared nothing and happened to look right. `md:bottom-6 md:mb-0` drops it
+ * back down where the nav is a left rail and there is nothing to clear.
+ *
+ * A PILL RATHER THAN A CIRCLE, and that is a deviation from a locked mockup:
+ * `01-app-skeleton.html` and `05-tasks.html` both draw this as border-radius
+ * 50%. The label is what makes the control legible, and a circle cannot hold
+ * it. Recorded as deliberate; the taste call is sofo's at the Task 34
+ * checkpoint. The pill drops `size-14`'s own 56px guarantee, so the target
+ * floor falls back to app.css's rule — `Drawer.Trigger` renders a <button>, so
+ * it is covered — at 44px, which `py-3` plus `text-sm` meets almost exactly.
  *
  * NAVIGATION IS THE SUCCESS STATE. Creating a task creates its first run, so
  * the honest landing place is that run: a toast over an unchanged list would
@@ -181,12 +191,18 @@ function NewTaskFab() {
   // sheet stays put and scrolls under the keyboard.
   return (
     <Drawer.Root open={open} onOpenChange={setOpen} repositionInputs={false}>
-      <Drawer.Trigger className="bg-accent text-accent-contrast fixed right-4 bottom-20 flex size-14 items-center justify-center rounded-full text-sm font-medium md:bottom-6">
+      <Drawer.Trigger className="bg-accent text-accent-contrast fixed right-4 bottom-tab-bar z-10 mb-4 flex items-center justify-center rounded-xl px-5 py-3 text-sm font-medium md:bottom-6 md:mb-0">
         New task
       </Drawer.Trigger>
       <Drawer.Portal>
-        <Drawer.Overlay className="bg-ground/70 fixed inset-0" />
-        <Drawer.Content className="bg-surface border-border fixed inset-x-0 bottom-0 max-h-[90dvh] overflow-y-auto rounded-t-xl border-t p-4">
+        {/* z-30 BECAUSE THE TAB BAR IS z-20. vaul sets no z-index anywhere and
+            ships no stylesheet, so both of these are `z-index: auto` by
+            default — and a positioned z-20 element paints above every
+            positioned auto element regardless of DOM order or portal. This
+            sheet is bottom-anchored, exactly where the bar now is, so without
+            this the bar covers its last ~64px: Cancel and part of the form. */}
+        <Drawer.Overlay className="bg-ground/70 fixed inset-0 z-30" />
+        <Drawer.Content className="bg-surface border-border fixed inset-x-0 bottom-0 z-30 max-h-[90dvh] overflow-y-auto rounded-t-xl border-t p-4">
           {/* Radix requires both, and neither is decoration: the title names the
               dialog for a screen reader and the description is what
               `aria-describedby` points at when it opens. */}

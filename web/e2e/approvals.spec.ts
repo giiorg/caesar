@@ -66,3 +66,78 @@ test('a gate opened by the backend moves the approvals badge with no user action
   await expect(bar.getByTestId('approvals-badge')).toHaveText('1', { timeout: 30_000 })
   await expect(page.getByText('E2E approval')).toBeVisible()
 })
+
+/**
+ * THE GEOMETRY HALF OF THE PINNED BAR, and it is only falsifiable here: jsdom
+ * loads no Tailwind, so the shell test beside this one can assert which class
+ * names were written and nothing about where anything lands.
+ *
+ * It opens a gate and then DECIDES it, so it leaves the inbox as it found it —
+ * BEAT 1 and BEAT 3 above are absolute claims about that inbox.
+ */
+test('the pinned bar never covers the decision controls or the end of a page', async ({
+  page,
+  request,
+}) => {
+  await signIn(page)
+  const runId = await openGate(request)
+  // The card for THIS run, found by the run in its own link. `GateCard` makes
+  // the title the only link (a <button> inside an <a> is invalid HTML), so
+  // `getByRole('link').first()` is that title — the same shape
+  // gate-decision.spec.ts uses.
+  await page
+    .getByTestId('gate-card')
+    .filter({ has: page.locator(`a[href^="/runs/${runId}"]`) })
+    .getByRole('link')
+    .first()
+    .click()
+  const bar = page.getByTestId('phone-tabs')
+  const approve = page.getByRole('button', { name: 'Approve', exact: true })
+  await expect(bar).toBeVisible()
+  await expect(approve).toBeVisible()
+  const barBox = await bar.boundingBox()
+  const btnBox = await approve.boundingBox()
+  // The decision controls sit fully ABOVE the pinned bar — overlap is the bug class.
+  expect(btnBox!.y + btnBox!.height).toBeLessThanOrEqual(barBox!.y + 1)
+
+  // THE MAIN-PADDING HALF NEEDS ITS OWN SUBJECT. The Approve button lives in a
+  // `sticky bottom-…` bar inside the approval surface with its OWN offset — it
+  // clears the tab bar whether or not <main> reserves anything, so measuring it
+  // proves nothing about `pb-tab-bar`. The subject is the event log: an
+  // ordinary, non-sticky block that is the LAST element of this page, so only
+  // <main>'s reservation keeps it off the bar at full scroll.
+  //
+  // `window.scrollTo`, not `keyboard.press('End')`: End depends on where focus
+  // landed after the click, and `scrollIntoViewIfNeeded` stops as soon as the
+  // element is PARTLY in view — the exact condition under test.
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight))
+  const tailBox = await page.getByTestId('event-log').boundingBox()
+  expect(tailBox!.y + tailBox!.height).toBeLessThanOrEqual(barBox!.y + 1)
+  // A pinned bar does not scroll away — without this, removing `fixed` passes
+  // both halves vacuously.
+  expect((await bar.boundingBox())!.y).toBe(barBox!.y)
+  // WHAT THE ASSERTION ABOVE DOES NOT COVER, stated rather than implied: the
+  // decision bar's OWN `bottom-tab-bar`. MEASURED — swapping it back to
+  // `bottom-0` leaves this test green on both hosts, because a bottom-sticky
+  // element only leaves its flow position once its containing block outgrows
+  // the viewport and neither fixture gate does (forcing the element's `bottom`
+  // to 0px, 64px and 200px in the live page moved its box not at all). So the
+  // half above is falsified by `fixed` and `pb-tab-bar`, and NOT by that
+  // offset; see approval-surface.tsx, and Task 32 owns the hole.
+  //
+  // The deep route is still worth walking. `ApprovalSurface` is the whole page
+  // there rather than a panel nested in a timeline row, so its controls sit at
+  // the bottom of <main> — the arrangement in which the reservation has to
+  // hold, on the screen a notification actually opens.
+  await page.getByRole('link', { name: 'Approvals' }).click()
+  await page.getByRole('link').filter({ hasText: 'E2E approval' }).first().click()
+  const deepApprove = page.getByRole('button', { name: 'Approve', exact: true })
+  await expect(deepApprove).toBeVisible()
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight))
+  const deepBar = (await bar.boundingBox())!
+  const deepBtn = (await deepApprove.boundingBox())!
+  expect(deepBtn.y + deepBtn.height).toBeLessThanOrEqual(deepBar.y + 1)
+  // Clickable proves not covered: Playwright refuses a covered target. This is
+  // also what returns the inbox to empty for the tests above.
+  await deepApprove.click()
+})

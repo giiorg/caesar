@@ -1,3 +1,4 @@
+import { Link } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
 import type { components } from '../api/schema'
 import type { ConnectionState } from '../realtime/connection-state'
@@ -30,7 +31,12 @@ export function AppShell(props: {
   return (
     <div className="bg-ground text-text flex min-h-dvh flex-col">
       <header className="border-border bg-surface flex items-center justify-between border-b px-4 py-2">
-        <span className="font-mono text-sm">caesar</span>
+        {/* The wordmark is a link Home — the affordance every web surface has
+            trained people to expect. In the <header>, so it adds no second
+            navigation landmark. */}
+        <Link to="/" className="font-mono text-sm">
+          caesar
+        </Link>
         <div className="flex items-center gap-2">
           <span className="text-text-muted font-mono text-xs">{props.me.user.email}</span>
           <ThemeToggle />
@@ -43,7 +49,10 @@ export function AppShell(props: {
           viewport `md:order-first` on the <nav> moves the rail to the left of
           <main> visually, which is a paint decision and not a reading order. */}
       <div className="flex flex-1 flex-col md:flex-row">
-        <main className="flex-1 p-4">{props.children}</main>
+        {/* `pb-tab-bar` is the other half of the fixed bar: pinning alone would
+            overlay the last screenful of every page. `md:pb-4` gives it back on
+            a viewport where the bar is display:none and the nav is a rail. */}
+        <main className="flex-1 p-4 pb-tab-bar md:pb-4">{props.children}</main>
         <Nav approvalCount={props.approvalCount ?? 0} />
       </div>
     </div>
