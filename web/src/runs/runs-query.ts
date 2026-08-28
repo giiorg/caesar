@@ -30,6 +30,12 @@ export type RunFilters = { status?: string; taskId?: string }
  * filters])]`) times both of them out at 5s, because the frame arrives, the
  * bridge invalidates `['runs']`, and nothing matches.
  *
+ * WHEN it goes out is a separate question from WHICH keys it reaches, and Task
+ * 12 split them: a window carrying any non-`phase.*` kind invalidates `['runs']`
+ * at once, and a phase-only burst gets one trailing refresh per
+ * `PHASE_TIER_THROTTLE_MS` instead of one per debounce window. The prefix width
+ * above is unaffected — whichever tier fires, it fires the bare `['runs']`.
+ *
  * ONE PAGE, deliberately. 12a's screens show the newest runs and infinite
  * scroll is not in the locked designs. The contract's `next_cursor` is
  * discarded here rather than absent from the wire, so the next plan can page

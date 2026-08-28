@@ -19,8 +19,13 @@ export type Task = components['schemas']['ApiTaskResponse']
  * THE KEY IS `['tasks']` WITH NOTHING AFTER IT. There are no filters on this
  * screen — the grouping is computed client-side from a status the list already
  * carries — so a second element would be an empty object that only made the key
- * harder to read. The cache bridge invalidates this exact prefix; see
- * `cache-bridge.ts` for why every frame reaches it.
+ * harder to read. The cache bridge invalidates this exact prefix, and every
+ * frame still reaches it — but since Task 12 not every frame reaches it at
+ * once: a window carrying any non-`phase.*` kind refetches this list
+ * immediately, while a phase-only burst collapses into one trailing refresh per
+ * `PHASE_TIER_THROTTLE_MS`. The Tasks screen's groups come from a run's STATUS,
+ * which is a lifecycle fact, so the tier that moves a row is the immediate one;
+ * the throttled tier is what keeps its PhaseDots advancing.
  */
 export const tasksQueryOptions = queryOptions({
   queryKey: ['tasks'],

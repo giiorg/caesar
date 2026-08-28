@@ -376,7 +376,7 @@ describe('Home', () => {
     expect(screen.queryByText(/showing the 10 most recent/i)).toBeNull()
   })
 
-  it('redraws when a phase transition arrives, with no user action', async () => {
+  it('redraws when a phase transition arrives, with no user action — on the REAL throttle', async () => {
     // THE FIRST OBSERVATION OF THE `['runs', filters]` PREFIX MATCH, which
     // `runs-query.ts` and `cache-bridge.ts` have each claimed in a comment and
     // nothing has asserted. The bridge invalidates the BARE `['runs']`; this
@@ -385,9 +385,18 @@ describe('Home', () => {
     // (`['runs:waiting']`) would make that prefix match nothing, and the only
     // symptom would be a list quietly as stale as the refresh floor allows.
     //
-    // The end-to-end claim of Task 9, asserted on the rendered DOM rather than
-    // on a request count: a refetch is the MECHANISM, and forbidding it would
-    // assert against the design.
+    // THE SLOWEST TEST IN THE TREE, DELIBERATELY, since Task 12. A `phase.*`
+    // frame now reaches this list on the throttled tier, so the wait is 250ms
+    // of debounce plus PHASE_TIER_THROTTLE_MS — about 5.3 seconds of real
+    // clock, through the PRODUCTION bridge with its own timers. That cost is
+    // the whole value: decisions §7 locks Home's live phase dots, 5s is a bet
+    // against that lock, and this is the only thing in the tree that would
+    // notice the constant being retuned to the 60s refresh floor. Everything
+    // faster — `cache-bridge.test.ts`, `refetch-fan.test.tsx` — runs on an
+    // injected timer and would pass with any value at all.
+    //
+    // Asserted on the rendered DOM rather than on a request count: a refetch
+    // is the MECHANISM, and forbidding it would assert against the design.
     const stream = scriptedStream()
     let phases = ['build:running:implement']
     renderApp('/', [inbox(0), runs(() => [runWith(phases)]), stream.handler])
@@ -399,9 +408,9 @@ describe('Home', () => {
         expect(
           within(screen.getByTestId('phase-dots')).getAllByRole('listitem')[0],
         ).toHaveAttribute('data-state', 'succeeded'),
-      { timeout: 5_000 },
+      { timeout: 10_000 },
     )
-  })
+  }, 15_000)
 
   it('carries the decision rules of every host', async () => {
     // The SAME assertions Task 11 exports, run against this host. §7 asks for

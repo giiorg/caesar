@@ -739,10 +739,14 @@ describe('run detail', () => {
 
   it('advances live when a phase transition arrives, with no user action', async () => {
     // THE END-TO-END PROOF OF THE `['run', runId]` SPELLING. The bridge names
-    // that key from a frame (`realtime/cache-bridge.ts:92`) and
-    // `runs/run-query.ts:32` spells it again; the two are deliberately not a
-    // shared constant, so nothing but this round trip holds them together and a
-    // typo in either is invisible to the compiler and to every other test.
+    // that key from a frame (`realtime/cache-bridge.ts`) and `runs/run-query.ts`
+    // spells it again; the two are deliberately not a shared constant, so
+    // nothing but this round trip holds them together and a typo in either is
+    // invisible to the compiler and to every other test.
+    //
+    // It is also the one live-update test a `phase.*` frame still drives at full
+    // speed after Task 12: the run DTO is the per-window tier, so this lands in
+    // 250ms while the collections wait out the throttle.
     const stream = scriptedStream()
     let shape = threePhases()
     renderApp('/runs/run-1', [run(() => shape), stream.handler])
@@ -755,12 +759,21 @@ describe('run detail', () => {
     )
   })
 
-  it('carries the event log along on the same frame, with no second rule', async () => {
-    // The log's key is `['run', runId, 'events']` and the bridge invalidates
-    // `['run', runId]`, which react-query PREFIX-matches unless `exact` is set.
-    // Nothing in the tree states that relationship — it is a property of two
-    // literals in two files — so this is the only thing that would notice the
-    // key being respelled `['run-events', runId]`.
+  it('carries the event log along on the same frame, by NAMING it', async () => {
+    // The log's key is `['run', runId, 'events']` and this is the only thing in
+    // the tree that would notice it being respelled `['run-events', runId]` —
+    // the spelling lives in two files as two literals, deliberately not as a
+    // shared constant.
+    //
+    // WHAT CARRIES IT CHANGED IN TASK 12, and the old sentence here is why this
+    // comment is being rewritten rather than left alone: the log used to arrive
+    // for free, because the bridge invalidated `['run', runId]` and react-query
+    // prefix-matches unless `exact` is set. That prefix ride is exactly what
+    // made a chatty run refetch its whole log ten times a window, so the run DTO
+    // now goes out exact and the log states its own tier membership. This test
+    // stayed green across that change with its stated reason turned false —
+    // `gate.waiting` is a lifecycle kind, so the log is invalidated by name on
+    // the immediate tier.
     const stream = scriptedStream()
     let rows = threeEvents()
     renderApp('/runs/run-1', [run(threePhases()), events(() => rows), stream.handler])

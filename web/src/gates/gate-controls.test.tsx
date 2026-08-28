@@ -414,9 +414,9 @@ describe('gate controls', () => {
     expect(await screen.findByText('cid-77')).toBeInTheDocument()
   })
 
-  it('invalidates all four keys of its cache contract, the TASK list among them', async () => {
+  it('invalidates all five keys of its cache contract, the EVENT LOG among them', async () => {
     // A SPY on the key set, where every other test in this file asserts through
-    // a rendered surface, and the reason is that three of these four keys have
+    // a rendered surface, and the reason is that four of these five keys have
     // no host here to observe them: `['tasks']` belongs to a screen these
     // controls never mount, so a behavioural proof would mean rendering the
     // Tasks list around a gate decision to watch one refetch. What the contract
@@ -427,15 +427,23 @@ describe('gate controls', () => {
     // frames that follow it are idempotent only if both invalidate the same
     // things — so a key silently dropped from either side is the failure worth
     // catching, and only an equality assertion catches a drop.
+    //
+    // THE WHOLE FILTER OBJECT, not `c[0]?.queryKey`, and that is Task 12's
+    // doing. `exact: true` on the run key is what keeps `['run', id, 'events']`
+    // off the prefix — which is why the log had to be added explicitly on the
+    // line below it — and a reader that projected the key alone would leave the
+    // flag unfalsifiable here: delete it and the five keys still come out in
+    // this order.
     const spy = vi.spyOn(queryClient, 'invalidateQueries')
     renderControls({ evidence: decidable })
     await userEvent.click(await screen.findByRole('button', { name: /^approve$/i }))
     await waitFor(() =>
-      expect(spy.mock.calls.map((c) => c[0]?.queryKey)).toEqual([
-        ['approvals'],
-        ['runs'],
-        ['tasks'],
-        ['run', 'r1'],
+      expect(spy.mock.calls.map((c) => c[0])).toEqual([
+        { queryKey: ['approvals'] },
+        { queryKey: ['run', 'r1'], exact: true },
+        { queryKey: ['runs'] },
+        { queryKey: ['tasks'] },
+        { queryKey: ['run', 'r1', 'events'] },
       ]),
     )
   })

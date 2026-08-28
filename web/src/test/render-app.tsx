@@ -1,4 +1,4 @@
-import { QueryClientProvider } from '@tanstack/react-query'
+import { QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { createMemoryHistory, createRouter, RouterProvider } from '@tanstack/react-router'
 import { render } from '@testing-library/react'
 import { delay, HttpResponse, http, type RequestHandler } from 'msw'
@@ -116,7 +116,69 @@ export function scriptedStream() {
  * `server.use` themselves before `renderApp` — silently loses, because the
  * harness's own call would then be the later one.
  */
-export function renderApp(path: string, handlers: RequestHandler[] = []) {
+/**
+ * A query options object, as loosely as this harness can state it and still
+ * refuse something that is not one.
+ *
+ * `UseQueryOptions<unknown, …>` would be the tempting spelling and it does not
+ * work: `queryFn` is contravariant in its context, so a concretely-typed
+ * `queryOptions<Task[], …, ['tasks']>` is NOT assignable to the `unknown`/
+ * `QueryKey` widening, and every caller would need a cast at its own site.
+ * `never[]` parameters accept any function shape, so the constraint stays on
+ * this side and the one cast lives with it.
+ *
+ * `queryFn` is OPTIONAL because `queryOptions()` returns it optional — MEASURED,
+ * `tsc` refuses `tasksQueryOptions` against a required one. The key is what this
+ * type really insists on, and it is the field the harness itself would use.
+ */
+type ObservableQuery = {
+  queryKey: readonly unknown[]
+  queryFn?: (...args: never[]) => unknown
+}
+
+/**
+ * AN OBSERVER PER OPTION, mounted inside the same provider as the router.
+ *
+ * An invalidation reaches a query only if something is watching it, so a test
+ * asserting "this endpoint was refetched N times" is measuring nothing unless
+ * the query has a live observer. MEASURED on `renderApp('/runs/run-1')`: the
+ * first paint fetches the run, its events, the inbox and `me` — and `['runs']`
+ * and `['tasks']` sit at ZERO, because run detail reads neither. Any ceiling on
+ * those two would pass against any bridge.
+ *
+ * A real `useQuery` rather than a hand-rolled `queryCache.subscribe`, because
+ * the property under test is what the CACHE does for an observer the way the
+ * app makes one — a subscription with different fetch semantics would answer a
+ * different question convincingly.
+ *
+ * The hook-in-a-loop is safe here and only here: `observe` is fixed for the
+ * lifetime of one `renderApp` call, so the hook order never changes.
+ */
+function Observers(props: { options: readonly ObservableQuery[] }) {
+  return (
+    <>
+      {props.options.map((o) => (
+        <Observer key={JSON.stringify(o.queryKey)} options={o} />
+      ))}
+    </>
+  )
+}
+
+function Observer(props: { options: ObservableQuery }) {
+  useQuery(props.options as Parameters<typeof useQuery>[0])
+  return null
+}
+
+/**
+ * @param observe query options to mount an observer for, ALONGSIDE the route.
+ *   `['approvals']` never needs one: `AppLayout`'s badge observes it on every
+ *   protected route.
+ */
+export function renderApp(
+  path: string,
+  handlers: RequestHandler[] = [],
+  opts: { observe?: readonly ObservableQuery[] } = {},
+) {
   queryClient.clear()
   server.use(
     ...handlers,
@@ -167,6 +229,7 @@ export function renderApp(path: string, handlers: RequestHandler[] = []) {
   })
   render(
     <QueryClientProvider client={queryClient}>
+      <Observers options={opts.observe ?? []} />
       <RouterProvider router={router} />
     </QueryClientProvider>,
   )

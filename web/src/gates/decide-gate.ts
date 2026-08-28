@@ -18,14 +18,22 @@ export type DecisionInput = { nodeId: string; decision: Decision; note?: string 
  * One gate decision.
  *
  * WHAT IT INVALIDATES IS THE WHOLE OF ITS CACHE CONTRACT, and it is deliberately
- * the same four keys the stream's bridge invalidates (the `fire()` in
- * `realtime/cache-bridge.ts:84-100`): the inbox (this gate left it), the run
- * list (the run's status changed), the TASK list — `TaskResponse.Status` IS the
- * latest run's status, so a decision moves the task between the Tasks screen's
- * four attention groups — and this run. Writing the new state into the cache instead would be the client
- * reconstructing an orchestrator transition it did not perform — approve
+ * the same five keys, spelled in the same order, that the stream's bridge sends
+ * out on its LIFECYCLE tier (`fire()` in `realtime/cache-bridge.ts`): the inbox
+ * (this gate left it), this run, the run list (the run's status changed), the
+ * TASK list — `TaskResponse.Status` IS the latest run's status, so a decision
+ * moves the task between the Tasks screen's four attention groups — and this
+ * run's EVENT LOG. Writing the new state into the cache instead would be the
+ * client reconstructing an orchestrator transition it did not perform — approve
  * resumes the run, request_changes opens a generation and rewinds a slice, and
  * neither is derivable from the response.
+ *
+ * THE LOG IS NAMED, AND THE RUN KEY IS EXACT, since Task 12. `['run', id,
+ * 'events']` used to arrive for free by prefix under `['run', id]`; the bridge's
+ * tier split made that invalidation exact, so a key that wants refreshing now
+ * has to say so. A gate decision is exactly the event that rewrites the log it
+ * is displayed beside, and a decision that left it stale would be the client
+ * showing a log that stops one row before the thing the user just did.
  *
  * The frames arriving from the stream a moment later are then idempotent with
  * this, which is why both paths invalidate rather than one of them patching.
@@ -61,9 +69,10 @@ export function useDecideGate(runId: string) {
       // that needs the refetch most — it is also what lets the conflict surface
       // name the decision that beat this caller to it.
       void qc.invalidateQueries({ queryKey: ['approvals'] })
+      void qc.invalidateQueries({ queryKey: ['run', runId], exact: true })
       void qc.invalidateQueries({ queryKey: ['runs'] })
       void qc.invalidateQueries({ queryKey: ['tasks'] })
-      void qc.invalidateQueries({ queryKey: ['run', runId] })
+      void qc.invalidateQueries({ queryKey: ['run', runId, 'events'] })
     },
   })
 }

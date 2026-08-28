@@ -162,19 +162,26 @@ describe('the runs list', () => {
     expect(screen.queryByText(/no runs yet/i)).toBeNull()
   })
 
-  it('refreshes a FILTERED list when a phase transition arrives', async () => {
+  it('refreshes a FILTERED list when a frame arrives', async () => {
     // THE PREFIX MATCH AT ITS LOAD-BEARING WIDTH. `cache-bridge.ts` invalidates
     // the bare `['runs']` and this screen mounts `['runs', {status:'running'}]`
     // — a key that is only reached because the filters live in the SECOND key
     // element. Home's version of this test covers `['runs', {}]`, which a
     // respelling to `['runs:waiting']` would break too; this one is the case
     // the comment in `runs-query.ts` actually names.
+    //
+    // A LIFECYCLE KIND, since Task 12, and the change is deliberate. This test's
+    // subject is the prefix WIDTH, which the frame's kind has nothing to do
+    // with; `run.started` reaches the list on the immediate tier and keeps the
+    // test at a few hundred milliseconds. The throttled tier's own real-clock
+    // proof is Home's version of this test, which pays 5.3 seconds for it once
+    // rather than twice.
     const stream = scriptedStream()
     let rows = [runRow({ id: 'run-1', task_title: 'still going', status: 'running' })]
     renderApp('/runs?status=running', [runs(() => rows), stream.handler])
     expect(within(await screen.findByTestId('run-list')).getAllByTestId('run-card')).toHaveLength(1)
     rows = [...rows, runRow({ id: 'run-9', task_title: 'just started', status: 'running' })]
-    await stream.emit({ kind: 'phase.started', run_id: 'run-9' })
+    await stream.emit({ kind: 'run.started', run_id: 'run-9' })
     await waitFor(
       () =>
         expect(within(screen.getByTestId('run-list')).getAllByTestId('run-card')).toHaveLength(2),

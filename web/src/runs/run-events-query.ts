@@ -15,14 +15,26 @@ export type RunEvent = components['schemas']['ApiRunEventResponse']
  * endpoint is described as the poll-and-resume path rather than a second live
  * channel.
  *
- * THE KEY IS `['run', runId, 'events']` AND THE PREFIX IS THE WHOLE MECHANISM.
- * The cache bridge invalidates `['run', runId]` for the run a frame names
- * (`realtime/cache-bridge.ts:92`), and react-query matches invalidation filters
- * by prefix unless `exact` is set — so this log follows the stream with no
- * second rule, and a key spelled `['run-events', runId]` would silently fall
- * back to the refresh floor. Nothing in either file states the relationship;
- * `routes/_app/runs.$runId.test.tsx` asserts the round trip instead, which is
- * the same choice `approvals-query.ts:10-14` records for its own key.
+ * THE KEY IS `['run', runId, 'events']` AND ITS REFRESHES ARE EXPLICIT, not a
+ * side effect of anyone else's prefix.
+ *
+ * It used to be the prefix: the bridge invalidated `['run', runId]`, react-query
+ * matched by prefix, and this log came along for free. Task 12 ended that — the
+ * run DTO now goes out `exact`, because riding the prefix meant a chatty run
+ * refetching its whole event log on every debounce window, which was the largest
+ * single term in the old refetch fan. So THREE call sites name this key on
+ * purpose, and they are the whole mechanism:
+ *
+ *   - `realtime/cache-bridge.ts`, on the LIFECYCLE tier — immediately, because a
+ *     terminal or gate event is the row the reader is waiting for;
+ *   - the same file's PHASE tier, on the trailing refresh — a phase burst moves
+ *     this log too, just not once per window;
+ *   - `gates/decide-gate.ts`, which writes the row it then re-reads.
+ *
+ * A key respelled `['run-events', runId]` would still fall silently back to the
+ * refresh floor, and `routes/_app/runs.$runId.test.tsx` still asserts that round
+ * trip end to end rather than the spelling — the same choice `approvals-query.ts`
+ * records for its own key.
  *
  * `after` is deliberately unset. It is the resume cursor — the operation
  * describes it as "return events with id greater than this" — and a query that
