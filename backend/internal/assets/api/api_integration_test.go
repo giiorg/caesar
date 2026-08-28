@@ -5,6 +5,8 @@ package api_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -320,10 +322,16 @@ func TestAssetsAPI_CredentialFreshnessFields(t *testing.T) {
 	if created.LastUsedAt != nil || created.LastAuthExpiredAt != nil {
 		t.Fatalf("freshness stamps = %v/%v, want unset on create", created.LastUsedAt, created.LastAuthExpiredAt)
 	}
-	// The unset stamps stay off the wire entirely.
+	// An unset stamp is on the wire as null, not omitted: the property is
+	// required AND nullable, so "never used" is an answer the screen renders
+	// rather than a key it fails to find.
 	raw := decodeInto[map[string]any](t, do(t, http.MethodGet, srv.URL+"/api/v1/credentials/"+created.ID, "admin-tok", nil))
-	if _, ok := raw["last_used_at"]; ok {
-		t.Fatal("last_used_at must be omitted while NULL")
+	v, ok := raw["last_used_at"]
+	if !ok {
+		t.Fatal("last_used_at must be present while NULL, not omitted")
+	}
+	if v != nil {
+		t.Fatalf("last_used_at = %v, want null before any use", v)
 	}
 
 	// The secret round-trips byte for byte, and using it stamps the view.
@@ -347,4 +355,102 @@ func TestAssetsAPI_CredentialFreshnessFields(t *testing.T) {
 	if got := decodeInto[assetsapi.CredentialResponse](t, do(t, http.MethodGet, srv.URL+"/api/v1/credentials/"+created.ID, "admin-tok", nil)); got.SecretVersion != 2 {
 		t.Fatalf("secret_version = %d after rotate, want 2", got.SecretVersion)
 	}
+}
+
+// wantFingerprint asserts the property is PRESENT and carries want — nil for
+// the JSON null the three non-auth-file kinds store. Absence is checked
+// separately from the value, because `required:"true"` is exactly what lets a
+// client read null as an answer ("this kind has none") rather than as a key it
+// failed to find.
+func wantFingerprint(t *testing.T, where string, cred map[string]any, want any) {
+	t.Helper()
+	got, ok := cred["fingerprint"]
+	if !ok {
+		t.Fatalf("%s: no fingerprint property — required means the key is always on the wire", where)
+	}
+	if got != want {
+		t.Fatalf("%s: fingerprint = %v, want %v", where, got, want)
+	}
+}
+
+// TestAssetsAPI_FingerprintOnEveryCredentialReadPath pins the fingerprint to
+// all four reads, not just the list. Create, get, list and rotate each build
+// their own credentialRow, so a mapper wired at three of them passes a
+// list-only test and lies on whichever screen reads one of the other three.
+func TestAssetsAPI_FingerprintOnEveryCredentialReadPath(t *testing.T) {
+	srv, _, pool, ports := newTestServer(t)
+	admin := seedUser(t, pool, "root@example.com", authn.RoleAdmin)
+	login(ports, "admin-tok", admin)
+
+	// agent_auth_file is fingerprinted on tokens.refresh_token — the field
+	// that survives an access-token refresh, so one subscription keeps one
+	// fingerprint across renewals.
+	sum := sha256.Sum256([]byte("rt-face"))
+	wantFP := hex.EncodeToString(sum[:])
+
+	kinds := []struct {
+		kind, secret string
+		want         any
+	}{
+		{"forge_token", "ghp_forge", nil},
+		{"model_key", "sk-model", nil},
+		{"subscription_token", "sk-ant-oat01-sub", nil},
+		{"agent_auth_file", `{"tokens":{"refresh_token":"rt-face"}}`, wantFP},
+	}
+
+	ids := make(map[string]string, len(kinds))
+	for _, k := range kinds {
+		resp := do(t, http.MethodPost, srv.URL+"/api/v1/credentials", "admin-tok",
+			assetsapi.CreateCredentialRequest{Name: "cred-" + k.kind, Kind: k.kind, Secret: k.secret})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create %s = %d, want 201", k.kind, resp.StatusCode)
+		}
+		created := decodeInto[map[string]any](t, resp)
+		wantFingerprint(t, "create "+k.kind, created, k.want)
+		id, ok := created["id"].(string)
+		if !ok {
+			t.Fatalf("create %s: no id in %v", k.kind, created)
+		}
+		ids[k.kind] = id
+	}
+
+	for _, k := range kinds {
+		got := decodeInto[map[string]any](t, do(t, http.MethodGet, srv.URL+"/api/v1/credentials/"+ids[k.kind], "admin-tok", nil))
+		wantFingerprint(t, "get "+k.kind, got, k.want)
+	}
+
+	page := decodeInto[map[string]any](t, do(t, http.MethodGet, srv.URL+"/api/v1/credentials", "admin-tok", nil))
+	rows, ok := page["credentials"].([]any)
+	if !ok || len(rows) != len(kinds) {
+		t.Fatalf("list credentials = %v, want %d rows", page["credentials"], len(kinds))
+	}
+	byID := make(map[string]map[string]any, len(rows))
+	for _, r := range rows {
+		row, ok := r.(map[string]any)
+		if !ok {
+			t.Fatalf("list row = %v, want an object", r)
+		}
+		byID[row["id"].(string)] = row
+	}
+	for _, k := range kinds {
+		wantFingerprint(t, "list "+k.kind, byID[ids[k.kind]], k.want)
+	}
+
+	// Rotation is the fourth read path and the only one whose answer must
+	// differ from the created row's: it recomputes, so a response echoing the
+	// value the credential was created with is wrong here and nowhere else.
+	rotatedSum := sha256.Sum256([]byte("rt-rotated"))
+	resp := do(t, http.MethodPut, srv.URL+"/api/v1/credentials/"+ids["agent_auth_file"]+"/secret", "admin-tok",
+		assetsapi.RotateCredentialSecretRequest{Secret: `{"tokens":{"refresh_token":"rt-rotated"}}`})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rotate agent_auth_file = %d, want 200", resp.StatusCode)
+	}
+	wantFingerprint(t, "rotate agent_auth_file", decodeInto[map[string]any](t, resp), hex.EncodeToString(rotatedSum[:]))
+
+	resp = do(t, http.MethodPut, srv.URL+"/api/v1/credentials/"+ids["forge_token"]+"/secret", "admin-tok",
+		assetsapi.RotateCredentialSecretRequest{Secret: "ghp_forge_2"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rotate forge_token = %d, want 200", resp.StatusCode)
+	}
+	wantFingerprint(t, "rotate forge_token", decodeInto[map[string]any](t, resp), nil)
 }

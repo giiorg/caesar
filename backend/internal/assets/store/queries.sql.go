@@ -78,7 +78,7 @@ func (q *Queries) AcquireLease(ctx context.Context, arg AcquireLeaseParams) (Cre
 const createCredential = `-- name: CreateCredential :one
 INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext, fingerprint)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
+RETURNING id, name, kind, key_id, secret_version, fingerprint, last_used_at, last_auth_expired_at, created_at, updated_at
 `
 
 type CreateCredentialParams struct {
@@ -97,6 +97,7 @@ type CreateCredentialRow struct {
 	Kind              string
 	KeyID             string
 	SecretVersion     int64
+	Fingerprint       pgtype.Text
 	LastUsedAt        *time.Time
 	LastAuthExpiredAt *time.Time
 	CreatedAt         time.Time
@@ -120,6 +121,7 @@ func (q *Queries) CreateCredential(ctx context.Context, arg CreateCredentialPara
 		&i.Kind,
 		&i.KeyID,
 		&i.SecretVersion,
+		&i.Fingerprint,
 		&i.LastUsedAt,
 		&i.LastAuthExpiredAt,
 		&i.CreatedAt,
@@ -259,7 +261,7 @@ func (q *Queries) DeleteRepo(ctx context.Context, id uuid.UUID) (int64, error) {
 }
 
 const getCredential = `-- name: GetCredential :one
-SELECT id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
+SELECT id, name, kind, key_id, secret_version, fingerprint, last_used_at, last_auth_expired_at, created_at, updated_at
 FROM credentials WHERE id = $1
 `
 
@@ -269,6 +271,7 @@ type GetCredentialRow struct {
 	Kind              string
 	KeyID             string
 	SecretVersion     int64
+	Fingerprint       pgtype.Text
 	LastUsedAt        *time.Time
 	LastAuthExpiredAt *time.Time
 	CreatedAt         time.Time
@@ -284,6 +287,7 @@ func (q *Queries) GetCredential(ctx context.Context, id uuid.UUID) (GetCredentia
 		&i.Kind,
 		&i.KeyID,
 		&i.SecretVersion,
+		&i.Fingerprint,
 		&i.LastUsedAt,
 		&i.LastAuthExpiredAt,
 		&i.CreatedAt,
@@ -522,7 +526,7 @@ func (q *Queries) ListCredentialRowsForUpdate(ctx context.Context) ([]ListCreden
 }
 
 const listCredentials = `-- name: ListCredentials :many
-SELECT id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
+SELECT id, name, kind, key_id, secret_version, fingerprint, last_used_at, last_auth_expired_at, created_at, updated_at
 FROM credentials ORDER BY name
 `
 
@@ -532,6 +536,7 @@ type ListCredentialsRow struct {
 	Kind              string
 	KeyID             string
 	SecretVersion     int64
+	Fingerprint       pgtype.Text
 	LastUsedAt        *time.Time
 	LastAuthExpiredAt *time.Time
 	CreatedAt         time.Time
@@ -553,6 +558,7 @@ func (q *Queries) ListCredentials(ctx context.Context) ([]ListCredentialsRow, er
 			&i.Kind,
 			&i.KeyID,
 			&i.SecretVersion,
+			&i.Fingerprint,
 			&i.LastUsedAt,
 			&i.LastAuthExpiredAt,
 			&i.CreatedAt,
@@ -921,7 +927,7 @@ UPDATE credentials
 SET key_id = $2, wrapped_dek = $3, ciphertext = $4, fingerprint = $5,
     secret_version = secret_version + 1, updated_at = $6
 WHERE id = $1
-RETURNING id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
+RETURNING id, name, kind, key_id, secret_version, fingerprint, last_used_at, last_auth_expired_at, created_at, updated_at
 `
 
 type UpdateCredentialSecretParams struct {
@@ -939,6 +945,7 @@ type UpdateCredentialSecretRow struct {
 	Kind              string
 	KeyID             string
 	SecretVersion     int64
+	Fingerprint       pgtype.Text
 	LastUsedAt        *time.Time
 	LastAuthExpiredAt *time.Time
 	CreatedAt         time.Time
@@ -964,6 +971,7 @@ func (q *Queries) UpdateCredentialSecret(ctx context.Context, arg UpdateCredenti
 		&i.Kind,
 		&i.KeyID,
 		&i.SecretVersion,
+		&i.Fingerprint,
 		&i.LastUsedAt,
 		&i.LastAuthExpiredAt,
 		&i.CreatedAt,

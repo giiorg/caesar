@@ -11,10 +11,16 @@ import (
 
 // required:"true" on the fields below is read by swaggest/jsonschema-go and
 // puts the property in the schema's `required` array; without it
-// openapi-typescript renders every property optional. Only Plan 11's web
-// slice is marked up — the rest of this file's DTOs are Plan 12's to do as
-// those screens arrive. required and nullable are independent: Grants stays
-// type ["array","null"] because the handler really can emit null.
+// openapi-typescript renders every property optional. Every RESPONSE type
+// here is now marked — Plan 11 did the login/me slice, Plan 12 the
+// admin-users and project-grants ones as their screens arrived. The request
+// bodies are not swept: LoginRequest is marked because Plan 11's form read
+// it, and UpdateUserRequest must STAY unmarked because a PATCH that omits a
+// key means "leave it alone". CreateUserRequest, ChangePasswordRequest and
+// SetGrantRequest are simply unswept — they are inputs, so no screen reads
+// them through a generated type. required and nullable are independent:
+// Grants stays type ["array","null"] because the handler really can emit
+// null.
 
 type LoginRequest struct {
 	Email    string `json:"email" required:"true"`
@@ -41,7 +47,7 @@ type MeResponse struct {
 }
 
 type UserListResponse struct {
-	Users []UserResponse `json:"users"`
+	Users []UserResponse `json:"users" required:"true"`
 }
 
 type CreateUserRequest struct {
@@ -61,13 +67,13 @@ type ChangePasswordRequest struct {
 }
 
 type ProjectGrantResponse struct {
-	UserID string `json:"user_id"`
-	Email  string `json:"email"`
-	Level  string `json:"level"`
+	UserID string `json:"user_id" required:"true"`
+	Email  string `json:"email" required:"true"`
+	Level  string `json:"level" required:"true"`
 }
 
 type GrantListResponse struct {
-	Grants []ProjectGrantResponse `json:"grants"`
+	Grants []ProjectGrantResponse `json:"grants" required:"true"`
 }
 
 type SetGrantRequest struct {

@@ -2635,6 +2635,9 @@
             ]
           }
         },
+        "required": [
+          "credentials"
+        ],
         "type": "object"
       },
       "ApiCredentialResponse": {
@@ -2642,6 +2645,12 @@
           "created_at": {
             "format": "date-time",
             "type": "string"
+          },
+          "fingerprint": {
+            "type": [
+              "null",
+              "string"
+            ]
           },
           "id": {
             "type": "string"
@@ -2682,6 +2691,19 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "key_id",
+          "secret_version",
+          "provided_at",
+          "fingerprint",
+          "last_used_at",
+          "last_auth_expired_at",
+          "created_at",
+          "updated_at"
+        ],
         "type": "object"
       },
       "ApiDecisionPageResponse": {
@@ -2870,6 +2892,9 @@
             ]
           }
         },
+        "required": [
+          "grants"
+        ],
         "type": "object"
       },
       "ApiGrantResponse": {
@@ -2899,6 +2924,9 @@
             ]
           }
         },
+        "required": [
+          "harnesses"
+        ],
         "type": "object"
       },
       "ApiHarnessResponse": {
@@ -2937,6 +2965,17 @@
             "type": "string"
           }
         },
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "image_ref",
+          "provider_endpoint",
+          "credential_id",
+          "defaults",
+          "created_at",
+          "updated_at"
+        ],
         "type": "object"
       },
       "ApiLoginRequest": {
@@ -3127,6 +3166,11 @@
             "type": "string"
           }
         },
+        "required": [
+          "user_id",
+          "email",
+          "level"
+        ],
         "type": "object"
       },
       "ApiProjectListResponse": {
@@ -3729,6 +3773,9 @@
             ]
           }
         },
+        "required": [
+          "users"
+        ],
         "type": "object"
       },
       "ApiUserResponse": {

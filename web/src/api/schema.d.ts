@@ -845,25 +845,26 @@ export interface components {
             name?: string;
         };
         ApiCredentialListResponse: {
-            credentials?: components["schemas"]["ApiCredentialResponse"][] | null;
+            credentials: components["schemas"]["ApiCredentialResponse"][] | null;
         };
         ApiCredentialResponse: {
             /** Format: date-time */
-            created_at?: string;
-            id?: string;
-            key_id?: string;
-            kind?: string;
+            created_at: string;
+            fingerprint: null | string;
+            id: string;
+            key_id: string;
+            kind: string;
             /** Format: date-time */
-            last_auth_expired_at?: null | string;
+            last_auth_expired_at: null | string;
             /** Format: date-time */
-            last_used_at?: null | string;
-            name?: string;
+            last_used_at: null | string;
+            name: string;
             /** Format: date-time */
-            provided_at?: string;
+            provided_at: string;
             /** Format: int64 */
-            secret_version?: number;
+            secret_version: number;
             /** Format: date-time */
-            updated_at?: string;
+            updated_at: string;
         };
         ApiDecisionPageResponse: {
             decisions: components["schemas"]["ApiDecisionResponse"][] | null;
@@ -914,29 +915,29 @@ export interface components {
             wall_deadline: string;
         };
         ApiGrantListResponse: {
-            grants?: components["schemas"]["ApiProjectGrantResponse"][] | null;
+            grants: components["schemas"]["ApiProjectGrantResponse"][] | null;
         };
         ApiGrantResponse: {
             level: string;
             project_id: string;
         };
         ApiHarnessListResponse: {
-            harnesses?: components["schemas"]["ApiHarnessResponse"][] | null;
+            harnesses: components["schemas"]["ApiHarnessResponse"][] | null;
         };
         ApiHarnessResponse: {
             /** Format: date-time */
-            created_at?: string;
-            credential_id?: string;
-            defaults?: {
+            created_at: string;
+            credential_id: string;
+            defaults: {
                 [key: string]: unknown;
             } | null;
-            id?: string;
-            image_ref?: string;
-            kind?: string;
-            name?: string;
-            provider_endpoint?: string;
+            id: string;
+            image_ref: string;
+            kind: string;
+            name: string;
+            provider_endpoint: string;
             /** Format: date-time */
-            updated_at?: string;
+            updated_at: string;
         };
         ApiLoginRequest: {
             email: string;
@@ -988,9 +989,9 @@ export interface components {
             title: string;
         };
         ApiProjectGrantResponse: {
-            email?: string;
-            level?: string;
-            user_id?: string;
+            email: string;
+            level: string;
+            user_id: string;
         };
         ApiProjectListResponse: {
             projects: components["schemas"]["ApiProjectResponse"][] | null;
@@ -1149,7 +1150,7 @@ export interface components {
             status: string;
         };
         ApiUserListResponse: {
-            users?: components["schemas"]["ApiUserResponse"][] | null;
+            users: components["schemas"]["ApiUserResponse"][] | null;
         };
         ApiUserResponse: {
             active: boolean;

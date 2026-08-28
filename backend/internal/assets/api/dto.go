@@ -82,21 +82,32 @@ func repoResponse(r assets.Repo) RepoResponse {
 // control plane. ProvidedAt is when the operator last supplied a secret
 // value; together with the two freshness stamps it is what an operator
 // reads to decide whether a subscription credential needs re-importing.
+//
+// The three nullable properties are required AND nullable, which is the
+// honest pair: "never used", "never auth-expired" and "this kind has no
+// fingerprint" are answers the credentials screen renders, not keys it
+// fails to find. That is why none of them carries omitempty — omitempty
+// contradicts required, and a client told a property is guaranteed and
+// then handed a body without it is reading a bug.
 type CredentialResponse struct {
-	ID                string     `json:"id"`
-	Name              string     `json:"name"`
-	Kind              string     `json:"kind"`
-	KeyID             string     `json:"key_id"`
-	SecretVersion     int64      `json:"secret_version"`
-	ProvidedAt        time.Time  `json:"provided_at"`
-	LastUsedAt        *time.Time `json:"last_used_at,omitempty"`
-	LastAuthExpiredAt *time.Time `json:"last_auth_expired_at,omitempty"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	ID            string    `json:"id" required:"true"`
+	Name          string    `json:"name" required:"true"`
+	Kind          string    `json:"kind" required:"true"`
+	KeyID         string    `json:"key_id" required:"true"`
+	SecretVersion int64     `json:"secret_version" required:"true"`
+	ProvidedAt    time.Time `json:"provided_at" required:"true"`
+	// Fingerprint is populated ONLY for agent_auth_file (it feeds the partial
+	// unique custody index; every other kind stores NULL) — required AND
+	// nullable, the honest pair.
+	Fingerprint       *string    `json:"fingerprint" required:"true"`
+	LastUsedAt        *time.Time `json:"last_used_at" required:"true"`
+	LastAuthExpiredAt *time.Time `json:"last_auth_expired_at" required:"true"`
+	CreatedAt         time.Time  `json:"created_at" required:"true"`
+	UpdatedAt         time.Time  `json:"updated_at" required:"true"`
 }
 
 type CredentialListResponse struct {
-	Credentials []CredentialResponse `json:"credentials"`
+	Credentials []CredentialResponse `json:"credentials" required:"true"`
 }
 
 type CreateCredentialRequest struct {
@@ -109,20 +120,23 @@ type RotateCredentialSecretRequest struct {
 	Secret string `json:"secret"`
 }
 
+// Defaults is required and nullable for the reason AuditEntryResponse.Detail
+// is: a Go map is always marshaled, and a nil one marshals to null. The key
+// is therefore always on the wire, carrying either an object or null.
 type HarnessResponse struct {
-	ID               string         `json:"id"`
-	Name             string         `json:"name"`
-	Kind             string         `json:"kind"`
-	ImageRef         string         `json:"image_ref"`
-	ProviderEndpoint string         `json:"provider_endpoint"`
-	CredentialID     string         `json:"credential_id"`
-	Defaults         map[string]any `json:"defaults"`
-	CreatedAt        time.Time      `json:"created_at"`
-	UpdatedAt        time.Time      `json:"updated_at"`
+	ID               string         `json:"id" required:"true"`
+	Name             string         `json:"name" required:"true"`
+	Kind             string         `json:"kind" required:"true"`
+	ImageRef         string         `json:"image_ref" required:"true"`
+	ProviderEndpoint string         `json:"provider_endpoint" required:"true"`
+	CredentialID     string         `json:"credential_id" required:"true"`
+	Defaults         map[string]any `json:"defaults" required:"true"`
+	CreatedAt        time.Time      `json:"created_at" required:"true"`
+	UpdatedAt        time.Time      `json:"updated_at" required:"true"`
 }
 
 type HarnessListResponse struct {
-	Harnesses []HarnessResponse `json:"harnesses"`
+	Harnesses []HarnessResponse `json:"harnesses" required:"true"`
 }
 
 type RegisterHarnessRequest struct {
@@ -145,7 +159,7 @@ type UpdateHarnessRequest struct {
 func credentialResponse(c assets.Credential) CredentialResponse {
 	return CredentialResponse{
 		ID: c.ID.String(), Name: c.Name, Kind: string(c.Kind), KeyID: c.KeyID,
-		SecretVersion: c.SecretVersion, ProvidedAt: c.UpdatedAt,
+		SecretVersion: c.SecretVersion, ProvidedAt: c.UpdatedAt, Fingerprint: c.Fingerprint,
 		LastUsedAt: c.LastUsedAt, LastAuthExpiredAt: c.LastAuthExpiredAt,
 		CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt,
 	}

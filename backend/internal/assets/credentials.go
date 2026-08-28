@@ -33,6 +33,13 @@ type credentialRow struct {
 	id                uuid.UUID
 	name, kind, keyID string
 	secretVersion     int64
+	// fingerprint keeps the store's own type rather than the domain's
+	// *string: sqlc has no text override, so every one of the four row
+	// structs spells it pgtype.Text, and holding it here lets each literal
+	// copy the field like its neighbours while newCredential unwraps it
+	// once. Four unwraps at the literals would be four chances to write it
+	// wrong.
+	fingerprint       pgtype.Text
 	lastUsedAt        *time.Time
 	lastAuthExpiredAt *time.Time
 	createdAt         time.Time
@@ -40,9 +47,14 @@ type credentialRow struct {
 }
 
 func newCredential(r credentialRow) Credential {
+	var fingerprint *string
+	if r.fingerprint.Valid {
+		fingerprint = &r.fingerprint.String
+	}
 	return Credential{
 		ID: r.id, Name: r.name, Kind: CredentialKind(r.kind), KeyID: r.keyID,
-		SecretVersion: r.secretVersion, LastUsedAt: r.lastUsedAt, LastAuthExpiredAt: r.lastAuthExpiredAt,
+		SecretVersion: r.secretVersion, Fingerprint: fingerprint,
+		LastUsedAt: r.lastUsedAt, LastAuthExpiredAt: r.lastAuthExpiredAt,
 		CreatedAt: r.createdAt, UpdatedAt: r.updatedAt,
 	}
 }
@@ -174,7 +186,8 @@ func (s *Service) CreateCredential(ctx context.Context, actor authn.Principal, n
 		}
 		c = newCredential(credentialRow{
 			id: row.ID, name: row.Name, kind: row.Kind, keyID: row.KeyID,
-			secretVersion: row.SecretVersion, lastUsedAt: row.LastUsedAt, lastAuthExpiredAt: row.LastAuthExpiredAt,
+			secretVersion: row.SecretVersion, fingerprint: row.Fingerprint,
+			lastUsedAt: row.LastUsedAt, lastAuthExpiredAt: row.LastAuthExpiredAt,
 			createdAt: row.CreatedAt, updatedAt: row.UpdatedAt,
 		})
 		return nil
@@ -194,7 +207,8 @@ func (s *Service) ListCredentials(ctx context.Context) ([]Credential, error) {
 	for _, r := range rows {
 		out = append(out, newCredential(credentialRow{
 			id: r.ID, name: r.Name, kind: r.Kind, keyID: r.KeyID,
-			secretVersion: r.SecretVersion, lastUsedAt: r.LastUsedAt, lastAuthExpiredAt: r.LastAuthExpiredAt,
+			secretVersion: r.SecretVersion, fingerprint: r.Fingerprint,
+			lastUsedAt: r.LastUsedAt, lastAuthExpiredAt: r.LastAuthExpiredAt,
 			createdAt: r.CreatedAt, updatedAt: r.UpdatedAt,
 		}))
 	}
@@ -211,7 +225,8 @@ func (s *Service) GetCredential(ctx context.Context, id uuid.UUID) (Credential, 
 	}
 	return newCredential(credentialRow{
 		id: row.ID, name: row.Name, kind: row.Kind, keyID: row.KeyID,
-		secretVersion: row.SecretVersion, lastUsedAt: row.LastUsedAt, lastAuthExpiredAt: row.LastAuthExpiredAt,
+		secretVersion: row.SecretVersion, fingerprint: row.Fingerprint,
+		lastUsedAt: row.LastUsedAt, lastAuthExpiredAt: row.LastAuthExpiredAt,
 		createdAt: row.CreatedAt, updatedAt: row.UpdatedAt,
 	}), nil
 }
@@ -276,7 +291,8 @@ func (s *Service) RotateCredentialSecret(ctx context.Context, actor authn.Princi
 		}
 		c = newCredential(credentialRow{
 			id: row.ID, name: row.Name, kind: row.Kind, keyID: row.KeyID,
-			secretVersion: row.SecretVersion, lastUsedAt: row.LastUsedAt, lastAuthExpiredAt: row.LastAuthExpiredAt,
+			secretVersion: row.SecretVersion, fingerprint: row.Fingerprint,
+			lastUsedAt: row.LastUsedAt, lastAuthExpiredAt: row.LastAuthExpiredAt,
 			createdAt: row.CreatedAt, updatedAt: row.UpdatedAt,
 		})
 		return nil

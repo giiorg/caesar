@@ -93,11 +93,16 @@ type Repo struct {
 // that was last used long after it last died is healthy, one that died
 // after its last use needs re-import.
 type Credential struct {
-	ID                uuid.UUID
-	Name              string
-	Kind              CredentialKind
-	KeyID             string
-	SecretVersion     int64
+	ID            uuid.UUID
+	Name          string
+	Kind          CredentialKind
+	KeyID         string
+	SecretVersion int64
+	// Fingerprint identifies the underlying subscription for the one kind
+	// that has one — agent_auth_file, hashed from tokens.refresh_token. It
+	// is what the partial unique custody index is built on, so every other
+	// kind stores NULL and reads back nil.
+	Fingerprint       *string
 	LastUsedAt        *time.Time
 	LastAuthExpiredAt *time.Time
 	CreatedAt         time.Time

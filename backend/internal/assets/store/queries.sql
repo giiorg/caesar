@@ -32,14 +32,14 @@ SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1);
 -- name: CreateCredential :one
 INSERT INTO credentials (id, name, kind, key_id, wrapped_dek, ciphertext, fingerprint)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at;
+RETURNING id, name, kind, key_id, secret_version, fingerprint, last_used_at, last_auth_expired_at, created_at, updated_at;
 
 -- name: ListCredentials :many
-SELECT id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
+SELECT id, name, kind, key_id, secret_version, fingerprint, last_used_at, last_auth_expired_at, created_at, updated_at
 FROM credentials ORDER BY name;
 
 -- name: GetCredential :one
-SELECT id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at
+SELECT id, name, kind, key_id, secret_version, fingerprint, last_used_at, last_auth_expired_at, created_at, updated_at
 FROM credentials WHERE id = $1;
 
 -- UseCredentialRow is the use-time read: it stamps last_used_at in the
@@ -63,7 +63,7 @@ UPDATE credentials
 SET key_id = $2, wrapped_dek = $3, ciphertext = $4, fingerprint = $5,
     secret_version = secret_version + 1, updated_at = $6
 WHERE id = $1
-RETURNING id, name, kind, key_id, secret_version, last_used_at, last_auth_expired_at, created_at, updated_at;
+RETURNING id, name, kind, key_id, secret_version, fingerprint, last_used_at, last_auth_expired_at, created_at, updated_at;
 
 -- RewrapCredential moves a row to another master key. The plaintext is
 -- unchanged, so secret_version, fingerprint, and updated_at ("when the
