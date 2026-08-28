@@ -2,6 +2,7 @@ import { queryOptions, useMutation, useQuery, useQueryClient } from '@tanstack/r
 import { useState } from 'react'
 import { FormProvider } from 'react-hook-form'
 import { z } from 'zod'
+import { usersQueryOptions } from '../admin/users-query'
 import { api, unwrap } from '../api/client'
 import { AUTH_SCOPED_QUERY_OPTIONS } from '../api/query-client'
 import type { components } from '../api/schema'
@@ -88,23 +89,6 @@ const grantsQueryOptions = (projectId: string) =>
       ).grants ?? [],
     ...AUTH_SCOPED_QUERY_OPTIONS,
   })
-
-/**
- * The user list, kept LOCAL to this module, on `repo-form.tsx`'s precedent.
- *
- * `GET /users` is admin-only (`identity/api/api.go`, `adminOnly`) and Task 21
- * builds the Users screen that owns it. Promoting the query now would put its
- * permanent home inside the group that happens to need it first, in a file that
- * task will not touch. One consumer means `tools/arch/import-graph.ts` says
- * nothing about where it lives, so the decision stays with the screen that owns
- * the resource — and Task 21 should IMPORT what it builds there rather than
- * leave two spellings of `['users']`, which would be two cache entries.
- */
-const usersQueryOptions = queryOptions({
-  queryKey: ['users'],
-  queryFn: async () => (await unwrap(await api.GET('/api/v1/users'))).users ?? [],
-  ...AUTH_SCOPED_QUERY_OPTIONS,
-})
 
 /**
  * Who can reach this project, and the controls to change it.

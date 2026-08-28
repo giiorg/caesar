@@ -254,6 +254,23 @@ export function renderApp(
     // otherwise.
     http.get('/api/v1/projects/:id/grants', () => HttpResponse.json({ grants: null })),
     http.get('/api/v1/credentials', () => HttpResponse.json({ credentials: null })),
+    // `users: null`, for the SEVENTH time and the same reason: required AND
+    // nullable, because a Go nil slice marshals to null; `handleListUsers`
+    // happens to build a non-nil slice today; and the `?? []` in
+    // `admin/users-query.ts` would otherwise be unreachable from every test in
+    // the tree.
+    //
+    // IT IS OBSERVED RATHER THAN MERELY PRESENT, which is the trap Task 19 fell
+    // into and Task 20 wrote down: `users-section.test.tsx`'s "renders the
+    // frame against the default list" deliberately does NOT override it, so
+    // deleting that coalesce kills a real test rather than none.
+    //
+    // Note this default is NOT an honest empty-list fixture the way `runs: null`
+    // is. `GET /users` is admin-only and returns every account, so its reader is
+    // always in the answer and a genuinely empty list cannot happen — which is
+    // why the Users section has no empty state. What the default exercises is
+    // the NULL, which the contract does permit.
+    http.get('/api/v1/users', () => HttpResponse.json({ users: null })),
     http.get('/api/v1/stream', silentStream),
   )
   // BOTH router arguments are load-bearing and neither is optional.
