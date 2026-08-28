@@ -232,6 +232,66 @@ func TestAssetsAPI_RepoEndpointsEnforceManage(t *testing.T) {
 	}
 }
 
+// A repo held by a task answers 409 with a body that says which repo problem
+// it is. Before this classification the same request was a 500 "internal
+// error", which a UI can only render as an outage.
+func TestAssetsAPI_DeleteRepoInUseIsAConflict(t *testing.T) {
+	ctx := context.Background()
+	srv, svc, pool, ports := newTestServer(t)
+	admin := seedUser(t, pool, "root@example.com", authn.RoleAdmin)
+	login(ports, "admin-tok", admin)
+
+	p, err := svc.CreateProject(ctx, admin, "p", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := svc.CreateCredential(ctx, admin, "gh", assets.CredentialForgeToken, []byte("tok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := svc.CreateRepo(ctx, admin, p.ID, assets.NewRepo{
+		Forge: assets.ForgeGitHub, Slug: "giiorg/caesar", CredentialID: cred.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Raw: assets never imports the execution spine, so there is no intake here.
+	var versionID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		WITH w AS (INSERT INTO workflows (name) VALUES ('wf') RETURNING id)
+		INSERT INTO workflow_versions (workflow_id, version, content_hash, document)
+		SELECT w.id, 1, 'h', '{}' FROM w RETURNING id`).Scan(&versionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO tasks (project_id, repo_id, workflow_version_id, title, requester_id, created_at)
+		VALUES ($1, $2, $3, 'a task', $4, now())`,
+		p.ID, repo.ID, versionID, admin.UserID); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := do(t, http.MethodDelete, srv.URL+"/api/v1/repos/"+repo.ID.String(), "admin-tok", nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("delete in-use repo = %d, want 409", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("content type = %q, want application/problem+json", ct)
+	}
+	pd := decodeInto[httpx.ProblemDetails](t, resp)
+	if pd.Title != "Conflict" || pd.Status != http.StatusConflict {
+		t.Fatalf("problem = %+v, want a conflict envelope", pd)
+	}
+	if !strings.Contains(pd.Detail, "tasks") {
+		t.Fatalf("detail = %q, want it to name tasks", pd.Detail)
+	}
+	if pd.CorrelationID == "" {
+		t.Fatal("a 409 must still carry the correlation id")
+	}
+	// That the repo survives is asserted at the service tier, and only as
+	// documentation: the rollback guarantees it whatever the classification
+	// does. Repeating it here would add a second assertion that cannot fail.
+}
+
 func TestAssetsAPI_CredentialFreshnessFields(t *testing.T) {
 	ctx := context.Background()
 	srv, svc, pool, ports := newTestServer(t)

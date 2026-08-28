@@ -211,9 +211,33 @@ func (s *Service) UpdateRepo(ctx context.Context, actor authn.Principal, id uuid
 	return repo, nil
 }
 
+// repoInUse turns the RESTRICT constraint Postgres reported into a refusal an
+// operator can act on. Exactly three foreign keys reference repos.id, all
+// ON DELETE RESTRICT: tasks.repo_id, approved_patches.repo_id and
+// publish_intents.repo_id.
+//
+// Only the tasks branch is reachable from a fixture, and that is a fact about
+// the schema rather than a gap in the tests: every publish row descends from a
+// run, every run from a task, and nothing in this system deletes a task — so a
+// repo holding publish records always holds tasks too, and when more than one
+// RESTRICT is violated Postgres reports whichever it checks first. The publish
+// wording is therefore a backstop that stays correct if that ever changes; it
+// is pinned by the unit test rather than by an integration fixture.
+func repoInUse(constraint string) error {
+	if constraint == "tasks_repo_id_fkey" {
+		return xerrors.E(xerrors.ClassConflict, "this repository is used by existing tasks")
+	}
+	return xerrors.E(xerrors.ClassConflict, "this repository has publish records; it cannot be deleted")
+}
+
 func (s *Service) DeleteRepo(ctx context.Context, actor authn.Principal, id uuid.UUID) error {
 	return pg.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		n, err := store.New(tx).DeleteRepo(ctx, id)
+		// Before the generic wrap, and before n == 0: a refused delete removes
+		// no row, so reading n first would report a live repo as missing.
+		if constraint, fk := fkViolation(err); fk {
+			return repoInUse(constraint)
+		}
 		if err != nil {
 			return fmt.Errorf("assets: delete repo: %w", err)
 		}

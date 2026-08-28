@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/giiorg/caesar/backend/internal/assets"
 	"github.com/giiorg/caesar/backend/internal/platform/authn"
@@ -119,5 +120,82 @@ func TestRepos_CRUDWithGuards(t *testing.T) {
 		if got := auditCount(t, pool, action); got != want {
 			t.Errorf("%s audits = %d, want %d", action, got, want)
 		}
+	}
+}
+
+// TestDeleteRepo_RefusedWhileTasksExist pins the RESTRICT refusal an operator
+// actually meets. The task row goes in raw: assets never imports the execution
+// spine (arch law), so this package has no intake to create one through, and
+// tasks.workflow_version_id is satisfiable only by a real workflow version.
+func TestDeleteRepo_RefusedWhileTasksExist(t *testing.T) {
+	ctx := context.Background()
+	svc, pool, _ := newTestService(t)
+	admin := seedActor(t, pool, "root@example.com", authn.RoleAdmin)
+
+	p, err := svc.CreateProject(ctx, admin, "p", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := svc.CreateCredential(ctx, admin, "gh", assets.CredentialForgeToken, []byte("tok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := svc.CreateRepo(ctx, admin, p.ID, assets.NewRepo{
+		Forge: assets.ForgeGitHub, Slug: "giiorg/caesar", CredentialID: cred.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second repo on the same project, referenced by nothing: it holds the
+	// refusal to THIS repo's tasks. Without it, "delete always conflicts" and
+	// "delete conflicts when a task points here" are the same test.
+	spare, err := svc.CreateRepo(ctx, admin, p.ID, assets.NewRepo{
+		Forge: assets.ForgeGitHub, Slug: "giiorg/spare", CredentialID: cred.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedTaskOn(t, pool, p.ID, repo.ID, admin.UserID)
+
+	err = svc.DeleteRepo(ctx, admin, repo.ID)
+	if xerrors.ClassOf(err) != xerrors.ClassConflict {
+		t.Fatalf("class = %v (%v), want conflict while tasks exist", xerrors.ClassOf(err), err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "tasks") {
+		t.Fatalf("message = %q, want it to name tasks", msg)
+	}
+	// Documentation, not a guard: the FK violation aborts the transaction
+	// (measured — a write placed after it fails with 25P02), so the rollback
+	// guarantees this whichever way the error is classified. An audit-count
+	// assertion here would restate the same rollback and read as coverage of
+	// the audit path, so there isn't one.
+	if _, err := svc.GetRepo(ctx, repo.ID); err != nil {
+		t.Fatalf("repo must survive a refused delete: %v", err)
+	}
+
+	if err := svc.DeleteRepo(ctx, admin, spare.ID); err != nil {
+		t.Fatalf("unreferenced repo must still delete: %v", err)
+	}
+}
+
+// seedTaskOn inserts the workflows → workflow_versions → tasks chain a
+// tasks.repo_id reference needs, with the minimum each NOT NULL and CHECK
+// accepts.
+func seedTaskOn(t *testing.T, pool *pgxpool.Pool, projectID, repoID, requesterID uuid.UUID) {
+	t.Helper()
+	ctx := context.Background()
+	var versionID uuid.UUID
+	err := pool.QueryRow(ctx, `
+		WITH w AS (INSERT INTO workflows (name) VALUES ('wf') RETURNING id)
+		INSERT INTO workflow_versions (workflow_id, version, content_hash, document)
+		SELECT w.id, 1, 'h', '{}' FROM w RETURNING id`).Scan(&versionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO tasks (project_id, repo_id, workflow_version_id, title, requester_id, created_at)
+		VALUES ($1, $2, $3, 'a task', $4, now())`,
+		projectID, repoID, versionID, requesterID); err != nil {
+		t.Fatal(err)
 	}
 }
