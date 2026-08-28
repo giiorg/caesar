@@ -55,7 +55,8 @@ import { type Run, runQueryOptions } from '../../runs/run-query'
  * PLAIN `z.number()`, NOT `z.coerce.number()`, and the reason is the measured
  * parser behaviour recorded above — `JSON.parse` per value, so a numeric param
  * ARRIVES AS A NUMBER. `coerce` therefore buys nothing on the happy path and
- * loses information on the unhappy one. MEASURED, both spellings, against `?phase=gate&generation=true`:
+ * loses information on the unhappy one. MEASURED, both spellings, against
+ * `?phase=gate&generation=true`:
  * `z.coerce.number()` reads the boolean as 1 and silently targets a real
  * attempt, while `z.number()` rejects the object, `validateSearch` answers
  * `{}`, the raw boolean survives the ancestor merge and the read-site narrow
@@ -81,11 +82,10 @@ const searchSchema = z.object({
  * does not remove it, which that schema's own comment measures at length — so
  * `generation` really can hold a boolean, a string, or a fractional number by
  * the time it reaches `useSearch()`. It re-asserts what the schema asserts,
- * rather than
- * merely `typeof === 'number'`: a `1.5` the schema rejected must land where a
- * `true` the schema rejected lands, and a looser narrow would instead route it
- * to the "not in this run's phase list" sentence, which reads as a claim about
- * the RUN rather than about the URL.
+ * rather than merely `typeof === 'number'`: a `1.5` the schema rejected must
+ * land where a `true` the schema rejected lands, and a looser narrow would
+ * instead route it to the "not in this run's phase list" sentence, which reads
+ * as a claim about the RUN rather than about the URL.
  */
 function attemptOrdinal(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
@@ -548,16 +548,30 @@ function EventRow(props: { runId: string; event: RunEvent }) {
  * kind is a lifecycle transition whose whole content is already the sentence in
  * the row.
  *
- * A PULL REQUEST IS TWO KINDS BECAUSE THE EMITTER PICKS ONE, NOT BECAUSE THERE
- * ARE TWO THINGS. `publish.go` builds ONE event, fills ONE payload — `node_id`,
- * `branch`, `pr_number`, `pr_url`, `state`, `adopted` — and then chooses its
- * kind: `EventPublishAdopted` when the branch already had a pull request open
- * and this run took it over, `EventPublishPROpened` when the run opened one
- * (`runs/publish.go:993-1017`). Same `pr_url` either way. So an adopted
- * publication has exactly the pull request an opened one has, and linking only
- * `pr_opened` would leave a reader looking at a row that names a PR nobody can
- * reach — indistinguishable from a bug. Spec §2.4 named only `pr_opened`
- * because nobody had read the emitter; it was amended to say both.
+ * A PULL REQUEST ARRIVES UNDER TWO KINDS, AND `publish.adopted` IS NOT ALWAYS
+ * ONE OF THEM. `openPublication` builds ONE event, fills ONE payload —
+ * `node_id`, `branch`, `pr_number`, `pr_url`, `state`, `adopted` — and then
+ * chooses its kind: `EventPublishAdopted` when the branch already had a pull
+ * request open and this run took it over, `EventPublishPROpened` when the run
+ * opened one (`runs/publish.go:993-1017`). Same `pr_url` either way, so linking
+ * only `pr_opened` would leave a reader looking at a row that names a PR nobody
+ * can reach — indistinguishable from a bug.
+ *
+ * BUT `publish.adopted` HAS A SECOND EMITTER, and it names no pull request at
+ * all: `pushPublication` writes the same kind when the push found the branch
+ * already at the wanted head and adopted it instead of pushing again
+ * (`runs/publish.go:807-810`) — the crash-after-push recovery. Its payload is
+ * `node_id`, `branch`, `head_sha`, `tree_hash`, `created`, with no `pr_url` and
+ * no `pr_number`, and the emitter says so itself: "`branch` is what tells the
+ * two `publish.adopted` meanings apart" (`runs/publish.go:832-834`).
+ *
+ * SO THE KIND SAYS A ROW MAY NAME A PULL REQUEST AND THE PAYLOAD SAYS WHETHER
+ * IT DOES — which is why the scheme guard below, not the kind test, is what
+ * decides that a link appears. A branch-adoption row falls out of it as the
+ * plain line it should be. Spec §2.4 named only `pr_opened` because nobody had
+ * read the emitters; it was amended to name both kinds, and amended again when
+ * the second `adopted` emitter turned up and made the first amendment's reason
+ * false.
  *
  * EVERY FIELD IS READ AS `unknown`, and that is the payload's actual type
  * (`api/schema.d.ts:983-985`) rather than caution. There is no typed event
@@ -599,7 +613,7 @@ function EventDestination(props: { runId: string; event: RunEvent }) {
     const number = payload.pr_number
     // A SCHEME CHECK, NOT A STRING CHECK, because this href is built from a
     // value the control plane copied out of a forge's JSON
-    // (`runs/publish.go:1010-1017` stores `pr.URL` verbatim) and never parsed.
+    // (`runs/publish.go:1016` stores `pr.URL` verbatim) and never parsed.
     //
     // NOT BECAUSE REACT WOULD OTHERWISE RUN IT — MEASURED on 19.2.8: React
     // REPLACES a `javascript:` href with `javascript:throw new Error('React

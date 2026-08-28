@@ -153,8 +153,9 @@ const gateDecision = (verb: string, note: string): NonNullable<Phase['decision']
  * They can only be separated by a round the gate did not take part in, and
  * `plan-gate` is that round. `attempt` is a PER-NODE ordinal that a
  * rematerialized node continues (`store/queries.sql:719-723`) while
- * `generation` is the RUN's revision round, bumped by `openRevision`
- * (`runs/revisions.go:30`) — the only writer of it — so any gate that has been
+ * `generation` is the RUN's revision round, bumped by `openRevision`'s call to
+ * `BumpRunGeneration` (`runs/revisions.go:129`, its only caller anywhere) — so
+ * any gate that has been
  * decided in every round of its run has attempt == generation forever. Here
  * `plan-gate` spends round 1 before `gate` has materialized at all, which is
  * what a workflow with a plan gate ahead of a review gate does every time.
@@ -827,7 +828,7 @@ describe('run detail', () => {
   })
 
   it('links a publish.pr_opened row to the pull request, and only a real URL', async () => {
-    // `pr_url` is the key (`runs/publish.go:1010-1017`), and it is a string the
+    // `pr_url` is the key (`runs/publish.go:1016`), and it is a string the
     // control plane copied out of a forge's JSON — so the scheme is checked
     // rather than assumed. All three rows below are the same code path with one
     // field changed, which is what stops the exact-list assertion passing
@@ -871,15 +872,18 @@ describe('run detail', () => {
     expect(links[0]).toHaveTextContent('#42')
   })
 
-  it('links publish.adopted to the same pull request, because it IS the same payload', async () => {
-    // `publish.go` builds ONE event and picks its kind — `publish.adopted` when
-    // the branch already had a pull request and this run took it over,
-    // `publish.pr_opened` when the run opened one — over one payload with one
-    // `pr_url` (`runs/publish.go:993-1017`). A reader looking at an adopted
-    // publication has exactly the pull request an opened one has, so a log that
-    // linked only one of the two kinds would be showing them a PR they cannot
-    // reach for a reason that is invisible from the row. Spec §2.4 named only
-    // `pr_opened`; it was amended in the same change as this test.
+  it('links the publish.adopted that adopted a PR, and not the one that adopted a branch', async () => {
+    // ONE KIND, TWO EMITTERS, AND ONLY ONE OF THEM NAMES A PULL REQUEST.
+    // `openPublication` picks `publish.adopted` over `publish.pr_opened` when
+    // the branch already had a PR and this run took it over, on the same
+    // payload with the same `pr_url` (`runs/publish.go:993-1017`) — so a log
+    // that linked only `pr_opened` would show a reader a PR they cannot reach
+    // for a reason invisible from the row. But `pushPublication` writes the
+    // same kind when the push found the branch already at the wanted head
+    // (`runs/publish.go:807-810`, the crash-after-push recovery), over
+    // `{node_id, branch, head_sha, tree_hash, created}` — no `pr_url` at all.
+    // Both rows are below because the kind cannot tell them apart and the
+    // payload can: the second one is the honest absence, a line with no link.
     //
     // The `adopted: true` flag in the payload is NOT what is read — the KIND is.
     // Asserting on the flag instead would pass against an implementation that
@@ -901,9 +905,22 @@ describe('run detail', () => {
           },
           occurred_at: AT,
         },
+        {
+          id: 2,
+          kind: 'publish.adopted',
+          payload: {
+            node_id: 'publish',
+            branch: 'caesar/run-1',
+            head_sha: 'c0ffee1',
+            tree_hash: 'deadbee',
+            created: false,
+          },
+          occurred_at: AT,
+        },
       ]),
     ])
     const log = await screen.findByTestId('event-log')
+    expect(within(log).getAllByRole('listitem')).toHaveLength(2)
     const link = within(log).getByRole('link')
     expect(link).toHaveAttribute('href', 'https://forge.test/pr/7')
     expect(link).toHaveTextContent('#7')
@@ -920,14 +937,16 @@ describe('run detail', () => {
       events([
         ...threeEvents(),
         { id: 4, kind: 'gate.decided', payload: { node_id: 'gate' }, occurred_at: AT },
-        // THE KIND IS THE FILTER, NOT THE PAYLOAD SHAPE, and this row is what
-        // says so: a perfectly usable `pr_url` under a kind §2.4 does not name.
-        // `publish.halted` carries no `pr_url` today — nothing but the one
-        // event `publish.go` builds does (`runs/publish.go:1010-1017`) — so
-        // without this row an implementation that linked ANY payload holding a
-        // URL would be green, and would start linking the first kind that ever
+        // THE KIND IS A FILTER THE PAYLOAD SHAPE CANNOT REPLACE, and this row
+        // is what says so: a perfectly usable `pr_url` under a kind §2.4 does
+        // not name. `publish.halted` carries no `pr_url` today — nothing but
+        // `openPublication`'s event does (`runs/publish.go:1016`) — so without
+        // this row an implementation that linked ANY payload holding a URL
+        // would be green, and would start linking the first kind that ever
         // gains one. MEASURED: dropping the kind test entirely survived until
-        // this row existed.
+        // this row existed. The converse — that the kind cannot replace the
+        // payload check either, because `publish.adopted` is written by an
+        // emitter that names no PR — is the branch-adoption row two tests up.
         {
           id: 5,
           kind: 'publish.halted',
