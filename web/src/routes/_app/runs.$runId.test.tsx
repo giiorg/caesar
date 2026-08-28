@@ -138,26 +138,65 @@ const gateDecision = (verb: string, note: string): NonNullable<Phase['decision']
  * shape for the attempt-precise link, and the ordinary life of a gate rather
  * than an edge case: request_changes opens a revision, which bumps the run's
  * generation and rematerializes the slice, and the gate comes back under the
- * SAME node id (`runs/revisions.go:22-40`). The attempt ordinal continues
- * across the round (`store/queries.sql:719-723`), so the second gate is
- * generation 2, attempt 2.
+ * SAME node id (`runs/revisions.go:22-40`). `?phase=gate` names both of its
+ * rows and the timeline collapses them to the newest, so a link carrying only
+ * the node would send BOTH `gate.decided` events to the approval — including
+ * the one recording the request for changes.
  *
- * `?phase=gate` names both of these rows and the timeline collapses them to the
- * newest, so a link that carried only the node would send BOTH `gate.decided`
- * events to the approval — including the one recording the request for changes.
+ * THE GATE'S GENERATION AND ATTEMPT DELIBERATELY DIFFER — (2,1) then (3,2) —
+ * AND AN EARLIER GATE IS WHAT MAKES THEM. A fixture whose two ordinals move
+ * together cannot tell the triple's second key from its third: MEASURED, a
+ * transposition at either wiring site (the arguments to `phaseForSelector`, or
+ * the two keys in the event row's `search`) survived the whole suite, and
+ * TypeScript catches neither because both are `number`.
+ *
+ * They can only be separated by a round the gate did not take part in, and
+ * `plan-gate` is that round. `attempt` is a PER-NODE ordinal that a
+ * rematerialized node continues (`store/queries.sql:719-723`) while
+ * `generation` is the RUN's revision round, bumped by `openRevision`
+ * (`runs/revisions.go:30`) — the only writer of it — so any gate that has been
+ * decided in every round of its run has attempt == generation forever. Here
+ * `plan-gate` spends round 1 before `gate` has materialized at all, which is
+ * what a workflow with a plan gate ahead of a review gate does every time.
+ *
+ * NOT A RETRY OF THE GATE, which was the other way to separate them and is not
+ * a shape the control plane can produce: `InsertGatePhase` writes
+ * `waiting_decision` and its own comment says the claim CTE predicates on
+ * `pending` (`store/queries.sql:404-411`), so a gate is never leased and never
+ * reaches the retry path that inserts `Attempt+1` at the same generation
+ * (`runs/orchestrator.go:1609`). `materializeNode` is the only writer of a gate
+ * row, so a gate's attempt advances once per revision round and never twice.
  */
 const twoDecisions = (): RunShape => ({
+  generation: 3,
   phases: [
-    phase({ node_id: 'impl', status: 'superseded' }),
+    // ROUND 1, and this gate is only here to spend it. Its request_changes is
+    // what carried the run to generation 2 while `impl` and `gate` below were
+    // still unmaterialized — a node materializes when its upstream lands.
     phase({
-      node_id: 'gate',
+      node_id: 'plan-gate',
       status: 'superseded',
-      decision: gateDecision('request_changes', 'narrow the diff'),
+      decision: gateDecision('request_changes', 'plan the migration first'),
     }),
-    phase({ node_id: 'impl', generation: 2, attempt: 2 }),
+    phase({
+      node_id: 'plan-gate',
+      generation: 2,
+      attempt: 2,
+      decision: gateDecision('approve', 'good plan'),
+    }),
+    // ROUND 2: `gate`'s FIRST attempt, at the run's SECOND generation.
+    phase({ node_id: 'impl', generation: 2, status: 'superseded' }),
     phase({
       node_id: 'gate',
       generation: 2,
+      status: 'superseded',
+      decision: gateDecision('request_changes', 'narrow the diff'),
+    }),
+    // ROUND 3: the same gate, one round on, at attempt 2.
+    phase({ node_id: 'impl', generation: 3, attempt: 2 }),
+    phase({
+      node_id: 'gate',
+      generation: 3,
       attempt: 2,
       decision: gateDecision('approve', 'ship it'),
     }),
@@ -172,7 +211,7 @@ const twoDecisionEvents = () => [
     payload: {
       node_id: 'gate',
       attempt: 1,
-      generation: 1,
+      generation: 2,
       decision: 'request_changes',
       examined_artifact_id: 'a1',
       acted_by: 'u2',
@@ -186,7 +225,7 @@ const twoDecisionEvents = () => [
     payload: {
       node_id: 'gate',
       attempt: 2,
-      generation: 2,
+      generation: 3,
       decision: 'approve',
       examined_artifact_id: 'a2',
       acted_by: 'u2',
@@ -689,8 +728,8 @@ describe('run detail', () => {
 
   it('sends each gate.decided row to ITS attempt, not to the newest of that node', async () => {
     // THE ACCEPTANCE SHAPE FOR §2.4's SECOND LINK CLASS. Both rows name the
-    // same node, so a `?phase=gate` link resolves both to generation 2 — and
-    // the row recording a request for changes would open somebody else's
+    // same node, so a `?phase=gate` link resolves both to the newest attempt —
+    // and the row recording a request for changes would open somebody else's
     // approval. The two clicks below are the same assertion in both
     // directions: each pane shows its own verb AND not the other's, so neither
     // half can pass because the text was never on screen.
@@ -700,7 +739,7 @@ describe('run detail', () => {
 
     await userEvent.click(within(log).getByRole('link', { name: /gate attempt 1/ }))
     await waitFor(() =>
-      expect(router.state.location.search).toEqual({ phase: 'gate', generation: 1, attempt: 1 }),
+      expect(router.state.location.search).toEqual({ phase: 'gate', generation: 2, attempt: 1 }),
     )
     expect(await within(detail).findByText(/requested changes on this gate/)).toBeVisible()
     expect(within(detail).queryByText(/approved this gate/)).toBeNull()
@@ -710,9 +749,21 @@ describe('run detail', () => {
     // tests read.
     expect(screen.getByTestId('phase-gate')).toHaveAttribute('data-state', 'superseded')
 
+    // AND EVERY OTHER ROW STILL SHOWS ITSELF. The selected attempt belongs to
+    // ONE row; a resolution that leaked into the closed rows would put the
+    // gate's node id and the gate's status on the `impl` row, which is a
+    // visible rendering bug that the two assertions above cannot see — MEASURED,
+    // the `open &&` conjunct in `PhaseTimeline`'s `shown` was unfalsifiable
+    // until this pair existed. The node label is asserted beside `data-state`
+    // because a leak changes both and the label is what a reader would notice.
+    const implRow = within(screen.getByTestId('phase-impl'))
+    expect(screen.getByTestId('phase-impl')).toHaveAttribute('data-state', 'succeeded')
+    expect(implRow.getAllByText('impl').length).toBeGreaterThan(0)
+    expect(implRow.queryByText('gate')).toBeNull()
+
     await userEvent.click(within(log).getByRole('link', { name: /gate attempt 2/ }))
     await waitFor(() =>
-      expect(router.state.location.search).toEqual({ phase: 'gate', generation: 2, attempt: 2 }),
+      expect(router.state.location.search).toEqual({ phase: 'gate', generation: 3, attempt: 2 }),
     )
     expect(await within(detail).findByText(/approved this gate/)).toBeVisible()
     expect(within(detail).queryByText(/requested changes on this gate/)).toBeNull()
@@ -769,7 +820,7 @@ describe('run detail', () => {
     // `generation`/`attempt` would open a node at an attempt belonging to a
     // different node. The assertion is `toEqual` on the WHOLE search object
     // for that reason — a `toMatchObject` would pass with both keys still on it.
-    const router = renderApp('/runs/run-1?phase=gate&generation=1&attempt=1', [run(twoDecisions())])
+    const router = renderApp('/runs/run-1?phase=gate&generation=2&attempt=1', [run(twoDecisions())])
     const rail = await screen.findByTestId('phase-rail')
     await userEvent.click(within(rail).getByRole('link', { name: /impl/ }))
     await waitFor(() => expect(router.state.location.search).toEqual({ phase: 'impl' }))
@@ -820,9 +871,48 @@ describe('run detail', () => {
     expect(links[0]).toHaveTextContent('#42')
   })
 
+  it('links publish.adopted to the same pull request, because it IS the same payload', async () => {
+    // `publish.go` builds ONE event and picks its kind — `publish.adopted` when
+    // the branch already had a pull request and this run took it over,
+    // `publish.pr_opened` when the run opened one — over one payload with one
+    // `pr_url` (`runs/publish.go:993-1017`). A reader looking at an adopted
+    // publication has exactly the pull request an opened one has, so a log that
+    // linked only one of the two kinds would be showing them a PR they cannot
+    // reach for a reason that is invisible from the row. Spec §2.4 named only
+    // `pr_opened`; it was amended in the same change as this test.
+    //
+    // The `adopted: true` flag in the payload is NOT what is read — the KIND is.
+    // Asserting on the flag instead would pass against an implementation that
+    // never looked at `publish.adopted` at all, because `pr_opened` carries the
+    // same key set with the flag false.
+    renderApp('/runs/run-1', [
+      run(threePhases()),
+      events([
+        {
+          id: 1,
+          kind: 'publish.adopted',
+          payload: {
+            node_id: 'publish',
+            branch: 'caesar/run-1',
+            pr_number: 7,
+            pr_url: 'https://forge.test/pr/7',
+            state: 'open',
+            adopted: true,
+          },
+          occurred_at: AT,
+        },
+      ]),
+    ])
+    const log = await screen.findByTestId('event-log')
+    const link = within(log).getByRole('link')
+    expect(link).toHaveAttribute('href', 'https://forge.test/pr/7')
+    expect(link).toHaveTextContent('#7')
+  })
+
   it('leaves every other event row exactly as it was — a line, not a link', async () => {
-    // §2.4 names two kinds in this log and Task 8 owns the third link class
-    // from the phase card. A lifecycle transition's whole content is the
+    // §2.4 names a gate decision and a pull request in this log — three kinds,
+    // since a pull request arrives under two — and Task 8 owns the third link
+    // class from the phase card. A lifecycle transition's whole content is the
     // sentence in the row, and a `gate.decided` whose payload lost a key is a
     // row with no link rather than a link to nowhere.
     renderApp('/runs/run-1', [
@@ -830,10 +920,24 @@ describe('run detail', () => {
       events([
         ...threeEvents(),
         { id: 4, kind: 'gate.decided', payload: { node_id: 'gate' }, occurred_at: AT },
+        // THE KIND IS THE FILTER, NOT THE PAYLOAD SHAPE, and this row is what
+        // says so: a perfectly usable `pr_url` under a kind §2.4 does not name.
+        // `publish.halted` carries no `pr_url` today — nothing but the one
+        // event `publish.go` builds does (`runs/publish.go:1010-1017`) — so
+        // without this row an implementation that linked ANY payload holding a
+        // URL would be green, and would start linking the first kind that ever
+        // gains one. MEASURED: dropping the kind test entirely survived until
+        // this row existed.
+        {
+          id: 5,
+          kind: 'publish.halted',
+          payload: { node_id: 'publish', pr_url: 'https://forge.test/pr/9', pr_number: 9 },
+          occurred_at: AT,
+        },
       ]),
     ])
     const log = await screen.findByTestId('event-log')
-    expect(within(log).getAllByRole('listitem')).toHaveLength(4)
+    expect(within(log).getAllByRole('listitem')).toHaveLength(5)
     expect(within(log).queryAllByRole('link')).toEqual([])
   })
 

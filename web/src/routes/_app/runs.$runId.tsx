@@ -53,9 +53,9 @@ import { type Run, runQueryOptions } from '../../runs/run-query'
  * where the pair's meaning is argued.
  *
  * PLAIN `z.number()`, NOT `z.coerce.number()`, and the reason is the measured
- * parser behaviour two paragraphs up: numbers already arrive as numbers, so
- * `coerce` buys nothing on the happy path and loses information on the unhappy
- * one. MEASURED, both spellings, against `?phase=gate&generation=true`:
+ * parser behaviour recorded above — `JSON.parse` per value, so a numeric param
+ * ARRIVES AS A NUMBER. `coerce` therefore buys nothing on the happy path and
+ * loses information on the unhappy one. MEASURED, both spellings, against `?phase=gate&generation=true`:
  * `z.coerce.number()` reads the boolean as 1 and silently targets a real
  * attempt, while `z.number()` rejects the object, `validateSearch` answers
  * `{}`, the raw boolean survives the ancestor merge and the read-site narrow
@@ -539,14 +539,25 @@ function EventRow(props: { runId: string; event: RunEvent }) {
 }
 
 /**
- * THE TWO EVENT KINDS THAT NAME SOMEWHERE TO GO, and nothing else in the log.
+ * THE EVENT KINDS THAT NAME SOMEWHERE TO GO, and nothing else in the log.
  *
  * §2.4 names three link classes on this screen; the third — a phase's artifacts
  * — belongs to `PhaseArtifacts`, per row, because an attempt writes several.
- * The event log's share is these two, and both are cases where the row records
- * a thing that exists elsewhere: a decision on one gate attempt, and a pull
- * request on a forge. Every other kind is a lifecycle transition whose whole
- * content is already the sentence in the row.
+ * The event log's share is a decision on one gate attempt and a pull request on
+ * a forge: both are rows recording a thing that exists elsewhere. Every other
+ * kind is a lifecycle transition whose whole content is already the sentence in
+ * the row.
+ *
+ * A PULL REQUEST IS TWO KINDS BECAUSE THE EMITTER PICKS ONE, NOT BECAUSE THERE
+ * ARE TWO THINGS. `publish.go` builds ONE event, fills ONE payload — `node_id`,
+ * `branch`, `pr_number`, `pr_url`, `state`, `adopted` — and then chooses its
+ * kind: `EventPublishAdopted` when the branch already had a pull request open
+ * and this run took it over, `EventPublishPROpened` when the run opened one
+ * (`runs/publish.go:993-1017`). Same `pr_url` either way. So an adopted
+ * publication has exactly the pull request an opened one has, and linking only
+ * `pr_opened` would leave a reader looking at a row that names a PR nobody can
+ * reach — indistinguishable from a bug. Spec §2.4 named only `pr_opened`
+ * because nobody had read the emitter; it was amended to say both.
  *
  * EVERY FIELD IS READ AS `unknown`, and that is the payload's actual type
  * (`api/schema.d.ts:983-985`) rather than caution. There is no typed event
@@ -583,7 +594,7 @@ function EventDestination(props: { runId: string; event: RunEvent }) {
       </Link>
     )
   }
-  if (props.event.kind === 'publish.pr_opened') {
+  if (props.event.kind === 'publish.pr_opened' || props.event.kind === 'publish.adopted') {
     const url = payload.pr_url
     const number = payload.pr_number
     // A SCHEME CHECK, NOT A STRING CHECK, because this href is built from a
