@@ -160,8 +160,13 @@ type PhaseSummaryResponse struct {
 type ListRunsQuery struct {
 	Status string `query:"status" description:"pending | running | waiting | succeeded | failed | superseded | dead"`
 	TaskID string `query:"task_id" description:"only this task's runs (uuid)"`
-	Cursor string `query:"cursor" description:"opaque; the previous page's next_cursor"`
-	Limit  int32  `query:"limit" description:"1-200, default 50"`
+	// WorkflowID is the WORKFLOW and not a version of it, which the description
+	// says outright: the two are both uuids, so a caller who passes the wrong
+	// one gets an empty page and no other signal.
+	WorkflowID string `query:"workflow_id" description:"only runs of tasks pinned to any version of this workflow (uuid)"`
+	RepoID     string `query:"repo_id" description:"only runs of tasks on this repo (uuid)"`
+	Cursor     string `query:"cursor" description:"opaque; the previous page's next_cursor"`
+	Limit      int32  `query:"limit" description:"1-200, default 50"`
 }
 
 type OutcomeResponse struct {

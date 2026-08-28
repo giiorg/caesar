@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -653,13 +654,15 @@ func (a *API) handleListRuns(w http.ResponseWriter, r *http.Request, sess authn.
 func runListFilter(r *http.Request) (runs.RunListFilter, error) {
 	q := r.URL.Query()
 	f := runs.RunListFilter{Status: q.Get("status"), Cursor: q.Get("cursor")}
-	if raw := q.Get("task_id"); raw != "" {
-		id, err := uuid.Parse(raw)
-		if err != nil {
-			return runs.RunListFilter{}, xerrors.E(xerrors.ClassInvalid, "validation failed").
-				WithFields(xerrors.FieldError{Field: "task_id", Message: "must be a uuid"})
-		}
-		f.TaskID = &id
+	var err error
+	if f.TaskID, err = uuidParam(q, "task_id"); err != nil {
+		return runs.RunListFilter{}, err
+	}
+	if f.RepoID, err = uuidParam(q, "repo_id"); err != nil {
+		return runs.RunListFilter{}, err
+	}
+	if f.WorkflowID, err = uuidParam(q, "workflow_id"); err != nil {
+		return runs.RunListFilter{}, err
 	}
 	if raw := q.Get("limit"); raw != "" {
 		n, err := strconv.ParseInt(raw, 10, 32)
@@ -673,6 +676,28 @@ func runListFilter(r *http.Request) (runs.RunListFilter, error) {
 		f.Limit = int32(n)
 	}
 	return f, nil
+}
+
+// uuidParam reads an optional uuid-valued query parameter. Absent is nil and
+// never an error; present and unparseable is a field error naming the parameter
+// the caller wrote, which is what routes the message back to the control that
+// produced it.
+//
+// One helper for three parameters because the SHAPE is the contract — an
+// unparseable id must never become a silent ignore, which answers with the
+// whole list and looks like a filter that did nothing. Three copies drift one
+// at a time, and it is the third one added that gets it wrong.
+func uuidParam(q url.Values, name string) (*uuid.UUID, error) {
+	raw := q.Get(name)
+	if raw == "" {
+		return nil, nil
+	}
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		return nil, xerrors.E(xerrors.ClassInvalid, "validation failed").
+			WithFields(xerrors.FieldError{Field: name, Message: "must be a uuid"})
+	}
+	return &id, nil
 }
 
 // handleListApprovals is the approvals inbox. It is unbounded by design at V1:

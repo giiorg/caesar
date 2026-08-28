@@ -755,12 +755,28 @@ RETURNING id, node_id, attempt;
 -- grant set is an EMPTY page, and `= ANY('{}')` gives exactly that, while an
 -- admin needs every row. Conflating them is how an ungranted member sees
 -- everything.
+--
+-- workflow_id names ANOTHER CONTEXT'S TABLE, workflow_versions, and that is
+-- licensed rather than incidental: the runs context stores the pinned VERSION
+-- id on tasks, and "every run of this workflow" is a question about the
+-- workflow. The alternative is a read port resolving a workflow to its version
+-- ids before this query runs — a second round trip, and two statements that can
+-- disagree if a version is published between them. No Go import crosses, so the
+-- seam internal/arch actually enforces is untouched.
+--
+-- A subquery rather than a join, so the FROM clause stays the two tables the
+-- projection reads and no row can be duplicated by a version fan-out.
 SELECT sqlc.embed(r), t.title, t.project_id, t.repo_id, t.workflow_version_id, t.requester_id
 FROM runs r
 JOIN tasks t ON t.id = r.task_id
 WHERE (sqlc.arg(all_projects)::boolean OR t.project_id = ANY(sqlc.arg(project_ids)::uuid[]))
   AND (sqlc.narg(status)::text IS NULL OR r.status = sqlc.narg(status)::text)
   AND (sqlc.narg(task_id)::uuid IS NULL OR r.task_id = sqlc.narg(task_id)::uuid)
+  AND (sqlc.narg(repo_id)::uuid IS NULL OR t.repo_id = sqlc.narg(repo_id)::uuid)
+  AND (sqlc.narg(workflow_id)::uuid IS NULL
+       OR t.workflow_version_id IN (
+           SELECT wv.id FROM workflow_versions wv
+           WHERE wv.workflow_id = sqlc.narg(workflow_id)::uuid))
   AND (sqlc.narg(cursor_created_at)::timestamptz IS NULL
        OR (r.created_at, r.id) < (sqlc.narg(cursor_created_at)::timestamptz, sqlc.narg(cursor_id)::uuid))
 ORDER BY r.created_at DESC, r.id DESC

@@ -5,8 +5,15 @@ import type { components } from '../api/schema'
 
 export type RunSummary = components['schemas']['ApiRunSummaryResponse']
 
-/** The filters that are URL state on Runs and Tasks. */
-export type RunFilters = { status?: string; taskId?: string }
+/**
+ * The filters that are URL state on Runs and Tasks.
+ *
+ * `workflowId` is the WORKFLOW and not a version of it — a task pinned to an
+ * older version is still a task of that workflow, and the server resolves the
+ * versions (`queries.sql`, `ListRunsPage`). Both ids ride the SECOND key
+ * element below, with the others.
+ */
+export type RunFilters = { status?: string; taskId?: string; workflowId?: string; repoId?: string }
 
 /**
  * The runs list.
@@ -45,9 +52,11 @@ export function runsQueryOptions(filters: RunFilters = {}) {
   // Built by assignment rather than as a literal because tsconfig sets
   // `exactOptionalPropertyTypes`: `{ status: undefined }` is not assignable to
   // `{ status?: string }` under it, and an unfiltered list would not compile.
-  const query: { status?: string; task_id?: string } = {}
+  const query: { status?: string; task_id?: string; workflow_id?: string; repo_id?: string } = {}
   if (filters.status !== undefined) query.status = filters.status
   if (filters.taskId !== undefined) query.task_id = filters.taskId
+  if (filters.workflowId !== undefined) query.workflow_id = filters.workflowId
+  if (filters.repoId !== undefined) query.repo_id = filters.repoId
 
   return queryOptions({
     queryKey: ['runs', filters],

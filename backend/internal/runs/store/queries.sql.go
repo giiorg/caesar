@@ -2397,10 +2397,15 @@ JOIN tasks t ON t.id = r.task_id
 WHERE ($1::boolean OR t.project_id = ANY($2::uuid[]))
   AND ($3::text IS NULL OR r.status = $3::text)
   AND ($4::uuid IS NULL OR r.task_id = $4::uuid)
-  AND ($5::timestamptz IS NULL
-       OR (r.created_at, r.id) < ($5::timestamptz, $6::uuid))
+  AND ($5::uuid IS NULL OR t.repo_id = $5::uuid)
+  AND ($6::uuid IS NULL
+       OR t.workflow_version_id IN (
+           SELECT wv.id FROM workflow_versions wv
+           WHERE wv.workflow_id = $6::uuid))
+  AND ($7::timestamptz IS NULL
+       OR (r.created_at, r.id) < ($7::timestamptz, $8::uuid))
 ORDER BY r.created_at DESC, r.id DESC
-LIMIT $7
+LIMIT $9
 `
 
 type ListRunsPageParams struct {
@@ -2408,6 +2413,8 @@ type ListRunsPageParams struct {
 	ProjectIds      []uuid.UUID
 	Status          pgtype.Text
 	TaskID          uuid.NullUUID
+	RepoID          uuid.NullUUID
+	WorkflowID      uuid.NullUUID
 	CursorCreatedAt *time.Time
 	CursorID        uuid.NullUUID
 	PageLimit       int32
@@ -2435,12 +2442,25 @@ type ListRunsPageRow struct {
 // grant set is an EMPTY page, and `= ANY('{}')` gives exactly that, while an
 // admin needs every row. Conflating them is how an ungranted member sees
 // everything.
+//
+// workflow_id names ANOTHER CONTEXT'S TABLE, workflow_versions, and that is
+// licensed rather than incidental: the runs context stores the pinned VERSION
+// id on tasks, and "every run of this workflow" is a question about the
+// workflow. The alternative is a read port resolving a workflow to its version
+// ids before this query runs — a second round trip, and two statements that can
+// disagree if a version is published between them. No Go import crosses, so the
+// seam internal/arch actually enforces is untouched.
+//
+// A subquery rather than a join, so the FROM clause stays the two tables the
+// projection reads and no row can be duplicated by a version fan-out.
 func (q *Queries) ListRunsPage(ctx context.Context, arg ListRunsPageParams) ([]ListRunsPageRow, error) {
 	rows, err := q.db.Query(ctx, listRunsPage,
 		arg.AllProjects,
 		arg.ProjectIds,
 		arg.Status,
 		arg.TaskID,
+		arg.RepoID,
+		arg.WorkflowID,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.PageLimit,

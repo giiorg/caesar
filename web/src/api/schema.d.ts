@@ -2315,6 +2315,10 @@ export interface operations {
                 status?: string;
                 /** @description only this task's runs (uuid) */
                 task_id?: string;
+                /** @description only runs of tasks pinned to any version of this workflow (uuid) */
+                workflow_id?: string;
+                /** @description only runs of tasks on this repo (uuid) */
+                repo_id?: string;
                 /** @description opaque; the previous page's next_cursor */
                 cursor?: string;
                 /** @description 1-200, default 50 */

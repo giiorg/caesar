@@ -70,11 +70,20 @@ type RunSummary struct {
 // RunListFilter is one page request. All is the admin view; ProjectIDs is the
 // exact grant set otherwise, and an empty one with All false is an empty page
 // rather than everything.
+//
+// Every filter below NARROWS the grant predicate and never replaces it: they
+// are separate AND terms in one WHERE clause, so naming a repository in a
+// project the caller holds no grant on is an empty page rather than a way in.
 type RunListFilter struct {
 	All        bool
 	ProjectIDs []uuid.UUID
 	Status     string
 	TaskID     *uuid.UUID
+	// RepoID and WorkflowID are the two locked surfaces' filters. WorkflowID is
+	// the WORKFLOW, not the pinned version: a task on version 2 is still a task
+	// of that workflow, and the query resolves the versions itself.
+	RepoID     *uuid.UUID
+	WorkflowID *uuid.UUID
 	Limit      int32
 	Cursor     string
 }
@@ -188,6 +197,12 @@ func (s *Service) ListRuns(ctx context.Context, f RunListFilter) ([]RunSummary, 
 	}
 	if f.TaskID != nil {
 		params.TaskID = uuid.NullUUID{UUID: *f.TaskID, Valid: true}
+	}
+	if f.RepoID != nil {
+		params.RepoID = uuid.NullUUID{UUID: *f.RepoID, Valid: true}
+	}
+	if f.WorkflowID != nil {
+		params.WorkflowID = uuid.NullUUID{UUID: *f.WorkflowID, Valid: true}
 	}
 	if f.Cursor != "" {
 		at, id, err := decodeKeysetCursor(f.Cursor)

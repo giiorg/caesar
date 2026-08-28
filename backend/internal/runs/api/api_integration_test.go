@@ -74,11 +74,8 @@ type spinePorts struct {
 }
 
 func (p spinePorts) Definition(_ context.Context, workflowID uuid.UUID, version int32) (runs.PinnedDefinition, error) {
-	if workflowID != p.h.workflowID {
-		return runs.PinnedDefinition{}, xerrors.E(xerrors.ClassNotFound, "no such workflow version")
-	}
 	for _, v := range p.h.versions {
-		if v.number == version {
+		if v.workflowID == workflowID && v.number == version {
 			return p.pinned(v), nil
 		}
 	}
@@ -96,7 +93,7 @@ func (p spinePorts) DefinitionByVersionID(_ context.Context, versionID uuid.UUID
 
 func (p spinePorts) pinned(v stagedVersion) runs.PinnedDefinition {
 	return runs.PinnedDefinition{
-		VersionID: v.id, WorkflowID: p.h.workflowID, Version: v.number,
+		VersionID: v.id, WorkflowID: v.workflowID, Version: v.number,
 		ContentHash: v.contentHash, Doc: v.doc,
 	}
 }
@@ -167,7 +164,7 @@ func (p spinePorts) WorkflowNames(_ context.Context, versionIDs []uuid.UUID) (ma
 	for _, vid := range versionIDs {
 		for _, v := range p.h.versions {
 			if v.id == vid {
-				out[vid] = workflowName
+				out[vid] = p.h.workflowNames[v.workflowID]
 			}
 		}
 	}
@@ -218,7 +215,13 @@ func gatedDoc() runs.DefinitionDoc {
 // because tasks.workflow_version_id is a foreign key — so the two are kept
 // together here rather than left to be matched up by id at two call sites.
 type stagedVersion struct {
-	id          uuid.UUID
+	id uuid.UUID
+	// workflowID is the workflow this version is a version OF. It was implicit
+	// — one workflow per harness — until the run list gained a workflow_id
+	// filter, which cannot be falsified against a fixture with one workflow in
+	// it. Carrying it per version also means `version` is no longer a unique
+	// key over this slice: two workflows both have a version 1.
+	workflowID  uuid.UUID
 	number      int32
 	contentHash string
 	doc         runs.DefinitionDoc
@@ -235,11 +238,21 @@ const (
 	verdictGateVersion int32 = 3
 )
 
-// workflowName is the one workflow every staged version belongs to. It is a
-// constant because the label port answers with it and the list assertions read
-// it back: a literal in two places is a test that agrees with itself by
-// coincidence.
-const workflowName = "spine-wf"
+// workflowName is the workflow every staged version belongs to unless a test
+// asks for the other one. They are constants because the label port answers
+// with them and the list assertions read them back: a literal in two places is
+// a test that agrees with itself by coincidence.
+//
+// workflowNameB is the SECOND workflow, and it exists for exactly one reason:
+// `workflow_id=X` cannot be told apart from no filter at all while every run in
+// the fixture belongs to one workflow. It stages a single version, because the
+// filter's other property — that a task pinned to version 2 of a workflow still
+// matches that workflow — is proved on the FIRST workflow, which already has
+// three.
+const (
+	workflowName  = "spine-wf"
+	workflowNameB = "spine-wf-b"
+)
 
 // planGateDoc is a gate over a PLAN, with a review node hanging off the same
 // plan. The review finishes later, so "the newest artifact on the run" and "the
@@ -305,6 +318,13 @@ type harness struct {
 	repoB      uuid.UUID
 	repos      map[uuid.UUID]uuid.UUID // repo id -> project id
 	workflowID uuid.UUID
+	// workflowB is the second workflow. Only the run list's workflow_id filter
+	// stages runs on it; every other test in this package runs on workflowID.
+	workflowB uuid.UUID
+	// workflowNames is what the label port answers, keyed by workflow id. A map
+	// rather than a constant now that a version does not imply which workflow
+	// named it.
+	workflowNames map[uuid.UUID]string
 	// versionID is version 1 — gatedDoc, what every test that does not ask for
 	// another graph runs on.
 	versionID uuid.UUID
@@ -437,9 +457,18 @@ func newHarnessWithStreams(t *testing.T, streams runsapi.StreamServer) *harness 
 		`INSERT INTO workflows (name) VALUES ($1) RETURNING id`, workflowName).Scan(&h.workflowID); err != nil {
 		t.Fatal(err)
 	}
-	h.versionID = h.registerVersion(t, gatedVersion, "deadbeef", gatedDoc())
-	h.registerVersion(t, planGateVersion, "deadbeef02", planGateDoc())
-	h.registerVersion(t, verdictGateVersion, "deadbeef03", verdictGateDoc())
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO workflows (name) VALUES ($1) RETURNING id`, workflowNameB).Scan(&h.workflowB); err != nil {
+		t.Fatal(err)
+	}
+	h.workflowNames = map[uuid.UUID]string{h.workflowID: workflowName, h.workflowB: workflowNameB}
+	h.versionID = h.registerVersion(t, h.workflowID, gatedVersion, "deadbeef", gatedDoc())
+	h.registerVersion(t, h.workflowID, planGateVersion, "deadbeef02", planGateDoc())
+	h.registerVersion(t, h.workflowID, verdictGateVersion, "deadbeef03", verdictGateDoc())
+	// Workflow B stages gatedDoc again, deliberately: the filter is about which
+	// workflow a task points at, not about the graph, and a second shape here
+	// would make a failure ambiguous between the two.
+	h.registerVersion(t, h.workflowB, gatedVersion, "deadbeefb1", gatedDoc())
 
 	h.admin = seedUser(t, pool, "root@example.com", authn.RoleAdmin)
 	h.runner = seedUser(t, pool, "runner@example.com", authn.RoleMember)
@@ -478,17 +507,23 @@ func newHarnessWithStreams(t *testing.T, streams runsapi.StreamServer) *harness 
 // registerVersion inserts a workflow version row and teaches the definition
 // port the document it pins. content_hash is a parameter because the schema
 // makes it UNIQUE per workflow, so two versions cannot share one.
-func (h *harness) registerVersion(t *testing.T, number int32, contentHash string, doc runs.DefinitionDoc) uuid.UUID {
+//
+// The workflow is a parameter rather than h.workflowID because the definition
+// port now resolves on the PAIR: two workflows each have a version 1, and a
+// lookup by number alone would answer for whichever was staged first.
+func (h *harness) registerVersion(t *testing.T, workflowID uuid.UUID, number int32, contentHash string, doc runs.DefinitionDoc) uuid.UUID {
 	t.Helper()
 	var id uuid.UUID
 	if err := h.pool.QueryRow(context.Background(),
 		`INSERT INTO workflow_versions (workflow_id, version, content_hash, document)
 		 VALUES ($1, $2, $3, '{"schema":1,"nodes":[]}'::jsonb) RETURNING id`,
-		h.workflowID, number, contentHash,
+		workflowID, number, contentHash,
 	).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-	h.versions = append(h.versions, stagedVersion{id: id, number: number, contentHash: contentHash, doc: doc})
+	h.versions = append(h.versions, stagedVersion{
+		id: id, workflowID: workflowID, number: number, contentHash: contentHash, doc: doc,
+	})
 	return id
 }
 
@@ -573,8 +608,12 @@ func (h *harness) newTaskInRepo(repoID uuid.UUID, title string) runsapi.CreateTa
 }
 
 func (h *harness) newTaskOnVersion(repoID uuid.UUID, title string, version int32) runsapi.CreateTaskRequest {
+	return h.newTaskOnWorkflowVersion(repoID, title, h.workflowID, version)
+}
+
+func (h *harness) newTaskOnWorkflowVersion(repoID uuid.UUID, title string, workflowID uuid.UUID, version int32) runsapi.CreateTaskRequest {
 	return runsapi.CreateTaskRequest{
-		RepoID: repoID.String(), WorkflowID: h.workflowID.String(), WorkflowVersion: version,
+		RepoID: repoID.String(), WorkflowID: workflowID.String(), WorkflowVersion: version,
 		Title: title, Inputs: map[string]any{"hint": "small"},
 	}
 }
@@ -592,7 +631,12 @@ func (h *harness) createTaskInRepo(t *testing.T, token string, repoID uuid.UUID,
 
 func (h *harness) createTaskOnVersion(t *testing.T, token string, repoID uuid.UUID, title string, version int32) runsapi.TaskResponse {
 	t.Helper()
-	resp := h.do(t, http.MethodPost, "/api/v1/tasks", token, h.newTaskOnVersion(repoID, title, version))
+	return h.createTaskOnWorkflowVersion(t, token, repoID, title, h.workflowID, version)
+}
+
+func (h *harness) createTaskOnWorkflowVersion(t *testing.T, token string, repoID uuid.UUID, title string, workflowID uuid.UUID, version int32) runsapi.TaskResponse {
+	t.Helper()
+	resp := h.do(t, http.MethodPost, "/api/v1/tasks", token, h.newTaskOnWorkflowVersion(repoID, title, workflowID, version))
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create task = %d, want 201", resp.StatusCode)
 	}

@@ -32,6 +32,16 @@ type stagedRuns struct {
 	noPhases uuid.UUID
 	// taskWithRuns is a task id the task filter can be pointed at.
 	taskWithRuns uuid.UUID
+	// onWorkflowB is the one run whose task points at the SECOND workflow. It
+	// is on project A's repo, not project B's, so the repo and workflow
+	// partitions of the fixture cross-cut: neither filter can be mistaken for
+	// the other, and composing them is not the same answer as either alone.
+	onWorkflowB uuid.UUID
+	// onSecondVersion is a run whose task pins version 2 of the FIRST workflow.
+	// A workflow_id filter that resolved the workflow to a single version id —
+	// its latest, say — drops this row while answering every other assertion
+	// correctly.
+	onSecondVersion uuid.UUID
 }
 
 // listPageWalkSize is the page size the paging subtest walks with, and it is a
@@ -66,6 +76,11 @@ const listPageWalkSize = 2
 //     regardless, so a run with zero phases and a run with every phase both
 //     satisfy "one entry per node" — and only a partially materialized one can
 //     tell that projection apart from one that lists materialized rows.
+//  4. THE REPO AND WORKFLOW PARTITIONS CROSS-CUT, and one task pins a
+//     non-latest version. Both are what make the two filters this fixture feeds
+//     falsifiable: with every workflow-B run also being a repo-B run, one
+//     filter implemented as the other passes; with every task on version 1, a
+//     workflow filter that resolved a workflow to one version id passes too.
 func (h *harness) stageRunsForListing(t *testing.T) stagedRuns {
 	t.Helper()
 	ctx := context.Background()
@@ -74,6 +89,13 @@ func (h *harness) stageRunsForListing(t *testing.T) stagedRuns {
 	// project-A list's newest is the unique 20, so the card subtest does not
 	// depend on how a tie breaks.
 	//
+	// The workflow and version columns exist for property 4. Exactly one row
+	// points at workflow B, and it is on project A's REPO — putting it on repo B
+	// would let `repo_id=B` and `workflow_id=B` return the same rows, and either
+	// filter could then be implemented as the other. Exactly one row pins
+	// version 2 of workflow A, and it is a repo-B row, so the second version is
+	// not a project-A coincidence either.
+	//
 	// Newest-first these read 20, 30, 40, 50, 50, 60, 70 — so the pair occupies
 	// ranks 4 and 5, and a two-row walk ends its second page between them. That
 	// placement is what assertSharedPairStraddlesAPageBoundary holds; moving the
@@ -81,26 +103,28 @@ func (h *harness) stageRunsForListing(t *testing.T) stagedRuns {
 	// property of this fixture true and makes the paging subtest stop testing
 	// the id half of the cursor.
 	staged := []struct {
-		repo    uuid.UUID
-		title   string
-		agoMin  int32
-		status  string
-		started bool
-		done    bool
+		repo     uuid.UUID
+		workflow uuid.UUID
+		version  int32
+		title    string
+		agoMin   int32
+		status   string
+		started  bool
+		done     bool
 	}{
-		{h.repoID, "oldest in A", 70, "waiting", true, false},
-		{h.repoID, "second in A", 60, "succeeded", true, true},
-		{h.repoID, "shared timestamp one", 50, "failed", true, true},
-		{h.repoID, "shared timestamp two", 50, "pending", false, false},
-		{h.repoID, "newest in A", 20, "running", true, false},
-		{h.repoB, "older in B", 40, "running", true, false},
-		{h.repoB, "newer in B", 30, "pending", false, false},
+		{h.repoID, h.workflowID, gatedVersion, "oldest in A", 70, "waiting", true, false},
+		{h.repoID, h.workflowID, gatedVersion, "second in A", 60, "succeeded", true, true},
+		{h.repoID, h.workflowB, gatedVersion, "shared timestamp one", 50, "failed", true, true},
+		{h.repoID, h.workflowID, gatedVersion, "shared timestamp two", 50, "pending", false, false},
+		{h.repoID, h.workflowID, gatedVersion, "newest in A", 20, "running", true, false},
+		{h.repoB, h.workflowID, planGateVersion, "older in B", 40, "running", true, false},
+		{h.repoB, h.workflowID, gatedVersion, "newer in B", 30, "pending", false, false},
 	}
 
 	var out stagedRuns
 	runIDs := make([]uuid.UUID, 0, len(staged))
 	for i, s := range staged {
-		task := h.createTaskInRepo(t, "admin-tok", s.repo, s.title)
+		task := h.createTaskOnWorkflowVersion(t, "admin-tok", s.repo, s.title, s.workflow, s.version)
 		runID, err := uuid.Parse(task.LatestRunID)
 		if err != nil {
 			t.Fatal(err)
@@ -117,6 +141,12 @@ func (h *harness) stageRunsForListing(t *testing.T) stagedRuns {
 		}
 		if i == 4 {
 			out.newestInA = runID
+		}
+		if i == 2 {
+			out.onWorkflowB = runID
+		}
+		if i == 5 {
+			out.onSecondVersion = runID
 		}
 	}
 
@@ -222,6 +252,75 @@ func (h *harness) assertListingFixtureIsNotTheSimpleCase(t *testing.T, staged st
 	if untouched != 0 {
 		t.Fatalf("the run staged as unclaimed has %d phase rows, want 0 — "+
 			"attempt 0 is only meaningful on a run nothing has claimed", untouched)
+	}
+	h.assertRepoAndWorkflowPartitionsCrossCut(t, staged)
+}
+
+// assertRepoAndWorkflowPartitionsCrossCut is property 4, read off the rows the
+// filters actually query rather than off the table that meant to write them.
+//
+// It asserts the SHAPE the two filter subtests need and not the row ids they
+// happen to use: that one repo holds runs of more than one workflow, that one
+// workflow spans more than one repo, and that one task pins a version that is
+// not the only one of its workflow. Any of the three collapsing turns a filter
+// subtest green against an implementation that filtered by the OTHER column, or
+// by version id instead of workflow id — and the collapse is invisible from the
+// subtest, which would still watch a proper subset come back.
+func (h *harness) assertRepoAndWorkflowPartitionsCrossCut(t *testing.T, staged stagedRuns) {
+	t.Helper()
+	ctx := context.Background()
+
+	var workflowsOnRepoA, reposOnWorkflowA int
+	if err := h.pool.QueryRow(ctx,
+		`SELECT count(DISTINCT wv.workflow_id)
+		 FROM runs r JOIN tasks t ON t.id = r.task_id
+		 JOIN workflow_versions wv ON wv.id = t.workflow_version_id
+		 WHERE t.repo_id = $1`, h.repoID).Scan(&workflowsOnRepoA); err != nil {
+		t.Fatal(err)
+	}
+	if workflowsOnRepoA < 2 {
+		t.Fatalf("repo A's runs span %d workflows, want at least 2 — "+
+			"a workflow_id filter implemented as a repo_id filter passes otherwise",
+			workflowsOnRepoA)
+	}
+	if err := h.pool.QueryRow(ctx,
+		`SELECT count(DISTINCT t.repo_id)
+		 FROM runs r JOIN tasks t ON t.id = r.task_id
+		 JOIN workflow_versions wv ON wv.id = t.workflow_version_id
+		 WHERE wv.workflow_id = $1`, h.workflowID).Scan(&reposOnWorkflowA); err != nil {
+		t.Fatal(err)
+	}
+	if reposOnWorkflowA < 2 {
+		t.Fatalf("workflow A's runs span %d repos, want at least 2 — "+
+			"a repo_id filter implemented as a workflow_id filter passes otherwise",
+			reposOnWorkflowA)
+	}
+
+	// And the version half: the run staged on a second version really is on one
+	// that is not what every other workflow-A task pins.
+	var version int32
+	if err := h.pool.QueryRow(ctx,
+		`SELECT wv.version
+		 FROM runs r JOIN tasks t ON t.id = r.task_id
+		 JOIN workflow_versions wv ON wv.id = t.workflow_version_id
+		 WHERE r.id = $1`, staged.onSecondVersion).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version == gatedVersion {
+		t.Fatalf("the run staged on a second version is on version %d, the same one "+
+			"every other task pins — a workflow filter that resolved a workflow to a "+
+			"single version id would pass", version)
+	}
+	var distinctVersions int
+	if err := h.pool.QueryRow(ctx,
+		`SELECT count(DISTINCT t.workflow_version_id)
+		 FROM runs r JOIN tasks t ON t.id = r.task_id
+		 JOIN workflow_versions wv ON wv.id = t.workflow_version_id
+		 WHERE wv.workflow_id = $1`, h.workflowID).Scan(&distinctVersions); err != nil {
+		t.Fatal(err)
+	}
+	if distinctVersions < 2 {
+		t.Fatalf("workflow A's runs span %d versions, want at least 2", distinctVersions)
 	}
 }
 
@@ -494,11 +593,124 @@ func TestListRuns(t *testing.T) {
 		}
 	})
 
+	t.Run("filters by repo and by workflow, and they compose", func(t *testing.T) {
+		all := h.listRuns(t, "admin-tok", "").Runs
+		ids := func(rs []runsapi.RunSummaryResponse) []string {
+			out := make([]string, 0, len(rs))
+			for _, r := range rs {
+				out = append(out, r.ID)
+			}
+			return out
+		}
+		contains := func(rs []runsapi.RunSummaryResponse, id uuid.UUID) bool {
+			for _, r := range rs {
+				if r.ID == id.String() {
+					return true
+				}
+			}
+			return false
+		}
+
+		// REPO. The fixture puts runs of two workflows on repo A, so a proper
+		// subset here is not explained by the workflow filter having been
+		// wired to this parameter.
+		byRepo := h.listRuns(t, "admin-tok", "?repo_id="+h.repoID.String()).Runs
+		if len(byRepo) == 0 || len(byRepo) == len(all) {
+			t.Errorf("repo filter returned %d of %d runs; a filter matching nothing or "+
+				"everything asserts nothing", len(byRepo), len(all))
+		}
+		for _, r := range byRepo {
+			if !contains(all, uuid.MustParse(r.ID)) {
+				t.Errorf("repo filter returned %s, which the unfiltered list does not hold", r.ID)
+			}
+		}
+		if contains(byRepo, staged.onSecondVersion) {
+			t.Error("repo_id=A returned a run whose task is on repo B")
+		}
+		if !contains(byRepo, staged.newestInA) {
+			t.Errorf("repo_id=A dropped %s, a run on repo A", staged.newestInA)
+		}
+
+		// WORKFLOW, and it is the workflow that decides, not the version. The
+		// run on version 2 of workflow A has to come back, and the run on
+		// workflow B must not.
+		byWorkflow := h.listRuns(t, "admin-tok", "?workflow_id="+h.workflowID.String()).Runs
+		if len(byWorkflow) == len(all) {
+			t.Errorf("workflow_id=A returned the whole list (%d runs); the fixture stages "+
+				"one run on a second workflow, so a proper subset is the answer", len(all))
+		}
+		if !contains(byWorkflow, staged.onSecondVersion) {
+			t.Errorf("workflow_id=A dropped %s, whose task pins version 2 of that workflow — "+
+				"the filter is on the WORKFLOW, and a task does not leave it by being pinned "+
+				"to an older version", staged.onSecondVersion)
+		}
+		if contains(byWorkflow, staged.onWorkflowB) {
+			t.Errorf("workflow_id=A returned %s, whose task is on workflow B", staged.onWorkflowB)
+		}
+		byWorkflowB := h.listRuns(t, "admin-tok", "?workflow_id="+h.workflowB.String()).Runs
+		if len(byWorkflowB) != 1 || !contains(byWorkflowB, staged.onWorkflowB) {
+			t.Errorf("workflow_id=B = %v, want exactly [%s]", ids(byWorkflowB), staged.onWorkflowB)
+		}
+
+		// COMPOSED, and the composition is narrower than either half. The
+		// workflow-B run is on repo A, so repo A ∩ workflow A drops it while
+		// neither filter alone does what the other does.
+		both := h.listRuns(t, "admin-tok",
+			"?repo_id="+h.repoID.String()+"&workflow_id="+h.workflowID.String()).Runs
+		if len(both) >= len(byRepo) || len(both) >= len(byWorkflow) {
+			t.Errorf("repo_id=A&workflow_id=A returned %d runs, want fewer than both "+
+				"repo_id=A (%d) and workflow_id=A (%d) — otherwise one of the two "+
+				"predicates is not being applied",
+				len(both), len(byRepo), len(byWorkflow))
+		}
+		if contains(both, staged.onWorkflowB) {
+			t.Error("repo_id=A&workflow_id=A returned the workflow-B run that sits on repo A")
+		}
+
+		// And with status, whose predicate is a different shape again. The
+		// unfiltered `running` set spans both repos; scoped to repo A it is one
+		// run, so a dropped repo predicate is visible as a count.
+		running := h.listRuns(t, "admin-tok", "?status=running").Runs
+		runningInA := h.listRuns(t, "admin-tok", "?status=running&repo_id="+h.repoID.String()).Runs
+		if len(running) < 2 {
+			t.Fatalf("the fixture stages %d running runs, want at least 2 across both repos — "+
+				"composing status with repo_id asserts nothing otherwise", len(running))
+		}
+		if len(runningInA) != 1 || !contains(runningInA, staged.newestInA) {
+			t.Errorf("status=running&repo_id=A = %v, want exactly [%s]",
+				ids(runningInA), staged.newestInA)
+		}
+	})
+
+	t.Run("a run scoped away by a grant is not reachable through a filter", func(t *testing.T) {
+		// The filters narrow; they never widen. A project-A approver naming
+		// project B's repository gets an empty page, not project B's runs —
+		// which is what a filter applied INSTEAD of the grant predicate, rather
+		// than alongside it, would return.
+		if got := h.listRuns(t, "approver-tok", "?repo_id="+h.repoB.String()).Runs; len(got) != 0 {
+			t.Errorf("project-A approver filtering to repo B got %d runs, want 0", len(got))
+		}
+		// Workflow A spans both projects, so this one is the sharper case: the
+		// filter matches rows in both, and only the grant predicate excludes B's.
+		got := h.listRuns(t, "approver-tok", "?workflow_id="+h.workflowID.String()).Runs
+		for _, r := range got {
+			if r.ProjectID != h.projectID.String() {
+				t.Errorf("project-A approver filtering to workflow A got a run from project %s", r.ProjectID)
+			}
+		}
+		if len(got) == 0 {
+			t.Error("project-A approver filtering to workflow A got nothing; the fixture stages " +
+				"their own runs on it, so this would assert nothing")
+		}
+	})
+
 	t.Run("a bad cursor and a bad status are 400 with a field error, not 500", func(t *testing.T) {
 		for _, tc := range []struct{ query, field string }{
 			{"?cursor=!!!", "cursor"},
 			{"?status=nonsense", "status"},
 			{"?task_id=not-a-uuid", "task_id"},
+			{"?workflow_id=not-a-uuid", "workflow_id"},
+			{"?repo_id=not-a-uuid", "repo_id"},
 			{"?limit=soon", "limit"},
 		} {
 			resp := h.do(t, http.MethodGet, "/api/v1/runs"+tc.query, "admin-tok", nil)
