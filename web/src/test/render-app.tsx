@@ -285,6 +285,19 @@ export function renderApp(
     // deployment starts in, which is why that section has an empty state and
     // the Users section does not.
     http.get('/api/v1/harnesses', () => HttpResponse.json({ harnesses: null })),
+    // `entries: null`, for the NINTH time and the same reason: required AND
+    // nullable, because a Go nil slice marshals to null, and the `?? []` in
+    // `audit/audit-query.ts` would otherwise be unreachable from every test in
+    // the tree. `audit-section.test.tsx`'s empty-log test deliberately does NOT
+    // override it — the Task 19 trap — so deleting that coalesce kills a real
+    // test rather than none.
+    //
+    // Like `users: null` and unlike `runs: null`, it is not an honest empty
+    // fixture: bootstrap writes `user.bootstrapped` and the admin reading the
+    // screen wrote `auth.login` by arriving, so a deployment with an empty
+    // audit log and a reader to notice cannot happen. What the default
+    // exercises is the NULL, which the contract does permit.
+    http.get('/api/v1/audit', () => HttpResponse.json({ entries: null, next_cursor: null })),
     http.get('/api/v1/stream', silentStream),
   )
   // BOTH router arguments are load-bearing and neither is optional.
