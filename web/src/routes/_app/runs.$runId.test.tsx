@@ -122,6 +122,80 @@ const decidedGate = (): RunShape => ({
   ],
 })
 
+/** A gate decision as `GET /runs/{id}` carries it, with the verb varying. */
+const gateDecision = (verb: string, note: string): NonNullable<Phase['decision']> => ({
+  decision: verb,
+  note,
+  acted_by_id: 'u2',
+  acted_by_email: 'alice@example.com',
+  acted_at: '2026-08-20T00:01:00Z',
+  self_approval: false,
+  examined_artifact_id: 'a1',
+})
+
+/**
+ * ONE GATE, TWO DECISIONS, ONE REVISION ROUND APART — the spec's own acceptance
+ * shape for the attempt-precise link, and the ordinary life of a gate rather
+ * than an edge case: request_changes opens a revision, which bumps the run's
+ * generation and rematerializes the slice, and the gate comes back under the
+ * SAME node id (`runs/revisions.go:22-40`). The attempt ordinal continues
+ * across the round (`store/queries.sql:719-723`), so the second gate is
+ * generation 2, attempt 2.
+ *
+ * `?phase=gate` names both of these rows and the timeline collapses them to the
+ * newest, so a link that carried only the node would send BOTH `gate.decided`
+ * events to the approval — including the one recording the request for changes.
+ */
+const twoDecisions = (): RunShape => ({
+  phases: [
+    phase({ node_id: 'impl', status: 'superseded' }),
+    phase({
+      node_id: 'gate',
+      status: 'superseded',
+      decision: gateDecision('request_changes', 'narrow the diff'),
+    }),
+    phase({ node_id: 'impl', generation: 2, attempt: 2 }),
+    phase({
+      node_id: 'gate',
+      generation: 2,
+      attempt: 2,
+      decision: gateDecision('approve', 'ship it'),
+    }),
+  ],
+})
+
+/** The two `gate.decided` events those two decisions wrote (`runs/gates.go:228-237`, `runs/revisions.go:212-221`). */
+const twoDecisionEvents = () => [
+  {
+    id: 1,
+    kind: 'gate.decided',
+    payload: {
+      node_id: 'gate',
+      attempt: 1,
+      generation: 1,
+      decision: 'request_changes',
+      examined_artifact_id: 'a1',
+      acted_by: 'u2',
+      self_approval: false,
+    },
+    occurred_at: AT,
+  },
+  {
+    id: 2,
+    kind: 'gate.decided',
+    payload: {
+      node_id: 'gate',
+      attempt: 2,
+      generation: 2,
+      decision: 'approve',
+      examined_artifact_id: 'a2',
+      acted_by: 'u2',
+      self_approval: false,
+    },
+    occurred_at: AT,
+  },
+]
+
 /**
  * A run whose publish node has a publication. The phase and the publication
  * share `node_id`, which is the ONLY thing tying them together on the wire:
@@ -611,6 +685,156 @@ describe('run detail', () => {
     expect(await screen.findByText(/nothing of its graph has been materialized/i)).toBeVisible()
     expect(screen.queryByTestId('phase-rail')).toBeNull()
     expect(screen.queryByText(/pick a phase/i)).toBeNull()
+  })
+
+  it('sends each gate.decided row to ITS attempt, not to the newest of that node', async () => {
+    // THE ACCEPTANCE SHAPE FOR §2.4's SECOND LINK CLASS. Both rows name the
+    // same node, so a `?phase=gate` link resolves both to generation 2 — and
+    // the row recording a request for changes would open somebody else's
+    // approval. The two clicks below are the same assertion in both
+    // directions: each pane shows its own verb AND not the other's, so neither
+    // half can pass because the text was never on screen.
+    const router = renderApp('/runs/run-1', [run(twoDecisions()), events(twoDecisionEvents())])
+    const log = await screen.findByTestId('event-log')
+    const detail = screen.getByTestId('phase-detail')
+
+    await userEvent.click(within(log).getByRole('link', { name: /gate attempt 1/ }))
+    await waitFor(() =>
+      expect(router.state.location.search).toEqual({ phase: 'gate', generation: 1, attempt: 1 }),
+    )
+    expect(await within(detail).findByText(/requested changes on this gate/)).toBeVisible()
+    expect(within(detail).queryByText(/approved this gate/)).toBeNull()
+    // The summary and `data-state` follow the body. A row that rendered
+    // attempt 1's decision under the newest attempt's status would be the same
+    // lie in a quieter attribute, and `data-state` is what the live-update
+    // tests read.
+    expect(screen.getByTestId('phase-gate')).toHaveAttribute('data-state', 'superseded')
+
+    await userEvent.click(within(log).getByRole('link', { name: /gate attempt 2/ }))
+    await waitFor(() =>
+      expect(router.state.location.search).toEqual({ phase: 'gate', generation: 2, attempt: 2 }),
+    )
+    expect(await within(detail).findByText(/approved this gate/)).toBeVisible()
+    expect(within(detail).queryByText(/requested changes on this gate/)).toBeNull()
+    expect(screen.getByTestId('phase-gate')).toHaveAttribute('data-state', 'succeeded')
+  })
+
+  it('says so when the URL names an attempt this run does not carry', async () => {
+    // HONEST ABSENCE RATHER THAN A SILENT FALL-BACK TO NEWEST, which would
+    // re-create the exact bug the selector exists to fix — quietly, and only
+    // for the links that had gone stale.
+    renderApp('/runs/run-1?phase=gate&generation=9&attempt=9', [run(twoDecisions())])
+    expect(await screen.findByText(/not in the run's phase list/i)).toBeVisible()
+    expect(screen.queryByText(/approved this gate/)).toBeNull()
+  })
+
+  /**
+   * A SELECTOR `searchSchema` REJECTS MUST LAND ON THE NODE'S NEWEST — every
+   * such value, by the same route, and never on the "not in this run's phase
+   * list" sentence, which is a claim about the RUN rather than about the URL.
+   *
+   * The first case is the one that decides the schema's spelling, and it is
+   * MEASURED rather than reasoned. TanStack Router's parser JSON.parses each
+   * value, so `?generation=true` reaches `validateSearch` as the BOOLEAN true.
+   * `z.coerce.number()` reads it as 1 and silently targets attempt 1 — a real
+   * row, a real decision, and not the one anybody asked for; plain
+   * `z.number()` rejects the object, the raw boolean survives the ancestor
+   * merge, and the read-site narrow lands it where `?phase=42` already lands.
+   * Both spellings run against this fixture, and it tells them apart because
+   * attempt 1 and attempt 2 of this gate were decided differently.
+   *
+   * The other two are what makes the read-site narrow re-assert the SCHEMA's
+   * claim — integer and positive — rather than merely `typeof === 'number'`.
+   * Both reach `useSearch()` as ordinary numbers that the schema refused, and
+   * a looser narrow would carry them into `phaseForSelector` and answer the
+   * absence sentence. MEASURED: with the narrow weakened to `typeof value ===
+   * 'number'` the whole suite stayed green until these two cases existed.
+   */
+  it.each([
+    ['a boolean the parser never turned into a number', 'true'],
+    ['a fraction no attempt ordinal can be', '1.5'],
+    ['a zero, which no generation ever is', '0'],
+  ])('reads %s as no selector at all', async (_label, value) => {
+    renderApp(`/runs/run-1?phase=gate&generation=${value}&attempt=${value}`, [run(twoDecisions())])
+    expect(await screen.findByText(/approved this gate/)).toBeVisible()
+    expect(screen.queryByText(/not in the run's phase list/i)).toBeNull()
+  })
+
+  it('drops an attempt selector when a rail row is clicked, because a rail row means newest', async () => {
+    // AN OBJECT `search` REPLACES, IT DOES NOT MERGE — measured in
+    // `@tanstack/router-core@1.171.24` (`dist/esm/router.js:898`,
+    // `functionalUpdate(dest.search, currentSearch)` returns `dest.search`
+    // verbatim). Nothing in the tree pinned that, and Task 9 is the first
+    // change that breaks if it flips: a rail row that inherited a stale
+    // `generation`/`attempt` would open a node at an attempt belonging to a
+    // different node. The assertion is `toEqual` on the WHOLE search object
+    // for that reason — a `toMatchObject` would pass with both keys still on it.
+    const router = renderApp('/runs/run-1?phase=gate&generation=1&attempt=1', [run(twoDecisions())])
+    const rail = await screen.findByTestId('phase-rail')
+    await userEvent.click(within(rail).getByRole('link', { name: /impl/ }))
+    await waitFor(() => expect(router.state.location.search).toEqual({ phase: 'impl' }))
+  })
+
+  it('links a publish.pr_opened row to the pull request, and only a real URL', async () => {
+    // `pr_url` is the key (`runs/publish.go:1010-1017`), and it is a string the
+    // control plane copied out of a forge's JSON — so the scheme is checked
+    // rather than assumed. All three rows below are the same code path with one
+    // field changed, which is what stops the exact-list assertion passing
+    // because no row was ever rendered.
+    //
+    // THE THIRD ROW IS THE ONE THAT PROVES THE GUARD. React 19.2.8 rewrites a
+    // `javascript:` href to a thrower of its own accord — MEASURED — so a
+    // fixture carrying only that scheme would stay green with the check
+    // deleted, testing React rather than this file. A relative `pr_url` is the
+    // case nothing else catches: it renders a link straight back to the page
+    // the reader is already on.
+    const payload = (url: unknown) => ({
+      node_id: 'publish',
+      branch: 'caesar/run-1',
+      pr_number: 42,
+      pr_url: url,
+      state: 'open',
+      adopted: false,
+    })
+    renderApp('/runs/run-1', [
+      run(threePhases()),
+      events([
+        {
+          id: 1,
+          kind: 'publish.pr_opened',
+          payload: payload('https://forge.test/pr/42'),
+          occurred_at: AT,
+        },
+        {
+          id: 2,
+          kind: 'publish.pr_opened',
+          payload: payload('javascript:alert(1)'),
+          occurred_at: AT,
+        },
+        { id: 3, kind: 'publish.pr_opened', payload: payload('/runs/run-1'), occurred_at: AT },
+      ]),
+    ])
+    const log = await screen.findByTestId('event-log')
+    const links = within(log).getAllByRole('link')
+    expect(links.map((a) => a.getAttribute('href'))).toEqual(['https://forge.test/pr/42'])
+    expect(links[0]).toHaveTextContent('#42')
+  })
+
+  it('leaves every other event row exactly as it was — a line, not a link', async () => {
+    // §2.4 names two kinds in this log and Task 8 owns the third link class
+    // from the phase card. A lifecycle transition's whole content is the
+    // sentence in the row, and a `gate.decided` whose payload lost a key is a
+    // row with no link rather than a link to nowhere.
+    renderApp('/runs/run-1', [
+      run(threePhases()),
+      events([
+        ...threeEvents(),
+        { id: 4, kind: 'gate.decided', payload: { node_id: 'gate' }, occurred_at: AT },
+      ]),
+    ])
+    const log = await screen.findByTestId('event-log')
+    expect(within(log).getAllByRole('listitem')).toHaveLength(4)
+    expect(within(log).queryAllByRole('link')).toEqual([])
   })
 
   it('carries the decision rules of every host', async () => {

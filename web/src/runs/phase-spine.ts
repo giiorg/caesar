@@ -80,3 +80,52 @@ export function newestPhaseOf(run: Run, nodeId: string): Phase | null {
   }
   return best
 }
+
+/**
+ * The phase a LINK names: one attempt of one node, or the node's newest when
+ * the link names no attempt at all.
+ *
+ * WHY THE NEWEST IS NOT ENOUGH. `newestPhasePerNode` collapses a node to one
+ * row, which is what a timeline wants and what every `?phase=` link got until
+ * now. A `gate.decided` event is the opposite case: it records a decision made
+ * on ONE attempt, and by the time a reader clicks it the gate has usually come
+ * back at a higher generation — so "open this node" would show them a different
+ * decision than the row they clicked, made by somebody else, about a different
+ * patch. The event carries `attempt` and `generation`
+ * (`runs/gates.go:228-237`, `runs/revisions.go:212-221`), so the link can say
+ * which one.
+ *
+ * GENERATION IS A CONSISTENCY CHECK ON THE LINK, NOT A SECOND KEY — and
+ * `priorAttemptOf`'s paragraph in this file, which says adding `generation` to
+ * a lookup buys no narrowing, is right about that and is not being contradicted
+ * here. The pair in the URL was stamped on the event by the very code that
+ * wrote the phase row, so a URL naming a (generation, attempt) combination the
+ * row does not carry is malformed or hand-mangled, and answering null — an
+ * honest absence the caller renders as a sentence — beats rendering a row the
+ * link did not name. It never rejects a well-formed link: a rematerialized node
+ * writes a NEW row at a NEW attempt rather than editing an old row's generation
+ * (`runs/revisions.go:187-198`, over `MaxAttemptForNode` at
+ * `store/queries.sql:719-723`), so (node_id, attempt) → generation never moves
+ * once it is written.
+ *
+ * BOTH HALVES OR NEITHER. Half a selector is not a target — `generation` alone
+ * names every attempt of that round — so a partial one falls through to the
+ * newest, which is exactly what a link with no selector at all means. That
+ * fall-through is also why nothing on the screen moves until a selector is in
+ * the URL: `newestPhaseOf` and `newestPhasePerNode` run one comparator over one
+ * input and answer the same row for the same node.
+ */
+export function phaseForSelector(
+  run: Run,
+  nodeId: string,
+  generation?: number,
+  attempt?: number,
+): Phase | null {
+  if (generation === undefined || attempt === undefined) return newestPhaseOf(run, nodeId)
+  for (const phase of run.phases ?? []) {
+    if (phase.node_id === nodeId && phase.generation === generation && phase.attempt === attempt) {
+      return phase
+    }
+  }
+  return null
+}

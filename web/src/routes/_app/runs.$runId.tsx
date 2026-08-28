@@ -5,7 +5,12 @@ import { ApiError } from '../../api/errors'
 import { ApprovalSurface } from '../../approvals/approval-surface'
 import { ApiErrorPanel } from '../../errors/api-error-panel'
 import { GateDecision } from '../../gates/gate-decision'
-import { newestPhasePerNode, type Phase, priorAttemptOf } from '../../runs/phase-spine'
+import {
+  newestPhasePerNode,
+  type Phase,
+  phaseForSelector,
+  priorAttemptOf,
+} from '../../runs/phase-spine'
 import { phaseStatusLine } from '../../runs/phase-status'
 import { PublicationPanel } from '../../runs/publication-panel'
 import { type RunEvent, runEventsQueryOptions } from '../../runs/run-events-query'
@@ -38,8 +43,53 @@ import { type Run, runQueryOptions } from '../../runs/run-query'
  * comparison against a node id is false — which is the same place a param
  * naming a node this run does not have lands. A future reader adding a
  * `phase.startsWith(...)` or handing it to a template is the one this warns.
+ *
+ * `generation` AND `attempt` NARROW `phase` TO ONE ATTEMPT, and they arrive
+ * together or not at all. `?phase=gate` opens the node's newest attempt,
+ * because the timeline is one row per node — which is the right answer for a
+ * rail row and the wrong one for a `gate.decided` event, whose whole content is
+ * a decision made on ONE attempt. The pair is what the event carries, so it is
+ * what the link carries; `phaseForSelector` is where the triple is resolved and
+ * where the pair's meaning is argued.
+ *
+ * PLAIN `z.number()`, NOT `z.coerce.number()`, and the reason is the measured
+ * parser behaviour two paragraphs up: numbers already arrive as numbers, so
+ * `coerce` buys nothing on the happy path and loses information on the unhappy
+ * one. MEASURED, both spellings, against `?phase=gate&generation=true`:
+ * `z.coerce.number()` reads the boolean as 1 and silently targets a real
+ * attempt, while `z.number()` rejects the object, `validateSearch` answers
+ * `{}`, the raw boolean survives the ancestor merge and the read-site narrow
+ * below sends it to the node's newest — which is where every other unusable
+ * value on this route already lands.
  */
-const searchSchema = z.object({ phase: z.string().optional() })
+const searchSchema = z.object({
+  phase: z.string().optional(),
+  generation: z.number().int().positive().optional(),
+  attempt: z.number().int().positive().optional(),
+})
+
+/**
+ * One half of the attempt selector — a positive integer ordinal, or nothing.
+ *
+ * TWO CALLERS, ONE PREDICATE: the search params below, re-narrowed at the read
+ * site, and the `gate.decided` payload the link is BUILT from, which is
+ * `unknown` all the way down (`EventDestination`). A link written from a
+ * payload the emitter changed shape on must not be written at all, and it is
+ * the same question in both places — is this a usable ordinal?
+ *
+ * `searchSchema` is a claim the runtime is free to violate — rejecting a value
+ * does not remove it, which that schema's own comment measures at length — so
+ * `generation` really can hold a boolean, a string, or a fractional number by
+ * the time it reaches `useSearch()`. It re-asserts what the schema asserts,
+ * rather than
+ * merely `typeof === 'number'`: a `1.5` the schema rejected must land where a
+ * `true` the schema rejected lands, and a looser narrow would instead route it
+ * to the "not in this run's phase list" sentence, which reads as a claim about
+ * the RUN rather than about the URL.
+ */
+function attemptOrdinal(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
+}
 
 export const Route = createFileRoute('/_app/runs/$runId')({
   validateSearch: (search: Record<string, unknown>) => {
@@ -53,10 +103,21 @@ export const Route = createFileRoute('/_app/runs/$runId')({
 
 function RunDetail() {
   const { runId } = Route.useParams()
-  const { phase: openPhase } = Route.useSearch()
+  const { phase: openPhase, generation, attempt } = Route.useSearch()
   const navigate = Route.useNavigate()
   const { data: run } = useSuspenseQuery(runQueryOptions(runId))
   const spine = newestPhasePerNode(run)
+
+  // THE OPEN ROW IS RESOLVED ONCE, HERE, and handed down — not resolved again
+  // inside whichever component happens to need it. The spine is rendered by two
+  // hosts (see below) and a second resolution is how one of them comes to show
+  // attempt 1's body under attempt 3's heading. `typeof === 'string'` because
+  // `phase` is one more value the runtime can violate; a non-string names no
+  // node, which is where a `?phase=42` already lands.
+  const selected =
+    typeof openPhase === 'string'
+      ? phaseForSelector(run, openPhase, attemptOrdinal(generation), attemptOrdinal(attempt))
+      : null
 
   const toggle = (nodeId: string) => {
     // The updater form returns the WHOLE next search object, so closing a phase
@@ -86,7 +147,13 @@ function RunDetail() {
       <div className="md:flex md:items-start md:gap-4">
         <PhaseRail run={run} spine={spine} openPhase={openPhase} />
         <div data-testid="phase-detail" className="min-w-0 md:flex-1">
-          <PhaseTimeline run={run} spine={spine} openPhase={openPhase} onToggle={toggle} />
+          <PhaseTimeline
+            run={run}
+            spine={spine}
+            openPhase={openPhase}
+            selected={selected}
+            onToggle={toggle}
+          />
           {spine.length > 0 && !spine.some((p) => p.node_id === openPhase) && (
             /* `md:` ONLY: on a phone a closed timeline is the resting state
                and needs no caption, while on a wide viewport the pane beside
@@ -252,11 +319,21 @@ function RunHeader(props: { run: Run }) {
  * (`runs/compile.go:22`) pointing at bytes on the runner's disk, and serving
  * those is a safety decision that deserves its own design pass. A terminal box
  * that stayed empty would be the most convincing lie on this screen.
+ *
+ * THE OPEN ROW SHOWS `selected`, WHICH IS NOT ALWAYS THE SPINE ROW. The spine
+ * is one row per node — its newest attempt — and that is what every closed row
+ * and the whole rail mean. A URL naming an attempt — which is what a
+ * `gate.decided` event links to — resolves to a
+ * different row of the same node, and the open row then follows it: summary,
+ * body, AND `data-state`. All three or none — a body from attempt 1 rendered
+ * under attempt 3's `data-state` is the same lie in a quieter attribute, and
+ * `data-state` is what the live-update tests read.
  */
 function PhaseTimeline(props: {
   run: Run
   spine: Phase[]
   openPhase: string | undefined
+  selected: Phase | null
   onToggle: (nodeId: string) => void
 }) {
   if (props.spine.length === 0) {
@@ -273,12 +350,18 @@ function PhaseTimeline(props: {
     >
       {props.spine.map((phase) => {
         const open = props.openPhase === phase.node_id
+        // A CLOSED ROW IS ALWAYS THE SPINE ROW, and an open one is `selected`
+        // when there is one. Null here means the URL named an attempt this run
+        // does not carry: the row keeps its own summary — the reader still
+        // needs to see what the node's newest attempt did — and the body says
+        // what happened instead of quietly falling back to it.
+        const shown = open && props.selected !== null ? props.selected : phase
         return (
           <li
             key={phase.node_id}
             data-testid={`phase-${phase.node_id}`}
             data-node-id={phase.node_id}
-            data-state={phase.status}
+            data-state={shown.status}
             // A CLOSED ROW IS THE RAIL'S JOB ON A WIDE VIEWPORT, so it leaves
             // the pane rather than stacking N empty bordered strips above the
             // one body the pane exists to show. The row is still in the DOM,
@@ -292,11 +375,17 @@ function PhaseTimeline(props: {
               aria-expanded={open}
               className="text-text flex w-full items-center gap-2 px-3 py-3 text-left text-sm md:hidden"
             >
-              <PhaseSummary run={props.run} phase={phase} />
+              <PhaseSummary run={props.run} phase={shown} />
             </button>
             {open && (
               <div className="border-border border-t px-3 py-3 md:rounded-md md:border">
-                <PhaseBody run={props.run} phase={phase} />
+                {props.selected === null ? (
+                  <p className="text-text-muted text-sm">
+                    This attempt is not in the run's phase list.
+                  </p>
+                ) : (
+                  <PhaseBody run={props.run} phase={props.selected} />
+                )}
               </div>
             )}
           </li>
@@ -433,17 +522,91 @@ function EventLog(props: { runId: string }) {
   return (
     <ul data-testid="event-log" className="flex flex-col gap-1">
       {rows.map((e) => (
-        <EventRow key={e.id} event={e} />
+        <EventRow key={e.id} runId={props.runId} event={e} />
       ))}
     </ul>
   )
 }
 
-function EventRow(props: { event: RunEvent }) {
+function EventRow(props: { runId: string; event: RunEvent }) {
   return (
     <li className="text-text-muted flex gap-2 font-mono text-xs">
       <time dateTime={props.event.occurred_at}>{props.event.occurred_at}</time>
       <span className="text-text">{props.event.kind}</span>
+      <EventDestination runId={props.runId} event={props.event} />
     </li>
   )
+}
+
+/**
+ * THE TWO EVENT KINDS THAT NAME SOMEWHERE TO GO, and nothing else in the log.
+ *
+ * §2.4 names three link classes on this screen; the third — a phase's artifacts
+ * — belongs to `PhaseArtifacts`, per row, because an attempt writes several.
+ * The event log's share is these two, and both are cases where the row records
+ * a thing that exists elsewhere: a decision on one gate attempt, and a pull
+ * request on a forge. Every other kind is a lifecycle transition whose whole
+ * content is already the sentence in the row.
+ *
+ * EVERY FIELD IS READ AS `unknown`, and that is the payload's actual type
+ * (`api/schema.d.ts:983-985`) rather than caution. There is no typed event
+ * payload anywhere in `web/`: the control plane builds each one as a
+ * `map[string]any` at the emitter, `contracts:check` cannot police the keys, and
+ * a cast here would turn a payload shape change into a blank row or a crash
+ * instead of a row with no link on it.
+ *
+ * THE DECIDED GATE IS THE REASON THIS EXISTS. Two `gate.decided` rows on one
+ * run are the ordinary case — a request_changes and then an approve, one
+ * revision round apart — and until now they were two identical lines of text
+ * pointing nowhere. `?phase=` alone would have sent both to the SAME attempt,
+ * the newest, so the row recording somebody's request for changes would have
+ * opened somebody else's approval. Hence the whole triple, and hence the
+ * attempt in the link's own text: it is what separates the two rows for a
+ * reader and for a screen reader.
+ */
+function EventDestination(props: { runId: string; event: RunEvent }) {
+  const payload = props.event.payload
+  if (payload === null) return null
+  if (props.event.kind === 'gate.decided') {
+    const node = payload.node_id
+    const generation = attemptOrdinal(payload.generation)
+    const attempt = attemptOrdinal(payload.attempt)
+    if (typeof node !== 'string' || generation === undefined || attempt === undefined) return null
+    return (
+      <Link
+        to="/runs/$runId"
+        params={{ runId: props.runId }}
+        search={{ phase: node, generation, attempt }}
+        className="text-accent underline"
+      >
+        {node} attempt {attempt}
+      </Link>
+    )
+  }
+  if (props.event.kind === 'publish.pr_opened') {
+    const url = payload.pr_url
+    const number = payload.pr_number
+    // A SCHEME CHECK, NOT A STRING CHECK, because this href is built from a
+    // value the control plane copied out of a forge's JSON
+    // (`runs/publish.go:1010-1017` stores `pr.URL` verbatim) and never parsed.
+    //
+    // NOT BECAUSE REACT WOULD OTHERWISE RUN IT — MEASURED on 19.2.8: React
+    // REPLACES a `javascript:` href with `javascript:throw new Error('React
+    // has blocked a javascript: URL as a security precaution.')`, so that one
+    // scheme is already dead. What React does not do is anything about the
+    // ordinary case: an empty, relative, or `data:` `pr_url` renders a link
+    // that goes nowhere or back to the page the reader is on, which is the
+    // failure `publication-panel.tsx`'s `prLink` and the publication artifact
+    // view each guard separately. Leaning on a framework's block list for one
+    // scheme is not a policy; naming the two schemes a pull request can have
+    // is. An unusable URL leaves the row exactly as it was before this
+    // function existed — a log line with no link.
+    if (typeof url !== 'string' || !/^https?:\/\//.test(url)) return null
+    return (
+      <a className="text-accent underline" href={url}>
+        {typeof number === 'number' ? `#${number}` : url}
+      </a>
+    )
+  }
+  return null
 }
