@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { ApiError } from '../../api/errors'
 import { ApprovalSurface } from '../../approvals/approval-surface'
 import { ApiErrorPanel } from '../../errors/api-error-panel'
+import { asApiError, ErrorSurface } from '../../errors/error-surface'
 import { GateDecision } from '../../gates/gate-decision'
 import {
   newestPhasePerNode,
@@ -13,6 +14,7 @@ import {
 } from '../../runs/phase-spine'
 import { phaseStatusLine } from '../../runs/phase-status'
 import { PublicationPanel } from '../../runs/publication-panel'
+import { useRetryRun } from '../../runs/retry-run'
 import { type RunEvent, runEventsQueryOptions } from '../../runs/run-events-query'
 import { type Run, runQueryOptions } from '../../runs/run-query'
 
@@ -286,12 +288,41 @@ function RunHeader(props: { run: Run }) {
   // node does not move. The header wants the run's current attempt, so it
   // wants the newer row.
   const newest = (run.phases ?? []).at(-1)
+  // UNCONDITIONAL, on a header that renders for every status. The mutation is
+  // inert until `.mutate()`, so the cost of holding one on a succeeded run is
+  // nothing — and the alternative, a child component mounted only on `failed`,
+  // buys a rule-of-hooks guarantee this file does not need and costs the button
+  // its error surface, which belongs under the meta line rather than inside the
+  // title row.
+  const retry = useRetryRun(run.task_id)
   return (
     <header
       data-testid="run-header"
       className="bg-ground border-border sticky top-0 z-10 border-b py-3"
     >
-      <h1 className="text-text font-medium">{run.task_title}</h1>
+      <div className="flex items-start justify-between gap-3">
+        <h1 className="text-text font-medium">{run.task_title}</h1>
+        {/* RETRY, AND ONLY ON `failed` — sofo's checkpoint ruling. A rejected
+            run ends `failed` too (`gates.go:241-247` fails the run in the same
+            transaction that finishes the rejected gate), so this one comparison
+            covers a rejection as well.
+
+            The other terminal states are deliberately silent. `succeeded` has
+            nothing to retry; `superseded` means a re-run already happened and
+            offering a second one invites a third; `dead` is the reaper's
+            verdict. Widening this is a design decision, not a bug fix — the
+            suite's `NOT_FAILED` row is where it would have to be argued. */}
+        {run.status === 'failed' && (
+          <button
+            type="button"
+            onClick={() => retry.mutate()}
+            disabled={retry.isPending}
+            className="border-border text-text shrink-0 rounded-md border px-3 py-1 text-sm font-medium"
+          >
+            Retry
+          </button>
+        )}
+      </div>
       <p className="text-text-muted flex flex-wrap gap-2 font-mono text-xs">
         <span>{run.workflow_name}</span>
         <span>· {run.repo_slug}</span>
@@ -299,6 +330,17 @@ function RunHeader(props: { run: Run }) {
         {newest !== undefined && <span>· attempt {newest.attempt}</span>}
         <span>· generation {run.generation}</span>
       </p>
+      {/* IN THE STICKY HEADER, beside the button that produced it. A 409 here
+          is a normal answer — somebody else's re-run of this task won the race
+          (`runs/tasks.go:401`) — and the operator reading it is looking at the
+          button, not at the bottom of a timeline they would have to scroll to.
+          It is rendered only on a failure, so the header's height is unchanged
+          on every screen that has not clicked. */}
+      {retry.error !== null && (
+        <div className="pt-2">
+          <ErrorSurface failure={asApiError(retry.error)} />
+        </div>
+      )}
     </header>
   )
 }

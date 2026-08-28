@@ -4,6 +4,7 @@ import { FormProvider } from 'react-hook-form'
 import { z } from 'zod'
 import { ApiError } from '../api/errors'
 import { ApiErrorPanel } from '../errors/api-error-panel'
+import { asApiError, ErrorSurface } from '../errors/error-surface'
 import { FormError } from '../forms/form-error'
 import { TextField } from '../forms/text-field'
 import { useAppForm } from '../forms/use-app-form'
@@ -207,12 +208,11 @@ export function GateControls(props: {
     )
   }
 
-  // `decide.error` is NOT always an ApiError: `unwrap` throws one, but
-  // openapi-fetch propagates fetch's own TypeError from a request that never
-  // reached the server, and `ApiErrorPanel` deliberately rethrows anything that
-  // is not ours. Narrowing here is what keeps a dropped connection from
-  // becoming a render-time throw in whichever route is hosting these controls.
-  const failure = decide.error instanceof ApiError ? decide.error : null
+  // Narrowed before anything renders it — `errors/error-surface.tsx` records
+  // why an unnarrowed mutation error is a render-time throw. This host needs
+  // the narrowed value itself, not just the surface, because it singles out one
+  // status below.
+  const failure = asApiError(decide.error)
   const conflict = failure !== null && failure.status === 409 ? failure : null
   const busy = decide.isPending
 
@@ -313,25 +313,6 @@ export function GateControls(props: {
         <ErrorSurface failure={failure} />
       )}
     </div>
-  )
-}
-
-/**
- * Whatever went wrong that was not a 409.
- *
- * The `null` arm is a request that never completed — a dropped connection, a
- * backend restarting mid-click — where there is no status, no problem document
- * and therefore no correlation id to render. The wording is `useAppForm`'s,
- * deliberately: it names no cause, because a transport failure, an unparseable
- * 200 and a bug in the mutation all arrive here and only the first is a
- * connection problem.
- */
-function ErrorSurface(props: { failure: ApiError | null }) {
-  if (props.failure !== null) return <ApiErrorPanel error={props.failure} />
-  return (
-    <p role="alert" className="text-danger text-sm">
-      the request could not be completed — check your connection and try again
-    </p>
   )
 }
 

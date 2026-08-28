@@ -264,6 +264,47 @@ const run = (shape: RunShape | (() => RunShape)) =>
     ),
   )
 
+/**
+ * EVERY OTHER STATUS IN THE ENUM (`runs/status.go:14-20`), and the whole enum
+ * rather than a sample because "failed only" is the entire rule: the button's
+ * guard is one comparison, and a sampled list leaves whichever status it
+ * omitted as the one a widened guard could quietly start answering. `dead` and
+ * `superseded` are terminal too and are deliberately silent here — that is
+ * sofo's ruling and not an oversight, and this row is where a later ruling
+ * would have to be changed.
+ */
+const NOT_FAILED = ['pending', 'running', 'waiting', 'succeeded', 'superseded', 'dead'] as const
+
+/**
+ * `POST /api/v1/tasks/{id}/runs`, and the run detail the success navigates to.
+ *
+ * THE SPY RECORDS THE PATH, not merely that a call happened. The mutation names
+ * its task through `run.task_id`, and a version that passed `run.id` instead
+ * would still POST, still match a `:id`-shaped handler, still get its 201 and
+ * still navigate — every assertion but this one survives it. The path is the
+ * only place the two are distinguishable, which is why the fixture's `task_id`
+ * (`t1`) and its run id (`run-1`) are different strings.
+ */
+const rerunOk = (seen: { path?: string }) => [
+  http.post('/api/v1/tasks/:id/runs', ({ request }) => {
+    seen.path = new URL(request.url).pathname
+    return HttpResponse.json(onTheWire(rerunResult()), { status: 201 })
+  }),
+  http.get('/api/v1/runs/run-2', () => HttpResponse.json(onTheWire(rerunResult()))),
+]
+
+/** What `rerunTask` answers with: a fresh, still-pending run of the same task. */
+const rerunResult = (): Run => ({
+  ...baseRun(),
+  id: 'run-2',
+  status: 'pending',
+  started_at: null,
+  generation: 1,
+})
+
+const problem = (status: number, body: Record<string, unknown>) =>
+  HttpResponse.json(body, { status, headers: { 'content-type': 'application/problem+json' } })
+
 const PATCH_B64 = btoa('--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old\n+new\n')
 const patchPayload = () => ({ diff: PATCH_B64 })
 
@@ -447,10 +488,14 @@ describe('run detail', () => {
   })
 
   it('has a sticky header with workflow, repo and attempt — and no cancel or retry', async () => {
-    // §10.3: cancel does not exist and `runs/tasks.go:394` assigns it to Plan
-    // 09 (`run is in flight; cancel arrives in Plan 09`); whole-task retry DOES
-    // exist (rerunTask) and is deferred anyway, so the checkpoint can decide
-    // what this header should offer as a whole.
+    // NEITHER ABSENCE HAS THE SAME REASON ANY MORE, and the title keeps them
+    // together only because this fixture is `running`.
+    //
+    // Cancel does not exist at all: §10.3, and `runs/tasks.go:394` assigns it
+    // to Plan 09 (`run is in flight; cancel arrives in Plan 09`). Retry DOES
+    // exist and is right below — it is absent HERE because a running run is not
+    // a failed one, which makes this assertion one case of the `NOT_FAILED` row
+    // rather than a statement that the button was never built.
     renderApp('/runs/run-1', [run(threePhases())])
     const header = await screen.findByTestId('run-header')
     expect(header).toHaveTextContent('e2e')
@@ -463,6 +508,99 @@ describe('run detail', () => {
     // name.
     expect(within(header).getByText('e2e')).toBeInTheDocument()
     expect(within(header).queryByRole('button', { name: /cancel|retry/i })).toBeNull()
+  })
+
+  /**
+   * RETRY, AND ONLY ON A FAILED RUN — sofo's checkpoint ruling, verbatim.
+   *
+   * A rejected run ends `failed` too (`gates.go:241-247` fails the run in the
+   * same transaction that finishes the rejected gate), so this one status rule
+   * covers a rejection as well and there is no second branch for it.
+   *
+   * The button rides `rerunTask`, which is a TASK-level operation: it does not
+   * resume this run, it mints a new one from the task's pinned version. That is
+   * why the success navigates away rather than refreshing in place — the run on
+   * screen is not the run that will make progress.
+   */
+  it('offers Retry on a failed run', async () => {
+    renderApp('/runs/run-1', [run({ ...threePhases(), status: 'failed' })])
+    const header = await screen.findByTestId('run-header')
+    expect(within(header).getByRole('button', { name: /^retry$/i })).toBeInTheDocument()
+  })
+
+  it.each(NOT_FAILED)('offers no Retry on a %s run', async (status) => {
+    renderApp('/runs/run-1', [run({ ...threePhases(), status })])
+    const header = await screen.findByTestId('run-header')
+    expect(within(header).queryByRole('button', { name: /retry/i })).toBeNull()
+  })
+
+  it('Retry posts to the run’s TASK and lands on the run it created', async () => {
+    const seen: { path?: string } = {}
+    const router = renderApp('/runs/run-1', [
+      run({ ...threePhases(), status: 'failed' }),
+      ...rerunOk(seen),
+    ])
+    await userEvent.click(await screen.findByRole('button', { name: /^retry$/i }))
+    // The NAVIGATION is what is awaited, not the request: the POST resolving is
+    // one `onSuccess` away from the address changing, and asserting on the spy
+    // first would pass against a mutation that never navigated at all.
+    await waitFor(() => expect(router.state.location.pathname).toBe('/runs/run-2'))
+    expect(seen.path).toBe('/api/v1/tasks/t1/runs')
+    expect(await screen.findByTestId('run-header')).toHaveTextContent('pending')
+  })
+
+  /**
+   * The 409 the service really answers, and the reason the button needs an
+   * error surface at all.
+   *
+   * `runs/tasks.go:401` returns ClassConflict when another re-run of this task
+   * committed its pending run between our read and our insert — two operators
+   * on the same failed run, which is exactly the shape a shared inbox produces.
+   * It is a NORMAL answer: nothing is broken, somebody else's re-run won, and
+   * the screen must say so and keep its correlation id rather than throw.
+   */
+  it('renders a losing re-run’s conflict in place, correlation id and all', async () => {
+    renderApp('/runs/run-1', [
+      run({ ...threePhases(), status: 'failed' }),
+      http.post('/api/v1/tasks/:id/runs', () =>
+        problem(409, {
+          type: 'about:blank',
+          title: 'Conflict',
+          status: 409,
+          detail: 'another re-run of this task is already pending',
+          correlation_id: 'cid-11',
+        }),
+      ),
+    ])
+    await userEvent.click(await screen.findByRole('button', { name: /^retry$/i }))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('another re-run of this task is already pending')
+    expect(alert).toHaveTextContent('cid-11')
+    // Still on the failed run, and the button is still there to try again.
+    expect(screen.getByRole('button', { name: /^retry$/i })).toBeEnabled()
+  })
+
+  /**
+   * THE ARM THAT IS NOT AN `ApiError` AT ALL, and the only thing that makes the
+   * narrowing in front of `ApiErrorPanel` falsifiable.
+   *
+   * A request that never reached the server rejects with fetch's own TypeError,
+   * which carries no status, no problem document and no correlation id — and
+   * `ApiErrorPanel` deliberately RETHROWS anything that is not ours. Handed the
+   * raw error it would throw during render and take the whole run screen down,
+   * on the one failure a user is most likely to hit. Without this case the
+   * narrowing is unobservable: every other test here fails with a real problem
+   * document, which passes through it unchanged.
+   */
+  it('survives a Retry that never reaches the server', async () => {
+    renderApp('/runs/run-1', [
+      run({ ...threePhases(), status: 'failed' }),
+      http.post('/api/v1/tasks/:id/runs', () => HttpResponse.error()),
+    ])
+    await userEvent.click(await screen.findByRole('button', { name: /^retry$/i }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(/check your connection/i)
+    // The header is still rendered — the point of the case is that nothing threw.
+    expect(screen.getByTestId('run-header')).toHaveTextContent('caesar/e2e')
   })
 
   it('names the GENERATION as well as the attempt', async () => {
