@@ -167,23 +167,37 @@ the comparison (Task 7, `web/src/gates/identical-revision.ts`).
   decides a gate, requests changes, approves the next generation, and asserts both links
   resolve to their own decisions.
 
-  **Amended after Task 9 shipped, on sofo's ruling.** The PR link named only `publish.pr_opened`
-  until `69a0313`, and that was an oversight rather than a decision: `publish.go` builds ONE
-  event over ONE payload — `node_id`, `branch`, `pr_number`, `pr_url`, `state`, `adopted` — and
-  then chooses its kind, `EventPublishAdopted` when the branch already had a pull request open
-  and this run took it over, `EventPublishPROpened` when the run opened one
-  (`runs/publish.go:993-1017`). Same `pr_url` either way. So an adopted publication has exactly
-  the pull request an opened one has, and linking only one kind leaves a reader looking at a row
-  that names a PR they cannot reach, for a reason invisible from the row. The KIND is the filter
-  and the payload shape is not: no other event carries `pr_url` today, and an implementation
-  keyed on the field rather than the kind would start linking the first one that ever gains it.
+  **Amended after Task 9 shipped, on sofo's ruling, and corrected in the re-review.** The PR link
+  named only `publish.pr_opened` until `69a0313`, and that was an oversight rather than a
+  decision: `openPublication` builds ONE event over ONE payload — `node_id`, `branch`,
+  `pr_number`, `pr_url`, `state`, `adopted` — and then chooses its kind, `EventPublishAdopted`
+  when the branch already had a pull request open and this run took it over,
+  `EventPublishPROpened` when the run opened one (`runs/publish.go:993-1017`). Same `pr_url`
+  either way, so linking only `pr_opened` leaves a reader looking at a row that names a PR they
+  cannot reach, for a reason invisible from the row.
+
+  **`publish.adopted` is emitted twice and only one emitter names a pull request**, which the
+  first version of this paragraph got wrong: `pushPublication` writes the same kind when the push
+  found the branch already at the wanted head and adopted it instead of pushing again
+  (`runs/publish.go:807-810` — the crash-after-push recovery, covered by
+  `TestPublish_CrashAfterPushAdoptsTheBranchInsteadOfPushingAgain`), over a payload of `node_id`,
+  `branch`, `head_sha`, `tree_hash`, `created`, with no `pr_url` and no `pr_number`. The emitter
+  says so itself at `runs/publish.go:832-834`. **So the KIND says a row may name a pull request
+  and the PAYLOAD says whether it does, and both tests are load-bearing**: keying on the kind
+  alone would put a dead link on a branch-adoption row, and keying on the field alone would start
+  linking the first other kind that ever gains a `pr_url` — no other event carries one today
+  (`runs/publish.go:1016` is the only event payload with the key). A branch-adoption row renders
+  as a plain line, which is the same honest absence this section asks for below.
 
   Two further facts the shipped tests pin, both measured rather than reasoned. **The gate's
   `generation` and `attempt` come apart only through a round the gate did not take part in.**
   `attempt` is a per-node ordinal a rematerialized node continues
   (`runs/store/queries.sql:719-723`) and `generation` is the run's revision round, so a gate
-  decided in every round of its run has `attempt == generation` forever; only an EARLIER gate
-  spending a round before this one materializes separates them. A gate retry cannot:
+  decided in every round of its run has `attempt == generation` forever. An earlier gate spending
+  a round before this one materializes is one way to separate them and the one the shipped
+  fixture uses; a gate on a PARALLEL branch is another, since `generation` is run-level and a
+  revision anywhere bumps it while this node writes nothing — the same mechanism §2.3's amendment
+  above documents. A gate retry is not one of the ways:
   `InsertGatePhase` writes `waiting_decision` and the claim CTE predicates on `pending`
   (`runs/store/queries.sql:404-411`), so a gate is never leased and never reaches the retry path
   that inserts `Attempt+1` at the same generation (`runs/orchestrator.go:1609`). Any test of this
