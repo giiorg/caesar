@@ -414,19 +414,25 @@ describe('gate controls', () => {
     expect(await screen.findByText('cid-77')).toBeInTheDocument()
   })
 
-  it('invalidates all five keys of its cache contract, the EVENT LOG among them', async () => {
+  it('invalidates all six keys of its cache contract, the EVENT LOG and the HISTORY among them', async () => {
     // A SPY on the key set, where every other test in this file asserts through
-    // a rendered surface, and the reason is that four of these five keys have
+    // a rendered surface, and the reason is that five of these six keys have
     // no host here to observe them: `['tasks']` belongs to a screen these
     // controls never mount, so a behavioural proof would mean rendering the
     // Tasks list around a gate decision to watch one refetch. What the contract
     // actually says is which keys go out, and that is what this reads.
     //
     // The set is asserted WHOLE rather than with a `toContainEqual` per key.
-    // The keys are a set the stream's bridge must match — a decision and the
-    // frames that follow it are idempotent only if both invalidate the same
+    // The first five are a set the stream's bridge must match — a decision and
+    // the frames that follow it are idempotent only if both invalidate the same
     // things — so a key silently dropped from either side is the failure worth
     // catching, and only an equality assertion catches a drop.
+    //
+    // `['decisions']` IS THE ONE THE BRIDGE MUST NOT MATCH (Task 18), and it is
+    // asserted here for the opposite reason: the Approvals History tab has no
+    // other refresh path than this mutation and its 60s floor, so a key dropped
+    // here leaves the reader who just decided a gate looking at a history that
+    // does not contain their own decision.
     //
     // THE WHOLE FILTER OBJECT, not `c[0]?.queryKey`, and that is Task 12's
     // doing. `exact: true` on the run key is what keeps `['run', id, 'events']`
@@ -444,6 +450,7 @@ describe('gate controls', () => {
         { queryKey: ['runs'] },
         { queryKey: ['tasks'] },
         { queryKey: ['run', 'r1', 'events'] },
+        { queryKey: ['decisions'] },
       ]),
     )
   })

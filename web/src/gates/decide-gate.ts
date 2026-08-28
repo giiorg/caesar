@@ -17,9 +17,10 @@ export type DecisionInput = { nodeId: string; decision: Decision; note?: string 
 /**
  * One gate decision.
  *
- * WHAT IT INVALIDATES IS THE WHOLE OF ITS CACHE CONTRACT, and it is deliberately
- * the same five keys, spelled in the same order, that the stream's bridge sends
- * out on its LIFECYCLE tier (`fire()` in `realtime/cache-bridge.ts`): the inbox
+ * WHAT IT INVALIDATES IS THE WHOLE OF ITS CACHE CONTRACT: the same five keys,
+ * spelled in the same order, that the stream's bridge sends out on its
+ * LIFECYCLE tier (`fire()` in `realtime/cache-bridge.ts`) — and then one more
+ * that the bridge deliberately does NOT carry. The five: the inbox
  * (this gate left it), this run, the run list (the run's status changed), the
  * TASK list — `TaskResponse.Status` IS the latest run's status, so a decision
  * moves the task between the Tasks screen's four attention groups — and this
@@ -73,6 +74,16 @@ export function useDecideGate(runId: string) {
       void qc.invalidateQueries({ queryKey: ['runs'] })
       void qc.invalidateQueries({ queryKey: ['tasks'] })
       void qc.invalidateQueries({ queryKey: ['run', runId, 'events'] })
+      // THE SIXTH KEY IS THE ONE THE BRIDGE DOES NOT CARRY, and it is last so
+      // that the five above stay readable as the bridge's set in the bridge's
+      // order. `['decisions']` is the Approvals History tab
+      // (`decisions/decisions-query.ts`, where the twin half of this note
+      // lives): the row this mutation is about to create belongs at the top of
+      // it, and this client is the one place that knows a decision just
+      // happened rather than merely that a run changed. The stream is
+      // deliberately not extended to it — history moves only when a human
+      // decides, and somebody else's decision arrives on the refresh floor.
+      void qc.invalidateQueries({ queryKey: ['decisions'] })
     },
   })
 }

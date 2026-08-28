@@ -8,6 +8,21 @@ const DECIDED: Record<string, string> = {
 }
 
 /**
+ * The verb, and the DEGRADATION RULE with it, in one place for both surfaces.
+ *
+ * Exported since Task 18: the Approvals history renders the same event as this
+ * component — same decision, same person, same gate — from a different DTO
+ * (`DecisionResponse` carries no `acted_by_id` and no `self_approval`, so the
+ * component itself does not fit), and two spellings of "requested changes on"
+ * is how the run timeline and the history come to describe one decision
+ * differently. The `?? decision` fallback travels WITH the map rather than
+ * being restated per caller: a verdict the server grows and this map has not
+ * learned must degrade to the raw token everywhere, not to `undefined` on
+ * whichever surface forgot.
+ */
+export const decidedAs = (decision: string): string => DECIDED[decision] ?? decision
+
+/**
  * What a gate that is no longer waiting looks like: who decided it, what they
  * decided, what they said, and when.
  *
@@ -30,7 +45,7 @@ export function GateDecision(props: { decision: GateDecisionSummary }) {
           text children, so wrapping the address in a <span> would split the
           sentence and stop `findByText(/alice@example.com/)` resolving to it. */}
       <p className="text-text">
-        {decision.acted_by_email} {DECIDED[decision.decision] ?? decision.decision} this gate.
+        {decision.acted_by_email} {decidedAs(decision.decision)} this gate.
       </p>
       {decision.note !== '' && <p className="text-text-muted text-sm">{decision.note}</p>}
       <p className="text-text-muted text-sm">

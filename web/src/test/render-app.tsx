@@ -211,6 +211,17 @@ export function renderApp(
     // branch in `tasksQueryOptions` would otherwise be unreachable from every
     // test in the tree.
     http.get('/api/v1/tasks', () => HttpResponse.json({ tasks: null })),
+    // `decisions: null`, for the fourth time and the same reason: the contract
+    // marks it required AND nullable because a Go nil slice marshals to null,
+    // `handleListDecisions` happens to build a non-nil slice today, and the
+    // null branch in `decisionsInfiniteQueryOptions` would otherwise be
+    // unreachable from every test in the tree. Unlike the three above, only the
+    // History tab fetches this — so this default is what the history-empty
+    // assertion in `approvals/decision-history.test.tsx` runs against, rather
+    // than a stub that never sees a reader.
+    http.get('/api/v1/approvals/decisions', () =>
+      HttpResponse.json({ decisions: null, next_cursor: null }),
+    ),
     http.get('/api/v1/stream', silentStream),
   )
   // BOTH router arguments are load-bearing and neither is optional.
