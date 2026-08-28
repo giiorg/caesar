@@ -24,6 +24,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Global audit entries, newest first (admin). Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["listAudit"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/login": {
         parameters: {
             query?: never;
@@ -754,6 +774,24 @@ export interface components {
             parent_ids: string[] | null;
             type: string;
         };
+        ApiAuditEntryResponse: {
+            action: string;
+            actor_user_id: null | string;
+            correlation_id: string;
+            detail: {
+                [key: string]: unknown;
+            } | null;
+            /** Format: int64 */
+            id: number;
+            /** Format: date-time */
+            occurred_at: string;
+            subject_id: string;
+            subject_kind: string;
+        };
+        ApiAuditPageResponse: {
+            entries: components["schemas"]["ApiAuditEntryResponse"][] | null;
+            next_cursor: null | string;
+        };
         ApiChangePasswordRequest: {
             current_password?: string;
             new_password?: string;
@@ -1234,6 +1272,58 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    listAudit: {
+        parameters: {
+            query?: {
+                /** @description opaque; the previous page's next_cursor */
+                cursor?: string;
+                /** @description 1-200, default 50 */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiAuditPageResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

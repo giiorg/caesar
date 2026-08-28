@@ -64,6 +64,12 @@ CREATE TABLE audit_entries (
 
 CREATE INDEX audit_entries_occurred_idx ON audit_entries (occurred_at);
 
+-- Serves the admin read: newest-first keyset on (occurred_at DESC, id DESC).
+-- occurred_at is NOT unique (writers stamp it from the injected clock; one
+-- transaction can emit several entries — the login sweep), so the id
+-- tiebreaker is load-bearing, not defensive.
+CREATE INDEX audit_entries_read_idx ON audit_entries (occurred_at DESC, id DESC);
+
 -- DB-backed login rate limiting: scope is 'account:<lower(email)>',
 -- 'ip:<host>', or 'pwchange:<user_id>'. Parameters pinned in the plan
 -- headers (02: login scopes; 03: pwchange).

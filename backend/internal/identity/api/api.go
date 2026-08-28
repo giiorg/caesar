@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/giiorg/caesar/backend/internal/identity"
+	"github.com/giiorg/caesar/backend/internal/platform/audit"
 	"github.com/giiorg/caesar/backend/internal/platform/authn"
 	"github.com/giiorg/caesar/backend/internal/platform/httpx"
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
@@ -29,10 +31,15 @@ type API struct {
 	svc        *identity.Service
 	sessionTTL time.Duration // cookie Max-Age; server-side expiry is authoritative
 	projects   ProjectChecker
+	// audit is the read half of the shared-kernel recorder. It sits beside the
+	// other admin surfaces here rather than in a context of its own because
+	// audit_entries has no owner: every context writes to it, so no context can
+	// claim the read.
+	audit *audit.Reader
 }
 
-func New(svc *identity.Service, sessionTTL time.Duration, projects ProjectChecker) *API {
-	return &API{svc: svc, sessionTTL: sessionTTL, projects: projects}
+func New(svc *identity.Service, sessionTTL time.Duration, projects ProjectChecker, auditReader *audit.Reader) *API {
+	return &API{svc: svc, sessionTTL: sessionTTL, projects: projects, audit: auditReader}
 }
 
 // Operations is the single route table: mux registration (httpx.Mount)
@@ -89,6 +96,21 @@ func Operations(a *API) []httpx.Operation {
 			Pattern: "PATCH /api/v1/users/{id}", ID: "updateUser", Summary: "Update role or active flag (admin)",
 			Request: UpdateUserRequest{}, Response: UserResponse{}, Status: http.StatusOK,
 			Handler: a.adminOnly(a.handleUpdateUser),
+		},
+		{
+			Pattern: "GET /api/v1/audit", ID: "listAudit",
+			Summary: "Global audit entries, newest first (admin). " +
+				"Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.",
+			Request: ListAuditQuery{}, Response: AuditPageResponse{}, Status: http.StatusOK,
+			// The first operation in this table to declare Errors, and
+			// deliberately: the four admin operations above declare none, so a
+			// client reading the generated union has no branch for either
+			// refusal. Both are routine here rather than faults — a member
+			// following a shared link gets the 403, and a stale cookie gets the
+			// 401 — and this endpoint refuses outright where listRuns scopes,
+			// so unlike listRuns the 403 is real.
+			Errors:  []int{http.StatusUnauthorized, http.StatusForbidden},
+			Handler: a.adminOnly(a.handleListAudit),
 		},
 		{
 			Pattern: "GET /api/v1/projects/{id}/grants", ID: "listGrants", Summary: "List a project's grants (manage)",
@@ -383,4 +405,43 @@ func (a *API) handleDeleteGrant(w http.ResponseWriter, r *http.Request, sess ide
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleListAudit is the global audit read. It is admin-only and PAGINATED
+// from the outset: audit_entries is the one table that grows with every request
+// the server serves rather than with anything a human did, so "unpaginated is
+// fine at month-one volume" was already false for it.
+//
+// The session is unused. adminOnly has already made the only authorization
+// decision this endpoint has — the log is global, and there is no per-project
+// scoping to apply on top of the role.
+func (a *API) handleListAudit(w http.ResponseWriter, r *http.Request, _ identity.AuthSession) {
+	limit, err := auditPageLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	page, err := a.audit.ListPage(r.Context(), r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, auditPageResponse(page))
+}
+
+// auditPageLimit reads the limit parameter. An absent one is zero, which the
+// reader's clamp turns into the default; an OVERSIZED one is clamped there too
+// rather than refused, because the cap is this server's protection and not a
+// contract the caller agreed to. Only a value that is not a positive integer is
+// a refusal — the same rule GET /runs applies.
+func auditPageLimit(raw string) (int32, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || n < 1 {
+		return 0, xerrors.E(xerrors.ClassInvalid, "validation failed").
+			WithFields(xerrors.FieldError{Field: "limit", Message: "must be a positive integer"})
+	}
+	return int32(n), nil
 }

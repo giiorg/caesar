@@ -144,7 +144,7 @@ func TestGoldenSet_MonthOneLoopThroughRealRoutes(t *testing.T) {
 			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
 		})
 
-	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc))
+	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc, audit.NewReader(pool)))
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, identitySvc, identitySvc, identitySvc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, identitySvc))...)
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil, discard()))...)
@@ -461,7 +461,7 @@ func newGoldenEnv(t *testing.T) *goldenEnv {
 			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
 		})
 
-	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc))
+	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc, audit.NewReader(pool)))
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, identitySvc, identitySvc, identitySvc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, identitySvc))...)
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil, discard()))...)

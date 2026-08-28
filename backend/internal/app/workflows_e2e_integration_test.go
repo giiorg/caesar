@@ -45,7 +45,7 @@ func TestAppRoutes_WorkflowsEndToEnd(t *testing.T) {
 	}
 	workflowsSvc := workflows.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}))
 
-	ops := identityapi.Operations(identityapi.New(svc, 90*24*time.Hour, nil))
+	ops := identityapi.Operations(identityapi.New(svc, 90*24*time.Hour, nil, audit.NewReader(pool)))
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, svc))...)
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	srv := httptest.NewServer(app.Routes(log, pool, ops, "http://caesar.test", webui.Handler()))

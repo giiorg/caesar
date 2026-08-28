@@ -232,7 +232,7 @@ func addExtraSchemas(r *openapi31.Reflector) error {
 // dependencies — metadata only; handlers never run during generation.
 func operationTables() [][]httpx.Operation {
 	return [][]httpx.Operation{
-		identityapi.Operations(identityapi.New(nil, 0, nil)),
+		identityapi.Operations(identityapi.New(nil, 0, nil, nil)),
 		assetsapi.Operations(assetsapi.New(nil, nil, nil, nil)),
 		workflowsapi.Operations(workflowsapi.New(nil, nil)),
 		runsapi.Operations(runsapi.New(nil, nil, nil, nil, nil, nil)),

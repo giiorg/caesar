@@ -44,6 +44,76 @@
         }
       }
     },
+    "/api/v1/audit": {
+      "get": {
+        "summary": "Global audit entries, newest first (admin). Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "listAudit",
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "opaque; the previous page's next_cursor",
+            "schema": {
+              "description": "opaque; the previous page's next_cursor",
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "1-200, default 50",
+            "schema": {
+              "description": "1-200, default 50",
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiAuditPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/auth/login": {
       "post": {
         "summary": "Authenticate and set the session cookie",
@@ -2317,6 +2387,78 @@
           "type",
           "parent_ids",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "ApiAuditEntryResponse": {
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "actor_user_id": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "correlation_id": {
+            "type": "string"
+          },
+          "detail": {
+            "additionalProperties": {},
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "subject_id": {
+            "type": "string"
+          },
+          "subject_kind": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "occurred_at",
+          "actor_user_id",
+          "action",
+          "subject_kind",
+          "subject_id",
+          "correlation_id",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "ApiAuditPageResponse": {
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/ApiAuditEntryResponse"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "next_cursor": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "entries",
+          "next_cursor"
         ],
         "type": "object"
       },

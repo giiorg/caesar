@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const insertAuditEntry = `-- name: InsertAuditEntry :exec
@@ -49,6 +50,60 @@ ORDER BY id
 
 func (q *Queries) ListAuditEntriesByAction(ctx context.Context, action string) ([]AuditEntry, error) {
 	rows, err := q.db.Query(ctx, listAuditEntriesByAction, action)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditEntry
+	for rows.Next() {
+		var i AuditEntry
+		if err := rows.Scan(
+			&i.ID,
+			&i.OccurredAt,
+			&i.ActorUserID,
+			&i.Action,
+			&i.SubjectKind,
+			&i.SubjectID,
+			&i.CorrelationID,
+			&i.Detail,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAuditPage = `-- name: ListAuditPage :many
+SELECT id, occurred_at, actor_user_id, action, subject_kind, subject_id, correlation_id, detail
+FROM audit_entries
+WHERE ($1::timestamptz IS NULL
+       OR (occurred_at, id) < ($1::timestamptz, $2::bigint))
+ORDER BY occurred_at DESC, id DESC
+LIMIT $3
+`
+
+type ListAuditPageParams struct {
+	CursorOccurredAt *time.Time
+	CursorID         pgtype.Int8
+	PageLimit        int32
+}
+
+// Newest-first keyset, one page. The row-value comparison names the same two
+// columns as the ORDER BY, in the same direction, which is what makes the
+// cursor and the sort key incapable of disagreeing: written out by hand as
+// `occurred_at < $1 OR (occurred_at = $1 AND id < $2)`, a later edit to one
+// half silently drops or repeats the rows that share a timestamp — and here
+// they are not an edge case, because one transaction stamps every entry it
+// emits from the same clock reading.
+//
+// A null cursor means "the first page": both halves are narg and only the
+// first is tested, because they are set together or not at all.
+func (q *Queries) ListAuditPage(ctx context.Context, arg ListAuditPageParams) ([]AuditEntry, error) {
+	rows, err := q.db.Query(ctx, listAuditPage, arg.CursorOccurredAt, arg.CursorID, arg.PageLimit)
 	if err != nil {
 		return nil, err
 	}

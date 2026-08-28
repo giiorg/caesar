@@ -47,7 +47,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *identity.Service, *pgxpool.
 	svc := identity.NewService(pool, fake, audit.NewRecorder(fake), identity.Params{
 		SessionIdleTTL: 14 * 24 * time.Hour, SessionAbsoluteTTL: 90 * 24 * time.Hour,
 	})
-	a := identityapi.New(svc, 90*24*time.Hour, dbProjects{pool})
+	a := identityapi.New(svc, 90*24*time.Hour, dbProjects{pool}, audit.NewReader(pool))
 	mux := http.NewServeMux()
 	httpx.Mount(mux, identityapi.Operations(a))
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))

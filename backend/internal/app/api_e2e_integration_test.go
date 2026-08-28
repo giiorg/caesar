@@ -53,7 +53,7 @@ func TestAppRoutes_AuthLoopEndToEnd(t *testing.T) {
 	}
 	assetsSvc := assets.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}), keys)
 
-	ops := identityapi.Operations(identityapi.New(svc, 90*24*time.Hour, assetsSvc))
+	ops := identityapi.Operations(identityapi.New(svc, 90*24*time.Hour, assetsSvc, audit.NewReader(pool)))
 	// identity.Service serves as authenticator, authorizer, and grant
 	// source for the assets API, exactly as serve.go wires it.
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, svc, svc, svc))...)
@@ -185,7 +185,7 @@ func TestAppRoutes_GateSurfaceIsReachableThroughTheRealMiddleware(t *testing.T) 
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		nil, nil, nil, nil, nil, nil, runs.Params{Snapshot: runs.DefaultSnapshot()})
 
-	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc))
+	ops := identityapi.Operations(identityapi.New(identitySvc, 90*24*time.Hour, assetsSvc, audit.NewReader(pool)))
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	ops = append(ops, runsapi.Operations(runsapi.New(runsSvc, identitySvc, identitySvc, identitySvc, nil, log))...)
 	srv := httptest.NewServer(app.Routes(log, pool, ops, "http://caesar.test", webui.Handler()))

@@ -170,7 +170,7 @@ func runServeWith(ctx context.Context, cfg config.Config, log *slog.Logger, opts
 	// on unknown projects); identity.Service serves as authenticator,
 	// authorizer, and grant source for the assets API (the authn ports,
 	// wired here only).
-	ops := identityapi.Operations(identityapi.New(svc, cfg.Auth.SessionAbsoluteTTL.Std(), assetsSvc))
+	ops := identityapi.Operations(identityapi.New(svc, cfg.Auth.SessionAbsoluteTTL.Std(), assetsSvc, audit.NewReader(pool)))
 	ops = append(ops, assetsapi.Operations(assetsapi.New(assetsSvc, svc, svc, svc))...)
 	ops = append(ops, workflowsapi.Operations(workflowsapi.New(workflowsSvc, svc))...)
 
