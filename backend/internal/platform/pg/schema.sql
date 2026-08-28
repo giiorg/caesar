@@ -375,6 +375,11 @@ CREATE TABLE gate_decisions (
 
 CREATE INDEX gate_decisions_run_node_idx ON gate_decisions (run_id, node_id);
 
+-- The global newest-first history read. (run_id, node_id) cannot serve it: it
+-- is ordered by neither of this read's key columns, so a cross-run page would
+-- be a full scan and a sort.
+CREATE INDEX gate_decisions_acted_idx ON gate_decisions (acted_at DESC, id DESC);
+
 -- The single-use ApprovedPatch authorization (spec §2): the only token
 -- git-publish can consume, scoped to the one publish node its gate
 -- dominates. Every field here is re-validated at consumption; a mismatch

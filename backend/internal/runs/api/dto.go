@@ -339,6 +339,75 @@ type ApprovalListResponse struct {
 	Approvals []ApprovalResponse `json:"approvals" required:"true"`
 }
 
+// ListDecisionsQuery is the query string, declared as a struct so the
+// parameters reach the contract. Every field is `query`-tagged, so the
+// reflector renders parameters and no request body.
+type ListDecisionsQuery struct {
+	Cursor string `query:"cursor" description:"opaque; the previous page's next_cursor"`
+	Limit  int32  `query:"limit" description:"1-200, default 50"`
+}
+
+// DecisionPageResponse is one page of decision history. next_cursor is required
+// AND nullable: null means "this was the last page", which is a value the
+// client branches on, not a key it fails to find.
+type DecisionPageResponse struct {
+	Decisions  []DecisionResponse `json:"decisions" required:"true"`
+	NextCursor *string            `json:"next_cursor" required:"true"`
+}
+
+// DecisionResponse is one settled gate as a HISTORY ROW — the counterpart to
+// ApprovalResponse, which is one still waiting. It is a different projection
+// from GateDecisionSummary because that one hangs off a phase of a run already
+// on screen, while this one crosses runs and must say which run and which task
+// it came from.
+//
+// GENERATION AND ATTEMPT ARE BOTH HERE AND BOTH LOAD-BEARING. Task 18's rows
+// link with (run_id, node_id, generation, attempt) — Task 9's selector triple —
+// because a revision leaves two decided gate attempts under one node id, and a
+// link carrying only the generation lands on whichever attempt is newest rather
+// than on the one that was decided. The attempt exists nowhere on the decision
+// row itself; the server recovers it through the phase row the decision keys.
+//
+// self_approval is deliberately absent, unlike GateDecisionSummary: it is a
+// property of the decision as an AUDIT fact, and the history tab is a
+// navigation surface. Task 23's admin audit view is where that belongs.
+type DecisionResponse struct {
+	ID                 string    `json:"id" required:"true"`
+	RunID              string    `json:"run_id" required:"true"`
+	TaskID             string    `json:"task_id" required:"true"`
+	TaskTitle          string    `json:"task_title" required:"true"`
+	NodeID             string    `json:"node_id" required:"true"`
+	Generation         int32     `json:"generation" required:"true"`
+	Attempt            int32     `json:"attempt" required:"true"`
+	Decision           string    `json:"decision" required:"true"`
+	Note               string    `json:"note" required:"true"`
+	ActedByEmail       string    `json:"acted_by_email" required:"true"`
+	ActedAt            time.Time `json:"acted_at" required:"true"`
+	ExaminedArtifactID string    `json:"examined_artifact_id" required:"true"`
+}
+
+// decisionPageResponse projects one page. next is the service's empty string
+// for "there is no next page", and it becomes a JSON null rather than an absent
+// key or an empty string: the client branches on the value, and "" is a cursor
+// shape it would have to know is special.
+func decisionPageResponse(list []runs.DecidedGate, next string) DecisionPageResponse {
+	out := DecisionPageResponse{Decisions: make([]DecisionResponse, 0, len(list))}
+	if next != "" {
+		out.NextCursor = &next
+	}
+	for _, d := range list {
+		out.Decisions = append(out.Decisions, DecisionResponse{
+			ID: d.ID.String(), RunID: d.RunID.String(), TaskID: d.TaskID.String(),
+			TaskTitle: d.TaskTitle, NodeID: d.NodeID,
+			Generation: d.Generation, Attempt: d.Attempt,
+			Decision: d.Decision, Note: d.Note,
+			ActedByEmail: d.ActedByEmail, ActedAt: d.ActedAt,
+			ExaminedArtifactID: d.ExaminedArtifactID.String(),
+		})
+	}
+	return out
+}
+
 // GateDecisionSummary projects a decided gate onto its phase. The approver's
 // id and address are separate fields: a run is readable with view, so the
 // address reaches every member of the project and that has to be visible in

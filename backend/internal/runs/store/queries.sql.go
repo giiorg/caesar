@@ -1668,6 +1668,120 @@ func (q *Queries) ListAttentionEventsAfter(ctx context.Context, arg ListAttentio
 	return items, nil
 }
 
+const listDecisionsPage = `-- name: ListDecisionsPage :many
+SELECT gd.id, gd.run_id, gd.node_id, gd.generation, pr.attempt,
+       gd.decision, gd.note, gd.examined_artifact_id, gd.acted_at,
+       u.email AS acted_by_email,
+       t.id AS task_id, t.title AS task_title
+FROM gate_decisions gd
+JOIN phase_runs pr ON pr.id = gd.phase_run_id
+JOIN users u ON u.id = gd.acted_by
+JOIN runs r ON r.id = gd.run_id
+JOIN tasks t ON t.id = r.task_id
+WHERE ($1::boolean OR t.project_id = ANY($2::uuid[]))
+  AND ($3::timestamptz IS NULL
+       OR (gd.acted_at, gd.id) < ($3::timestamptz, $4::uuid))
+ORDER BY gd.acted_at DESC, gd.id DESC
+LIMIT $5
+`
+
+type ListDecisionsPageParams struct {
+	AllProjects   bool
+	ProjectIds    []uuid.UUID
+	CursorActedAt *time.Time
+	CursorID      uuid.NullUUID
+	PageLimit     int32
+}
+
+type ListDecisionsPageRow struct {
+	ID                 uuid.UUID
+	RunID              uuid.UUID
+	NodeID             string
+	Generation         int32
+	Attempt            int32
+	Decision           string
+	Note               string
+	ExaminedArtifactID uuid.UUID
+	ActedAt            time.Time
+	ActedByEmail       string
+	TaskID             uuid.UUID
+	TaskTitle          string
+}
+
+// Cross-run decision history, newest first — the read behind the Approvals
+// History tab, where ListGateDecisionsForRun above serves one run's page.
+//
+// Three joins, each earning its place:
+//
+//	phase_runs recovers the ATTEMPT. The decision row deliberately keys
+//	  phase_run_id and stores only generation, and a gate materialized once per
+//	  generation still advances its attempt ordinal past it — so the attempt a
+//	  history row links to exists nowhere on gate_decisions itself. The FK is
+//	  NOT NULL UNIQUE, so this join is 1:1 and cannot multiply a page.
+//	users for the actor's address, the ListGateDecisionsForRun precedent: a
+//	  uuid is not a readable answer to "who decided this".
+//	runs -> tasks for the title a row renders and the project that scopes it.
+//	  A decision carries no project of its own; the run's task holds it.
+//
+// The keyset predicate is a ROW-VALUE comparison over the same two columns the
+// ORDER BY names, in the same direction — see ListRunsPage for why writing it
+// out by hand is what silently drops or repeats rows sharing a timestamp. Here
+// sharing one is not even rare: acted_at is stamped from the DATABASE clock,
+// which is transaction_timestamp() and frozen per transaction.
+//
+// all_projects is passed rather than inferred from an empty array, for the
+// reason ListRunsPage states: an empty grant set is an EMPTY page and
+// `= ANY('{}')` gives exactly that, while an admin needs every row.
+//
+// THE `, gd.id DESC` HALF OF THE ORDER BY IS NOT INDEPENDENTLY FALSIFIABLE, and
+// that is stated rather than left for someone to rediscover. Removing it leaves
+// every test in this repo green, because gate_decisions_acted_idx is
+// (acted_at DESC, id DESC) and the planner reads the page straight off it —
+// measured with EXPLAIN on both spellings, identical plans, an Index Scan and
+// no sort node in either. It stays because the ORDER BY must not depend on a
+// physical-design choice a later migration is free to make differently: the
+// cursor predicate above compares (acted_at, id), and the day this index is
+// dropped or replaced, an ORDER BY that names only acted_at starts silently
+// dropping and repeating the rows that share one.
+func (q *Queries) ListDecisionsPage(ctx context.Context, arg ListDecisionsPageParams) ([]ListDecisionsPageRow, error) {
+	rows, err := q.db.Query(ctx, listDecisionsPage,
+		arg.AllProjects,
+		arg.ProjectIds,
+		arg.CursorActedAt,
+		arg.CursorID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDecisionsPageRow
+	for rows.Next() {
+		var i ListDecisionsPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.NodeID,
+			&i.Generation,
+			&i.Attempt,
+			&i.Decision,
+			&i.Note,
+			&i.ExaminedArtifactID,
+			&i.ActedAt,
+			&i.ActedByEmail,
+			&i.TaskID,
+			&i.TaskTitle,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listExpiredLeaseIDs = `-- name: ListExpiredLeaseIDs :many
 SELECT id FROM phase_runs WHERE status = 'running' AND leased_until <= now() LIMIT $1
 `

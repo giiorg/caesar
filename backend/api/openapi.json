@@ -44,6 +44,66 @@
         }
       }
     },
+    "/api/v1/approvals/decisions": {
+      "get": {
+        "summary": "Decision history across runs, newest first (the projects the caller holds any grant on; an admin sees every one). Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.",
+        "description": "Errors use the RFC 9457 problem+json envelope on every non-2xx status.",
+        "operationId": "listDecisions",
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "opaque; the previous page's next_cursor",
+            "schema": {
+              "description": "opaque; the previous page's next_cursor",
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "1-200, default 50",
+            "schema": {
+              "description": "1-200, default 50",
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiDecisionPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpxProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/audit": {
       "get": {
         "summary": "Global audit entries, newest first (admin). Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.",
@@ -2604,6 +2664,88 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "ApiDecisionPageResponse": {
+        "properties": {
+          "decisions": {
+            "items": {
+              "$ref": "#/components/schemas/ApiDecisionResponse"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "next_cursor": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "decisions",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "ApiDecisionResponse": {
+        "properties": {
+          "acted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "acted_by_email": {
+            "type": "string"
+          },
+          "attempt": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "decision": {
+            "type": "string"
+          },
+          "examined_artifact_id": {
+            "type": "string"
+          },
+          "generation": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "task_title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "run_id",
+          "task_id",
+          "task_title",
+          "node_id",
+          "generation",
+          "attempt",
+          "decision",
+          "note",
+          "acted_by_email",
+          "acted_at",
+          "examined_artifact_id"
+        ],
         "type": "object"
       },
       "ApiGateDecisionResponse": {

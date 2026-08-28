@@ -2,9 +2,7 @@ package runs
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -79,44 +77,6 @@ type RunListFilter struct {
 	TaskID     *uuid.UUID
 	Limit      int32
 	Cursor     string
-}
-
-// encodeRunCursor is the opaque page marker. It carries BOTH halves of the sort
-// key, so the cursor and the ORDER BY cannot disagree about where a page ended
-// — the failure that makes a paginated list silently drop or repeat rows.
-//
-// RFC3339Nano, because uuidv7 ids come off a millisecond clock: two runs
-// created in the same millisecond are separated only by id, and a truncated
-// timestamp would put them on the wrong side of the boundary.
-func encodeRunCursor(createdAt time.Time, id uuid.UUID) string {
-	return base64.RawURLEncoding.EncodeToString(
-		[]byte(createdAt.UTC().Format(time.RFC3339Nano) + "|" + id.String()))
-}
-
-// decodeRunCursor is deliberately strict. A cursor is opaque to the client, so
-// a malformed one is an ordinary thing to receive — from a truncated URL, a
-// stale bookmark, a hand-typed value — and every one of them must be a field
-// error rather than a panic or a silent page-one.
-func decodeRunCursor(s string) (time.Time, uuid.UUID, error) {
-	invalid := xerrors.E(xerrors.ClassInvalid, "validation failed").
-		WithFields(xerrors.FieldError{Field: "cursor", Message: "not a cursor this endpoint issued"})
-	raw, err := base64.RawURLEncoding.DecodeString(s)
-	if err != nil {
-		return time.Time{}, uuid.Nil, invalid
-	}
-	at, rest, ok := strings.Cut(string(raw), "|")
-	if !ok {
-		return time.Time{}, uuid.Nil, invalid
-	}
-	createdAt, err := time.Parse(time.RFC3339Nano, at)
-	if err != nil {
-		return time.Time{}, uuid.Nil, invalid
-	}
-	id, err := uuid.Parse(rest)
-	if err != nil {
-		return time.Time{}, uuid.Nil, invalid
-	}
-	return createdAt, id, nil
 }
 
 // phaseSummaries renders the run's whole shape: every node of the compiled
@@ -230,7 +190,7 @@ func (s *Service) ListRuns(ctx context.Context, f RunListFilter) ([]RunSummary, 
 		params.TaskID = uuid.NullUUID{UUID: *f.TaskID, Valid: true}
 	}
 	if f.Cursor != "" {
-		at, id, err := decodeRunCursor(f.Cursor)
+		at, id, err := decodeKeysetCursor(f.Cursor)
 		if err != nil {
 			return nil, "", err
 		}
@@ -247,7 +207,7 @@ func (s *Service) ListRuns(ctx context.Context, f RunListFilter) ([]RunSummary, 
 	if len(rows) > int(limit) {
 		rows = rows[:limit]
 		last := rows[len(rows)-1].Run
-		next = encodeRunCursor(last.CreatedAt, last.ID)
+		next = encodeKeysetCursor(last.CreatedAt, last.ID)
 	}
 	if len(rows) == 0 {
 		return []RunSummary{}, next, nil

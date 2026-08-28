@@ -774,3 +774,53 @@ SELECT DISTINCT ON (run_id, node_id) run_id, node_id, attempt, generation, statu
 FROM phase_runs
 WHERE run_id = ANY(sqlc.arg(run_ids)::uuid[])
 ORDER BY run_id, node_id, generation DESC, attempt DESC;
+
+-- name: ListDecisionsPage :many
+-- Cross-run decision history, newest first — the read behind the Approvals
+-- History tab, where ListGateDecisionsForRun above serves one run's page.
+--
+-- Three joins, each earning its place:
+--   phase_runs recovers the ATTEMPT. The decision row deliberately keys
+--     phase_run_id and stores only generation, and a gate materialized once per
+--     generation still advances its attempt ordinal past it — so the attempt a
+--     history row links to exists nowhere on gate_decisions itself. The FK is
+--     NOT NULL UNIQUE, so this join is 1:1 and cannot multiply a page.
+--   users for the actor's address, the ListGateDecisionsForRun precedent: a
+--     uuid is not a readable answer to "who decided this".
+--   runs -> tasks for the title a row renders and the project that scopes it.
+--     A decision carries no project of its own; the run's task holds it.
+--
+-- The keyset predicate is a ROW-VALUE comparison over the same two columns the
+-- ORDER BY names, in the same direction — see ListRunsPage for why writing it
+-- out by hand is what silently drops or repeats rows sharing a timestamp. Here
+-- sharing one is not even rare: acted_at is stamped from the DATABASE clock,
+-- which is transaction_timestamp() and frozen per transaction.
+--
+-- all_projects is passed rather than inferred from an empty array, for the
+-- reason ListRunsPage states: an empty grant set is an EMPTY page and
+-- `= ANY('{}')` gives exactly that, while an admin needs every row.
+--
+-- THE `, gd.id DESC` HALF OF THE ORDER BY IS NOT INDEPENDENTLY FALSIFIABLE, and
+-- that is stated rather than left for someone to rediscover. Removing it leaves
+-- every test in this repo green, because gate_decisions_acted_idx is
+-- (acted_at DESC, id DESC) and the planner reads the page straight off it —
+-- measured with EXPLAIN on both spellings, identical plans, an Index Scan and
+-- no sort node in either. It stays because the ORDER BY must not depend on a
+-- physical-design choice a later migration is free to make differently: the
+-- cursor predicate above compares (acted_at, id), and the day this index is
+-- dropped or replaced, an ORDER BY that names only acted_at starts silently
+-- dropping and repeating the rows that share one.
+SELECT gd.id, gd.run_id, gd.node_id, gd.generation, pr.attempt,
+       gd.decision, gd.note, gd.examined_artifact_id, gd.acted_at,
+       u.email AS acted_by_email,
+       t.id AS task_id, t.title AS task_title
+FROM gate_decisions gd
+JOIN phase_runs pr ON pr.id = gd.phase_run_id
+JOIN users u ON u.id = gd.acted_by
+JOIN runs r ON r.id = gd.run_id
+JOIN tasks t ON t.id = r.task_id
+WHERE (sqlc.arg(all_projects)::boolean OR t.project_id = ANY(sqlc.arg(project_ids)::uuid[]))
+  AND (sqlc.narg(cursor_acted_at)::timestamptz IS NULL
+       OR (gd.acted_at, gd.id) < (sqlc.narg(cursor_acted_at)::timestamptz, sqlc.narg(cursor_id)::uuid))
+ORDER BY gd.acted_at DESC, gd.id DESC
+LIMIT sqlc.arg(page_limit);

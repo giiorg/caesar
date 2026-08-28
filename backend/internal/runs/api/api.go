@@ -187,6 +187,21 @@ func Operations(a *API) []httpx.Operation {
 			Errors:  []int{http.StatusUnauthorized},
 			Handler: a.authenticated(a.handleListApprovals),
 		},
+		{
+			Pattern: "GET /api/v1/approvals/decisions", ID: "listDecisions",
+			// The history arm of the same surface: the entry above is what is
+			// still waiting, this is what was settled. Scoped identically, and
+			// for the same reason — seeing a decision is not being allowed to
+			// have made it.
+			Summary: "Decision history across runs, newest first (the projects the caller holds any grant on; an admin sees every one). " +
+				"Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.",
+			Request: ListDecisionsQuery{}, Response: DecisionPageResponse{}, Status: http.StatusOK,
+			// 401 and no 403, exactly as the two lists above: authenticated()
+			// refuses a missing cookie before the handler runs, and the handler
+			// scopes rather than refuses.
+			Errors:  []int{http.StatusUnauthorized},
+			Handler: a.authenticated(a.handleListDecisions),
+		},
 	}
 }
 
@@ -707,6 +722,70 @@ func (a *API) handleListApprovals(w http.ResponseWriter, r *http.Request, sess a
 		}))
 	}
 	httpx.JSON(w, http.StatusOK, out)
+}
+
+// handleListDecisions is the decision history — the settled counterpart to the
+// inbox above, across every run the caller can see.
+//
+// The grant resolution is the same shape as handleListRuns' and it is written
+// out rather than shared, deliberately: what a list endpoint scopes to is a
+// security statement about THAT endpoint, and a reader of this handler should
+// be able to see the whole of it without following a helper. The two lists
+// drifting apart would be a visible behaviour change, not a silent one.
+func (a *API) handleListDecisions(w http.ResponseWriter, r *http.Request, sess authn.AuthSession) {
+	filter, err := decisionFilter(r)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	if sess.Role == authn.RoleAdmin {
+		filter.All = true
+	} else {
+		grants, err := a.grants.GrantsForUser(r.Context(), sess.UserID)
+		if err != nil {
+			httpx.Problem(w, r, err)
+			return
+		}
+		// Built even when it is empty, and passed as an empty set rather than
+		// as "no filter": an ungranted member sees NOTHING, and inferring the
+		// admin view from an empty list is how they would see everything.
+		ids := make([]uuid.UUID, 0, len(grants))
+		for _, g := range grants {
+			ids = append(ids, g.ProjectID)
+		}
+		filter.ProjectIDs = ids
+	}
+	list, next, err := a.svc.ListDecisions(r.Context(), filter)
+	if err != nil {
+		httpx.Problem(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, decisionPageResponse(list, next))
+}
+
+// decisionFilter parses the query string. A limit that is not a positive
+// integer is a FIELD ERROR naming the parameter rather than a silent fallback
+// to the default, for the reason runListFilter states: a filter that quietly
+// did nothing answers with a page the caller did not ask for and looks correct.
+//
+// The cursor is NOT decoded here. It is carried into the service, which fails
+// it as a field error of the same shape — one decode site, so the endpoint
+// cannot end up with two ideas of what a valid cursor is.
+func decisionFilter(r *http.Request) (runs.DecisionFilter, error) {
+	q := r.URL.Query()
+	f := runs.DecisionFilter{Cursor: q.Get("cursor")}
+	if raw := q.Get("limit"); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil || n < 1 {
+			return runs.DecisionFilter{}, xerrors.E(xerrors.ClassInvalid, "validation failed").
+				WithFields(xerrors.FieldError{Field: "limit", Message: "must be a positive integer"})
+		}
+		// An oversized limit is CLAMPED rather than refused: the cap is this
+		// server's protection, not a contract the caller agreed to, and a page
+		// of 200 is a complete answer to "give me 1000".
+		f.Limit = int32(n)
+	}
+	return f, nil
 }
 
 // handleListRunEvents answers this run's events either way the client asked

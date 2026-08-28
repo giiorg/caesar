@@ -24,6 +24,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/approvals/decisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Decision history across runs, newest first (the projects the caller holds any grant on; an admin sees every one). Cursor-paginated: pass `next_cursor` back as `cursor`; a null `next_cursor` is the last page.
+         * @description Errors use the RFC 9457 problem+json envelope on every non-2xx status.
+         */
+        get: operations["listDecisions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/audit": {
         parameters: {
             query?: never;
@@ -845,6 +865,27 @@ export interface components {
             /** Format: date-time */
             updated_at?: string;
         };
+        ApiDecisionPageResponse: {
+            decisions: components["schemas"]["ApiDecisionResponse"][] | null;
+            next_cursor: null | string;
+        };
+        ApiDecisionResponse: {
+            /** Format: date-time */
+            acted_at: string;
+            acted_by_email: string;
+            /** Format: int32 */
+            attempt: number;
+            decision: string;
+            examined_artifact_id: string;
+            /** Format: int32 */
+            generation: number;
+            id: string;
+            node_id: string;
+            note: string;
+            run_id: string;
+            task_id: string;
+            task_title: string;
+        };
         ApiGateDecisionResponse: {
             authorization_id?: string;
             decision?: string;
@@ -1259,6 +1300,49 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApiApprovalListResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["HttpxProblemDetails"];
+                };
+            };
+        };
+    };
+    listDecisions: {
+        parameters: {
+            query?: {
+                /** @description opaque; the previous page's next_cursor */
+                cursor?: string;
+                /** @description 1-200, default 50 */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiDecisionPageResponse"];
                 };
             };
             /** @description Bad Request */
