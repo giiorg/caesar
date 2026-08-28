@@ -140,8 +140,9 @@ the comparison (Task 7, `web/src/gates/identical-revision.ts`).
   (`POST /api/v1/tasks/{id}/runs`). Rerun keeps title, inputs and pinned version — right for
   transient failures, and rejected runs end `failed`, so one status rule covers both (sofo's
   checkpoint ruling, verbatim "Retry on failed runs only").
-- **Event rows and phase cards that name a destination become links**: `publish.pr_opened` → the
-  PR URL, `gate.decided` → the gate decision, phases with artifacts → the artifact view
+- **Event rows and phase cards that name a destination become links**: `publish.pr_opened` AND
+  `publish.adopted` → the PR URL, `gate.decided` → the gate decision, phases with artifacts →
+  the artifact view
   (finding 13 / mockup-gap entry thirteen). "The artifact view" is a route this plan must
   BUILD, not one it links: the run screen's own comment records that
   `GET /runs/{id}/artifacts/{artifact_id}` serves payloads but 12a added no route rendering
@@ -165,6 +166,30 @@ the comparison (Task 7, `web/src/gates/identical-revision.ts`).
   targeted node. §3.2's history rows carry the same pair and link the same way. The test
   decides a gate, requests changes, approves the next generation, and asserts both links
   resolve to their own decisions.
+
+  **Amended after Task 9 shipped, on sofo's ruling.** The PR link named only `publish.pr_opened`
+  until `69a0313`, and that was an oversight rather than a decision: `publish.go` builds ONE
+  event over ONE payload — `node_id`, `branch`, `pr_number`, `pr_url`, `state`, `adopted` — and
+  then chooses its kind, `EventPublishAdopted` when the branch already had a pull request open
+  and this run took it over, `EventPublishPROpened` when the run opened one
+  (`runs/publish.go:993-1017`). Same `pr_url` either way. So an adopted publication has exactly
+  the pull request an opened one has, and linking only one kind leaves a reader looking at a row
+  that names a PR they cannot reach, for a reason invisible from the row. The KIND is the filter
+  and the payload shape is not: no other event carries `pr_url` today, and an implementation
+  keyed on the field rather than the kind would start linking the first one that ever gains it.
+
+  Two further facts the shipped tests pin, both measured rather than reasoned. **The gate's
+  `generation` and `attempt` come apart only through a round the gate did not take part in.**
+  `attempt` is a per-node ordinal a rematerialized node continues
+  (`runs/store/queries.sql:719-723`) and `generation` is the run's revision round, so a gate
+  decided in every round of its run has `attempt == generation` forever; only an EARLIER gate
+  spending a round before this one materializes separates them. A gate retry cannot:
+  `InsertGatePhase` writes `waiting_decision` and the claim CTE predicates on `pending`
+  (`runs/store/queries.sql:404-411`), so a gate is never leased and never reaches the retry path
+  that inserts `Attempt+1` at the same generation (`runs/orchestrator.go:1609`). Any test of this
+  clause whose fixture moves the two ordinals together cannot tell the pair's halves apart.
+  **A selector naming no row renders an honest absence**, not a silent fall-back to the newest —
+  the fall-back would re-create this clause's own bug, quietly, for exactly the stale links.
 - The **wordmark links Home** (finding 15); the **FAB is restyled** (finding 16, taste verdict
   at the checkpoint).
 
