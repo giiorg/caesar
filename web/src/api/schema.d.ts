@@ -1176,21 +1176,21 @@ export interface components {
             updated_at: string;
         };
         ApiWorkflowVersionListResponse: {
-            versions?: components["schemas"]["ApiWorkflowVersionMetaResponse"][] | null;
+            versions: components["schemas"]["ApiWorkflowVersionMetaResponse"][] | null;
         };
         ApiWorkflowVersionMetaResponse: {
-            content_hash?: string;
+            content_hash: string;
             /** Format: date-time */
-            created_at?: string;
-            version?: number;
+            created_at: string;
+            version: number;
         };
         ApiWorkflowVersionResponse: {
-            content_hash?: string;
+            content_hash: string;
             /** Format: date-time */
-            created_at?: string;
-            document?: unknown;
-            version?: number;
-            workflow_id?: string;
+            created_at: string;
+            document: unknown;
+            version: number;
+            workflow_id: string;
         };
         ContractsGateDecisionParams: {
             decision?: string;

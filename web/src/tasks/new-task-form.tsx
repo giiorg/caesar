@@ -1,22 +1,16 @@
-import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { FormProvider } from 'react-hook-form'
 import { z } from 'zod'
 import { api, unwrap } from '../api/client'
-import { AUTH_SCOPED_QUERY_OPTIONS } from '../api/query-client'
 import { FormError } from '../forms/form-error'
 import { SelectField, type SelectOption } from '../forms/select-field'
 import { TextField } from '../forms/text-field'
 import { TextAreaField } from '../forms/textarea-field'
 import { useAppForm } from '../forms/use-app-form'
 import { projectReposQueryOptions, projectsQueryOptions } from '../projects/projects-query'
+import { workflowsQueryOptions } from '../workflows/workflows-query'
 import type { Task } from './tasks-query'
-
-const workflowsQueryOptions = queryOptions({
-  queryKey: ['workflows'],
-  queryFn: async () => (await unwrap(await api.GET('/api/v1/workflows'))).workflows ?? [],
-  ...AUTH_SCOPED_QUERY_OPTIONS,
-})
 
 /**
  * `project_id` IS NOT A `CreateTaskRequest` FIELD and is deliberately in the

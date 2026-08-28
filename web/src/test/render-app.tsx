@@ -298,6 +298,24 @@ export function renderApp(
     // audit log and a reader to notice cannot happen. What the default
     // exercises is the NULL, which the contract does permit.
     http.get('/api/v1/audit', () => HttpResponse.json({ entries: null, next_cursor: null })),
+    // `workflows: null`, for the TENTH time and the same reason: required AND
+    // nullable, because a Go nil slice marshals to null, and the `?? []` in
+    // `workflows/workflows-query.ts` would otherwise be unreachable from every
+    // test in the tree. `workflows.index.test.tsx`'s empty-state test
+    // deliberately does NOT override it — the Task 19 trap — so deleting that
+    // coalesce kills a real test rather than none.
+    //
+    // TWO SCREENS OBSERVE IT, and this is the first default whose two readers
+    // read it for different purposes: the Workflows list renders it, and the
+    // new-task form's Workflow select is populated from the SAME cache entry
+    // (`['workflows']`, promoted out of that form by Task 24). A second
+    // spelling of the key would have made this default cover only one of them.
+    //
+    // Like `harnesses: null` and unlike `users: null`, it is an honest empty
+    // fixture as well as a null: a deployment with no workflow defined is the
+    // state every deployment starts in, which is why this list has empty states
+    // at all.
+    http.get('/api/v1/workflows', () => HttpResponse.json({ workflows: null })),
     http.get('/api/v1/stream', silentStream),
   )
   // BOTH router arguments are load-bearing and neither is optional.

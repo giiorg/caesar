@@ -43,22 +43,39 @@ type CreateWorkflowVersionRequest struct {
 	Document json.RawMessage `json:"document"`
 }
 
+// WorkflowVersionResponse is the full version, document included, and every
+// field of it is required — `versionResponse` below sets all five
+// unconditionally and none of them can be absent.
+//
+// DOCUMENT'S MARK IS THE ONE THAT MATTERS and the list projection is not an
+// argument against it: the list uses WorkflowVersionMetaResponse, a separate
+// type with no Document field at all, so there is no shape in which a
+// WorkflowVersionResponse lacks its document. `omitempty` had to go with it —
+// the pairing is a contradiction, the same one Task 17 removed from LastUsedAt.
+//
+// THE $ref RULE DOES NOT REACH THIS FIELD, and not merely because
+// json.RawMessage is no pointer-to-named-struct: swaggest reflects it to the
+// EMPTY schema (`"document": {}` — any JSON), so no $ref is emitted for the
+// property in the first place and there is no null branch for `required` to
+// contradict. It reaches the client as `unknown`, which is the honest type for
+// a blob whose shape the write door validates and the transport contract does
+// not: web narrows it with readers that answer null, never with a cast.
 type WorkflowVersionResponse struct {
-	WorkflowID  string          `json:"workflow_id"`
-	Version     int             `json:"version"`
-	ContentHash string          `json:"content_hash"`
-	Document    json.RawMessage `json:"document,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
+	WorkflowID  string          `json:"workflow_id" required:"true"`
+	Version     int             `json:"version" required:"true"`
+	ContentHash string          `json:"content_hash" required:"true"`
+	Document    json.RawMessage `json:"document" required:"true"`
+	CreatedAt   time.Time       `json:"created_at" required:"true"`
 }
 
 type WorkflowVersionMetaResponse struct {
-	Version     int       `json:"version"`
-	ContentHash string    `json:"content_hash"`
-	CreatedAt   time.Time `json:"created_at"`
+	Version     int       `json:"version" required:"true"`
+	ContentHash string    `json:"content_hash" required:"true"`
+	CreatedAt   time.Time `json:"created_at" required:"true"`
 }
 
 type WorkflowVersionListResponse struct {
-	Versions []WorkflowVersionMetaResponse `json:"versions"`
+	Versions []WorkflowVersionMetaResponse `json:"versions" required:"true"`
 }
 
 func workflowResponse(w workflows.Workflow) WorkflowResponse {
