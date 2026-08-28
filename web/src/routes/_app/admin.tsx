@@ -6,6 +6,8 @@ import {
   type AdminSection,
   asAdminSection,
 } from '../../admin/admin-nav'
+import { CredentialsSection } from '../../admin/credentials-section'
+import { HarnessesSection } from '../../admin/harnesses-section'
 import { UsersSection } from '../../admin/users-section'
 import { StubPanel } from '../../ui/stub-panel'
 
@@ -51,11 +53,7 @@ function Admin() {
           open every admin query on arrival, three of them for a section nobody
           asked to look at. */}
       <div role="tabpanel" aria-labelledby={tabId(section)}>
-        {section === 'users' ? (
-          <UsersSection />
-        ) : (
-          <StubPanel plan="Plan 12" what={label(section)} />
-        )}
+        <SectionPanel section={section} />
       </div>
       <RowNinePlaceholder />
     </section>
@@ -63,6 +61,28 @@ function Admin() {
 }
 
 const label = (section: AdminSection): string => ADMIN_SECTION_LABELS[section]
+
+/**
+ * The panel's contents, as an EXHAUSTIVE switch rather than a chain of
+ * ternaries. Three of the four sections are built and Audit is Task 23's, so
+ * the shape has to survive one more entry being filled in — and a `switch` over
+ * the union is the spelling `tsc` checks: adding a fifth section to
+ * `ADMIN_SECTIONS` without a case here fails to compile, where a trailing
+ * `: <StubPanel/>` would silently absorb it and the new tab would open onto a
+ * "not built yet" card nobody wrote.
+ */
+function SectionPanel(props: { section: AdminSection }) {
+  switch (props.section) {
+    case 'users':
+      return <UsersSection />
+    case 'harnesses':
+      return <HarnessesSection />
+    case 'credentials':
+      return <CredentialsSection />
+    case 'audit':
+      return <StubPanel plan="Plan 12" what={label(props.section)} />
+  }
+}
 
 /**
  * The four sections as LINKS, with the ARIA that follows — `approvals.index.tsx`

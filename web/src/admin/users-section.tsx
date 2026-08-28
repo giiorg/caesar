@@ -4,12 +4,12 @@ import { FormProvider } from 'react-hook-form'
 import { z } from 'zod'
 import { api, unwrap } from '../api/client'
 import type { components } from '../api/schema'
-import { asApiError, ErrorSurface } from '../errors/error-surface'
 import { FormError } from '../forms/form-error'
 import { SelectField } from '../forms/select-field'
 import { TextField } from '../forms/text-field'
 import { useAppForm } from '../forms/use-app-form'
 import { FormSheet } from '../ui/form-sheet'
+import { AdminRefusal } from './admin-refusal'
 import { usersQueryOptions } from './users-query'
 
 type User = components['schemas']['ApiUserResponse']
@@ -35,54 +35,6 @@ type User = components['schemas']['ApiUserResponse']
 const ROLES = ['member', 'admin'] as const
 
 type Role = (typeof ROLES)[number]
-
-/**
- * A refusal from an admin endpoint, said in the server's own words.
- *
- * IT DELIBERATELY DOES NOT GO THROUGH `ApiErrorPanel`, and that is a
- * correctness point rather than a styling preference. That panel answers every
- * 403 with "You do not have access to this project. Ask an admin for a grant."
- * — true on the project screens it was written for, and FALSE three times over
- * here. This screen produces three refusals a reader can really hit and not one
- * of them is about a project grant:
- *
- *   403 "admin role required"                        — a member opened /admin
- *   403 "cannot change own role or active flag"      — the own-row guard
- *   409 "cannot remove the last active admin"        — the last-admin guard
- *
- * Telling a member to ask for a project grant when what they lack is the admin
- * ROLE sends them to ask the wrong person for the wrong thing, and telling an
- * admin the same when they have just tried to demote themselves is nonsense.
- * So the server's `detail` is rendered as written: all three sentences above
- * are already complete, actionable statements, which is precisely why the panel
- * substitutes its own on the project screens (where the raw detail is
- * "insufficient project grant" and says nothing about what to do).
- *
- * TASKS 22 AND 23 WILL WANT THIS. Harnesses, credentials and audit refuse a
- * member identically, so when the second consumer arrives this should move to
- * its own module in `admin/` rather than be imported from here — the same call
- * `grants-section.tsx` made about `usersQueryOptions`, which is why that query
- * had a clean home to be promoted to today.
- *
- * The no-status arm delegates to `ErrorSurface`, which owns the one sentence
- * for a request that never reached the server. A second copy of that wording is
- * how two screens come to disagree about what a dropped connection looks like.
- */
-function AdminRefusal(props: { error: unknown }) {
-  const failure = asApiError(props.error)
-  if (failure === null) return <ErrorSurface failure={null} />
-  return (
-    <section role="alert" className="bg-surface text-text border-border rounded-md border p-4">
-      <h3 className="font-medium">{failure.title}</h3>
-      <p>{failure.detail !== '' ? failure.detail : 'The request was refused.'}</p>
-      {/* UNCONDITIONAL, and last, exactly as `ApiErrorPanel` has it: whatever
-          else the surface says, this is the string support asks for. */}
-      <p>
-        Reference: <code>{failure.correlationId}</code>
-      </p>
-    </section>
-  )
-}
 
 /**
  * Accounts and their roles — the account-level half of authz. The project-level

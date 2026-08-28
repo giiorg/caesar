@@ -271,6 +271,20 @@ export function renderApp(
     // why the Users section has no empty state. What the default exercises is
     // the NULL, which the contract does permit.
     http.get('/api/v1/users', () => HttpResponse.json({ users: null })),
+    // `harnesses: null`, for the EIGHTH time and the same reason: required AND
+    // nullable, because a Go nil slice marshals to null, and the `?? []` in
+    // `admin/harnesses-query.ts` would otherwise be unreachable from every test
+    // in the tree.
+    //
+    // IT IS OBSERVED RATHER THAN MERELY PRESENT — the trap Task 19 fell into.
+    // `harnesses-section.test.tsx`'s empty-state test deliberately does NOT
+    // override it, so deleting that coalesce kills a real test rather than none.
+    //
+    // Unlike `users: null`, this one IS an honest empty-list fixture as well as
+    // a null: a deployment with no harness registered is the state every
+    // deployment starts in, which is why that section has an empty state and
+    // the Users section does not.
+    http.get('/api/v1/harnesses', () => HttpResponse.json({ harnesses: null })),
     http.get('/api/v1/stream', silentStream),
   )
   // BOTH router arguments are load-bearing and neither is optional.

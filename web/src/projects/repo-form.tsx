@@ -1,33 +1,14 @@
-import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { FormProvider } from 'react-hook-form'
 import { z } from 'zod'
+import { type Credential, credentialsQueryOptions } from '../admin/credentials-query'
 import { api, unwrap } from '../api/client'
-import { AUTH_SCOPED_QUERY_OPTIONS } from '../api/query-client'
-import type { components } from '../api/schema'
 import { asApiError } from '../errors/error-surface'
 import { FormError } from '../forms/form-error'
 import { SelectField, type SelectOption } from '../forms/select-field'
 import { TextField } from '../forms/text-field'
 import { useAppForm } from '../forms/use-app-form'
 import type { Repo } from './projects-query'
-
-type Credential = components['schemas']['ApiCredentialResponse']
-
-/**
- * The credential list, kept LOCAL to this module on purpose.
- *
- * `GET /credentials` is admin-only (`assets/api/api.go`, `adminOnly`) and Task
- * 22 builds the Credentials screen that owns it. Promoting the query to
- * `projects/` now would put its permanent home inside the group that happens to
- * need it first, in the file that task will rewrite. One consumer means
- * `tools/arch/import-graph.ts` says nothing about where it lives, so the
- * decision stays where it belongs: with the screen that owns the resource.
- */
-const credentialsQueryOptions = queryOptions({
-  queryKey: ['credentials'],
-  queryFn: async () => (await unwrap(await api.GET('/api/v1/credentials'))).credentials ?? [],
-  ...AUTH_SCOPED_QUERY_OPTIONS,
-})
 
 /**
  * `forge` IS IN THE SCHEMA AND ONLY THE CREATE FORM RENDERS A CONTROL FOR IT.
