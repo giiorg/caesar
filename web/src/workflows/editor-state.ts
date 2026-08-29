@@ -1,12 +1,19 @@
+import type { FieldError } from '../api/errors'
+// `./derive.ts`, with the extension, for the reason `op-generator.ts` sets out
+// at length: this module is folded outside any bundler by
+// `tools/gen-editor-corpus.mts`, and node's resolver will not complete the
+// specifier for it. The type-only import above needs no such treatment —
+// `import type` is erased before resolution ever happens.
 import {
   type Card,
   type CardType,
+  isAgentic,
   legalTargetsFor,
   MIN_REVISION_ROUNDS,
   NODE_ID_PATTERN,
   nextCardId,
   prefixViolation,
-} from './derive'
+} from './derive.ts'
 
 /**
  * The outline editor's state machine.
@@ -210,6 +217,21 @@ function setField(
       note: null,
     }
   }
+  /**
+   * A HARNESS ON A GATE IS NOT A FIELD, it is a mistake — `validateNodeConfig`
+   * answers "only agentic steps take a harness", so storing one would build a
+   * document the write door refuses for a reason the person never typed. Like
+   * the `maxRounds` no-op above, this is unreachable from the UI (a gate card
+   * renders no harness or instructions control) and meaningless besides, and
+   * for the same reason it is a no-op rather than a refusal: nobody asked for
+   * it, so there is nobody to answer.
+   *
+   * MEASURED, not anticipated: the corpus generator dispatches by id without
+   * seeing the outline, so it lands `setField harness` on gates — and without
+   * this line the completed documents carry a harness on a gate and
+   * `grammarViolation` refuses them at the end of the fold.
+   */
+  if (!isAgentic(card.type)) return state
   const { field, value } = action
   return {
     cards: mapCard(state.cards, action.id, (c) => ({ ...c, [field]: value })),
@@ -286,4 +308,71 @@ function mapCard(cards: readonly Card[], id: string, f: (card: Card) => Card): C
 /** The same cards, by reference, plus the reason. */
 function refuse(state: EditorState, cardId: string | null, reason: string): EditorState {
   return { cards: state.cards, refusal: { cardId, reason }, note: null }
+}
+
+/**
+ * A server rejection, placed: per card where the path names one, on the banner
+ * where it does not.
+ *
+ * NOT REDUCER STATE, and the separation is the point. A `Refusal` is this
+ * editor's answer to a gesture the person just made and it is produced by a
+ * pure function of the outline; this is the SERVER's answer to a document that
+ * was posted, and it stops being true the moment anything changes. Folding it
+ * into `EditorState` would make every keystroke responsible for deciding
+ * whether a rejection from two seconds ago still applies. It lives with the
+ * mutation that produced it, which throws it away on the next attempt.
+ */
+export type SaveRejection = {
+  /** The unplaceable part, or the whole rejection when nothing was placeable. */
+  banner: string | null
+  /** Card id → the messages bound to it, in the order the server listed them. */
+  byCard: ReadonlyMap<string, readonly string[]>
+}
+
+/**
+ * `Violation.Path` for a node, as the API emits it: `nodes[2].harness`,
+ * `nodes[0].on_request_changes.max_rounds`, or bare `nodes[4]`.
+ *
+ * THE INDEX IS THE WHOLE MECHANISM. Violations address the POSTED array
+ * positionally (`workflows.go`'s violation → field-error mapping), so a card
+ * list that posted its nodes in a different order — or a mapper that matched
+ * `nodes[1]` against `nodes[10]` — would hang the server's sentence on the
+ * wrong step. The anchors and the `\d+` group are what make that impossible.
+ */
+const NODE_PATH = /^nodes\[(\d+)\](?:\.(.+))?$/
+
+/**
+ * The ordering below is `applyProblemToForm`'s, deliberately: unplaceable wins,
+ * then placed, then the detail. A message this screen cannot put next to a card
+ * is still the server's explanation of why the save failed, and swallowing it
+ * because something ELSE placed leaves a person staring at an editor that
+ * refused with no reason given.
+ *
+ * The card-bound message keeps its FIELD in front of it. The server's sentences
+ * are written to sit under a named field ("must be 1-8192 bytes"), and a card
+ * carries five of them, so the path's tail is the only thing that says which.
+ */
+export function bindSaveErrors(
+  problem: { fields: readonly FieldError[]; detail: string; title: string },
+  cards: readonly Card[],
+): SaveRejection {
+  const byCard = new Map<string, string[]>()
+  const unplaceable: string[] = []
+  for (const { field, message } of problem.fields) {
+    const match = NODE_PATH.exec(field)
+    // An index past the end of the outline is unplaceable rather than
+    // ignorable: it is the server describing a document this screen no longer
+    // holds, and dropping it would refuse with nothing said.
+    const card = match === null ? undefined : cards[Number(match[1])]
+    if (card === undefined) {
+      unplaceable.push(message)
+      continue
+    }
+    const suffix = match?.[2]
+    const text = suffix === undefined ? message : `${suffix}: ${message}`
+    byCard.set(card.id, [...(byCard.get(card.id) ?? []), text])
+  }
+  if (unplaceable.length > 0) return { banner: unplaceable.join('; '), byCard }
+  if (byCard.size > 0) return { banner: null, byCard }
+  return { banner: problem.detail !== '' ? problem.detail : problem.title, byCard }
 }

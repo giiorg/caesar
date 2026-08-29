@@ -278,12 +278,261 @@ describe('/workflows/$workflowId/edit', () => {
     expect(screen.queryByRole('combobox', { name: 'Add the first step' })).toBeNull()
   })
 
-  /** Saving is Task 28's, and the screen says so rather than showing a dead button. */
-  it('says that saving is not built yet', async () => {
-    renderApp('/workflows/w1/edit', [harnesses()])
-    const stub = await screen.findByText('Saving a new version')
-    expect(
-      within(stub.parentElement as HTMLElement).getByText(/not built yet/i),
-    ).toBeInTheDocument()
+  /**
+   * SAVE.
+   *
+   * Every case below OPENS FROM A DRAFT rather than clicking an outline
+   * together, and that is a choice about what is under test: building
+   * `plan · implement · gate · git-publish` through the menus is five
+   * interactions this file already covers one by one, and repeating them in
+   * front of each save assertion would put the add-step menu on the failure
+   * path of every rejection test. `readDraft` is production code with its own
+   * suite; here it is the fixture loader.
+   */
+  describe('save', () => {
+    const created = (status: number, version: number) =>
+      http.post('/api/v1/workflows/:id/versions', () =>
+        HttpResponse.json(
+          {
+            workflow_id: 'w1',
+            version,
+            content_hash: 'a'.repeat(64),
+            document: CHAIN,
+            created_at: '2026-08-29T09:00:00Z',
+          },
+          { status },
+        ),
+      )
+
+    const rejected = (body: Record<string, unknown>) =>
+      http.post('/api/v1/workflows/:id/versions', () =>
+        HttpResponse.json(body, {
+          status: 400,
+          headers: { 'content-type': 'application/problem+json' },
+        }),
+      )
+
+    it('posts the derived document, lands on the new version, and clears the draft', async () => {
+      const user = userEvent.setup()
+      const posted: unknown[] = []
+      localStorage.setItem(draftKey('w1'), JSON.stringify(CHAIN))
+      renderApp('/workflows/w1/edit', [
+        harnesses(),
+        http.post('/api/v1/workflows/:id/versions', async ({ request }) => {
+          posted.push(await request.json())
+          return HttpResponse.json(
+            {
+              workflow_id: 'w1',
+              version: 7,
+              content_hash: 'a'.repeat(64),
+              document: CHAIN,
+              created_at: '2026-08-29T09:00:00Z',
+            },
+            { status: 201 },
+          )
+        }),
+        version(CHAIN),
+      ])
+
+      await user.click(await screen.findByRole('button', { name: 'Save version' }))
+
+      // The version view, reached by navigation — not a banner claiming success.
+      expect(await screen.findByRole('heading', { name: 'v7' })).toBeInTheDocument()
+      // THE BODY IS THE ROUND TRIP: this document came off the wire, through
+      // `toCard`, through the reducer's state, and back through `toDocument`.
+      expect(posted).toEqual([{ document: CHAIN }])
+      expect(localStorage.getItem(draftKey('w1'))).toBeNull()
+    })
+
+    /**
+     * THE UNDECLARED 200. `createWorkflowVersion` answers 201 for a new
+     * document and 200 with the EXISTING version when the content hash already
+     * exists (`workflows/api/api.go`, `workflows.go`'s `GetVersionByHash`
+     * branch) — and `httpx.Operation.Status` holds one value, so the generated
+     * types predict only the 201. Saving an unchanged outline is the ordinary
+     * way to reach it: open v3, change nothing, save.
+     *
+     * A save path keyed on `status === 201` would strand that person on the
+     * editor with no error and no navigation, which is the one outcome worse
+     * than a visible failure.
+     */
+    it('treats the idempotent 200 replay as success', async () => {
+      const user = userEvent.setup()
+      localStorage.setItem(draftKey('w1'), JSON.stringify(CHAIN))
+      renderApp('/workflows/w1/edit', [harnesses(), created(200, 3), version(CHAIN)])
+
+      await user.click(await screen.findByRole('button', { name: 'Save version' }))
+
+      expect(await screen.findByRole('heading', { name: 'v3' })).toBeInTheDocument()
+      expect(localStorage.getItem(draftKey('w1'))).toBeNull()
+    })
+
+    /**
+     * A REJECTION LANDS ON THE CARD IT IS ABOUT, and the mapping is POSITIONAL
+     * — `Violation.Path` is `nodes[1].instructions`, an index into the array
+     * this editor posted, which is why the card order and the node order are
+     * the same list.
+     */
+    it('binds a nodes[i] field error onto that card', async () => {
+      const user = userEvent.setup()
+      localStorage.setItem(draftKey('w1'), JSON.stringify(CHAIN))
+      renderApp('/workflows/w1/edit', [
+        harnesses(),
+        rejected({
+          title: 'Invalid request',
+          status: 400,
+          detail: 'definition is invalid',
+          correlation_id: 'corr-1',
+          errors: [{ field: 'nodes[1].instructions', message: 'must be 1-8192 bytes' }],
+        }),
+      ])
+
+      await user.click(await screen.findByRole('button', { name: 'Save version' }))
+
+      const cards = await screen.findAllByRole('listitem')
+      expect(within(cards[1] as HTMLElement).getByRole('alert')).toHaveTextContent(
+        'instructions: must be 1-8192 bytes',
+      )
+      // Not on its neighbours, and not doubled onto the banner.
+      expect(within(cards[0] as HTMLElement).queryByRole('alert')).toBeNull()
+      expect(screen.queryByText('definition is invalid')).toBeNull()
+      // The reference survives a routed rejection — see `FormError`.
+      expect(screen.getByText(/corr-1/)).toBeInTheDocument()
+    })
+
+    /**
+     * A FIELD ERROR THAT NAMES NO CARD GOES TO THE BANNER. `ParseDocument`'s
+     * own rejections carry `document` and `schema`, and `validateShape` writes
+     * a bare `nodes` for the count rules — none of them is a card, and
+     * inventing one to hang the sentence on would blame a step at random.
+     */
+    it('sends a non-positional field error to the banner', async () => {
+      const user = userEvent.setup()
+      localStorage.setItem(draftKey('w1'), JSON.stringify(CHAIN))
+      renderApp('/workflows/w1/edit', [
+        harnesses(),
+        rejected({
+          title: 'Invalid request',
+          status: 400,
+          detail: 'definition is invalid',
+          correlation_id: 'corr-2',
+          errors: [{ field: 'document', message: 'must be at most 1048576 bytes' }],
+        }),
+      ])
+
+      await user.click(await screen.findByRole('button', { name: 'Save version' }))
+
+      expect(await screen.findByText('must be at most 1048576 bytes')).toBeInTheDocument()
+      expect(
+        screen.getAllByRole('listitem').every((card) => within(card).queryByRole('alert') === null),
+      ).toBe(true)
+    })
+
+    /**
+     * A MIXED REJECTION SHOWS BOTH HALVES, and the unplaceable half wins the
+     * banner even though something else routed. `applyProblemToForm` made the
+     * same call for the same reason: a message this screen cannot put next to a
+     * card is still the server's explanation, and dropping it because a
+     * DIFFERENT error found a home leaves the person reading a partial account
+     * of why their save failed.
+     *
+     * `nodes[9]` is the second half deliberately — a path that IS positional
+     * and names no card this outline has. It is the branch a mapper that
+     * trusted the index would put on a card that does not exist, or drop
+     * silently.
+     */
+    it('shows a card error and an unplaceable one together', async () => {
+      const user = userEvent.setup()
+      localStorage.setItem(draftKey('w1'), JSON.stringify(CHAIN))
+      renderApp('/workflows/w1/edit', [
+        harnesses(),
+        rejected({
+          title: 'Invalid request',
+          status: 400,
+          detail: 'definition is invalid',
+          correlation_id: 'corr-4',
+          errors: [
+            { field: 'nodes[1].instructions', message: 'must be 1-8192 bytes' },
+            { field: 'nodes[9].harness', message: 'must name a registered harness' },
+          ],
+        }),
+      ])
+
+      await user.click(await screen.findByRole('button', { name: 'Save version' }))
+
+      expect(await screen.findByText('must name a registered harness')).toBeInTheDocument()
+      const cards = screen.getAllByRole('listitem')
+      expect(within(cards[1] as HTMLElement).getByRole('alert')).toHaveTextContent(
+        'instructions: must be 1-8192 bytes',
+      )
+    })
+
+    /**
+     * PARSE-SHAPED REJECTIONS CARRY NO FIELDS AT ALL — detail
+     * `"invalid definition document"` and nothing else (pre-flight 12) — so the
+     * banner is the only place they can go, and a save path that only knew how
+     * to place field errors would refuse silently.
+     */
+    it('shows a detail-only rejection on the banner', async () => {
+      const user = userEvent.setup()
+      localStorage.setItem(draftKey('w1'), JSON.stringify(CHAIN))
+      renderApp('/workflows/w1/edit', [
+        harnesses(),
+        rejected({
+          title: 'Invalid request',
+          status: 400,
+          detail: 'invalid definition document',
+          correlation_id: 'corr-3',
+        }),
+      ])
+
+      await user.click(await screen.findByRole('button', { name: 'Save version' }))
+
+      expect(await screen.findByText('invalid definition document')).toBeInTheDocument()
+      expect(screen.getByText(/corr-3/)).toBeInTheDocument()
+    })
+
+    /**
+     * A DROPPED CONNECTION IS NOT A REJECTION. `unwrap` turns every answer the
+     * server gives into an `ApiError`, so the only way past it is `fetch`
+     * itself failing — no status, no problem document, no correlation id,
+     * nothing that names a card. The banner says what happened instead of
+     * blaming a step at random.
+     */
+    it('says so when the request never reached the server', async () => {
+      const user = userEvent.setup()
+      localStorage.setItem(draftKey('w1'), JSON.stringify(CHAIN))
+      renderApp('/workflows/w1/edit', [
+        harnesses(),
+        http.post('/api/v1/workflows/:id/versions', () => HttpResponse.error()),
+      ])
+
+      await user.click(await screen.findByRole('button', { name: 'Save version' }))
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(/failed/i)
+      // Nothing was saved, so the draft is still the only copy of this outline.
+      expect(localStorage.getItem(draftKey('w1'))).not.toBeNull()
+    })
+
+    /**
+     * SAVE IS THE ONE PLACE `grammarViolation` IS ASKED, and an incomplete
+     * outline disables it WITH THE REASON. The alternative — an enabled button
+     * that posts a document the server refuses — spends a round trip to learn
+     * what the client already knows, and answers in the validator's words
+     * rather than the editor's.
+     */
+    it('refuses to save an incomplete outline, and says what is missing', async () => {
+      localStorage.setItem(
+        draftKey('w1'),
+        JSON.stringify({
+          schema: 2,
+          nodes: [{ id: 'impl-1', type: 'implement', harness: 'codex', instructions: 'do it' }],
+        }),
+      )
+      renderApp('/workflows/w1/edit', [harnesses()])
+
+      expect(await screen.findByRole('button', { name: 'Save version' })).toBeDisabled()
+      expect(screen.getByText(/still needs a gate and a git-publish/)).toBeInTheDocument()
+    })
   })
 })

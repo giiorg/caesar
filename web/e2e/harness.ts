@@ -78,10 +78,35 @@ export async function openGate(request: APIRequestContext): Promise<string> {
  */
 export async function seedLabels(
   request: APIRequestContext,
-): Promise<{ project: string; repo: string; workflow: string }> {
+): Promise<{ project: string; repo: string; workflow: string; harness: string }> {
   const res = await request.get(`${CONTROL}/fixture/seed`)
   expect(res.status()).toBe(200)
-  return (await res.json()) as { project: string; repo: string; workflow: string }
+  return (await res.json()) as {
+    project: string
+    repo: string
+    workflow: string
+    harness: string
+  }
+}
+
+/**
+ * What the BACKEND says about one workflow — `latest_version`, read through
+ * `workflows.Service` rather than off the screen.
+ *
+ * IT DOES NOT GO THROUGH THE APP'S OWN API, and the reason is worth keeping:
+ * Playwright's `page.request` shares the browser's cookie jar but honours
+ * `Secure` strictly, while browsers exempt localhost — so the `__Host-` session
+ * cookie never rides a Node-side request and `GET /api/v1/workflows/{id}` from
+ * a spec answers 401 with the UI perfectly signed in. Measured, on this file's
+ * first gate run.
+ */
+export async function workflowState(
+  request: APIRequestContext,
+  workflowId: string,
+): Promise<{ name: string; latest_version: number }> {
+  const res = await request.get(`${CONTROL}/fixture/workflow/${workflowId}`)
+  expect(res.status(), await res.text()).toBe(200)
+  return (await res.json()) as { name: string; latest_version: number }
 }
 
 /**

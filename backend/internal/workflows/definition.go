@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/giiorg/caesar/backend/internal/platform/xerrors"
 )
@@ -50,12 +51,22 @@ const (
 	NodeGitPublish NodeType = "git-publish"
 )
 
+// nodeTypes is the vocabulary itself, in spec order. It exists because two
+// gates now need to ITERATE the types rather than test one: the editor
+// corpus asserts that every type it contains appears somewhere
+// (editorcorpus_test.go), and the §10.9 descriptor emits the vocabulary
+// mechanically. Both read NodeTypes below, and Valid ranges over the same
+// array — so a sixth type is a one-line edit that immediately reddens
+// whichever of those two has not learned about it. A second hand-written
+// list is how a vocabulary and its gate drift apart.
+var nodeTypes = [...]NodeType{NodePlan, NodeImplement, NodeReview, NodeGate, NodeGitPublish}
+
+// NodeTypes is the V1 step vocabulary as a slice, copied: callers iterate it,
+// and the source of truth is not theirs to reorder.
+func NodeTypes() []NodeType { return slices.Clone(nodeTypes[:]) }
+
 func (t NodeType) Valid() bool {
-	switch t {
-	case NodePlan, NodeImplement, NodeReview, NodeGate, NodeGitPublish:
-		return true
-	}
-	return false
+	return slices.Contains(nodeTypes[:], t)
 }
 
 // Agentic reports whether the node runs a harness (needs harness +

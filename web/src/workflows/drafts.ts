@@ -51,11 +51,23 @@ export function readDraft(workflowId: string): Card[] | null {
 }
 
 /**
- * THERE IS DELIBERATELY NO `clearDraft` HERE. The one thing that clears a draft
- * is a successful save, and save is Task 28 — an exported clear with no
- * production caller is a seam whose tests all pass against code nothing runs.
- * It arrives with the mutation that calls it.
+ * Forget the draft, because it was saved.
+ *
+ * ITS ONE CALLER IS THE SAVE MUTATION'S `onSuccess`, and it arrived with that
+ * caller rather than with the rest of this file: an exported clear with nothing
+ * in production driving it is a seam whose tests all pass against code the app
+ * never runs.
+ *
+ * A SUCCESSFUL SAVE IS THE ONLY THING THAT CLEARS ONE. Not opening the editor,
+ * not abandoning it, not a rejection — a draft outranks a prefill precisely
+ * because it is work that exists nowhere else, and it stops being that at the
+ * moment the server holds a version of it. The 200 replay clears it too: the
+ * content hash already existed, so the server holds those bytes either way.
  */
+export function clearDraft(workflowId: string): void {
+  localStorage.removeItem(draftKey(workflowId))
+}
+
 function parse(raw: string): unknown {
   try {
     return JSON.parse(raw)

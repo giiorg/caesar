@@ -277,6 +277,27 @@ WEB_CMDS=(
 WEBE2E_CMDS=(
 	'task: [web:e2e] go test -tags "integration,webe2e,embedui" -count=1 -timeout 15m ./internal/app/ -run TestWebE2E'
 )
+# The contracts lanes. Until Plan 12b Task 28 this log was checked for its EXIT
+# STATUS and nothing else, which left the drift gate's own scope unasserted:
+# drop a generator from contracts:gen and `contracts:check` regenerates less,
+# diffs nothing, and exits 0 — a green lane over a generated artifact that has
+# quietly stopped being regenerated. The last two lines are the gate itself, and
+# their PATH LISTS are the thing worth pinning: removing a path from either is
+# how a whole category of artifact stops being watched with every signal in this
+# script still green.
+#
+# Measured, not derived: these are the lines go-task echoed for this edit,
+# `$(...)` and all — it prints the command before the shell expands it.
+# shellcheck disable=SC2016
+CONTRACTS_CMDS=(
+	'task: [db:sqlc] bin/sqlc generate'
+	'task: [contracts:openapi] go run ./internal/contracts/cmd/openapigen -out api/openapi.json'
+	'task: [contracts:ts] ../scripts/with-node npm ci'
+	'task: [contracts:ts] ../scripts/with-node npm run api:gen'
+	'task: [contracts:editorcorpus] ../scripts/with-node node --experimental-strip-types tools/gen-editor-corpus.mts'
+	'task: [contracts:check] git diff --exit-code -- backend/api/openapi.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store backend/internal/workflows/store backend/internal/runs/store backend/internal/workflows/testdata/editor_corpus'
+	'task: [contracts:check] test -z "$(git status --porcelain -- backend/api web/src/api backend/internal/workflows/testdata/editor_corpus)"'
+)
 # The two embedui lanes. Both lines below are what go-task ECHOED when the lanes
 # were run for this edit, not a hand-derivation from Taskfile.yml — the double
 # space in the `go test` line is an empty {{.CLI_ARGS}} and would not have been
@@ -331,6 +352,7 @@ assert_lane() {
 }
 
 for want in "${LANE_CMDS[@]}"; do assert_lane "$CI_LOG" "$want"; done
+for want in "${CONTRACTS_CMDS[@]}"; do assert_lane "$CONTRACTS_LOG" "$want"; done
 for want in "${RUNNER_CMDS[@]}"; do assert_lane "$RUNNER_LOG" "$want"; done
 for want in "${WEB_CMDS[@]}"; do assert_lane "$WEB_LOG" "$want"; done
 for want in "${EMBEDUI_TEST_CMDS[@]}"; do assert_lane "$EMBEDUI_TEST_LOG" "$want"; done

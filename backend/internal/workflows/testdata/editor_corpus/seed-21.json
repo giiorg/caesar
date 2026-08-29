@@ -1,0 +1,1 @@
+{"schema":2,"nodes":[{"id":"impl-1","type":"implement","harness":"claude-code","instructions":"do the implement work"},{"id":"gate-1","type":"gate"},{"id":"publish-1","type":"git-publish"}],"edges":[{"from":"impl-1","to":"gate-1","artifact":"patch"},{"from":"gate-1","to":"publish-1","artifact":"patch"}]}

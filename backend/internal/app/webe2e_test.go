@@ -254,6 +254,7 @@ func e2eFixtures(seed e2eFixture) http.Handler {
 	mux.HandleFunc("GET /fixture/seed", func(w http.ResponseWriter, _ *http.Request) {
 		e2eJSON(w, http.StatusOK, map[string]any{
 			"project": seed.projectName, "repo": seed.repoSlug, "workflow": seed.workflowName,
+			"harness": seed.harnessName,
 		})
 	})
 
@@ -281,6 +282,34 @@ func e2eFixtures(seed e2eFixture) http.Handler {
 		}
 		e2eJSON(w, http.StatusOK, map[string]any{
 			"generation": run.Generation, "status": string(run.Status), "phases": rows,
+		})
+	})
+
+	// The same oracle for the workflow the EDITOR authors. `latest_version` is a
+	// database fact, and a version view rendering "v1" is a statement about a
+	// template.
+	//
+	// IT GOES THROUGH THE CONTROL SERVER RATHER THAN THE APP'S OWN API, and that
+	// is measured rather than stylistic: Playwright's `page.request` shares the
+	// browser context's cookie jar but applies `Secure` strictly, while the
+	// browser exempts localhost — so the `__Host-` session cookie rides every
+	// request the PAGE makes and none that the Node-side client makes. The spec
+	// asking `GET /api/v1/workflows/{id}` that way got a 401 with the UI
+	// otherwise green. This reads through workflows.Service, which is stronger
+	// anyway: no HTTP layer between the assertion and the row.
+	mux.HandleFunc("GET /fixture/workflow/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		wf, err := seed.workflowsSvc.GetWorkflow(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		e2eJSON(w, http.StatusOK, map[string]any{
+			"name": wf.Name, "latest_version": wf.LatestVersion,
 		})
 	})
 
@@ -446,8 +475,12 @@ type e2eFixture struct {
 	// What the create-task form's three selects LABEL their options with, so
 	// `/fixture/seed` can serve them and the Path-2 spec can pick by label
 	// instead of hard-coding names this file owns.
-	projectName, repoSlug, workflowName string
-	runsSvc                             *runs.Service
+	// …and, since Task 28, what the workflow EDITOR's harness picker labels its
+	// options with: a definition authored through the UI names a harness, and
+	// `checkHarnesses` refuses an unregistered one at intake.
+	projectName, repoSlug, workflowName, harnessName string
+	runsSvc                                          *runs.Service
+	workflowsSvc                                     *workflows.Service
 }
 
 // e2eSeed builds the world through the REAL services — the same doors the admin
@@ -495,10 +528,11 @@ func e2eSeed(ctx context.Context, t *testing.T, cfg config.Config) e2eFixture {
 	// The workflow names harness "e2e", and checkHarnesses resolves every
 	// agentic node's harness at intake — an unregistered one is a 400 at
 	// CreateTask, not a hang, which is worth knowing when this lane fails.
-	if _, err := assetsSvc.RegisterHarness(ctx, admin, assets.NewHarness{
+	harness, err := assetsSvc.RegisterHarness(ctx, admin, assets.NewHarness{
 		Name: "e2e", Kind: assets.HarnessCodex, ImageRef: "unused-by-the-fake-executor",
 		ProviderEndpoint: "http://localhost:1", CredentialID: modelCred.ID,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	repo, err := assetsSvc.CreateRepo(ctx, admin, project.ID, assets.NewRepo{
@@ -535,7 +569,9 @@ func e2eSeed(ctx context.Context, t *testing.T, cfg config.Config) e2eFixture {
 		admin: admin, email: email, password: password,
 		repoID: repo.ID, workflowID: wf.ID, workflowVersion: version.Version,
 		projectName: project.Name, repoSlug: repo.Slug, workflowName: wf.Name,
-		runsSvc: runsSvc,
+		harnessName:  harness.Name,
+		runsSvc:      runsSvc,
+		workflowsSvc: workflowsSvc,
 	}
 }
 

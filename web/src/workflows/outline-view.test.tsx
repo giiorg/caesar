@@ -33,6 +33,9 @@ const TWO_IMPL: Card[] = [
 
 const HARNESSES = ['claude-code', 'codex']
 
+/** No server rejection in play — every case but the one that is about one. */
+const NO_FIELD_ERRORS = new Map<string, readonly string[]>()
+
 /** The editor's real wiring: a `useReducer` whose handles go straight to the view. */
 function LiveOutline(props: { initial?: readonly Card[] }) {
   const [state, dispatch] = useReducer(editorReducer, {
@@ -42,7 +45,13 @@ function LiveOutline(props: { initial?: readonly Card[] }) {
   return (
     <OutlineView
       cards={state.cards}
-      edit={{ dispatch, harnesses: HARNESSES, refusal: state.refusal, note: state.note }}
+      edit={{
+        dispatch,
+        harnesses: HARNESSES,
+        refusal: state.refusal,
+        note: state.note,
+        fieldErrors: NO_FIELD_ERRORS,
+      }}
     />
   )
 }
@@ -275,6 +284,7 @@ describe('refusals', () => {
           harnesses: HARNESSES,
           refusal: { cardId: null, reason: 'a review needs a patch before it' },
           note: null,
+          fieldErrors: NO_FIELD_ERRORS,
         }}
       />,
     )
@@ -290,10 +300,39 @@ describe('refusals', () => {
           harnesses: HARNESSES,
           refusal: null,
           note: 'The revision loop on gate-1 → impl-2 was cleared.',
+          fieldErrors: NO_FIELD_ERRORS,
         }}
       />,
     )
     expect(screen.getByRole('status')).toHaveTextContent('was cleared')
+  })
+
+  /**
+   * THE SERVER'S REJECTION SITS WHERE THE REDUCER'S DOES, and both can be on
+   * screen at once: the reducer refuses the gesture that just happened, the
+   * server refused the document that was posted, and neither answers for the
+   * other. The fixture puts them on DIFFERENT cards so a renderer that dropped
+   * one and kept the other is visible.
+   */
+  it('renders a card-bound server rejection on its own card', () => {
+    render(
+      <OutlineView
+        cards={CONVEYOR}
+        edit={{
+          dispatch: vi.fn(),
+          harnesses: HARNESSES,
+          refusal: { cardId: 'plan-1', reason: 'plan “plan-1” cannot go here' },
+          note: null,
+          fieldErrors: new Map([['review-1', ['instructions: must be 1-8192 bytes']]]),
+        }}
+      />,
+    )
+    const rows = screen.getAllByRole('listitem')
+    expect(within(rows[2] as HTMLElement).getByRole('alert')).toHaveTextContent(
+      'instructions: must be 1-8192 bytes',
+    )
+    expect(within(rows[0] as HTMLElement).getByRole('alert')).toHaveTextContent('cannot go here')
+    expect(within(rows[1] as HTMLElement).queryByRole('alert')).toBeNull()
   })
 })
 

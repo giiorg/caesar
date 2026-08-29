@@ -324,6 +324,31 @@ describe('setField', () => {
     })
     expect(state).toBe(built)
   })
+
+  /**
+   * A HARNESS IS AN AGENTIC FIELD, and storing one anywhere else would build a
+   * document `validateNodeConfig` refuses — "only agentic steps take a harness"
+   * — for something the person never typed, since a gate card renders no such
+   * control. Both non-agentic types are covered because they are separate
+   * branches of nothing: the guard reads `isAgentic`, and a mutant that named
+   * one type would pass a test that only tried the other.
+   */
+  it.each(['gate-1', 'publish-1'])('ignores a harness on %s', (id) => {
+    const built = run(CONVEYOR)
+    const state = editorReducer(built, { kind: 'setField', id, field: 'harness', value: 'codex' })
+    expect(state).toBe(built)
+  })
+
+  it('ignores instructions on a non-agentic card', () => {
+    const built = run(CONVEYOR)
+    const state = editorReducer(built, {
+      kind: 'setField',
+      id: 'gate-1',
+      field: 'instructions',
+      value: 'decide well',
+    })
+    expect(state).toBe(built)
+  })
 })
 
 /**

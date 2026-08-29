@@ -257,19 +257,38 @@ tasks:
       - ../scripts/with-node npm ci
       - ../scripts/with-node npm run api:gen
 
+  # The seeded editor corpus (Plan 12b §6.3): documents the WEB editor's reducer
+  # and derivation produce, written where the Go validator can judge them
+  # (backend/internal/workflows/editorcorpus_test.go). It is generated rather
+  # than hand-written for the ordinary reason — a TypeScript derivation change
+  # must either diff these files or redden that test — and it runs AFTER
+  # contracts:ts because that is the step that runs `npm ci`, and this one needs
+  # web/node_modules to exist only for the node binary's sake. Type stripping is
+  # built into node 24, so there is no compiler in this lane.
+  contracts:editorcorpus:
+    desc: "Regenerate the seeded editor corpus the Go validator judges"
+    dir: web
+    cmds:
+      - ../scripts/with-node node --experimental-strip-types tools/gen-editor-corpus.mts
+
   contracts:gen:
     desc: "Regenerate every generated contract artifact"
     cmds:
       - task: db:sqlc
       - task: contracts:openapi
       - task: contracts:ts
+      - task: contracts:editorcorpus
 
   contracts:check:
     desc: "Regenerate all contracts and fail on drift"
     cmds:
       - task: contracts:gen
-      - git diff --exit-code -- backend/api/openapi.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store backend/internal/workflows/store backend/internal/runs/store
-      - test -z "$(git status --porcelain -- backend/api web/src/api)"
+      - git diff --exit-code -- backend/api/openapi.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store backend/internal/workflows/store backend/internal/runs/store backend/internal/workflows/testdata/editor_corpus
+      # The porcelain half is not a restatement of the diff above: `git diff`
+      # says nothing about an UNTRACKED file, and a new corpus seed arrives
+      # untracked. It is also what catches the reverse — a generator that
+      # deleted a committed document without the diff noticing.
+      - test -z "$(git status --porcelain -- backend/api web/src/api backend/internal/workflows/testdata/editor_corpus)"
 
   # Every web lane invokes the installed binary by path. `npx` and `npm exec --`
   # both fall back to the public registry when the binary is not in

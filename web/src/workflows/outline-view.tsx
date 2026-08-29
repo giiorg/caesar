@@ -36,6 +36,16 @@ export type OutlineEdit = {
    * alternative to telling them is dropping a setting they chose.
    */
   note: string | null
+  /**
+   * The SERVER's last word about a posted document, per card — `bindSaveErrors`
+   * having turned `nodes[2].harness` into the id of the card that sits there.
+   *
+   * A MAP RATHER THAN AN OPTIONAL, and empty when there is nothing to say: an
+   * absent map and an empty one would mean the same thing to every reader here,
+   * which is the second state `edit?: OutlineEdit` already refuses to admit
+   * one level up.
+   */
+  fieldErrors: ReadonlyMap<string, readonly string[]>
 }
 
 export function OutlineView(props: { cards: readonly Card[]; edit?: OutlineEdit }) {
@@ -128,6 +138,11 @@ function Row(props: {
 }) {
   const { card, edit } = props
   const refusal = edit?.refusal?.cardId === card.id ? edit.refusal.reason : null
+  // THE SERVER'S SENTENCE GOES WHERE THE REDUCER'S GOES. Both answer "why did
+  // that not work" about this step, and a person who has just been told the
+  // gate cannot go here should not have to look somewhere else to be told its
+  // instructions are too long.
+  const rejected = edit?.fieldErrors.get(card.id) ?? []
 
   return (
     <article
@@ -215,6 +230,9 @@ function Row(props: {
       )}
 
       {refusal !== null && <Refused reason={refusal} />}
+      {rejected.map((message) => (
+        <Refused key={message} reason={message} />
+      ))}
     </article>
   )
 }

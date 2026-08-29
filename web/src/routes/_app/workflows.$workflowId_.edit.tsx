@@ -1,22 +1,25 @@
-import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
-import { createFileRoute, Link } from '@tanstack/react-router'
+import { useMutation, useQuery, useQueryClient, useSuspenseQuery } from '@tanstack/react-query'
+import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { useReducer, useState } from 'react'
 import { z } from 'zod'
 import { AdminRefusal } from '../../admin/admin-refusal'
 import { harnessesQueryOptions } from '../../admin/harnesses-query'
+import { api, unwrap } from '../../api/client'
+import { ApiError } from '../../api/errors'
 import { useMe } from '../../auth/me-query'
-import { StubPanel } from '../../ui/stub-panel'
+import { FormError } from '../../forms/form-error'
 import { DagPreview } from '../../workflows/dag-preview'
 import {
   type Card,
   type DocShape,
+  grammarViolation,
   isChainShaped,
   readDocument,
   toCard,
   toDocument,
 } from '../../workflows/derive'
-import { readDraft, useDraftPersistence } from '../../workflows/drafts'
-import { EMPTY_EDITOR, editorReducer } from '../../workflows/editor-state'
+import { clearDraft, readDraft, useDraftPersistence } from '../../workflows/drafts'
+import { bindSaveErrors, EMPTY_EDITOR, editorReducer } from '../../workflows/editor-state'
 import { OutlineView } from '../../workflows/outline-view'
 import { workflowVersionQueryOptions } from '../../workflows/workflows-query'
 
@@ -187,6 +190,17 @@ function Editor(props: {
   })
   useDraftPersistence(props.workflowId, state.cards)
   const harnesses = useQuery(harnessesQueryOptions)
+  const save = useSaveVersion(props.workflowId)
+  /**
+   * THE ONE PLACE `grammarViolation` IS ASKED IN THE WHOLE EDITOR.
+   *
+   * Every transition the reducer judges is judged by `prefixViolation`, because
+   * an outline is incomplete for the entire authoring session and refusing the
+   * first card ever added is not an editor. Completeness only becomes a real
+   * question at the door, and this is the door.
+   */
+  const incomplete = grammarViolation(state.cards)
+  const failure = saveFailure(save.error, state.cards)
 
   return (
     <Screen workflowId={props.workflowId} heading="New version">
@@ -215,15 +229,102 @@ function Editor(props: {
           harnesses: (harnesses.data ?? []).map((h) => h.name),
           refusal: state.refusal,
           note: state.note,
+          fieldErrors: failure.byCard,
         }}
       />
 
-      {/* Saving is Task 28's, and a `StubPanel` says so out loud. A Save button
-          that did nothing — or one disabled with a reason that never clears —
-          would be the plausible-looking control a stub exists not to fake. */}
-      <StubPanel plan="Plan 12b Task 28" what="Saving a new version" />
+      <div className="flex flex-col gap-2">
+        <FormError message={failure.banner} correlationId={failure.correlationId} />
+        {/* THE REASON SITS BESIDE THE DISABLED BUTTON rather than replacing it.
+            A control that is simply absent until some invisible condition holds
+            leaves the person guessing what the condition is; this one names
+            what the outline still needs, and the sentence disappears as they
+            supply it. */}
+        {incomplete !== null && <p className="text-text-muted text-sm">{incomplete}</p>}
+        <button
+          type="button"
+          disabled={incomplete !== null || save.isPending}
+          onClick={() => save.mutate(state.cards)}
+          className="bg-accent text-accent-contrast self-start rounded-md px-4 py-2 text-sm font-medium disabled:opacity-40"
+        >
+          {save.isPending ? 'Saving…' : 'Save version'}
+        </button>
+      </div>
     </Screen>
   )
+}
+
+/**
+ * The save mutation: POST the derived document, then leave.
+ *
+ * SUCCESS IS `response.ok`, NEVER `status === 201`, and that is the whole of
+ * pre-flight 11. `createWorkflowVersion` answers 201 for new content and 200
+ * with the EXISTING version when the content hash is already registered
+ * (`workflows.go`'s `GetVersionByHash` branch) — a status the generated types
+ * do not predict, because `httpx.Operation.Status` holds one value. `unwrap`
+ * already decides on `response.ok`, so this path needs no status check at all;
+ * what it needs is to not grow one.
+ *
+ * IT NAVIGATES TO THE VERSION IT WAS GIVEN, whichever of the two happened. For
+ * the replay that is an older version number, and landing on it is the honest
+ * answer: those bytes are registered, this is where they live.
+ *
+ * WHAT IT INVALIDATES: `['workflows']`, because a workflow card renders
+ * `latest_version`; and `['workflow', id]`, which is the prefix over both the
+ * detail header and the version LIST that just grew a row. The individual
+ * version entries live under that prefix too and are immutable — marking them
+ * stale costs nothing, since none is mounted at the moment this fires and the
+ * one being navigated to was never in the cache.
+ */
+function useSaveVersion(workflowId: string) {
+  const qc = useQueryClient()
+  const navigate = useNavigate()
+  return useMutation({
+    mutationFn: async (cards: readonly Card[]) =>
+      unwrap(
+        await api.POST('/api/v1/workflows/{id}/versions', {
+          params: { path: { id: workflowId } },
+          body: { document: toDocument(cards) },
+        }),
+      ),
+    onSuccess: (version) => {
+      clearDraft(workflowId)
+      void qc.invalidateQueries({ queryKey: ['workflows'] })
+      void qc.invalidateQueries({ queryKey: ['workflow', workflowId] })
+      void navigate({
+        to: '/workflows/$workflowId/versions/$version',
+        params: { workflowId, version: String(version.version) },
+      })
+    },
+  })
+}
+
+/** Nothing to say, and the same empty map every render — see `OutlineEdit.fieldErrors`. */
+const NO_FIELD_ERRORS: ReadonlyMap<string, readonly string[]> = new Map()
+
+/**
+ * A failed save, placed onto the screen.
+ *
+ * THE NON-`ApiError` BRANCH IS THE TRANSPORT, and it is not decoration:
+ * `unwrap` turns every answer the server gave into an `ApiError`, so what is
+ * left is the case where there was no answer — `fetch` rejecting on a dropped
+ * connection. That failure names no card and carries no correlation id,
+ * because no request ever reached a handler to log one.
+ */
+function saveFailure(
+  error: Error | null,
+  cards: readonly Card[],
+): {
+  banner: string | null
+  byCard: ReadonlyMap<string, readonly string[]>
+  correlationId: string | null
+} {
+  if (error === null) return { banner: null, byCard: NO_FIELD_ERRORS, correlationId: null }
+  if (!(error instanceof ApiError)) {
+    return { banner: error.message, byCard: NO_FIELD_ERRORS, correlationId: null }
+  }
+  const { banner, byCard } = bindSaveErrors(error, cards)
+  return { banner, byCard, correlationId: error.correlationId !== '' ? error.correlationId : null }
 }
 
 function Screen(props: { workflowId: string; heading: string; children: React.ReactNode }) {
