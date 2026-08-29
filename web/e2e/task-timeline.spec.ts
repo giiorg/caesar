@@ -28,7 +28,24 @@ test('creating a task produces a run whose timeline advances live', async ({ pag
 
   // Landing on the run is the form's own contract, and it is what makes the
   // next assertions about a LIVE timeline rather than about a fresh page load.
-  await expect(page.getByTestId('phase-timeline')).toBeVisible({ timeout: 30_000 })
+  //
+  // WHICH ELEMENT PROVES THE LANDING IS PER-PROJECT, and this is the one place
+  // in the shared critical path where that is true. MEASURED on the desktop
+  // project's first run: `phase-timeline` resolves at 1280px and is HIDDEN.
+  // Every CLOSED row carries `md:hidden` on purpose — on a wide viewport a
+  // closed row is the rail's job, so the pane holds the one open body instead
+  // of a stack of empty bordered strips (`runs.$runId.tsx`, PhaseTimeline) —
+  // and with no `?phase=` yet there is no open row, so the `<ol>` is a real
+  // element with an empty box. The rail is what a person is looking at there.
+  //
+  // The two `data-state` assertions below need no branch: the rows stay in the
+  // DOM at both viewports and `toHaveAttribute` does not ask for a box, which
+  // is exactly what that component's comment promises the live-update tests.
+  const landed =
+    test.info().project.name === 'desktop'
+      ? page.getByTestId('phase-rail')
+      : page.getByTestId('phase-timeline')
+  await expect(landed).toBeVisible({ timeout: 30_000 })
 
   // ADVANCES WITHOUT A RELOAD: both rows reach these states on the same DOM the
   // create-task navigation landed on, driven by the stream through the cache

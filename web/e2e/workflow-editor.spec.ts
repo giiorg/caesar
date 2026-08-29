@@ -26,9 +26,17 @@ test('authors a workflow definition in the editor and saves it as v1', async ({
 
   // --- the first of the two writes: name the workflow ---
   //
-  // A name unique to this spec: one server and one database serve every spec
-  // file, and `CreateWorkflow` refuses a duplicate name with a 409.
-  const name = 'e2e-editor-authored'
+  // A name unique to this spec AND TO THIS PROJECT: one server and one database
+  // serve every spec file, and `CreateWorkflow` refuses a duplicate name with a
+  // 409 (`workflows.name` is `NOT NULL UNIQUE`; `workflows.go:92` maps the
+  // unique violation to `ClassConflict`).
+  //
+  // The project suffix is what Task 32 forced. "Unique to this spec" was enough
+  // while there was one project; a second one re-runs every spec file against
+  // the same database, so this spec collided WITH ITSELF — the desktop pass
+  // creating the name the mobile pass had already taken, and failing at "Create
+  // workflow" with what reads like an editor bug.
+  const name = `e2e-editor-authored-${test.info().project.name}`
   await page.goto('/workflows')
   await page.getByRole('button', { name: 'New workflow' }).click()
   await page.getByLabel('Name').fill(name)
@@ -72,12 +80,18 @@ test('authors a workflow definition in the editor and saves it as v1', async ({
 
   // --- a reorder, through the control a phone actually has ---
   //
-  // THE ARROWS, NOT THE GRIP. HTML5 drag-and-drop emits nothing from a touch,
-  // and this project runs at a Pixel 7 viewport, so the grip is dead here by
-  // design — `outline-view.tsx` says as much where it renders both. The drag
-  // path is covered by `outline-view.test.tsx`, which fires the drag events
-  // directly, and the desktop project (Task 32) is where a real pointer drag
-  // belongs.
+  // THE ARROWS, NOT THE GRIP, ON BOTH PROJECTS. HTML5 drag-and-drop emits
+  // nothing from a touch, so on the mobile pass the grip is dead by design —
+  // `outline-view.tsx` says as much where it renders both. The arrows are the
+  // control every viewport shares, so this reorder is the one assertion that
+  // means the same thing in both passes.
+  //
+  // THE DESKTOP PASS STILL DOES NOT DRAG, deliberately. Task 32 built the
+  // desktop project and declined to add a real pointer drag to it: the drag
+  // path is already covered by `outline-view.test.tsx`, which fires the drag
+  // events directly, so what a real drag would add is the browser's own HTML5
+  // DnD dispatch — the flakiest thing Playwright does — in the slowest lane in
+  // the repo. Still where such a test belongs if one is ever wanted.
   await page.getByRole('button', { name: 'Move impl-2 up' }).click()
   await expect(page.getByRole('textbox', { name: 'Step id' }).nth(0)).toHaveValue('impl-2')
   await expect(page.getByRole('textbox', { name: 'Step id' }).nth(1)).toHaveValue('impl-1')

@@ -2,10 +2,35 @@ import { defineConfig, devices } from '@playwright/test'
 
 export default defineConfig({
   testDir: './e2e',
-  // Mobile-viewport project only: the phone is the flagship surface, and a
+  // TWO VIEWPORTS, ONE CRITICAL PATH. 12a ran mobile alone and said why: "a
   // desktop project here would double the plan's slowest lane for a viewport
-  // Plan 12 owns.
-  projects: [{ name: 'mobile', use: { ...devices['Pixel 7'] } }],
+  // Plan 12 owns". This is that plan. The cost is real and accepted, and it
+  // buys the only place three claims are falsifiable at all — the rail paints
+  // left of <main>, run detail is two-pane, and the phone bar is gone — none of
+  // which jsdom can judge, because it loads no Tailwind and applies no media
+  // queries.
+  //
+  // WHAT IS PER-PROJECT AND WHAT IS NOT. The shared critical path is ONE set of
+  // specs that both projects run; only assertions about CHROME are branched,
+  // and they are branched inside the spec that makes them (`approvals.spec.ts`)
+  // rather than duplicated into a second file.
+  //
+  // `testIgnore` AND NOT `test.skip`. The plan asked for
+  // `test.skip(({}, testInfo) => …)`, which does not exist: `ConditionBody` is
+  // `(args: TestArgs) => boolean` (types/test.d.ts:2725), one parameter, no
+  // testInfo — and `({}, …)` is an empty object pattern, which biome's
+  // recommended `noEmptyPattern` rejects. The failure modes also differ the
+  // right way round: a pattern that matches nothing lets the file run on mobile
+  // and fail loudly at 412px, where a mistyped skip condition would skip every
+  // test and stay green.
+  projects: [
+    {
+      name: 'mobile',
+      use: { ...devices['Pixel 7'] },
+      testIgnore: /desktop-geometry\.spec\.ts/,
+    },
+    { name: 'desktop', use: { ...devices['Desktop Chrome'] } },
+  ],
   use: { baseURL: process.env.CAESAR_BASE_URL },
   // The Go harness owns the server's lifecycle, so there is no webServer here.
   forbidOnly: true,
@@ -19,6 +44,13 @@ export default defineConfig({
   // badge count at all, would have each worker clearing the others' gates.
   // Parallelism buys little here regardless: the lane's cost is the Postgres
   // container and the migrations, both of which happen once before any spec.
+  //
+  // THE SECOND PROJECT MAKES "ONE WORLD" STRICTER, NOT LOOSER. Every spec file
+  // now runs TWICE against that single database, so a spec that writes a
+  // uniquely-constrained row can collide WITH ITSELF — `workflow-editor.spec.ts`
+  // did, on `workflows.name`'s UNIQUE index, and its name is per-project for
+  // exactly that reason. One worker keeps the two passes serial as well as the
+  // files within a pass, which is what leaves `quiesce` sufficient.
   workers: 1,
   // Playwright's default is 30s PER TEST, which is not a budget these paths
   // fit: a revision round is two more fake executions plus the orchestrator's
