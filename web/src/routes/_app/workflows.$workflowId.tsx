@@ -1,8 +1,10 @@
-import { useMutation, useQueryClient, useSuspenseQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient, useSuspenseQuery } from '@tanstack/react-query'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { useState } from 'react'
 import { api, unwrap } from '../../api/client'
 import { asApiError, ErrorSurface } from '../../errors/error-surface'
+import { RunCard } from '../../runs/run-card'
+import { runsQueryOptions } from '../../runs/runs-query'
 import { FormSheet } from '../../ui/form-sheet'
 import { WorkflowForm } from '../../workflows/workflow-form'
 import {
@@ -23,6 +25,14 @@ import {
  * (`workflows/workflows.go` calls `GetWorkflow` first), so a bad id in the
  * address bar fails both reads with the same sentence rather than one of them
  * with a confusing one.
+ *
+ * THE RUN HISTORY IS A THIRD READ AND IT IS DELIBERATELY NOT HERE. Those two
+ * are the page's IDENTITY — a 404 on either means the address names nothing and
+ * the screen has nothing left to say. `RunHistory` is a SECTION of the page: a
+ * `useQuery` that renders its own failure in place, so a 500 on `GET /runs`
+ * cannot blank the workflow's name, its versions, or the delete refusal an
+ * operator is standing on. `RepoActivity` settled the same shape on the same
+ * endpoint in Task 20.
  */
 export const Route = createFileRoute('/_app/workflows/$workflowId')({
   loader: ({ context, params }) =>
@@ -42,6 +52,7 @@ function WorkflowDetail() {
     <div className="flex flex-col gap-6">
       <WorkflowHeader workflow={workflow} />
       <VersionHistory workflowId={workflowId} versions={versions} />
+      <RunHistory workflowId={workflowId} />
     </div>
   )
 }
@@ -171,6 +182,77 @@ function VersionHistory(props: { workflowId: string; versions: readonly Workflow
                   {version.created_at}
                 </time>
               </Link>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  )
+}
+
+/**
+ * Every run this workflow has ever produced — the locked page map's "Run
+ * history per definition" (`01-app-skeleton.html`, the Workflows area).
+ *
+ * IT WAS DEFERRED ON A MISSING FILTER, AND TASK 15 BUILT IT. 12b's design
+ * departure 7 deferred this surface because `GET /runs` filtered by
+ * `status`/`task_id` only; it now takes `workflow_id`, so the deferral is spent
+ * rather than still standing.
+ *
+ * THE WORKFLOW, NOT A VERSION OF IT, and the server agrees: `ListRunsPage`
+ * resolves `workflow_id` through a `workflow_versions` subquery, so a task
+ * pinned to v1 is still a run of this workflow. That is the right reading of
+ * "per definition" for a page whose section above is the version list — a
+ * history that restarted at every publish would be a history of nothing.
+ *
+ * THE SERVER'S ORDER, KEPT, which is `VersionHistory`'s rule one section up.
+ * `ListRunsPage` is "one page of the run list, newest first"
+ * (`ORDER BY r.created_at DESC, r.id DESC`).
+ *
+ * NO LOAD-MORE, AND THE RESIDUAL IS NAMED RATHER THAN HIDDEN. One page is
+ * `defaultRunPageLimit = 50` (`backend/internal/runs/runlist.go`) and
+ * `runsQueryOptions` discards `next_cursor` deliberately, so a workflow past
+ * its fiftieth run has older ones that this screen cannot reach. At month-one
+ * volume that page is the whole history. The obvious escape — a "see all runs"
+ * link — does NOT exist and is not faked: `runs.index.tsx`'s search schema is
+ * `{ status }` alone, so such a link would land on the UNFILTERED list under a
+ * label promising this workflow's, which is worse than saying nothing. Widening
+ * that schema is the change that would earn the link.
+ *
+ * NOT SLICED, unlike `RepoActivity`'s five. That surface is a glance under a
+ * project detail that can open many repos at once; this one IS the history the
+ * locked page map names, and a silent cap on it would be a lie about how often
+ * the workflow has run.
+ */
+function RunHistory(props: { workflowId: string }) {
+  const runs = useQuery(runsQueryOptions({ workflowId: props.workflowId }))
+
+  return (
+    <section className="flex flex-col gap-3">
+      <h3 className="text-text font-medium">Runs</h3>
+      {runs.isError ? (
+        /* A section that failed is not a section that is empty, and only one of
+           the two is a fact about this workflow. `ErrorSurface` renders the
+           server's own sentence with its correlation id, or the null arm when a
+           dropped connection left no problem document behind. */
+        <ErrorSurface failure={asApiError(runs.error)} />
+      ) : runs.data === undefined ? (
+        /* A HISTORY NOT YET READ IS NOT AN EMPTY ONE, and this branch is the
+           only thing saying so. Collapsing it into the empty state below —
+           `(runs.data ?? []).length === 0` — survived every other assertion
+           about this section, because they all wait for the answer before
+           looking; what it changes is the moment before it arrives, where the
+           screen would tell an operator "No runs have used this workflow."
+           without knowing. `does not claim a workflow has never run while it is
+           still asking` is the test written against that mutant. */
+        <p className="text-text-muted text-sm">Reading the run history…</p>
+      ) : runs.data.length === 0 ? (
+        <p className="text-text-muted text-sm">No runs have used this workflow.</p>
+      ) : (
+        <ul data-testid="run-history" className="flex flex-col gap-2">
+          {runs.data.map((run) => (
+            <li key={run.id}>
+              <RunCard run={run} />
             </li>
           ))}
         </ul>
