@@ -1,8 +1,8 @@
 import { type APIRequestContext, expect, type Page } from '@playwright/test'
 
 /**
- * What the three specs share: signing in, and the four control-server calls
- * that let a spec set up and read the world the Go harness owns.
+ * What the specs share: signing in, and the six control-server calls that let a
+ * spec set up and read the world the Go harness owns.
  *
  * NOT A `.spec.ts`, deliberately. Playwright's default `testMatch` collects
  * `**\/*.@(spec|test).?(c|m)[jt]s?(x)`, so this file is imported and never
@@ -121,4 +121,31 @@ export async function runState(
   const res = await request.get(`${CONTROL}/fixture/run/${runId}`)
   expect(res.status(), await res.text()).toBe(200)
   return (await res.json()) as { generation: number; status: string }
+}
+
+/**
+ * Point the code-host doubles at a repository that was registered THROUGH THE
+ * BROWSER, and answer with the head they will now serve for it.
+ *
+ * A repo a spec created in the UI exists in the database and nowhere else: the
+ * fake forge has no head to pin as its base SHA, the fake publisher has nowhere
+ * to push, and the fake executor — with no remote for it — falls back to the
+ * synthetic patch that `gitops.Publish` refuses. This is the one call that
+ * makes such a repo runnable, and it must precede the first task on it.
+ *
+ * IT TAKES THE PROJECT NAME AND THE SLUG, not an id, and the reason is the
+ * `Secure`-cookie fact this file already records twice: a spec cannot ask the
+ * app's API for the id, and the id is not in the DOM either. The Go side
+ * resolves the pair through `assets.Service`.
+ */
+export async function registerRemote(
+  request: APIRequestContext,
+  project: string,
+  slug: string,
+): Promise<{ repo_id: string; head: string }> {
+  const res = await request.post(`${CONTROL}/fixture/register-remote`, {
+    data: { project, slug },
+  })
+  expect(res.status(), await res.text()).toBe(200)
+  return (await res.json()) as { repo_id: string; head: string }
 }

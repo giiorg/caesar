@@ -107,11 +107,40 @@ const msgListening = "http server listening"
 // (workflows.validateConsumption requires it to examine exactly one plan or
 // patch), so reaching phase_runs.status = 'waiting_decision' means an agentic
 // phase must complete, and the web E2E lane substitutes the agent CONTAINER so
-// the orchestrator's real gate materialization can be observed. Everything
-// below that substitution is production code.
+// the orchestrator's real gate materialization can be observed.
+//
+// THE BOUNDARY MOVED IN TASK 33, and it moved for the same reason it was drawn
+// where it was. The original sentence here ended "everything below that
+// substitution is production code", which was true of a lane that stopped at a
+// decided gate. The milestone shadow walks one node further, to `git-publish` —
+// and publication is the one leg of the spine whose effects are entirely
+// outside this process: it clones a repository over the network and opens a
+// pull request on a code host. There is nothing to substitute the CONTAINER of;
+// what stands in for a forge is a forge. So the rule is unchanged in kind: what
+// may be replaced here is the far side of a network boundary, and everything on
+// this side of it — the publish state machine, its intent rows, its recovery
+// probes, the events it writes — stays production code.
+//
+// Both new slots take PORT interfaces rather than concrete doubles, so nothing
+// in this file knows a fake exists.
 type serveOptions struct {
 	// executor, when non-nil, replaces the executor the configuration selected.
 	executor runs.Executor
+	// forge, when non-nil, replaces the forge adapter the configuration built.
+	//
+	// It is the intake head resolver AND the publish side's branch probe, pull
+	// request opener and pull request lister — one port, four methods, and a
+	// lane that replaced only some of them would be two forges disagreeing
+	// about which repository they describe.
+	forge runs.Forge
+	// publisher, when non-nil, replaces the git publisher.
+	//
+	// It travels WITH forge and is not independently useful: a fake forge whose
+	// pull requests are opened against branches a production publisher pushed
+	// to a real code host is not a configuration any test wants. They are two
+	// slots rather than one because the ports are two, not because the lane may
+	// pick.
+	publisher runs.GitPublisher
 	// listener, when non-nil, is served INSTEAD of binding cfg.Server.Addr.
 	//
 	// It exists because of a genuine ordering deadlock, not for convenience.
@@ -183,7 +212,7 @@ func runServeWith(ctx context.Context, cfg config.Config, log *slog.Logger, opts
 	// the clone host drift apart, which is the silent self-hosted failure: the
 	// run can read the repository and publishes nothing.
 	endpoints := forgeEndpointsFrom(cfg.Forge)
-	forgeSvc := newForgeAdapter(assetsSvc, endpoints,
+	var forgeSvc runs.Forge = newForgeAdapter(assetsSvc, endpoints,
 		&http.Client{Timeout: cfg.Forge.RequestTimeout.Std()})
 
 	// config.Load validates publish_work_dir as a non-empty absolute path, so
@@ -209,7 +238,19 @@ func runServeWith(ctx context.Context, cfg config.Config, log *slog.Logger, opts
 	if err := probeWritable(workDir); err != nil {
 		return fmt.Errorf("serve: publish work dir: %w", err)
 	}
-	publisher := gitPublisher{assets: assetsSvc, workDir: workDir, endpoints: endpoints}
+	var publisher runs.GitPublisher = gitPublisher{assets: assetsSvc, workDir: workDir, endpoints: endpoints}
+
+	// The substitutions, both AFTER the production values are built rather than
+	// instead of building them. That is deliberate: the work-dir creation and
+	// the write probe above are boot behaviour a lane running this function
+	// should still execute, and the adapter's construction costs nothing. The
+	// only thing an override changes is which value the service is handed.
+	if opts.forge != nil {
+		forgeSvc = opts.forge
+	}
+	if opts.publisher != nil {
+		publisher = opts.publisher
+	}
 
 	runsSvc := runs.NewService(pool, clock.System{}, audit.NewRecorder(clock.System{}),
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},

@@ -29,7 +29,20 @@ export default defineConfig({
       use: { ...devices['Pixel 7'] },
       testIgnore: /desktop-geometry\.spec\.ts/,
     },
-    { name: 'desktop', use: { ...devices['Desktop Chrome'] } },
+    // THE MILESTONE WALK IS PHONE-ONLY, and for two reasons rather than taste.
+    // The conveyor's own screen is the phone (§1: the gate arrives on a phone
+    // and is decided there), and the desktop pass over these surfaces is the
+    // operator checkpoint's job, not a lane's. The mechanical one is stronger:
+    // the walk opens its gate by tapping the phase row's disclosure, and that
+    // <button> is `md:hidden` (`runs.$runId.tsx`) — at 1280px a closed row
+    // leaves the pane entirely and the rail is what selects a phase. A desktop
+    // arm would be a branch through the middle of the walk, buying a second
+    // spelling of a claim that is not about chrome at all.
+    {
+      name: 'desktop',
+      use: { ...devices['Desktop Chrome'] },
+      testIgnore: /milestone-walk\.spec\.ts/,
+    },
   ],
   use: { baseURL: process.env.CAESAR_BASE_URL },
   // The Go harness owns the server's lifecycle, so there is no webServer here.

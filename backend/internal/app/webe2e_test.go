@@ -3,21 +3,47 @@
 package app
 
 // The web E2E harness. It boots the PRODUCTION runServe against a real
-// Postgres, stands up a forge stub for the one outbound HTTP call task intake
-// makes, and exposes a control server Playwright calls between assertions so
-// the gate opens WHILE the browser is watching.
+// Postgres, hands it the doubles that stand in for the code host, and exposes a
+// control server Playwright calls between assertions so the gate opens WHILE
+// the browser is watching.
 //
 // What is real here: Routes, every handler, the Orchestrator, materializeNode,
 // appendEvents (ordered ids under the counter lock, the outbox envelope and the
-// NOTIFY, all in one transaction), the tailer, the hub and the SSE wire.
+// NOTIFY, all in one transaction), the tailer, the hub and the SSE wire — and,
+// since Task 33, the whole publish state machine: its authorization row, its
+// intent, its recovery probes and the events it writes.
 //
-// What is faked: runs.Executor and the forge stub named above — which answers
-// with the head SHA of the same bare repository the executor is pointed at —
-// and nothing else. Raw SQL insertion of a gate
-// row is BANNED and this file must never grow one — appendEvents allocates the
-// ids the resume path depends on, so a hand-written INSERT desynchronises the
-// counter and leaves later resume behaviour broken in a way no assertion in
-// this lane would catch. That ban covers the RESET as much as the setup:
+// What is faked: runs.Executor, and the FORGE and PUBLISHER — the two ports
+// whose far side is somebody else's server. Nothing else.
+//
+// THE FORGE IS A PORT DOUBLE, NOT AN HTTP STUB, AND THE DIFFERENCE IS THE
+// LANE'S HONESTY. Until Task 33 this file stood up an httptest server that
+// answered `{"sha": …}` to every request whatever the path, which was enough
+// for the one outbound call task intake makes and nothing more: there was no
+// repository behind it to clone and no pull-request endpoint, so a spec that
+// reached `git-publish` would have died at its last beat. It is replaced by
+// fake.Forge and fake.Publisher (the pair `goldenset_integration_test.go`
+// already drives a full conveyor through), and the stub is GONE rather than
+// left standing beside them — with it still answering, a broken `opts.forge`
+// wiring would leave intake green and the lane would be lying about which forge
+// it runs. The forge base URLs now point at 127.0.0.1:1, a port nothing can
+// listen on, so that mistake cannot hide: MEASURED by dropping the `forge` slot
+// below, every task intake in the lane refuses — `POST /api/v1/tasks` answered
+// 429 twice and no run was created at all — because resolveIntake's ResolveHead
+// is on the way to every task. There is no assertion to write for this and no
+// way to write a test that survives the wiring being wrong.
+//
+// What this lane consequently does NOT cover, said out loud: newForgeAdapter,
+// the GitHub client's HTTP marshalling, and UseCredential on a repo's forge
+// token. All three are covered directly by forgeadapter_integration_test.go —
+// ResolveHead through the audited credential path, typed outcomes on every
+// run-path method, absence-as-an-answer for BranchHead, the whole
+// FindPullRequests receipt — so nothing loses its only cover here.
+//
+// Raw SQL insertion of a gate row is BANNED and this file must never grow one
+// — appendEvents allocates the ids the resume path depends on, so a
+// hand-written INSERT desynchronises the counter and leaves later resume
+// behaviour broken in a way no assertion in this lane would catch. That ban covers the RESET as much as the setup:
 // /fixture/quiesce decides leftover gates through runs.Service rather than
 // deleting their rows.
 //
@@ -124,16 +150,20 @@ func TestWebE2E(t *testing.T) {
 	bare := filepath.Join(bareDir, "bare.git")
 	executor := fake.NewExecutor()
 
-	// 2. The forge stub. resolveIntake calls ResolveHead on the way to every
-	//    task, and the GitHub client wants {"sha": ...} from
-	//    GET {base}/repos/{slug}/commits/{branch}. It answers the BARE REPO'S
-	//    head rather than a zero sha: `approvedTree` checks that commit out to
-	//    build the tree id the patch pins, and a sha the repository does not
-	//    contain fails the implement node instead of the gate.
-	forgeStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]string{"sha": baseSHA})
-	}))
-	defer forgeStub.Close()
+	// 2. The code host: one forge and one publisher, shared by everything.
+	//
+	//    ONE OF EACH, and that is the same rule serve.go states about building
+	//    its endpoints value once. Two forges would be two pull-request stores,
+	//    and the run that opened a request against one would be invisible to
+	//    the other; two publishers would be two branch namespaces over one bare
+	//    repository. The served process and the control-side service below both
+	//    receive THESE.
+	//
+	//    They are told about each repository as it appears, not here: the seed's
+	//    repo id exists only after e2eSeed runs, and the milestone walk's repo
+	//    is created through the browser minutes later. See registerRemote.
+	forgeSvc := fake.NewForge(map[uuid.UUID]string{})
+	publisher := fake.NewPublisher(nil)
 
 	// 3. Bind FIRST, then configure. The port must be known before AppOrigin
 	//    is set: CheckOrigin compares the browser's Origin header to it by
@@ -144,17 +174,19 @@ func TestWebE2E(t *testing.T) {
 		t.Fatalf("reserve listener: %v", err)
 	}
 	baseURL := "http://" + ln.Addr().String()
-	cfg := e2eConfig(t, testdb.NewURL(t), forgeStub.URL, baseURL)
+	cfg := e2eConfig(t, testdb.NewURL(t), baseURL)
 
-	// 4. Boot the production server with the ONE substitution. The listener is
-	//    a test seam, not a second fake: production Serve receives the same
+	// 4. Boot the production server with the substitutions. The listener is a
+	//    test seam, not a fake: production Serve receives the same
 	//    *net.TCPListener it would have bound itself.
 	logBuf := &syncBuffer{}
 	done := make(chan error, 1)
 	go func() {
 		done <- runServeWith(ctx, cfg, e2eLogger(logBuf), serveOptions{
-			executor: executor,
-			listener: ln,
+			executor:  executor,
+			forge:     forgeSvc,
+			publisher: publisher,
+			listener:  ln,
 		})
 	}()
 	// The socket accepts the moment it is bound, so a connection would queue in
@@ -164,17 +196,24 @@ func TestWebE2E(t *testing.T) {
 
 	// 5. Bootstrap the admin THROUGH the production path, then seed the assets
 	//    the slice needs. Every one of these goes through the real services.
-	seed := e2eSeed(ctx, t, cfg)
+	//
+	//    The fakes go in too: the control-side runs.Service built in there does
+	//    task intake, so it needs the same forge the orchestrator has. Two
+	//    would be the drift serve.go:180 describes — the API host and the clone
+	//    host disagreeing — reproduced inside one test binary.
+	seed := e2eSeed(ctx, t, cfg, forgeSvc, publisher)
 	// The repo id only exists once the seed has run, and the first execution
 	// only happens once Playwright calls the control server — so telling the
-	// executor here is in time. Without this line every implement node falls
-	// back to the synthetic patch and the gate screen has nothing to show.
-	executor.Remote(seed.repoID, bare)
+	// ports here is in time.
+	registerRemote(forgeSvc, publisher, executor, seed.repoID, bare, baseSHA)
 
 	// 6. The control server. Playwright calls this BETWEEN assertions, which is
 	//    what makes beat 2 happen while the browser is watching. It is part of
 	//    the harness and never part of caesar's routes.
-	control := httptest.NewServer(e2eFixtures(seed))
+	control := httptest.NewServer(e2eFixtures(e2eControl{
+		seed: seed, forge: forgeSvc, publisher: publisher, executor: executor,
+		bare: bare, baseSHA: baseSHA,
+	}))
 	defer control.Close()
 
 	// 7. Hand it to Playwright. By PATH, never `npx`: npx reaches the public
@@ -220,8 +259,46 @@ func TestWebE2E(t *testing.T) {
 // the previous file left behind. It is paired with `workers: 1` in
 // playwright.config.ts — with two workers, each one's reset would clear the
 // other's gate.
-func e2eFixtures(seed e2eFixture) http.Handler {
+func e2eFixtures(c e2eControl) http.Handler {
+	seed := c.seed
 	mux := http.NewServeMux()
+
+	// THE MILESTONE WALK'S OWN REPOSITORY, told to the ports that have to know
+	// about it. The walk creates a project, a credential and a repo through the
+	// BROWSER, so its repo id does not exist until a person has filled in two
+	// forms — and until this call the run it starts cannot resolve a head,
+	// cannot emit a publishable patch, and cannot push.
+	//
+	// IT TAKES THE TWO STRINGS THE SPEC TYPED, NOT AN ID, and that is forced
+	// rather than chosen: the repo id is nowhere in the DOM, and a spec cannot
+	// read it out of the API either — Playwright's `page.request` shares the
+	// browser's cookie jar but honours `Secure` strictly while browsers exempt
+	// localhost, so the `__Host-` session cookie never rides a Node-side
+	// request (harness.ts records the 401 that taught this). Resolving names
+	// through assets.Service is also the stronger failure: a UI that created
+	// the project under a mangled name 404s HERE, naming what it looked for.
+	//
+	// The bare repository is SHARED with the seed's repo rather than minted per
+	// registration. Publication branches are `caesar/<artifact uuid>`
+	// (`runs/ports.go:240`), so two repos pointing at one bare cannot collide,
+	// and the walk is the only spec that pushes at all.
+	mux.HandleFunc("POST /fixture/register-remote", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Project, Slug string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		repoID, err := e2eFindRepo(r.Context(), c, body.Project, body.Slug)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		registerRemote(c.forge, c.publisher, c.executor, repoID, c.bare, c.baseSHA)
+		// The id and the head go back so a failure downstream can be read: a
+		// walk that fails at publication with THIS head in its log did reach
+		// the fake, and one that fails at intake never did.
+		e2eJSON(w, http.StatusOK, map[string]any{"repo_id": repoID.String(), "head": c.baseSHA})
+	})
 
 	// The gate opener, answering 202 exactly as it always has. What is new is
 	// the BODY: a spec that cannot name its own run cannot tell its gate card
@@ -325,6 +402,71 @@ func e2eFixtures(seed e2eFixture) http.Handler {
 	return mux
 }
 
+// e2eControl is everything the control server can reach: the seeded world, and
+// the three ports a repository has to be registered with before a run against
+// it can do anything.
+type e2eControl struct {
+	seed      e2eFixture
+	forge     *fake.Forge
+	publisher *fake.Publisher
+	executor  *fake.Executor
+	// The bare repository every registered repo resolves to, and its head.
+	bare, baseSHA string
+}
+
+// registerRemote tells ALL THREE PORTS about one repository, because each of
+// them needs it for a different reason and the shortfall of any one is silent
+// until a different beat fails:
+//
+//	forge.Head     — intake pins this as the run's base SHA. Without it
+//	                 ResolveHead answers an error and CreateTask 500s.
+//	forge.Remote   — branch probes and pull-request head SHAs are read off the
+//	                 real repository rather than scripted, so publication needs
+//	                 it AFTER the push has put a branch there.
+//	publisher      — gitops.Publish clones and pushes to it. This is the real
+//	                 git, not a map: what ends up on the remote is the only
+//	                 interesting question about a publication.
+//	executor       — without a remote the implement node emits the historical
+//	                 SYNTHETIC patch, whose tree hash is a digest rather than a
+//	                 git tree object id. gitops.Publish refuses that, and the
+//	                 gate screen shows nothing to examine (step 1 above).
+//
+// One function rather than four call sites twice over: the seed and the
+// milestone walk register different repositories for identical reasons, and a
+// registration that grew a fourth port on one path only is the bug this shape
+// forecloses. It is `goldenset_integration_test.go:514-517` given a name.
+func registerRemote(f *fake.Forge, p *fake.Publisher, e *fake.Executor, repoID uuid.UUID, bare, head string) {
+	f.Head(repoID, head)
+	f.Remote(repoID, bare)
+	p.Remote(repoID, bare)
+	e.Remote(repoID, bare)
+}
+
+// e2eFindRepo resolves (project name, repo slug) to a repo id through
+// assets.Service — the same door the API handlers use, and no SQL.
+func e2eFindRepo(ctx context.Context, c e2eControl, project, slug string) (uuid.UUID, error) {
+	projects, err := c.seed.assetsSvc.ListProjects(ctx)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("register-remote: list projects: %w", err)
+	}
+	for _, p := range projects {
+		if p.Name != project {
+			continue
+		}
+		repos, err := c.seed.assetsSvc.ListRepos(ctx, p.ID)
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("register-remote: list repos of %q: %w", project, err)
+		}
+		for _, r := range repos {
+			if r.Slug == slug {
+				return r.ID, nil
+			}
+		}
+		return uuid.Nil, fmt.Errorf("register-remote: project %q has no repo %q", project, slug)
+	}
+	return uuid.Nil, fmt.Errorf("register-remote: no project named %q", project)
+}
+
 func e2eJSON(w http.ResponseWriter, status int, body map[string]any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -424,6 +566,10 @@ func awaitListening(t *testing.T, log *syncBuffer, done <-chan error) {
 	}
 }
 
+// forgeDeadEnd is the address every forge endpoint in this lane points at: a
+// port nothing can listen on. See e2eConfig for why it is not a stub.
+const forgeDeadEnd = "http://127.0.0.1:1"
+
 // e2eConfig builds the server configuration.
 //
 // appOrigin is the browser-visible base URL, and it must be character-for-
@@ -435,7 +581,7 @@ func awaitListening(t *testing.T, log *syncBuffer, done <-chan error) {
 // oversight: validate() is called only from config.Load, and nothing here goes
 // through Load — the same shape serve_integration_test.go has always used.
 // Stated because it looks like a bug on every reading.
-func e2eConfig(t *testing.T, dbURL, forgeBase, appOrigin string) config.Config {
+func e2eConfig(t *testing.T, dbURL, appOrigin string) config.Config {
 	t.Helper()
 	return config.Config{
 		Server:   config.Server{Addr: "127.0.0.1:0", ShutdownTimeout: config.Duration(10 * time.Second), AppOrigin: appOrigin},
@@ -452,11 +598,21 @@ func e2eConfig(t *testing.T, dbURL, forgeBase, appOrigin string) config.Config {
 			LeaseTTL: config.Duration(time.Minute), HeartbeatInterval: config.Duration(10 * time.Second),
 			OutboxRetention: config.Duration(time.Hour),
 		},
-		// Only the API bases matter: nothing in this lane clones or pushes, and
-		// resolveIntake's ResolveHead is the single outbound call.
+		// A DEAD ADDRESS ON PURPOSE, and it is the wiring proof rather than a
+		// placeholder. Every forge call in this lane goes to fake.Forge and
+		// every push to fake.Publisher, so nothing should ever dial these — and
+		// if the serveOptions wiring were wrong, the production adapter would
+		// take over and these are what it would reach. Port 1 refuses
+		// instantly, so that mistake surfaces as a connection refused at the
+		// first spec's first beat. An address that ANSWERED would leave intake
+		// green and the whole lane running against a forge it did not mean.
+		//
+		// PublishWorkDir is real, because it is not a forge address: runServe
+		// creates it and probes it writable at boot, which is production
+		// behaviour this lane should keep executing.
 		Forge: config.Forge{
-			GitHubBaseURL: forgeBase, GitLabBaseURL: forgeBase,
-			GitHubCloneBaseURL: forgeBase, GitLabCloneBaseURL: forgeBase,
+			GitHubBaseURL: forgeDeadEnd, GitLabBaseURL: forgeDeadEnd,
+			GitHubCloneBaseURL: forgeDeadEnd, GitLabCloneBaseURL: forgeDeadEnd,
 			PublishWorkDir: t.TempDir(), RequestTimeout: config.Duration(5 * time.Second),
 		},
 		Realtime: config.Realtime{
@@ -481,11 +637,17 @@ type e2eFixture struct {
 	projectName, repoSlug, workflowName, harnessName string
 	runsSvc                                          *runs.Service
 	workflowsSvc                                     *workflows.Service
+	// Read-only here, and only so `/fixture/register-remote` can resolve the
+	// repository the milestone walk made in the browser.
+	assetsSvc *assets.Service
 }
 
 // e2eSeed builds the world through the REAL services — the same doors the admin
 // CLI and the HTTP handlers use. Nothing here writes SQL directly.
-func e2eSeed(ctx context.Context, t *testing.T, cfg config.Config) e2eFixture {
+func e2eSeed(
+	ctx context.Context, t *testing.T, cfg config.Config,
+	forgeSvc *fake.Forge, publisher *fake.Publisher,
+) e2eFixture {
 	t.Helper()
 	pool, err := pgxpool.New(ctx, cfg.Database.URL)
 	if err != nil {
@@ -555,11 +717,16 @@ func e2eSeed(ctx context.Context, t *testing.T, cfg config.Config) e2eFixture {
 
 	// A SECOND runs.Service over the same pool, for the control server only.
 	// The one inside runServe owns the orchestrator; this one owns intake. They
-	// share the database, which is the only state that matters.
+	// share the database, which is the only state that matters — AND, since
+	// Task 33, the same forge and the same publisher. They used to be handed
+	// their own adapter and their own gitPublisher, which was harmless while
+	// both were stateless clients of one HTTP stub and is not harmless now: the
+	// fakes hold state. Two forges would be two pull-request stores and two
+	// head maps, so a repository registered through the control server would be
+	// unknown to the orchestrator that has to publish it.
 	runsSvc := runs.NewService(pool, clk, rec,
 		runsDefinitionSource{svc: workflowsSvc}, runsAssetSource{svc: assetsSvc}, runsAssetSource{svc: assetsSvc},
-		newForgeAdapter(assetsSvc, forgeEndpointsFrom(cfg.Forge), &http.Client{Timeout: 5 * time.Second}),
-		gitPublisher{assets: assetsSvc, workDir: cfg.Forge.PublishWorkDir, endpoints: forgeEndpointsFrom(cfg.Forge)},
+		forgeSvc, publisher,
 		principalSource{svc: identitySvc}, runs.Params{
 			Snapshot: runs.DefaultSnapshot(),
 			Labels:   runsLabelSource{assets: assetsSvc, workflows: workflowsSvc},
@@ -572,6 +739,7 @@ func e2eSeed(ctx context.Context, t *testing.T, cfg config.Config) e2eFixture {
 		harnessName:  harness.Name,
 		runsSvc:      runsSvc,
 		workflowsSvc: workflowsSvc,
+		assetsSvc:    assetsSvc,
 	}
 }
 
