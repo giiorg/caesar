@@ -183,6 +183,34 @@ describe('the desktop rail', () => {
   })
 })
 
+describe('the ⌘K affordance', () => {
+  it('puts a visible trigger in the top bar, desktop only', () => {
+    // decisions §7 is "desktop = full sidebar + top bar with ⌘K" — the chord is
+    // named as a THING IN THE TOP BAR, not only as a key binding. Task 31's
+    // plan asked for the listener alone, and a palette reachable only by a
+    // chord nobody was told about has no discoverability at all.
+    //
+    // STRUCTURE ONLY, the same terms as the tab-bar assertions above: jsdom
+    // loads no Tailwind, so `hidden` + `md:flex` is a claim about which classes
+    // were written. What it buys is that the phone shell — five tabs and no
+    // room — does not grow a control for a keyboard the device may not have,
+    // while the LISTENER stays mounted at every viewport for the ones that do.
+    renderShell()
+    const trigger = screen.getByRole('button', { name: '⌘K' })
+    expect(trigger.className).toMatch(/\bhidden\b/)
+    expect(trigger.className).toMatch(/\bmd:flex\b/)
+  })
+
+  it('is in the header, so it adds no navigation landmark', () => {
+    // Same argument as the wordmark: chrome that navigates but is not the nav
+    // must not become a second 'navigation' role, which nine findByRole call
+    // sites in _app.test.tsx and two in e2e depend on staying unambiguous.
+    renderShell()
+    expect(screen.getAllByRole('navigation')).toHaveLength(1)
+    expect(screen.getByRole('banner')).toContainElement(screen.getByRole('button', { name: '⌘K' }))
+  })
+})
+
 describe('the theme toggle', () => {
   afterEach(() => {
     document.documentElement.removeAttribute('data-theme')

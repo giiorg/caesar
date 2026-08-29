@@ -37,11 +37,22 @@ export const SECONDARY = [
 ] as const
 
 /**
+ * THE PAGE MAP — decisions §7's seven pages, and the only list that is one.
+ *
  * `PHONE_TABS.slice(0, 4)` and not a third literal: the rail is the four real
  * tabs plus the secondary pages. `More` is a phone affordance with nothing
  * behind it on a surface that already shows everything it holds.
+ *
+ * EXPORTED FOR THE COMMAND PALETTE, which needs the seven pages and must not
+ * re-spell this expression to get them. Task 31's plan says to consume
+ * `PHONE_TABS` and `SECONDARY` directly, and that is eight entries ending in
+ * `More` — a palette row that navigates to a menu of rows already in the same
+ * palette. Two copies of the slice would also drift the first time a page moves
+ * between the tab bar and the overflow, which is precisely the failure
+ * `SECONDARY`'s comment above is written against; the palette would be the
+ * surface that lost the page.
  */
-const RAIL = [...PHONE_TABS.slice(0, 4), ...SECONDARY] as const
+export const PAGES = [...PHONE_TABS.slice(0, 4), ...SECONDARY] as const
 
 const linkClass = 'text-text-muted flex items-center gap-1 px-3 py-2 text-sm'
 
@@ -118,7 +129,7 @@ export function Nav(props: { approvalCount: number }) {
         data-testid="desktop-rail"
         className="border-border bg-surface hidden w-44 shrink-0 md:flex md:flex-col md:border-r"
       >
-        {RAIL.map((item) => (
+        {PAGES.map((item) => (
           <Link
             key={item.to}
             to={item.to}

@@ -394,6 +394,51 @@ describe('Tasks', () => {
     })
   })
 
+  it('opens the drawer from the URL alone', async () => {
+    // THE WHOLE POINT OF MOVING IT OUT OF `useState`: the command palette
+    // cannot reach a component's local state, so "New task" as a palette entry
+    // is only possible if the open drawer is an address. It is also now
+    // linkable and survives a reload, which the local-state version was not.
+    renderApp('/tasks?new=1', [tasks([]), runs([]), ...formHandlers()])
+    expect(await screen.findByRole('heading', { name: 'New task' })).toBeInTheDocument()
+    expect(await screen.findByLabelText(/^title$/i)).toBeInTheDocument()
+  })
+
+  it('leaves the drawer CLOSED for a value that is not 1', async () => {
+    // THE READ-SITE NARROW, AND THE MUTANT IT EXISTS FOR: `search.new !==
+    // undefined`. `validateSearch` cannot drop a key — a route's search is its
+    // ancestors' merged over its own validated result, and nothing above
+    // `/tasks` validates anything — so `2` is rejected by the schema and STILL
+    // arrives here. The widened narrow opens the drawer on it and passes every
+    // other test in this file.
+    renderApp('/tasks?new=2', [tasks([]), runs([]), ...formHandlers()])
+    // Awaited on the list, not on an absence: `queryByRole` before the route
+    // has rendered anything would answer null for a screen that has not
+    // painted yet, which is a pass for any implementation.
+    expect(await screen.findByText(/nothing queued/i)).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'New task' })).toBeNull()
+    expect(screen.queryByLabelText(/^title$/i)).toBeNull()
+  })
+
+  it('the FAB writes the drawer into the address', async () => {
+    // The other direction: opening by hand must produce the URL the palette
+    // navigates to, or the two entry paths are two different features that
+    // happen to look alike.
+    const router = renderApp('/tasks', [tasks([]), runs([]), ...formHandlers()])
+    await userEvent.click(await screen.findByRole('button', { name: /new task/i }))
+    await waitFor(() => expect(router.state.location.search).toEqual({ new: 1 }))
+  })
+
+  it('Cancel takes the param back out', async () => {
+    // Every way out of the sheet is one `onOpenChange(false)` in vaul, so this
+    // covers Escape and the swipe with it. A drawer that closed on screen but
+    // left `?new=1` in the address would re-open on the next reload — and on
+    // the back button, which is the same bug arriving faster.
+    const router = renderApp('/tasks?new=1', [tasks([]), runs([]), ...formHandlers()])
+    await userEvent.click(await screen.findByRole('button', { name: /^cancel$/i }))
+    await waitFor(() => expect(router.state.location.search).toEqual({}))
+  })
+
   it('asks only for the repos of the project that was picked', async () => {
     // The cascade, and the half a single-project fixture cannot see: `p2` has no
     // repos, so a form that fetched every repo in the deployment would still

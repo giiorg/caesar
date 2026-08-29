@@ -1,13 +1,49 @@
 import { useSuspenseQuery } from '@tanstack/react-query'
-import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { useState } from 'react'
+import { createFileRoute, Link } from '@tanstack/react-router'
 import { Drawer } from 'vaul'
+import { z } from 'zod'
 import { useStreamStatus } from '../../realtime/stream-status'
 import { PhaseDots } from '../../runs/phase-dots'
 import { type RunSummary, runsQueryOptions } from '../../runs/runs-query'
 import { NewTaskForm } from '../../tasks/new-task-form'
 import { groupTasks, TASK_GROUPS, type TaskGroup } from '../../tasks/task-groups'
 import { type Task, tasksQueryOptions } from '../../tasks/tasks-query'
+
+/**
+ * THE NEW-TASK DRAWER IS URL STATE, and `1` is a NUMBER here rather than a
+ * string — measured on this tree, not assumed:
+ *
+ *     PROBE search= {"new":1} typeof new = number
+ *
+ * The router `JSON.parse`s each value, which `runs.$runId.tsx` records at
+ * length for `generation`. `z.string()` would reject the only value this
+ * feature ever writes and the drawer would never open.
+ *
+ * WHY THE DRAWER MOVED OUT OF `useState` AT ALL: the command palette offers
+ * "New task" as one of its three entry classes, and an entry that navigates to
+ * `/tasks` and stops is a command that does not perform its command. Local
+ * state is unreachable from the shell. This is the plan's URL-as-state
+ * constraint applied once more, and it buys two things the previous version did
+ * not have — the open drawer is linkable, and it survives a reload.
+ *
+ * `z.literal(1)` and not `z.number()`: one value opens it. A `?new=7` is as
+ * meaningless as a `?new=banana`, and both must land in the same place.
+ */
+const searchSchema = z.object({ new: z.literal(1).optional() })
+
+/**
+ * The read-site re-narrow, and it is load-bearing rather than defensive.
+ *
+ * `validateSearch` CANNOT DROP A KEY — measured twice in this tree
+ * (`runs.index.tsx` carries the transcript, `runs.$runId.tsx` repeats it): a
+ * route's search is its ancestors' search with its own validated result merged
+ * OVER it, and nothing between `/` and here declares one. So a rejected value
+ * still arrives, and `search.new` really can hold `2`, `true` or a string by
+ * the time it reaches this component. `=== 1` is what makes every one of those
+ * land where `?new=banana` lands — closed — instead of opening a drawer
+ * because something was present.
+ */
+const drawerOpen = (value: unknown): boolean => value === 1
 
 /**
  * This route HAD no loader, deliberately, and `_app.test.tsx` navigated here
@@ -19,6 +55,10 @@ import { type Task, tasksQueryOptions } from '../../tasks/tasks-query'
  * See `_app.test.tsx`'s first two cases.
  */
 export const Route = createFileRoute('/_app/tasks')({
+  validateSearch: (search: Record<string, unknown>) => {
+    const parsed = searchSchema.safeParse(search)
+    return parsed.success ? parsed.data : {}
+  },
   loader: ({ context }) =>
     // BOTH, IN PARALLEL, AND BOTH MAY REJECT — unlike Home, which suspends on
     // nothing. `/` is where `/login`'s guard sends every authenticated visitor,
@@ -182,15 +222,31 @@ function TaskRow(props: { task: Task; run: RunSummary | undefined }) {
  * make the operator go find what they just made.
  */
 function NewTaskFab() {
-  const [open, setOpen] = useState(false)
-  const navigate = useNavigate()
+  const search = Route.useSearch()
+  const navigate = Route.useNavigate()
+  const open = drawerOpen(search.new)
   // repositionInputs OFF: vaul's default keyboard handling transforms the
   // sheet against the visual viewport, and on iOS Safari that moved the whole
   // form out of view the moment a field was focused (operator checkpoint,
   // 2026-08-26, real iPhone — invisible in desktop emulation). With it off the
   // sheet stays put and scrolls under the keyboard.
   return (
-    <Drawer.Root open={open} onOpenChange={setOpen} repositionInputs={false}>
+    <Drawer.Root
+      open={open}
+      /* EVERY WAY OUT OF THE SHEET COMES THROUGH HERE — Cancel, Escape, the
+         swipe, and the overlay tap are all `onOpenChange(false)` in vaul — so
+         writing the URL here is what keeps the address honest for all four
+         without a handler each.
+
+         A PLAIN OBJECT AND NOT AN UPDATER FUNCTION: `search` given an object
+         REPLACES, which is how `{}` clears the param. `(prev) => ({...prev,
+         new: undefined})` would be the shape that merges, and it does not
+         compile under `exactOptionalPropertyTypes` anyway. */
+      onOpenChange={(next) => {
+        void navigate({ search: next ? { new: 1 } : {} })
+      }}
+      repositionInputs={false}
+    >
       <Drawer.Trigger className="bg-accent text-accent-contrast fixed right-4 bottom-tab-bar z-10 mb-4 flex items-center justify-center rounded-xl px-5 py-3 text-sm font-medium md:bottom-6 md:mb-0">
         New task
       </Drawer.Trigger>
@@ -211,8 +267,11 @@ function NewTaskFab() {
             Caesar creates the task and starts its first run.
           </Drawer.Description>
           <NewTaskForm
+            /* NO EXPLICIT CLOSE ANY MORE. `open` is derived from the URL, and
+               this navigation leaves `/tasks` entirely — so the param goes with
+               it. The old `setOpen(false)` beside this line would now be a
+               second navigation racing this one to define the next address. */
             onCreated={(task) => {
-              setOpen(false)
               void navigate({ to: '/runs/$runId', params: { runId: task.latest_run_id } })
             }}
           />

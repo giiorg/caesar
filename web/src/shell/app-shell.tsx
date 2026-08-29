@@ -1,7 +1,8 @@
 import { Link } from '@tanstack/react-router'
-import type { ReactNode } from 'react'
+import { type ReactNode, useEffect, useState } from 'react'
 import type { components } from '../api/schema'
 import type { ConnectionState } from '../realtime/connection-state'
+import { CommandPalette } from './command-palette'
 import { ConnectionIndicator } from './connection-indicator'
 import { Nav } from './nav'
 import { ThemeToggle } from './theme-toggle'
@@ -28,6 +29,27 @@ export function AppShell(props: {
   connection?: ConnectionState
   approvalCount?: number
 }) {
+  const [paletteOpen, setPaletteOpen] = useState(false)
+
+  /**
+   * ONE window-level listener, removed on unmount.
+   *
+   * `metaKey` AND `ctrlKey`, because the same chord is ⌘K on a Mac and Ctrl+K
+   * everywhere else and this is one operator's tool on whichever machine is to
+   * hand. `preventDefault` because ⌘K is the browser's own focus-the-search
+   * shortcut in Chrome and Firefox — without it the address bar takes the
+   * keystroke and the palette opens behind it.
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() !== 'k' || !(e.metaKey || e.ctrlKey)) return
+      e.preventDefault()
+      setPaletteOpen(true)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
   return (
     <div className="bg-ground text-text flex min-h-dvh flex-col">
       <header className="border-border bg-surface flex items-center justify-between border-b px-4 py-2">
@@ -38,10 +60,28 @@ export function AppShell(props: {
           caesar
         </Link>
         <div className="flex items-center gap-2">
+          {/* THE VISIBLE HALF OF ⌘K, and it is in the top bar because that is
+              where the locked decision puts it: "desktop = full sidebar + top
+              bar with ⌘K" (decisions §7). A chord with no affordance is a
+              feature nobody was told about — and the plan's file list asked for
+              the listener alone.
+
+              `md:flex` ONLY. The phone shell is the five tabs and has no room
+              for chrome that duplicates them; a keyboard chord on a device with
+              no keyboard is not a control worth the width. The listener stays
+              mounted at every viewport, so an attached keyboard still works. */}
+          <button
+            type="button"
+            onClick={() => setPaletteOpen(true)}
+            className="border-border text-text-muted hidden items-center rounded-md border px-2 py-1 font-mono text-xs md:flex"
+          >
+            ⌘K
+          </button>
           <span className="text-text-muted font-mono text-xs">{props.me.user.email}</span>
           <ThemeToggle />
         </div>
       </header>
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
       <ConnectionIndicator state={props.connection ?? 'live'} />
       {/* DOM ORDER IS header, indicator, main, nav — deliberately, and it does
           not change with the viewport. On a phone that puts the tab bar last in
