@@ -292,10 +292,11 @@ WEBE2E_CMDS=(
 CONTRACTS_CMDS=(
 	'task: [db:sqlc] bin/sqlc generate'
 	'task: [contracts:openapi] go run ./internal/contracts/cmd/openapigen -out api/openapi.json'
+	'task: [contracts:descriptor] go run ./internal/workflows/cmd/descriptorgen -out api/workflow-descriptor.json'
 	'task: [contracts:ts] ../scripts/with-node npm ci'
 	'task: [contracts:ts] ../scripts/with-node npm run api:gen'
 	'task: [contracts:editorcorpus] ../scripts/with-node node --experimental-strip-types tools/gen-editor-corpus.mts'
-	'task: [contracts:check] git diff --exit-code -- backend/api/openapi.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store backend/internal/workflows/store backend/internal/runs/store backend/internal/workflows/testdata/editor_corpus'
+	'task: [contracts:check] git diff --exit-code -- backend/api/openapi.json backend/api/workflow-descriptor.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store backend/internal/workflows/store backend/internal/runs/store backend/internal/workflows/testdata/editor_corpus'
 	'task: [contracts:check] test -z "$(git status --porcelain -- backend/api web/src/api backend/internal/workflows/testdata/editor_corpus)"'
 )
 # The two embedui lanes. Both lines below are what go-task ECHOED when the lanes

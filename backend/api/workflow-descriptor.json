@@ -1,0 +1,108 @@
+{
+  "node_types": [
+    "plan",
+    "implement",
+    "review",
+    "gate",
+    "git-publish"
+  ],
+  "agentic": [
+    "plan",
+    "implement",
+    "review"
+  ],
+  "node_fields": [
+    "id",
+    "type",
+    "harness",
+    "instructions",
+    "on_request_changes"
+  ],
+  "id_pattern": "^[a-z][a-z0-9_-]{0,63}$",
+  "rules": [
+    {
+      "node_type": "plan",
+      "wire_field": "harness",
+      "requirement": "required",
+      "max_bytes": 100
+    },
+    {
+      "node_type": "plan",
+      "wire_field": "instructions",
+      "requirement": "required",
+      "max_bytes": 8192
+    },
+    {
+      "node_type": "plan",
+      "wire_field": "on_request_changes",
+      "requirement": "forbidden"
+    },
+    {
+      "node_type": "implement",
+      "wire_field": "harness",
+      "requirement": "required",
+      "max_bytes": 100
+    },
+    {
+      "node_type": "implement",
+      "wire_field": "instructions",
+      "requirement": "required",
+      "max_bytes": 8192
+    },
+    {
+      "node_type": "implement",
+      "wire_field": "on_request_changes",
+      "requirement": "forbidden"
+    },
+    {
+      "node_type": "review",
+      "wire_field": "harness",
+      "requirement": "required",
+      "max_bytes": 100
+    },
+    {
+      "node_type": "review",
+      "wire_field": "instructions",
+      "requirement": "required",
+      "max_bytes": 8192
+    },
+    {
+      "node_type": "review",
+      "wire_field": "on_request_changes",
+      "requirement": "forbidden"
+    },
+    {
+      "node_type": "gate",
+      "wire_field": "harness",
+      "requirement": "forbidden"
+    },
+    {
+      "node_type": "gate",
+      "wire_field": "instructions",
+      "requirement": "forbidden"
+    },
+    {
+      "node_type": "gate",
+      "wire_field": "on_request_changes",
+      "requirement": "optional",
+      "min_int": 1,
+      "max_int": 10,
+      "sub_field": "max_rounds"
+    },
+    {
+      "node_type": "git-publish",
+      "wire_field": "harness",
+      "requirement": "forbidden"
+    },
+    {
+      "node_type": "git-publish",
+      "wire_field": "instructions",
+      "requirement": "forbidden"
+    },
+    {
+      "node_type": "git-publish",
+      "wire_field": "on_request_changes",
+      "requirement": "forbidden"
+    }
+  ]
+}

@@ -250,6 +250,18 @@ tasks:
     cmds:
       - go run ./internal/contracts/cmd/openapigen -out api/openapi.json
 
+  # The §10.9 workflow descriptor: the node-type vocabulary emitted from
+  # definition.go plus the per-type field rules descriptor_test.go convicts
+  # against Validate. web/src/workflows/descriptor-coverage.test.ts imports the
+  # emitted file directly — it is the artifact that holds the hand-authored
+  # editor forms to the engine, so a rule that changes here and nowhere else
+  # reddens the web suite.
+  contracts:descriptor:
+    desc: "Regenerate backend/api/workflow-descriptor.json from the definition engine"
+    dir: backend
+    cmds:
+      - go run ./internal/workflows/cmd/descriptorgen -out api/workflow-descriptor.json
+
   contracts:ts:
     desc: "Regenerate web/src/api/schema.d.ts from the OpenAPI document"
     dir: web
@@ -276,6 +288,7 @@ tasks:
     cmds:
       - task: db:sqlc
       - task: contracts:openapi
+      - task: contracts:descriptor
       - task: contracts:ts
       - task: contracts:editorcorpus
 
@@ -283,7 +296,7 @@ tasks:
     desc: "Regenerate all contracts and fail on drift"
     cmds:
       - task: contracts:gen
-      - git diff --exit-code -- backend/api/openapi.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store backend/internal/workflows/store backend/internal/runs/store backend/internal/workflows/testdata/editor_corpus
+      - git diff --exit-code -- backend/api/openapi.json backend/api/workflow-descriptor.json web/src/api backend/internal/identity/store backend/internal/platform/audit backend/internal/assets/store backend/internal/workflows/store backend/internal/runs/store backend/internal/workflows/testdata/editor_corpus
       # The porcelain half is not a restatement of the diff above: `git diff`
       # says nothing about an UNTRACKED file, and a new corpus seed arrives
       # untracked. It is also what catches the reverse — a generator that

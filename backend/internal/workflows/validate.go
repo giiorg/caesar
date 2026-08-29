@@ -22,6 +22,12 @@ const (
 	maxInstructionsLen = 8192
 	maxHarnessLen      = 100
 	maxRevisionRounds  = 10
+	// minRevisionRounds was the literal 1 inside validateNodeConfig's bound
+	// check. It is named because the §10.9 descriptor now publishes this bound
+	// as MinInt and the editor's rounds input enforces it as
+	// MIN_REVISION_ROUNDS — three spellings of one number, and a literal is how
+	// the validator and the control it drives drift by one.
+	minRevisionRounds = 1
 )
 
 var nodeIDPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
@@ -169,8 +175,8 @@ func validateNodeConfig(path string, n Node) []Violation {
 		if n.Type != NodeGate {
 			vs = append(vs, Violation{Path: path + ".on_request_changes", Message: "only gates declare revision transitions"})
 		} else {
-			if r := n.OnRequestChanges.MaxRounds; r < 1 || r > maxRevisionRounds {
-				vs = append(vs, Violation{Path: path + ".on_request_changes.max_rounds", Message: fmt.Sprintf("must be 1-%d", maxRevisionRounds)})
+			if r := n.OnRequestChanges.MaxRounds; r < minRevisionRounds || r > maxRevisionRounds {
+				vs = append(vs, Violation{Path: path + ".on_request_changes.max_rounds", Message: fmt.Sprintf("must be %d-%d", minRevisionRounds, maxRevisionRounds)})
 			}
 		}
 	}
