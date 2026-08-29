@@ -1,4 +1,4 @@
-import { screen } from '@testing-library/react'
+import { screen, within } from '@testing-library/react'
 import { HttpResponse, http } from 'msw'
 import { describe, expect, it, vi } from 'vitest'
 import { renderApp } from '../../test/render-app'
@@ -38,9 +38,72 @@ describe('/workflows/$workflowId/versions/$version', () => {
     // defeat the reason they came.
     expect(screen.getByText(HASH)).toBeInTheDocument()
     expect(screen.getByTestId('dag-preview-slot')).toBeInTheDocument()
-    // The outline is Task 27's and says out loud that it is not built. A
-    // bordered empty box reads as an outline that failed to draw.
-    expect(screen.getByTestId('outline-slot')).toHaveTextContent(/not built yet/i)
+    expect(screen.getByTestId('outline-slot')).toBeInTheDocument()
+  })
+
+  /**
+   * THE OUTLINE, ROW BY ROW: one per node, badged by type, carrying its typed
+   * fields. `data-node-type` is what a badge MEANS — the same convention the
+   * preview and the phase dots use — so this asserts the design rather than
+   * Tailwind's spelling.
+   */
+  it('lists the document’s steps with their type badges and fields', async () => {
+    renderApp('/workflows/w1/versions/2', [version()])
+
+    const slot = await screen.findByTestId('outline-slot')
+    const rows = [...slot.querySelectorAll('[data-node-type]')]
+    expect(rows.map((r) => r.getAttribute('data-node-type'))).toEqual(['plan', 'implement', 'gate'])
+    expect(within(slot).getByText('draft it')).toBeInTheDocument()
+    expect(within(slot).getByText('do it')).toBeInTheDocument()
+  })
+
+  /**
+   * A BRANCHING DOCUMENT STILL LISTS EVERY NODE. Two implements off one plan
+   * validates server-side (measured: 0 violations) and `isChainShaped` answers
+   * false, so the editor will not open it — and this page is then the whole of
+   * what its reader gets. Blanking here would hide a definition the runner
+   * executes.
+   */
+  it('lists every node of a document the editor could never author', async () => {
+    renderApp('/workflows/w1/versions/2', [
+      version({
+        document: {
+          schema: 2,
+          nodes: [
+            { id: 'plan-1', type: 'plan', harness: 'cc', instructions: 'x' },
+            { id: 'impl-a', type: 'implement', harness: 'cc', instructions: 'x' },
+            { id: 'impl-b', type: 'implement', harness: 'cc', instructions: 'x' },
+            { id: 'gate-1', type: 'gate' },
+            { id: 'publish-1', type: 'git-publish' },
+          ],
+          edges: [
+            { from: 'plan-1', to: 'impl-a', artifact: 'plan' },
+            { from: 'plan-1', to: 'impl-b', artifact: 'plan' },
+            { from: 'impl-a', to: 'gate-1', artifact: 'patch' },
+            { from: 'gate-1', to: 'publish-1', artifact: 'patch' },
+          ],
+        },
+      }),
+    ])
+
+    const slot = await screen.findByTestId('outline-slot')
+    expect([...slot.querySelectorAll('[data-node-type]')]).toHaveLength(5)
+    expect(within(slot).getByText('impl-a')).toBeInTheDocument()
+    expect(within(slot).getByText('impl-b')).toBeInTheDocument()
+  })
+
+  /**
+   * READ-ONLY, and asserted over the WHOLE page rather than the slot: the
+   * editor's controls are what this view must not grow, and a query scoped to
+   * the outline would pass against a page that sprouted them anywhere else.
+   */
+  it('offers no way to edit the version it is showing', async () => {
+    renderApp('/workflows/w1/versions/2', [version()])
+
+    await screen.findByTestId('outline-slot')
+    expect(screen.queryByRole('textbox')).toBeNull()
+    expect(screen.queryByRole('combobox')).toBeNull()
+    expect(screen.queryByRole('spinbutton')).toBeNull()
   })
 
   /**

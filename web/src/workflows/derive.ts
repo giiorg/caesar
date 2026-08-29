@@ -108,11 +108,46 @@ export type DocShape = { nodes: readonly DocNode[]; edges?: readonly DocEdge[] }
 /** `validate.go:23` — bytes, not characters. Exported so the editor's inline counter agrees with the server. */
 export const MAX_INSTRUCTIONS_BYTES = 8192
 
+/**
+ * BYTES, NOT CHARACTERS. Go measures `len(n.Instructions)`, so a string of
+ * multi-byte characters can be well under 8192 by `String.length` and over it
+ * on the wire.
+ *
+ * The editor's inline counter and `fieldViolation` below both call this, which
+ * is what makes "the card said 8100 and the server said 9300" impossible. The
+ * two render different SENTENCES — one sits on a card that already names the
+ * step, the other has to name it — but they count the one way.
+ */
+export function instructionsByteCount(text: string): number {
+  return new TextEncoder().encode(text).length
+}
+
 /** `validate.go:25`. */
 export const MAX_REVISION_ROUNDS = 10
 
-/** `validate.go:28`, character for character. */
-const NODE_ID_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/
+/**
+ * `validate.go:25`'s other end.
+ *
+ * A NAMED CONSTANT RATHER THAN THE LITERAL `1` because two places now spell
+ * this bound — `revisionViolation` below and the gate card's rounds input — and
+ * Task 29's coverage test holds BOTH to the engine descriptor's `MinInt`. Two
+ * literals is how the input and the validator drift by one.
+ */
+export const MIN_REVISION_ROUNDS = 1
+
+/**
+ * `validate.go:28`, character for character.
+ *
+ * EXPORTED FOR ITS SOURCE as much as for its behaviour: the editor's rename
+ * validates with it, and Task 29's coverage test compares
+ * `NODE_ID_PATTERN.source` against the string the engine descriptor carries —
+ * which is only a check at all while there is exactly one spelling of the
+ * pattern in this codebase.
+ *
+ * The `{0,63}` is 64 CHARACTERS, and for this charset — ASCII only — that is
+ * also the 64 bytes Go measures.
+ */
+export const NODE_ID_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/
 
 /**
  * Derived edges for a card sequence, in the emission order the corpus pins.
@@ -390,10 +425,7 @@ function fieldViolation(card: Card): string | null {
       return `Step “${card.id}” has a harness with surrounding whitespace.`
     }
     if (!card.instructions) return `Step “${card.id}” needs instructions.`
-    // BYTES, NOT CHARACTERS. Go measures `len(n.Instructions)`, so a string of
-    // multi-byte characters can be well under 8192 by `String.length` and over
-    // it on the wire.
-    const bytes = new TextEncoder().encode(card.instructions).length
+    const bytes = instructionsByteCount(card.instructions)
     if (bytes > MAX_INSTRUCTIONS_BYTES) {
       return `Step “${card.id}” has ${bytes} bytes of instructions; the limit is ${MAX_INSTRUCTIONS_BYTES}.`
     }
@@ -436,8 +468,8 @@ function revisionViolation(card: Card, cards: readonly Card[]): string | null {
   if (card.type !== 'gate') {
     return `Only a gate carries a revision loop; “${card.id}” is a ${card.type}.`
   }
-  if (revision.maxRounds < 1 || revision.maxRounds > MAX_REVISION_ROUNDS) {
-    return `The revision loop on “${card.id}” must run between 1 and ${MAX_REVISION_ROUNDS} rounds.`
+  if (revision.maxRounds < MIN_REVISION_ROUNDS || revision.maxRounds > MAX_REVISION_ROUNDS) {
+    return `The revision loop on “${card.id}” must run between ${MIN_REVISION_ROUNDS} and ${MAX_REVISION_ROUNDS} rounds.`
   }
   const target = cards.find((c) => c.id === revision.target)
   if (target === undefined || (target.type !== 'plan' && target.type !== 'implement')) {
@@ -464,6 +496,37 @@ export function legalTypesAt(cards: readonly Card[], index: number): CardType[] 
     const probe: Card = { id: 'probe', type }
     return prefixViolation([...cards.slice(0, index), probe, ...cards.slice(index)]) === null
   })
+}
+
+/**
+ * Which steps a gate's revision loop may aim at: the plan and implement cards
+ * BEFORE it.
+ *
+ * `legalTypesAt`'s sibling — the second question the editor asks positionally,
+ * and the one that populates a gate card's target select. A REVIEW IS NEVER
+ * HERE, for the reason `revisionViolation` sets out at length: the bypass edge
+ * routes the patch from the implement straight to the gate, so the review does
+ * not dominate it and `validateRevisions` refuses the target server-side.
+ *
+ * IT SLICES, and `revisionViolation` deliberately does not — the difference is
+ * when each runs. That one is reached only after the grammar walk has returned
+ * `published`, a state in which every plan and implement provably precedes the
+ * gate already, so its slice would be a line no fixture could distinguish. This
+ * one is a pure function the editor calls on whatever list it holds, including
+ * a document authored outside the editor, where a gate followed by an implement
+ * is an ordinary shape. Measured: with the slice dropped, the
+ * gate-then-implement fixture in the test file fails.
+ *
+ * An id that is not in the list answers `[]` rather than letting `findIndex`'s
+ * -1 slice the last card off and answer about the wrong prefix.
+ */
+export function legalTargetsFor(cards: readonly Card[], gateId: string): string[] {
+  const at = cards.findIndex((c) => c.id === gateId)
+  if (at === -1) return []
+  return cards
+    .slice(0, at)
+    .filter((c) => c.type === 'plan' || c.type === 'implement')
+    .map((c) => c.id)
 }
 
 /** The id stems, matching `validate_test.go:10-28`'s `conveyor()` so TS and Go fixtures read alike. */
@@ -695,8 +758,16 @@ function asObject(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>
 }
 
-/** A wire node as a card — the inverse of `toNode`, including the snake_case conversion. */
-function toCard(node: DocNode): Card {
+/**
+ * A wire node as a card — the inverse of `toNode`, including the snake_case
+ * conversion.
+ *
+ * EXPORTED FOR THE TWO READERS OF SOMEONE ELSE'S DOCUMENT: the editor's prefill
+ * (`/edit?from=<version>`) and the version read view's outline, which renders
+ * the typed rows of documents this editor could never author. `isChainShaped`
+ * was its only caller while nothing rendered a stored document as cards.
+ */
+export function toCard(node: DocNode): Card {
   return {
     id: node.id,
     type: node.type,

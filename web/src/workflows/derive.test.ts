@@ -8,10 +8,12 @@ import {
   deriveEdges,
   grammarViolation,
   isChainShaped,
+  legalTargetsFor,
   legalTypesAt,
   nextCardId,
   prefixViolation,
   readDocument,
+  toCard,
   toDocument,
 } from './derive'
 
@@ -833,5 +835,71 @@ describe('readDocument', () => {
     })
     expect(read).not.toBeNull()
     expect(isChainShaped(read as DocShape)).toBe(false)
+  })
+})
+
+describe('legalTargetsFor', () => {
+  /**
+   * The gate's revision loop may only aim at a plan or implement, and the
+   * review's exclusion is the bypass edge's consequence — `revisionViolation`'s
+   * comment states it. The fixture carries a review precisely so that its
+   * ABSENCE from the answer is what this measures.
+   */
+  it('offers the preceding plan and implement steps, and never the review', () => {
+    const cards = [plan(), impl('impl-1'), impl('impl-2'), review(), gate(), publish()]
+    expect(legalTargetsFor(cards, 'gate-1')).toEqual(['plan-1', 'impl-1', 'impl-2'])
+  })
+
+  /**
+   * PRECEDING, and the slice is measured rather than assumed.
+   *
+   * A gate with an implement after it is not something the reducer can build —
+   * `prefixViolation` admits no implement once a gate is placed — which is the
+   * argument `revisionViolation` uses to justify NOT slicing. It does not
+   * transfer: that function runs only after the grammar walk has reached
+   * `published`, and this one is a pure function the editor calls on whatever
+   * card list it is handed. With the slice dropped, `impl-late` joins the
+   * answer and this test fails.
+   */
+  it('does not offer a step that comes after the gate', () => {
+    const cards = [impl('impl-1'), gate(), impl('impl-late')]
+    expect(legalTargetsFor(cards, 'gate-1')).toEqual(['impl-1'])
+  })
+
+  /**
+   * A gate that is not in the list has no position to precede, and
+   * `findIndex`'s -1 would otherwise slice the LAST card off and answer
+   * confidently about the wrong prefix.
+   */
+  it('answers nothing for an id that is not in the outline', () => {
+    expect(legalTargetsFor([plan(), impl(), gate()], 'nowhere')).toEqual([])
+  })
+})
+
+describe('toCard', () => {
+  /**
+   * The inverse of `toNode`, and the snake_case boundary is the whole reason it
+   * is a function rather than a spread: the wire says
+   * `on_request_changes.max_rounds`, the editor says `revision.maxRounds`.
+   */
+  it('reads a wire node back as the card that would emit it', () => {
+    const node: DocNode = {
+      id: 'gate-1',
+      type: 'gate',
+      on_request_changes: { target: 'impl-1', max_rounds: 3 },
+    }
+    expect(toCard(node)).toEqual({
+      id: 'gate-1',
+      type: 'gate',
+      revision: { target: 'impl-1', maxRounds: 3 },
+    })
+  })
+
+  /** ABSENT STAYS ABSENT, so a round trip back through `toNode` grows no keys. */
+  it('leaves an absent field absent rather than empty', () => {
+    expect(toCard({ id: 'publish-1', type: 'git-publish' })).toEqual({
+      id: 'publish-1',
+      type: 'git-publish',
+    })
   })
 })

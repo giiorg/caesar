@@ -1,8 +1,8 @@
 import { useSuspenseQuery } from '@tanstack/react-query'
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { StubPanel } from '../../ui/stub-panel'
 import { DagPreview } from '../../workflows/dag-preview'
-import { readDocument } from '../../workflows/derive'
+import { readDocument, toCard } from '../../workflows/derive'
+import { OutlineView } from '../../workflows/outline-view'
 import { workflowVersionQueryOptions } from '../../workflows/workflows-query'
 
 /**
@@ -60,11 +60,15 @@ function WorkflowVersionView() {
         </Link>
       </section>
 
-      {/* THE TWO PROJECTIONS §6.1 NAMES. The first is built; the second is
-          Task 27's, and it is a `StubPanel` rather than an empty div because a
-          stub never fakes success — a bordered box with nothing in it is
-          indistinguishable, to the person looking at it, from an outline that
-          failed to draw.
+      {/* THE TWO PROJECTIONS §6.1 NAMES, both built now. The outline is the
+          editor's own renderer with its controls off — one component, so a
+          document that draws here draws identically in the editor's read-only
+          mode, and neither can drift into showing a field the other hides.
+
+          IT RENDERS ANY DOCUMENT THE API WILL RETURN, chain-shaped or not: a
+          branching definition written through the API is unreachable for the
+          editor and perfectly ordinary for the runner, so this view consults no
+          grammar and lists the nodes in document order.
 
           `null` IS "UNREADABLE", NOT "EMPTY", and the two must not render the
           same way. `Validate` refuses a document with no nodes, so an empty
@@ -81,7 +85,7 @@ function WorkflowVersionView() {
             <DagPreview doc={definition} />
           </section>
           <section data-testid="outline-slot">
-            <StubPanel plan="Plan 12b Task 27" what="The typed outline" />
+            <OutlineView cards={definition.nodes.map(toCard)} />
           </section>
         </>
       )}
