@@ -4,12 +4,14 @@ import {
   type CardType,
   type Doc,
   type DocNode,
+  type DocShape,
   deriveEdges,
   grammarViolation,
   isChainShaped,
   legalTypesAt,
   nextCardId,
   prefixViolation,
+  readDocument,
   toDocument,
 } from './derive'
 
@@ -606,5 +608,230 @@ describe('nextCardId', () => {
     for (const type of ['plan', 'implement', 'review', 'gate', 'git-publish'] as CardType[]) {
       expect(nextCardId([], type)).toMatch(pattern)
     }
+  })
+})
+
+/**
+ * THE ONLY DOOR FROM THE WIRE INTO THIS MODULE.
+ *
+ * Every other export here takes typed input, and every caller starts from
+ * `WorkflowVersionResponse.Document` — a `json.RawMessage`, which swaggest
+ * reflects to the EMPTY schema, so it arrives as `unknown`. Without this
+ * function `isChainShaped` cannot be called on a real document at all, and the
+ * DAG preview has nothing to be fed from.
+ *
+ * The fixtures are ADVERSARIAL BY SHAPE rather than by value: each one is a
+ * document some other producer could plausibly write, and the question each
+ * asks is whether this reader can honestly describe it.
+ */
+describe('readDocument', () => {
+  const conveyor = {
+    schema: 2,
+    nodes: [
+      { id: 'im', type: 'implement', harness: 'cc', instructions: 'do it' },
+      { id: 'rev', type: 'review', harness: 'cc', instructions: 'check it' },
+      { id: 'g', type: 'gate', on_request_changes: { target: 'im', max_rounds: 3 } },
+      { id: 'pub', type: 'git-publish' },
+    ],
+    edges: [
+      { from: 'im', to: 'rev', artifact: 'patch' },
+      { from: 'im', to: 'g', artifact: 'patch' },
+      { from: 'rev', to: 'g', artifact: 'review_verdict' },
+      { from: 'g', to: 'pub', artifact: 'patch' },
+    ],
+  }
+
+  it('reads a whole schema-2 document, optional node fields included', () => {
+    expect(readDocument(conveyor)).toEqual({
+      nodes: [
+        { id: 'im', type: 'implement', harness: 'cc', instructions: 'do it' },
+        { id: 'rev', type: 'review', harness: 'cc', instructions: 'check it' },
+        { id: 'g', type: 'gate', on_request_changes: { target: 'im', max_rounds: 3 } },
+        { id: 'pub', type: 'git-publish' },
+      ],
+      edges: [
+        { from: 'im', to: 'rev', artifact: 'patch' },
+        { from: 'im', to: 'g', artifact: 'patch' },
+        { from: 'rev', to: 'g', artifact: 'review_verdict' },
+        { from: 'g', to: 'pub', artifact: 'patch' },
+      ],
+    })
+  })
+
+  /**
+   * WHAT THE READER IS FOR, stated as a round trip: a document that went out
+   * over the wire comes back and reaches `isChainShaped`, which is the question
+   * the read view exists to ask of it. `JSON.parse(JSON.stringify(…))` launders
+   * every type away exactly as the transport does, so the reader has to put
+   * them back well enough for the chain check to say yes.
+   */
+  it('round-trips this module’s own emit back into a chain-shaped answer', () => {
+    const cards: Card[] = [
+      impl(),
+      review(),
+      gate('gate-1', { target: 'impl-1', maxRounds: 2 }),
+      publish(),
+    ]
+    const overTheWire: unknown = JSON.parse(JSON.stringify(toDocument(cards)))
+    const read = readDocument(overTheWire)
+    expect(read).not.toBeNull()
+    expect(isChainShaped(read as DocShape)).toBe(true)
+  })
+
+  /**
+   * SCHEMA 1 IS READ, and this assertion is what keeps every pre-bump version
+   * on the screen. `definition.go:20-27`: schema 2 differs from 1 in how
+   * agentic nodes are validated against payload schemas and "the DOCUMENT shape
+   * is unchanged"; `ParseDocument` accepts both (`MinSchemaVersion = 1`). A
+   * reader pinned to 2 would tell a person their oldest workflows could not be
+   * read, which would be false.
+   */
+  it('reads schema 1 as readily as schema 2', () => {
+    expect(readDocument({ ...conveyor, schema: 1 })).not.toBeNull()
+  })
+
+  it('refuses a schema this binary does not parse', () => {
+    expect(readDocument({ ...conveyor, schema: 3 })).toBeNull()
+    expect(readDocument({ ...conveyor, schema: 0 })).toBeNull()
+    expect(readDocument({ nodes: conveyor.nodes })).toBeNull()
+  })
+
+  it('refuses what is not a document at all', () => {
+    expect(readDocument(null)).toBeNull()
+    expect(readDocument('a document')).toBeNull()
+    expect(readDocument(42)).toBeNull()
+    expect(readDocument([{ id: 'im', type: 'implement' }])).toBeNull()
+  })
+
+  /**
+   * A `nodes` PRESENT AND NOT A LIST — the shape a truthiness check lets
+   * through. The fixture is an OBJECT rather than a string for the reason Task
+   * 24 measured: iterating a string yields characters and the reader answers
+   * null by a different route, so a weakened guard survives it; an object is
+   * not iterable at all, so the weakened guard throws instead.
+   */
+  it('refuses a document whose nodes are not a list', () => {
+    expect(readDocument({ schema: 2, nodes: { im: { id: 'im' } } })).toBeNull()
+    expect(readDocument({ schema: 2 })).toBeNull()
+  })
+
+  /**
+   * AN UNKNOWN NODE TYPE MAKES THE DOCUMENT UNREADABLE, and that is what the
+   * `type: CardType` in the return type MEANS. A future vocabulary word would
+   * otherwise reach the preview as a pill with no colour and reach
+   * `grammarViolation` as a card no transition row matches. Null is the honest
+   * answer for a document this binary does not understand.
+   */
+  it('refuses a node type this vocabulary does not have', () => {
+    expect(readDocument({ schema: 2, nodes: [{ id: 'd', type: 'deploy' }] })).toBeNull()
+    expect(readDocument({ schema: 2, nodes: [{ id: 'd' }] })).toBeNull()
+    expect(readDocument({ schema: 2, nodes: [{ type: 'gate' }] })).toBeNull()
+    // AN ID THAT IS PRESENT AND NOT A STRING, which is a different refusal from
+    // an id that is absent — MEASURED: with only the missing-id fixture above,
+    // the mutant weakening the check to `id === undefined` survives, and a
+    // numeric id then reaches every consumer typed as a `string` it is not.
+    expect(readDocument({ schema: 2, nodes: [{ id: 7, type: 'gate' }] })).toBeNull()
+  })
+
+  it('refuses a node whose optional fields are the wrong type', () => {
+    expect(
+      readDocument({ schema: 2, nodes: [{ id: 'im', type: 'implement', harness: 7 }] }),
+    ).toBeNull()
+    expect(
+      readDocument({ schema: 2, nodes: [{ id: 'im', type: 'implement', instructions: [] }] }),
+    ).toBeNull()
+    expect(
+      readDocument({
+        schema: 2,
+        nodes: [{ id: 'g', type: 'gate', on_request_changes: { target: 'im' } }],
+      }),
+    ).toBeNull()
+    expect(
+      readDocument({
+        schema: 2,
+        nodes: [{ id: 'g', type: 'gate', on_request_changes: { target: 7, max_rounds: 2 } }],
+      }),
+    ).toBeNull()
+  })
+
+  it('refuses an artifact type that is not a binding', () => {
+    expect(
+      readDocument({
+        schema: 2,
+        nodes: [
+          { id: 'im', type: 'implement' },
+          { id: 'g', type: 'gate' },
+        ],
+        // `log_ref` is a real artifact in the runtime's vocabulary and is NEVER
+        // an edge binding — `definition.go:65-77` lists exactly three — so it
+        // is the plausible wrong value here rather than a nonsense string.
+        edges: [{ from: 'im', to: 'g', artifact: 'log_ref' }],
+      }),
+    ).toBeNull()
+    expect(readDocument({ ...conveyor, edges: { a: 1 } })).toBeNull()
+    expect(readDocument({ ...conveyor, edges: [{ from: 'im', to: 'g' }] })).toBeNull()
+  })
+
+  /**
+   * AN EDGE MUST NAME NODES THAT EXIST, and the check is here rather than in
+   * the layout because it is what makes the layout's precondition true by
+   * construction. A dangling edge has no coordinates to be drawn between, so a
+   * layout handed one could only drop it — showing a person fewer bindings than
+   * the runner executes, which is the call the node reads above make about a
+   * node with no id — or invent a placement. `validateShape` refuses it at the
+   * write door ("unknown node %q", `validate.go:76,80`), so this costs no
+   * document that can actually arrive.
+   */
+  it('refuses an edge whose endpoints are not nodes of this document', () => {
+    const nodes = [
+      { id: 'im', type: 'implement' },
+      { id: 'g', type: 'gate' },
+    ]
+    expect(
+      readDocument({ schema: 2, nodes, edges: [{ from: 'ghost', to: 'g', artifact: 'patch' }] }),
+    ).toBeNull()
+    expect(
+      readDocument({ schema: 2, nodes, edges: [{ from: 'im', to: 'ghost', artifact: 'patch' }] }),
+    ).toBeNull()
+  })
+
+  /**
+   * AN ABSENT `edges` KEY STAYS ABSENT — the canonical form for a document with
+   * no bindings, since `Document.Edges` carries `omitempty` and `ParseDocument`
+   * nils an empty slice. Deliberately NOT normalized in the other direction:
+   * `edges: []` and an absent key are indistinguishable to every consumer here
+   * — `isChainShaped` and `layoutDag` both read `edges ?? []` — so normalizing
+   * would be a line no fixture could distinguish.
+   */
+  it('leaves an absent edges key absent', () => {
+    expect(readDocument({ schema: 2, nodes: [{ id: 'im', type: 'implement' }] })).toEqual({
+      nodes: [{ id: 'im', type: 'implement' }],
+    })
+  })
+
+  /**
+   * THE PLAN'S OWN BRANCHING FIXTURE, read whole. It is authorable (`Validate`:
+   * 0 violations) and NOT chain-shaped, which is exactly the pair of answers
+   * the version read view needs: draw it, and do not offer to edit it.
+   */
+  it('reads the branching document the editor cannot author', () => {
+    const read = readDocument({
+      schema: 2,
+      nodes: [
+        { id: 'plan-1', type: 'plan', harness: 'cc', instructions: 'x' },
+        { id: 'impl-a', type: 'implement', harness: 'cc', instructions: 'x' },
+        { id: 'impl-b', type: 'implement', harness: 'cc', instructions: 'x' },
+        { id: 'gate-1', type: 'gate' },
+        { id: 'publish-1', type: 'git-publish' },
+      ],
+      edges: [
+        { from: 'plan-1', to: 'impl-a', artifact: 'plan' },
+        { from: 'plan-1', to: 'impl-b', artifact: 'plan' },
+        { from: 'impl-a', to: 'gate-1', artifact: 'patch' },
+        { from: 'gate-1', to: 'publish-1', artifact: 'patch' },
+      ],
+    })
+    expect(read).not.toBeNull()
+    expect(isChainShaped(read as DocShape)).toBe(false)
   })
 })

@@ -89,6 +89,22 @@ export type DocEdge = { from: string; to: string; artifact: ArtifactType }
  */
 export type Doc = { schema: 2; nodes: DocNode[]; edges?: DocEdge[] }
 
+/**
+ * A document as its GRAPH — `Doc` without the `schema`, and the shape every
+ * reader of one takes.
+ *
+ * THE SCHEMA IS DELIBERATELY NOT CARRIED. Nothing downstream reads it:
+ * `isChainShaped` says below why chain-shapedness is a property of the graph
+ * and not of the version bump, the preview badges by node type, and the
+ * editor's prefill re-emits as `SchemaVersion` unconditionally. A field no
+ * consumer reads is one every consumer has to decide to ignore.
+ *
+ * `readonly` because its producers are `readDocument` — whose answer is a
+ * reading of someone else's bytes — and `toDocument`, whose answer is version
+ * identity. Neither is anybody's scratch space.
+ */
+export type DocShape = { nodes: readonly DocNode[]; edges?: readonly DocEdge[] }
+
 /** `validate.go:23` — bytes, not characters. Exported so the editor's inline counter agrees with the server. */
 export const MAX_INSTRUCTIONS_BYTES = 8192
 
@@ -500,10 +516,7 @@ export function nextCardId(cards: readonly Card[], type: CardType): string {
  * (`definition.go:20-27`), so a v1 document is editable on exactly the same
  * terms.
  */
-export function isChainShaped(doc: {
-  nodes: readonly DocNode[]
-  edges?: readonly DocEdge[]
-}): boolean {
+export function isChainShaped(doc: DocShape): boolean {
   const cards = doc.nodes.map(toCard)
   if (grammarViolation(cards) !== null) return false
   const derived = deriveEdges(cards)
@@ -512,6 +525,174 @@ export function isChainShaped(doc: {
   const key = (e: DocEdge) => `${e.from} ${e.to} ${e.artifact}`
   const want = new Set(derived.map(key))
   return actual.every((e) => want.has(key(e)))
+}
+
+/**
+ * A definition document read out of `unknown`, or `null` when this binary
+ * cannot describe it.
+ *
+ * THE ONLY DOOR FROM THE WIRE INTO THIS MODULE, and it has to exist because the
+ * transport declines to describe what it carries:
+ * `WorkflowVersionResponse.Document` is a `json.RawMessage`, which swaggest
+ * reflects to the EMPTY schema (`"document": {}` — any JSON), so no amount of
+ * contract marking gives it a shape on this side. What `required:"true"` on it
+ * buys is the ABSENCE of an absence: the property is always present, so nothing
+ * here carries an `undefined` branch the server cannot produce. The document's
+ * real schema is enforced by the write door (`ParseDocument` + `Validate`).
+ *
+ * READERS THAT ANSWER `null`, NEVER A CAST — `approvals/artifact-query.ts`'s
+ * shape, and every refusal below is a document some other producer could
+ * plausibly write. `null` means "this app cannot describe this document", which
+ * is not the same as a document with nothing in it.
+ *
+ * SCHEMA 1 IS AS READABLE AS 2. `ParseDocument` accepts both
+ * (`MinSchemaVersion = 1`) and `definition.go:20-27` says the difference is how
+ * agentic nodes are validated against payload schemas — "the DOCUMENT shape is
+ * unchanged". A reader pinned to 2 would report every pre-bump version as
+ * unreadable, which would be false.
+ */
+export function readDocument(value: unknown): DocShape | null {
+  const doc = asObject(value)
+  if (doc === null) return null
+  // The schema check is also what refuses a JSON ARRAY: an array carries no
+  // named properties, so `doc.schema` is undefined and the type test below
+  // fails. Same argument `workflows-query.ts` recorded about its own reader —
+  // an explicit array guard would be a line no fixture could distinguish.
+  const { schema } = doc
+  if (typeof schema !== 'number' || schema < MIN_SCHEMA_VERSION || schema > SCHEMA_VERSION) {
+    return null
+  }
+  // `Array.isArray`, NOT a presence check: a `nodes` that is present and not an
+  // array is the shape that gets past truthiness and then breaks — iterating a
+  // string yields characters and yields unreadable nodes, iterating an object
+  // throws inside a render.
+  if (!Array.isArray(doc.nodes)) return null
+
+  const nodes: DocNode[] = []
+  for (const raw of doc.nodes) {
+    const node = readNode(raw)
+    // ONE BAD NODE MAKES THE WHOLE DOCUMENT UNREADABLE rather than making the
+    // graph one node shorter. Skipping it would draw a person a smaller
+    // workflow than the runner executes.
+    if (node === null) return null
+    nodes.push(node)
+  }
+
+  // ABSENT STAYS ABSENT — the canonical form for a document with no bindings,
+  // since `Document.Edges` carries `omitempty` and `ParseDocument` nils an
+  // empty slice. Not normalized the other way: `edges: []` and an absent key
+  // are indistinguishable to every consumer here, both of which read
+  // `edges ?? []`.
+  if (doc.edges === undefined) return { nodes }
+  if (!Array.isArray(doc.edges)) return null
+
+  const ids = new Set(nodes.map((n) => n.id))
+  const edges: DocEdge[] = []
+  for (const raw of doc.edges) {
+    const edge = readEdge(raw, ids)
+    if (edge === null) return null
+    edges.push(edge)
+  }
+  return { nodes, edges }
+}
+
+/** `definition.go:31-33`. */
+const SCHEMA_VERSION = 2
+const MIN_SCHEMA_VERSION = 1
+
+/**
+ * One wire node, with its type checked against the vocabulary this binary has.
+ *
+ * AN UNKNOWN TYPE REFUSES THE DOCUMENT, and that refusal is what the
+ * `type: CardType` in `DocNode` means. A future vocabulary word would otherwise
+ * arrive at the preview as a pill with no colour and at `grammarViolation` as a
+ * card no transition row matches — two components each inventing a private
+ * answer for the same unknown.
+ */
+function readNode(value: unknown): DocNode | null {
+  const raw = asObject(value)
+  if (raw === null) return null
+  const { id, type, harness, instructions } = raw
+  if (typeof id !== 'string' || !isCardType(type)) return null
+  if (harness !== undefined && typeof harness !== 'string') return null
+  if (instructions !== undefined && typeof instructions !== 'string') return null
+
+  let loop: DocNode['on_request_changes']
+  if (raw.on_request_changes !== undefined) {
+    const read = readRevision(raw.on_request_changes)
+    if (read === null) return null
+    loop = read
+  }
+  // Key order is `Node`'s Go field order, the canonical encoding order
+  // (`definition.go:104-108`) — the same order `toNode` emits in, so a document
+  // that goes out and comes back does not change shape on the way.
+  return {
+    id,
+    type,
+    ...(harness === undefined ? {} : { harness }),
+    ...(instructions === undefined ? {} : { instructions }),
+    ...(loop === undefined ? {} : { on_request_changes: loop }),
+  }
+}
+
+function readRevision(value: unknown): { target: string; max_rounds: number } | null {
+  const raw = asObject(value)
+  if (raw === null) return null
+  const { target, max_rounds: rounds } = raw
+  if (typeof target !== 'string' || typeof rounds !== 'number') return null
+  return { target, max_rounds: rounds }
+}
+
+/**
+ * One typed binding, whose ends must be nodes of THIS document.
+ *
+ * THE ENDPOINT CHECK IS WHAT MAKES THE LAYOUT'S PRECONDITION TRUE. A dangling
+ * edge has no coordinates to be drawn between, so a layout handed one could
+ * only drop it — showing fewer bindings than the runner executes — or invent a
+ * placement. `validateShape` refuses the shape at the write door ("unknown node
+ * %q", `validate.go:76,80`), so the check costs no document that can arrive.
+ */
+function readEdge(value: unknown, ids: ReadonlySet<string>): DocEdge | null {
+  const raw = asObject(value)
+  if (raw === null) return null
+  const { from, to, artifact } = raw
+  if (typeof from !== 'string' || !ids.has(from)) return null
+  if (typeof to !== 'string' || !ids.has(to)) return null
+  if (!isArtifactType(artifact)) return null
+  return { from, to, artifact }
+}
+
+/**
+ * TYPE PREDICATES RATHER THAN CASTS, and the arrays are the ones already
+ * declared above — so the vocabulary is spelled once and a sixth node type
+ * cannot be added to `CARD_TYPES` while this reader goes on refusing it.
+ */
+function isCardType(value: unknown): value is CardType {
+  return typeof value === 'string' && (CARD_TYPES as readonly string[]).includes(value)
+}
+
+/** `definition.go:65-77`. `log_ref`/`failure_snapshot` are runtime outputs, never bindings. */
+const ARTIFACT_TYPES: readonly ArtifactType[] = ['plan', 'patch', 'review_verdict']
+
+function isArtifactType(value: unknown): value is ArtifactType {
+  return typeof value === 'string' && (ARTIFACT_TYPES as readonly string[]).includes(value)
+}
+
+/**
+ * `typeof null === 'object'`, and the null check is THE PREMISE OF THE CAST
+ * rather than a guard any input can trip.
+ *
+ * Said plainly because it is not what it looks like: dropping the check leaves
+ * every reader above working, since `null as Record<string, unknown>` is still
+ * `null` and each of them tests for `null` on the next line — MEASURED, the
+ * mutant survives the whole suite. What it would break is the DECLARED TYPE. A
+ * `Record<string, unknown>` that is really `null` is a lie the compiler cannot
+ * see through a cast, and the first reader written without a null check would
+ * find out at runtime. This is the line that makes the cast true.
+ */
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null) return null
+  return value as Record<string, unknown>
 }
 
 /** A wire node as a card — the inverse of `toNode`, including the snake_case conversion. */

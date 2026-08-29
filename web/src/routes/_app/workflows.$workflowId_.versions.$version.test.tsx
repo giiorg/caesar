@@ -1,4 +1,4 @@
-import { screen, within } from '@testing-library/react'
+import { screen } from '@testing-library/react'
 import { HttpResponse, http } from 'msw'
 import { describe, expect, it, vi } from 'vitest'
 import { renderApp } from '../../test/render-app'
@@ -29,7 +29,7 @@ const version = (over: Record<string, unknown> = {}) =>
   )
 
 describe('/workflows/$workflowId/versions/$version', () => {
-  it('names the version, shows the whole hash, and holds both slots', async () => {
+  it('names the version, shows the whole hash, and holds both projections', async () => {
     renderApp('/workflows/w1/versions/2', [version()])
 
     expect(await screen.findByRole('heading', { name: 'v2' })).toBeInTheDocument()
@@ -38,23 +38,33 @@ describe('/workflows/$workflowId/versions/$version', () => {
     // defeat the reason they came.
     expect(screen.getByText(HASH)).toBeInTheDocument()
     expect(screen.getByTestId('dag-preview-slot')).toBeInTheDocument()
-    expect(screen.getByTestId('outline-slot')).toBeInTheDocument()
-    // The slots say out loud that they are not built. A bordered empty box
-    // reads as a preview that failed to draw.
-    expect(screen.getByTestId('dag-preview-slot')).toHaveTextContent(/not built yet/i)
+    // The outline is Task 27's and says out loud that it is not built. A
+    // bordered empty box reads as an outline that failed to draw.
+    expect(screen.getByTestId('outline-slot')).toHaveTextContent(/not built yet/i)
   })
 
   /**
    * THE ASSERTION THAT THE DOCUMENT ARRIVED, and it is the only one on this
-   * page that can make it. Both slots above render identically for every
-   * version — a test built on them alone would pass against a page that never
-   * fetched anything at all.
+   * page that can make it. The heading and the hash come off the version's
+   * metadata and the outline slot renders identically for every version — a
+   * test built on those alone would pass against a page that fetched the
+   * metadata and dropped the definition on the floor.
+   *
+   * It reads the DRAWING, node by node: `data-node-type` is what a pill's
+   * colour and shape mean, so this is the same assertion the preview's own
+   * suite makes, arrived at through the route, the query and the reader.
    */
-  it('renders the node ids out of the fetched document', async () => {
+  it('draws the fetched document’s steps in the preview', async () => {
     renderApp('/workflows/w1/versions/2', [version()])
 
-    const ids = within(await screen.findByTestId('node-ids')).getAllByRole('listitem')
-    expect(ids.map((li) => li.textContent)).toEqual(['plan', 'implement', 'gate'])
+    const slot = await screen.findByTestId('dag-preview-slot')
+    const pills = [...slot.querySelectorAll('[data-node-type]')]
+    expect(pills.map((p) => p.getAttribute('data-node-type'))).toEqual([
+      'plan',
+      'implement',
+      'gate',
+    ])
+    expect(screen.getByRole('img', { name: '3 steps: plan, implement, gate' })).toBeInTheDocument()
   })
 
   /**
@@ -94,60 +104,27 @@ describe('/workflows/$workflowId/versions/$version', () => {
   /**
    * UNREADABLE IS NOT EMPTY, and the two must not render the same way.
    *
-   * `Validate` refuses a document with no nodes, so an empty list cannot come
-   * off the wire; a page that answered "no steps" here would describe a state
-   * the system does not have and send the operator looking for a workflow
-   * problem instead of a client one. The `not.toBeInTheDocument` half is what
-   * kills a reader that returned `[]` on a miss: the sentence alone would pass
-   * beside an empty list.
+   * `Validate` refuses a document with no nodes, so an empty definition cannot
+   * come off the wire; a page that drew an empty picture here would describe a
+   * state the system does not have and send an operator looking for a workflow
+   * problem instead of a client one. The second and third assertions are what
+   * make it bite — the sentence alone would pass beside an empty frame, and the
+   * outline stub would go on claiming a version this page could not read.
+   *
+   * ONE FIXTURE, NOT THE TABLE. Which shapes are unreadable is `readDocument`'s
+   * question and `derive.test.ts` asks it fifteen ways against the function
+   * itself; what is left for this page to prove is that a `null` answer reaches
+   * the screen as this sentence and displaces both projections. Re-running the
+   * shape table through a router, a query and a mock server would assert the
+   * same thing five times more slowly.
    */
-  it('says a document it cannot read is unreadable, rather than showing no steps', async () => {
+  it('says a document it cannot read is unreadable, and draws nothing', async () => {
     renderApp('/workflows/w1/versions/2', [version({ document: { schema: 99, steps: [] } })])
 
     expect(
       await screen.findByText(/could not be read by this version of the app/i),
     ).toBeInTheDocument()
-    expect(screen.queryByTestId('node-ids')).not.toBeInTheDocument()
-  })
-
-  /**
-   * A `nodes` THAT IS PRESENT AND NOT A LIST — the shape a presence check lets
-   * through, and the fixture is an OBJECT rather than a string on purpose.
-   *
-   * MEASURED, both ways: with `nodes: 'plan'` the mutant that weakens the guard
-   * to `doc.nodes === undefined` SURVIVES, because iterating a string yields
-   * characters, `asObject('p')` answers null, and the reader returns null by a
-   * different route — the two behaviours are indistinguishable on that input.
-   * An object is not iterable at all, so the weakened guard throws inside the
-   * render instead of answering, and the mutant dies. A keyed-by-id map is also
-   * the plausible wrong shape: it is what someone would write if they had never
-   * read `workflows.Document`.
-   */
-  it('refuses a document whose nodes are not a list', async () => {
-    renderApp('/workflows/w1/versions/2', [
-      version({ document: { schema: 2, nodes: { plan: { id: 'plan' } } } }),
-    ])
-
-    expect(
-      await screen.findByText(/could not be read by this version of the app/i),
-    ).toBeInTheDocument()
-    expect(screen.queryByTestId('node-ids')).not.toBeInTheDocument()
-  })
-
-  /**
-   * A NODE WITHOUT AN ID MAKES THE WHOLE DOCUMENT UNREADABLE rather than making
-   * the graph one node shorter. Dropping it silently would show a person fewer
-   * steps than the runner executes — `readPlan`'s call, on the same kind of
-   * partially-understood payload.
-   */
-  it('refuses a document whose nodes are not all identifiable', async () => {
-    renderApp('/workflows/w1/versions/2', [
-      version({ document: { schema: 2, nodes: [{ id: 'plan' }, { type: 'gate' }] } }),
-    ])
-
-    expect(
-      await screen.findByText(/could not be read by this version of the app/i),
-    ).toBeInTheDocument()
-    expect(screen.queryByText('plan')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('dag-preview-slot')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('outline-slot')).not.toBeInTheDocument()
   })
 })

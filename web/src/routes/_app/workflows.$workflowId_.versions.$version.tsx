@@ -1,7 +1,9 @@
 import { useSuspenseQuery } from '@tanstack/react-query'
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { StubPanel } from '../../ui/stub-panel'
-import { readNodeIds, workflowVersionQueryOptions } from '../../workflows/workflows-query'
+import { DagPreview } from '../../workflows/dag-preview'
+import { readDocument } from '../../workflows/derive'
+import { workflowVersionQueryOptions } from '../../workflows/workflows-query'
 
 /**
  * One registered version, read-only — the definition as the runner will see it.
@@ -30,7 +32,14 @@ export const Route = createFileRoute('/_app/workflows/$workflowId_/versions/$ver
 function WorkflowVersionView() {
   const { workflowId, version } = Route.useParams()
   const { data } = useSuspenseQuery(workflowVersionQueryOptions(workflowId, version))
-  const nodeIds = readNodeIds(data.document)
+  // READ ONCE, FOR THE WHOLE PAGE. Both projections below are readings of the
+  // same document, so unreadability is a property of the page's data rather
+  // than of one region — reading it inside each would put two copies of the
+  // same sentence on one screen the moment the outline lands beside the
+  // preview.
+  // `definition`, not `document`: this file renders into a DOM and the global
+  // of that name is a keystroke away.
+  const definition = readDocument(data.document)
 
   return (
     <div className="flex flex-col gap-6">
@@ -51,56 +60,31 @@ function WorkflowVersionView() {
         </Link>
       </section>
 
-      {/* THE TWO SLOTS THIS PAGE EXISTS TO HOLD, and neither is built yet.
-          Task 26 replaces the first with the SVG DAG preview and Task 27 the
-          second with the read-only typed outline it shares with the editor.
-          They are `StubPanel`s rather than empty divs because a stub never
-          fakes success: a bordered box with nothing in it is indistinguishable,
-          to the person looking at it, from a preview that failed to draw. */}
-      <section data-testid="dag-preview-slot">
-        <StubPanel plan="Plan 12b Task 26" what="The DAG preview" />
-      </section>
-      <section data-testid="outline-slot" className="flex flex-col gap-2">
-        <StubPanel plan="Plan 12b Task 27" what="The typed outline" />
-        <NodeIds ids={nodeIds} />
-      </section>
-    </div>
-  )
-}
+      {/* THE TWO PROJECTIONS §6.1 NAMES. The first is built; the second is
+          Task 27's, and it is a `StubPanel` rather than an empty div because a
+          stub never fakes success — a bordered box with nothing in it is
+          indistinguishable, to the person looking at it, from an outline that
+          failed to draw.
 
-/**
- * THE DOCUMENT ITSELF, at the only depth this task can honestly read it.
- *
- * It is here so that the page's central claim — the definition arrived, whole,
- * and this is which one — is on the screen and under test before Task 25's
- * parser exists. Both slots above render identically for every version, so a
- * test that asserted only on them would pass against a page that never fetched
- * anything.
- *
- * `null` IS "UNREADABLE", NOT "EMPTY", and the two must not be rendered the
- * same way. `Validate` refuses a document with no nodes, so an empty list
- * cannot come off the wire — a page that said "no steps" for an unreadable
- * document would be describing a state the system does not have, and the
- * operator would go looking for a workflow problem instead of a client one.
- */
-function NodeIds(props: { ids: readonly string[] | null }) {
-  if (props.ids === null) {
-    return (
-      <p className="text-danger text-sm">
-        This definition could not be read by this version of the app.
-      </p>
-    )
-  }
-  return (
-    <ul data-testid="node-ids" className="flex flex-wrap gap-2">
-      {props.ids.map((id) => (
-        <li
-          key={id}
-          className="border-border text-text rounded-md border px-2 py-1 font-mono text-xs"
-        >
-          {id}
-        </li>
-      ))}
-    </ul>
+          `null` IS "UNREADABLE", NOT "EMPTY", and the two must not render the
+          same way. `Validate` refuses a document with no nodes, so an empty
+          definition cannot come off the wire; a page that drew an empty picture
+          here would describe a state the system does not have, and would send
+          an operator looking for a workflow problem instead of a client one. */}
+      {definition === null ? (
+        <p className="text-danger text-sm">
+          This definition could not be read by this version of the app.
+        </p>
+      ) : (
+        <>
+          <section data-testid="dag-preview-slot">
+            <DagPreview doc={definition} />
+          </section>
+          <section data-testid="outline-slot">
+            <StubPanel plan="Plan 12b Task 27" what="The typed outline" />
+          </section>
+        </>
+      )}
+    </div>
   )
 }
